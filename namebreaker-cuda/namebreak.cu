@@ -28,12 +28,23 @@ __device__ __constant__ uint32_t d_seed2_start;
 
 __device__ __constant__ uint32_t d_cryptTable[0x500];
 
-__device__ uint32_t mpqHash(const char* str) {
+// Hashes `candidate` followed by d_suffix directly, without ever concatenating them
+// into a scratch buffer first. Starts from d_seed1_start/d_seed2_start, which already
+// account for the (extended) prefix's contribution - see mpqHashWithPrefixCache_CPU.
+// This is the hot path (every thread runs it), so avoiding the extra buffer write+read
+// that buildFilenameWithoutPrefix + a buffer-based hash would need is worth it; the
+// full filename is only built (via buildCompleteFilename) on the rare hashA match below.
+__device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen) {
     uint32_t seed1 = d_seed1_start;
     uint32_t seed2 = d_seed2_start;
-    char ch;
 
-    while ((ch = *str++) != '\0') {
+    for (int i = 0; i < candidateLen; ++i) {
+        char ch = candidate[i];
+        seed1 = d_cryptTable[0x100 + ch] ^ (seed1 + seed2);
+        seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
+    }
+    for (int i = 0; i < d_suffix_size; ++i) {
+        char ch = d_suffix[i];
         seed1 = d_cryptTable[0x100 + ch] ^ (seed1 + seed2);
         seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
     }
@@ -74,13 +85,6 @@ __device__ void buildCompleteFilename(const char* candidate, int candidateLen, c
     out[i] = '\0';
 }
 
-__device__ void buildFilenameWithoutPrefix(const char* candidate, int candidateLen, char* out) {
-    memcpy(out, candidate, candidateLen);
-    memcpy(out + candidateLen, d_suffix, d_suffix_size);
-
-    out[candidateLen + d_suffix_size] = '\0';
-}
-
 __global__ void bruteForceKernel(
     int candidateLen,
     uint64_t startIdx,
@@ -96,14 +100,11 @@ __global__ void bruteForceKernel(
     idx += startIdx;
 
     char candidate[MAX_CANDIDATE_LEN];
-    char filename[MAX_FILENAME_LEN];
-
     indexToCandidate(idx, candidateLen, candidate);
 
-    buildFilenameWithoutPrefix(candidate, candidateLen, filename);
-
-    uint32_t hashA = mpqHash(filename);
+    uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen);
     if (hashA == targetA) {
+        char filename[MAX_FILENAME_LEN];
         buildCompleteFilename(candidate, candidateLen, filename);
         printf("Hash A matches: %s\n", filename);
 
@@ -121,15 +122,11 @@ __global__ void bruteForceKernel(
 }
 
 
-int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout) {
+int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout, char* d_matches, int* d_matchCount) {
     int h_flag = 0;
     CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
 
     if (h_flag) return h_flag;
-    char* d_matches;
-    int* d_matchCount;
-    CUDA_CHECK(cudaMalloc(&d_matches, MAX_MATCHES * MAX_FILENAME_LEN));
-    CUDA_CHECK(cudaMalloc(&d_matchCount, sizeof(int)));
     CUDA_CHECK(cudaMemset(d_matchCount, 0, sizeof(int)));
 
     int threadsPerBlock = 256;
@@ -153,8 +150,6 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
         fflush(fout);
     }
 
-    CUDA_CHECK(cudaFree(d_matches));
-    CUDA_CHECK(cudaFree(d_matchCount));
     return h_flag;
 }
 
@@ -255,6 +250,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Allocated once and reused for every batch, instead of malloc/free per call -
+    // these buffers are always the same size, so there's no reason to pay driver
+    // allocation overhead on every single kernel launch.
+    char* d_matches;
+    int* d_matchCount;
+    CUDA_CHECK(cudaMalloc(&d_matches, MAX_MATCHES * MAX_FILENAME_LEN));
+    CUDA_CHECK(cudaMalloc(&d_matchCount, sizeof(int)));
+
     bool found_match = false;
     int candidateLen = start_candidate.size();
     const uint64_t batchSize = ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE;
@@ -320,7 +323,7 @@ int main(int argc, char* argv[]) {
 
             for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
                 uint64_t count = std::min(batchSize, trailEnd - i);
-                if (runCudaBatch(trailingLen, i, count, target_hash_A, target_hash_B, fout) == 1) {
+                if (runCudaBatch(trailingLen, i, count, target_hash_A, target_hash_B, fout, d_matches, d_matchCount) == 1) {
                     found_match = true;
                     goto breakfree;
                 }
@@ -336,6 +339,8 @@ int main(int argc, char* argv[]) {
     }
 breakfree:
 
+    CUDA_CHECK(cudaFree(d_matches));
+    CUDA_CHECK(cudaFree(d_matchCount));
     fclose(fout);
     return found_match ? 0 : 2;
 }
