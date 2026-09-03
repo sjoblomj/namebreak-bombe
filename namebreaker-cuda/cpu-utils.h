@@ -9,6 +9,8 @@
 
 std::pair<uint32_t, uint32_t > mpqHashWithPrefixCache_CPU(const char* str, const uint32_t* cryptTable);
 uint64_t stringToIndex(const std::string& str, std::string alphabet);
+std::string indexToString(uint64_t index, int len, const std::string& alphabet);
+bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::string& alphabet);
 void prepareCryptTable(uint32_t* table);
 std::string getStartCandidate(std::string path, std::string prefix, std::string suffix);
 std::string make_bound_string(std::string input, int candidateLen);

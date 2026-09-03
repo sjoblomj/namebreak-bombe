@@ -52,13 +52,45 @@ uint64_t stringToIndex(const std::string& str, std::string alphabet) {
 }
 
 
+std::string indexToString(uint64_t index, int len, const std::string& alphabet) {
+    std::string result(len, alphabet[0]);
+    for (int i = len - 1; i >= 0; --i) {
+        result[i] = alphabet[index % alphabet.size()];
+        index /= alphabet.size();
+    }
+    return result;
+}
+
+// Compares a and b by their characters' positions in `alphabet`, treating a shorter
+// string as if followed by the smallest alphabet character - matching how bounds are
+// extended elsewhere (e.g. make_bound_string). Deliberately does this character-by-
+// character rather than via stringToIndex: converting a long string to a single index
+// overflows uint64_t well before MAX_CANDIDATE_LEN characters (e.g. 50^16), so this
+// avoids that entirely regardless of string length.
+bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::string& alphabet) {
+    size_t n = std::max(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        char ca = i < a.size() ? a[i] : alphabet[0];
+        char cb = i < b.size() ? b[i] : alphabet[0];
+        if (ca == cb) continue;
+        size_t pa = alphabet.find(ca);
+        size_t pb = alphabet.find(cb);
+        if (pa == std::string::npos || pb == std::string::npos) {
+            fprintf(stderr, "Invalid character in string during comparison\n");
+            exit(1);
+        }
+        return pa < pb;
+    }
+    return false; // equal
+}
+
 std::string getStartCandidate(std::string path, std::string prefix, std::string suffix) {
     std::string full = path;
 
     // Remove prefix and suffix
     if (full.rfind(prefix, 0) != 0 || full.size() <= prefix.size() + suffix.size()) {
         fprintf(stderr, "Invalid start filename format.\n");
-        return nullptr;
+        exit(1);
     }
 
     return full.substr(prefix.size(), full.size() - prefix.size() - suffix.size());
@@ -86,34 +118,36 @@ std::string remove_prefix_and_suffix(std::string base, std::string prefix, std::
 
 std::string getLowerBound(const std::string& input, std::string alphabet) {
     std::string result = input;
-    if (result.empty()) return std::string(16, ' ');
+    if (result.empty()) return std::string(MAX_CANDIDATE_LEN, ' ');
 
     // Find index of the last character
     char& lastChar = result.back();
     auto pos = alphabet.find(lastChar);
-    if (pos == std::string::npos || pos - 1 < 0) {
+    if (pos == std::string::npos || pos == 0) {
         fprintf(stderr, "Cannot bump last character or character not in alphabet\n");
+        exit(1);
     }
     lastChar = alphabet[pos - 1];
 
-    // Pad with underscores to length 16
-    result.resize(16, '_');
+    // Pad with underscores to length MAX_CANDIDATE_LEN
+    result.resize(MAX_CANDIDATE_LEN, '_');
     return result;
 }
 
 std::string getUpperBound(const std::string& input, std::string alphabet) {
     std::string result = input;
-    if (result.empty()) return std::string(16, ' ');
+    if (result.empty()) return std::string(MAX_CANDIDATE_LEN, ' ');
 
     // Find index of the last character
     char& lastChar = result.back();
     auto pos = alphabet.find(lastChar);
     if (pos == std::string::npos || pos + 1 >= alphabet.size()) {
         fprintf(stderr, "Cannot bump last character or character not in alphabet\n");
+        exit(1);
     }
     lastChar = alphabet[pos + 1];
 
-    // Pad with spaces to length 16
-    result.resize(16, ' ');
+    // Pad with spaces to length MAX_CANDIDATE_LEN
+    result.resize(MAX_CANDIDATE_LEN, ' ');
     return result;
 }

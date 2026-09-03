@@ -1,6 +1,15 @@
 #include <cuda_runtime.h>
+#include <cstdint>
 #include "cpu-utils.h"
 #include "constants.h"
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err__ = (call); \
+    if (err__ != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+        exit(1); \
+    } \
+} while (0)
 
 // Terminology:
 // * Candidate = The part of the name that we are brute-forcing
@@ -12,10 +21,6 @@ const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]
 __device__ volatile int d_foundMatchFlag = 0;
 __device__ __constant__ char d_prefix[64];
 __device__ __constant__ char d_suffix[64];
-__device__ __constant__ char d_lowerBound[64];
-__device__ __constant__ char d_upperBound[64];
-__device__ __constant__ char lowerBound[64];
-__device__ __constant__ char upperBound[64];
 __device__ __constant__ short d_prefix_size;
 __device__ __constant__ short d_suffix_size;
 __device__ __constant__ uint32_t d_seed1_start;
@@ -118,14 +123,14 @@ __global__ void bruteForceKernel(
 
 int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout) {
     int h_flag = 0;
-    cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int));
+    CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
 
     if (h_flag) return h_flag;
     char* d_matches;
     int* d_matchCount;
-    cudaMalloc(&d_matches, MAX_MATCHES * MAX_FILENAME_LEN);
-    cudaMalloc(&d_matchCount, sizeof(int));
-    cudaMemset(d_matchCount, 0, sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_matches, MAX_MATCHES * MAX_FILENAME_LEN));
+    CUDA_CHECK(cudaMalloc(&d_matchCount, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_matchCount, 0, sizeof(int)));
 
     int threadsPerBlock = 256;
     int blocks = (count + threadsPerBlock - 1) / threadsPerBlock;
@@ -133,22 +138,23 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     bruteForceKernel<<<blocks, threadsPerBlock>>>(
             candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount
     );
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     int h_matchCount = 0;
-    cudaMemcpy(&h_matchCount, d_matchCount, sizeof(int), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(&h_matchCount, d_matchCount, sizeof(int), cudaMemcpyDeviceToHost));
     h_matchCount = std::min(h_matchCount, MAX_MATCHES);
 
     char h_matches[MAX_MATCHES][MAX_FILENAME_LEN];
-    cudaMemcpy(h_matches, d_matches, h_matchCount * MAX_FILENAME_LEN, cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_matches, d_matches, h_matchCount * MAX_FILENAME_LEN, cudaMemcpyDeviceToHost));
 
     for (int i = 0; i < h_matchCount; ++i) {
         fprintf(fout, "%s\n", h_matches[i]);
         fflush(fout);
     }
 
-    cudaFree(d_matches);
-    cudaFree(d_matchCount);
+    CUDA_CHECK(cudaFree(d_matches));
+    CUDA_CHECK(cudaFree(d_matchCount));
     return h_flag;
 }
 
@@ -169,22 +175,60 @@ int main(int argc, char* argv[]) {
     std::string start_candidate = getStartCandidate(argv[2], prefix, suffix);
     std::string lowerBound = argv[5];
     std::string upperBound = argv[6];
-    uint32_t target_hash_A = std::stoul(argv[7], nullptr, 16);
-    uint32_t target_hash_B = std::stoul(argv[8], nullptr, 16);
+    uint32_t target_hash_A, target_hash_B;
+    try {
+        target_hash_A = std::stoul(argv[7], nullptr, 16);
+        target_hash_B = std::stoul(argv[8], nullptr, 16);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Invalid target hash: %s\n", e.what());
+        return 1;
+    }
 
     std::string lower = remove_prefix_and_suffix(lowerBound, prefix, suffix);
     std::string upper = remove_prefix_and_suffix(upperBound, prefix, suffix);
 
+    // Compare lower/upper using the same alphabet ordering the rest of the search
+    // relies on, rather than raw string comparison (which would break if the
+    // alphabet's character order ever stopped matching ASCII order).
+    if (!isBeforeInAlphabet(lower, upper, alphabet)) {
+        fprintf(stderr, "lower bound ('%s') must be smaller than upper bound ('%s')\n", lower.c_str(), upper.c_str());
+        return 1;
+    }
+
     short prefix_size = prefix.size();
     short suffix_size = suffix.size();
-    cudaMemcpyToSymbol(d_prefix_size, &prefix_size, sizeof(prefix_size));
-    cudaMemcpyToSymbol(d_suffix_size, &suffix_size, sizeof(suffix_size));
-    cudaMemcpyToSymbol(d_prefix, prefix.c_str(), prefix_size + 1);
-    cudaMemcpyToSymbol(d_suffix, suffix.c_str(), suffix_size + 1);
-    cudaMemcpyToSymbol(d_lowerBound, lowerBound.c_str(), lowerBound.size() + 1);
-    cudaMemcpyToSymbol(d_upperBound, upperBound.c_str(), upperBound.size() + 1);
-    cudaMemcpyToSymbol(lowerBound, lower.c_str(), lower.size() + 1);
-    cudaMemcpyToSymbol(upperBound, upper.c_str(), upper.size() + 1);
+
+    // A candidate's trailing `windowSize` characters are brute-forced directly by the
+    // GPU using native 64-bit indices. Any characters beyond that are treated as an
+    // extension of the prefix: their contribution to the hash is folded in once per
+    // outer iteration on the CPU (see mpqHashWithPrefixCache_CPU below), so a candidate
+    // can grow up to MAX_CANDIDATE_LEN without the per-thread index ever overflowing
+    // uint64_t. Computed from ALPHABET_SIZE/MAX_CANDIDATE_LEN rather than hardcoded, so
+    // it stays correct if either of those change.
+    int windowSize = 0;
+    {
+        uint64_t product = 1;
+        while (windowSize < MAX_CANDIDATE_LEN && product <= UINT64_MAX / ALPHABET_SIZE) {
+            product *= ALPHABET_SIZE;
+            windowSize++;
+        }
+    }
+    int maxLeadingLen = MAX_CANDIDATE_LEN - windowSize;
+    printf("windowSize: %d (max leading/prefix-extension length: %d)\n", windowSize, maxLeadingLen);
+
+    if (prefix_size + maxLeadingLen >= (int) sizeof(d_prefix) || suffix_size >= (int) sizeof(d_suffix)) {
+        fprintf(stderr, "prefix (up to %d once extended by leading candidate characters) or suffix (%d) too long for device buffers (max: %zu each)\n",
+                prefix_size + maxLeadingLen, suffix_size, sizeof(d_prefix));
+        return 1;
+    }
+    if (prefix_size + suffix_size + MAX_CANDIDATE_LEN >= MAX_FILENAME_LEN) {
+        fprintf(stderr, "prefix (%d) + suffix (%d) + candidate (up to %d) would exceed MAX_FILENAME_LEN (%d)\n",
+                prefix_size, suffix_size, MAX_CANDIDATE_LEN, MAX_FILENAME_LEN);
+        return 1;
+    }
+
+    CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffix_size, sizeof(suffix_size)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, suffix.c_str(), suffix_size + 1));
 
     std::string lowerBoundLimit = getLowerBound(lower, alphabet);
     std::string upperBoundLimit = getUpperBound(upper, alphabet);
@@ -203,13 +247,7 @@ int main(int argc, char* argv[]) {
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
-    cudaMemcpyToSymbol(d_cryptTable, h_cryptTable, sizeof(h_cryptTable));
-
-    std::pair<uint32_t, uint32_t> pair = mpqHashWithPrefixCache_CPU(prefix.c_str(), h_cryptTable);
-    uint32_t seed1_start = pair.first;
-    uint32_t seed2_start = pair.second;
-    cudaMemcpyToSymbol(d_seed1_start, &seed1_start, sizeof(seed1_start));
-    cudaMemcpyToSymbol(d_seed2_start, &seed2_start, sizeof(seed2_start));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_cryptTable, h_cryptTable, sizeof(h_cryptTable)));
 
     FILE* fout = fopen("matches.txt", "a");
     if (!fout) {
@@ -219,21 +257,73 @@ int main(int argc, char* argv[]) {
 
     bool found_match = false;
     int candidateLen = start_candidate.size();
+    const uint64_t batchSize = ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE;
 
     while (true) {
-        std::string start_bound = make_bound_string(start_candidate, candidateLen);
-        std::string end_bound   = make_bound_string(upperBoundLimit, candidateLen);
+        if (candidateLen > MAX_CANDIDATE_LEN) {
+            fprintf(stderr, "candidateLen (%d) exceeds MAX_CANDIDATE_LEN (%d) - exiting\n", candidateLen, MAX_CANDIDATE_LEN);
+            break;
+        }
 
-        uint64_t startIdx = stringToIndex(start_bound, alphabet);
-        uint64_t endIdx   = stringToIndex(end_bound, alphabet);
-        printf("Starting at '%s'. Char length = %d → Total combinations: %llu\n", start_bound.c_str(), candidateLen, (unsigned long long)(endIdx - startIdx));
+        // Split the candidate into a leading part (folded into the prefix, hashed once
+        // per value on the CPU) and a trailing part of at most `windowSize` characters
+        // (brute-forced by the GPU with native 64-bit indices). Every combination of the
+        // leading part is enumerated too, so the full candidateLen-character space is
+        // still covered exhaustively - it's just indexed in two safely-sized pieces
+        // instead of one that could overflow uint64_t.
+        int trailingLen = std::min(candidateLen, windowSize);
+        int leadingLen = candidateLen - trailingLen;
+        if (leadingLen > windowSize) {
+            fprintf(stderr, "candidateLen (%d) needs a %d-character leading part, which exceeds windowSize (%d) - exiting\n",
+                    candidateLen, leadingLen, windowSize);
+            break;
+        }
 
-        const uint64_t batchSize = ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE;
-        for (uint64_t i = startIdx; i < endIdx; i += batchSize) {
-            uint64_t count = std::min(batchSize, endIdx - i);
-            if (runCudaBatch(candidateLen, i, count, target_hash_A, target_hash_B, fout) == 1) {
-                found_match = true;
-                goto breakfree;
+        std::string start_full = make_bound_string(start_candidate, candidateLen);
+        std::string end_full   = make_bound_string(upperBoundLimit, candidateLen);
+
+        std::string start_leading = start_full.substr(0, leadingLen);
+        std::string end_leading   = end_full.substr(0, leadingLen);
+
+        uint64_t startLeadingIdx = stringToIndex(start_leading, alphabet);
+        uint64_t endLeadingIdx   = stringToIndex(end_leading, alphabet);
+        uint64_t trailSpaceSize  = stringToIndex(std::string(trailingLen, alphabet.back()), alphabet) + 1;
+
+        // Cap progress logging to roughly 1000 lines per candidateLen, regardless of how
+        // large the leading space is - printing once per leading combination is fine
+        // when leadingLen is 0 (a single iteration), but would flood stdout (and cost
+        // real time) once leadingLen grows.
+        uint64_t leadingCount = endLeadingIdx - startLeadingIdx + 1;
+        uint64_t leadingLogInterval = std::max<uint64_t>(1, leadingCount / 1000);
+
+        for (uint64_t leadingIdx = startLeadingIdx; leadingIdx <= endLeadingIdx; ++leadingIdx) {
+            std::string leading = indexToString(leadingIdx, leadingLen, alphabet);
+            std::string extendedPrefix = prefix + leading;
+
+            short extPrefixSize = extendedPrefix.size();
+            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix_size, &extPrefixSize, sizeof(extPrefixSize)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix, extendedPrefix.c_str(), extPrefixSize + 1));
+
+            std::pair<uint32_t, uint32_t> pair = mpqHashWithPrefixCache_CPU(extendedPrefix.c_str(), h_cryptTable);
+            uint32_t seed1_start = pair.first;
+            uint32_t seed2_start = pair.second;
+            CUDA_CHECK(cudaMemcpyToSymbol(d_seed1_start, &seed1_start, sizeof(seed1_start)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_seed2_start, &seed2_start, sizeof(seed2_start)));
+
+            uint64_t trailStart = (leadingIdx == startLeadingIdx) ? stringToIndex(start_full.substr(leadingLen), alphabet) : 0;
+            uint64_t trailEnd   = (leadingIdx == endLeadingIdx)   ? stringToIndex(end_full.substr(leadingLen), alphabet)   : trailSpaceSize;
+
+            if ((leadingIdx - startLeadingIdx) % leadingLogInterval == 0) {
+                printf("Leading '%s'. Char length = %d → Trailing combinations: %llu\n",
+                       leading.c_str(), candidateLen, (unsigned long long)(trailEnd - trailStart));
+            }
+
+            for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
+                uint64_t count = std::min(batchSize, trailEnd - i);
+                if (runCudaBatch(trailingLen, i, count, target_hash_A, target_hash_B, fout) == 1) {
+                    found_match = true;
+                    goto breakfree;
+                }
             }
         }
 
