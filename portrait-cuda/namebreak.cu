@@ -99,24 +99,28 @@ __global__ void bruteForceKernel(
     uint32_t targetA,
     uint32_t targetB,
     char* d_matches,
-    int* d_matchCount
+    int* d_matchCount,
+    short split_point
 ) {
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
     idx += startIdx;
 
-    char candidate[16];
+    char candidate[MAX_CANDIDATE_LEN];
     char filename[MAX_FILENAME_LEN];
 
     indexToCandidate(idx, candidateLen, candidate);
 
-    // First try without backslash
-    ///
-    buildFilenameWithoutPrefixAndWithoutBackslash(candidate, candidateLen, filename);
+    if (split_point < 0) {
+        buildFilenameWithoutPrefixAndWithoutBackslash(candidate, candidateLen, filename);
+    } else {
+        buildFilenameWithoutPrefixAndWithBackslash(candidate, candidateLen, split_point, filename);
+    }
+
     uint32_t hashA = mpqHash(filename);
     if (hashA == targetA) {
-        buildCompleteFilename(candidate, candidateLen, 0, filename);
+        buildCompleteFilename(candidate, candidateLen, split_point, filename);
         printf("Hash A matches: %s\n", filename);
 
         uint32_t hashB = mpqHashSeed2(filename);
@@ -124,38 +128,16 @@ __global__ void bruteForceKernel(
             printf("BOTH HASHES MATCH: %s\n", filename);
             d_foundMatchFlag = 1;
         }
+
         int slot = atomicAdd(d_matchCount, 1);
         if (slot < MAX_MATCHES) {
             memcpy(&d_matches[slot * MAX_FILENAME_LEN], filename, MAX_FILENAME_LEN);
         }
     }
-    ///
-
-    // Then try with all possible splits
-    for (int split = 1; split <= candidateLen; ++split) {
-        buildFilenameWithoutPrefixAndWithBackslash(candidate, candidateLen, split, filename);
-
-        uint32_t hashA = mpqHash(filename);
-        if (hashA == targetA) {
-            buildCompleteFilename(candidate, candidateLen, split, filename);
-            printf("Hash A matches: %s\n", filename);
-
-            uint32_t hashB = mpqHashSeed2(filename);
-            if (hashB == targetB) {
-                printf("BOTH HASHES MATCH: %s\n", filename);
-                d_foundMatchFlag = 1;
-            }
-
-            int slot = atomicAdd(d_matchCount, 1);
-            if (slot < MAX_MATCHES) {
-                memcpy(&d_matches[slot * MAX_FILENAME_LEN], filename, MAX_FILENAME_LEN);
-            }
-        }
-    }
 }
 
 
-int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout) {
+int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, short split_point, FILE* fout) {
     int h_flag = 0;
     cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int));
 
@@ -170,7 +152,7 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     int blocks = (count + threadsPerBlock - 1) / threadsPerBlock;
 
     bruteForceKernel<<<blocks, threadsPerBlock>>>(
-            candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount
+            candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount, split_point
     );
     cudaDeviceSynchronize();
 
@@ -245,12 +227,6 @@ int main(int argc, char* argv[]) {
     prepareCryptTable(h_cryptTable);
     cudaMemcpyToSymbol(d_cryptTable, h_cryptTable, sizeof(h_cryptTable));
 
-    std::pair<uint32_t, uint32_t> pair = mpqHashWithPrefixCache_CPU(prefix.c_str(), h_cryptTable);
-    uint32_t seed1_start = pair.first;
-    uint32_t seed2_start = pair.second;
-    cudaMemcpyToSymbol(d_seed1_start, &seed1_start, sizeof(seed1_start));
-    cudaMemcpyToSymbol(d_seed2_start, &seed2_start, sizeof(seed2_start));
-
     FILE* fout = fopen("matches.txt", "a");
     if (!fout) {
         perror("fopen");
@@ -259,25 +235,93 @@ int main(int argc, char* argv[]) {
 
     bool found_match = false;
     int candidateLen = start_candidate.size();
-    while (true) {
-        std::string start_bound = make_bound_string(start_candidate, candidateLen);
+
+    short charLimit = 6;
+    if (operation == "bounded" && candidateLen <= charLimit) {
+        printf("Cannot use operation 'bounded' for strings shorter than %i characters", charLimit);
+        return 1;
+    }
+    // TODO: This does not work with backslash!
+    for (int i = candidateLen; i <= charLimit; ++i) {
+        std::string start_bound(i, alphabet[0]);
+        std::string end_bound  (i, alphabet[ALPHABET_SIZE - 1]);
 
         uint64_t startIdx = stringToIndex(start_bound, alphabet);
-        uint64_t endIdx = stringToIndex(make_bound_string(upperBoundLimit, candidateLen), alphabet);
+        uint64_t endIdx   = stringToIndex(end_bound, alphabet);
         printf("Starting at '%s'. Char length = %d → Total combinations: %llu\n", start_bound.c_str(), candidateLen, (unsigned long long)(endIdx - startIdx));
 
         const uint64_t batchSize = ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE;
         for (uint64_t i = startIdx; i < endIdx; i += batchSize) {
             uint64_t count = std::min(batchSize, endIdx - i);
-            if (runCudaBatch(candidateLen, i, count, target_hash_A, target_hash_B, fout) == 1) {
+            if (runCudaBatch(candidateLen, i, count, target_hash_A, target_hash_B, -1, fout) == 1) {
                 found_match = true;
                 goto breakfree;
             }
         }
+    }
+
+    while (true) {
+        std::string start = make_bound_string(start_candidate, candidateLen);
+        std::string end   = make_bound_string(upperBoundLimit, candidateLen);
+
+        std::string start_pre = start.substr(0, start.size() - charLimit);
+        std::string end_pre   =   end.substr(0,   end.size() - charLimit);
+
+        std::string start_bound = start.substr(start.size() - charLimit);
+        std::string end_bound   =   end.substr(  end.size() - charLimit);
+
+        uint64_t startIdx = stringToIndex(start_bound, alphabet);
+        uint64_t endIdx   = stringToIndex(end_bound, alphabet);
+
+        const uint64_t batchSize = ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE;
+
+        // AAA AAAAAA
+        // We have split the start_candidate string in two; the start_pre of length n, and
+        // start_bound of length charLimit. The idea is to consider start_pre as part of
+        // the prefix and use the hash of them as the start point and only iterate over
+        // start_bound. However, we also need to insert backslashes in all places.
+        //
+        // First call runCudaBatch without any backslashes at all. Then we insert backslashes
+        // between the letters of start_pre and call runCudaBatch for all those combinations.
+        // Finally, we don't insert backslashes in start_pre, but have the cuda batches
+        // insert backslashes between the letters of start_bound.
+        for (short split = 0; split <= candidateLen + 1; ++split) {
+            printf(
+                    "Starting at '%s', ending at '%s'. Char length = %d → Total combinations: %llu\n",
+                    start_bound.c_str(), end_bound.c_str(), candidateLen, (unsigned long long)(endIdx - startIdx)
+            );
+
+            short split_pos = split == 0 ? -1 : split; // Don't insert a backslash in the first position
+            std::string pre = combine_strings_and_insert_backslash(prefix, start_pre, split_pos);
+            split_pos = split - start_pre.size() - 1;
+            if (split_pos == 0) {
+                // split_pos == 0 means we insert a backslash as the first character in start_bound.
+                // But we have already inserted a backslash as the last character of pre, so that run
+                // of combinations has already been tried. Thus, we skip it.
+                continue;
+            }
+
+            std::pair<uint32_t, uint32_t> pair = mpqHashWithPrefixCache_CPU(pre.c_str(), h_cryptTable);
+            uint32_t seed1_start = pair.first;
+            uint32_t seed2_start = pair.second;
+            cudaMemcpyToSymbol(d_seed1_start, &seed1_start, sizeof(seed1_start));
+            cudaMemcpyToSymbol(d_seed2_start, &seed2_start, sizeof(seed2_start));
+
+//            std::string apa = combine_strings_and_insert_backslash("", start_bound, split_pos);
+//            printf("String: '%s' + '%s', split_pos: %i\n", pre.c_str(), apa.c_str(), split_pos);
+            for (uint64_t i = startIdx; i < endIdx; i += batchSize) {
+                uint64_t count = std::min(batchSize, endIdx - i);
+                if (runCudaBatch(candidateLen, i, count, target_hash_A, target_hash_B, split_pos, fout) == 1) {
+                    found_match = true;
+                    goto breakfree;
+                }
+            }
+        }
+
         candidateLen += 1;
         start_candidate = lowerBoundLimit;
         if (operation == "bounded") {
-            printf("Reached the upper limit; exiting");
+            printf("Reached the upper limit - exiting\n");
             goto breakfree;
         }
     }
