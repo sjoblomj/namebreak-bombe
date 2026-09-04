@@ -15,8 +15,8 @@
 // * Candidate = The part of the name that we are brute-forcing
 // * Filename  = The Prefix + Candidate + Suffix
 
-__device__ __constant__ char d_alphabet[ALPHABET_SIZE + 1] = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]_";
-const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]_";
+__device__ __constant__ char d_alphabet[ALPHABET_SIZE + 1] = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
+const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
 
 __device__ volatile int d_foundMatchFlag = 0;
 __device__ __constant__ char d_prefix[64];
