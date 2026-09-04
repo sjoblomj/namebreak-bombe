@@ -116,38 +116,69 @@ std::string remove_prefix_and_suffix(std::string base, std::string prefix, std::
     return str;
 }
 
+// Computes the predecessor of `input` (zero-extended to MAX_CANDIDATE_LEN with alphabet's
+// min character), i.e. the largest full-length candidate strictly less than `input`. This
+// needs a cascading borrow rather than just decrementing the last character: e.g. if the
+// last character is already the alphabet minimum, that position wraps to the max and the
+// borrow propagates to the character before it (standard "120 - 1 = 119" style borrow).
+// If every character in `input` is already the alphabet minimum, `input` itself is already
+// the absolute minimum candidate and has no predecessor - saturate to that minimum instead
+// of erroring, since callers use this as a starting point for the search.
 std::string getLowerBound(const std::string& input, std::string alphabet) {
+    if (input.empty()) return std::string(MAX_CANDIDATE_LEN, alphabet.front());
+
     std::string result = input;
-    if (result.empty()) return std::string(MAX_CANDIDATE_LEN, ' ');
-
-    // Find index of the last character
-    char& lastChar = result.back();
-    auto pos = alphabet.find(lastChar);
-    if (pos == std::string::npos || pos == 0) {
-        fprintf(stderr, "Cannot bump last character or character not in alphabet\n");
-        exit(1);
+    int i = (int) result.size() - 1;
+    for (; i >= 0; --i) {
+        auto pos = alphabet.find(result[i]);
+        if (pos == std::string::npos) {
+            fprintf(stderr, "Invalid character in string: '%c'\n", result[i]);
+            exit(1);
+        }
+        if (pos == 0) {
+            result[i] = alphabet.back(); // borrow: this digit wraps to max, keep borrowing left
+            continue;
+        }
+        result[i] = alphabet[pos - 1];
+        break;
     }
-    lastChar = alphabet[pos - 1];
+    if (i < 0) {
+        return std::string(MAX_CANDIDATE_LEN, alphabet.front());
+    }
 
-    // Pad with underscores to length MAX_CANDIDATE_LEN
-    result.resize(MAX_CANDIDATE_LEN, '_');
+    // Positions beyond input's length are implicitly the min character, which the borrow
+    // above already maxes out - so pad the rest with the max character too.
+    result.resize(MAX_CANDIDATE_LEN, alphabet.back());
     return result;
 }
 
+// Symmetric to getLowerBound: computes the successor of `input` (max-extended to
+// MAX_CANDIDATE_LEN), cascading a carry through the string, saturating to the absolute
+// maximum candidate if `input` is already all max characters.
 std::string getUpperBound(const std::string& input, std::string alphabet) {
+    if (input.empty()) return std::string(MAX_CANDIDATE_LEN, ' ');
+
     std::string result = input;
-    if (result.empty()) return std::string(MAX_CANDIDATE_LEN, ' ');
-
-    // Find index of the last character
-    char& lastChar = result.back();
-    auto pos = alphabet.find(lastChar);
-    if (pos == std::string::npos || pos + 1 >= alphabet.size()) {
-        fprintf(stderr, "Cannot bump last character or character not in alphabet\n");
-        exit(1);
+    int i = (int) result.size() - 1;
+    for (; i >= 0; --i) {
+        auto pos = alphabet.find(result[i]);
+        if (pos == std::string::npos) {
+            fprintf(stderr, "Invalid character in string: '%c'\n", result[i]);
+            exit(1);
+        }
+        if (pos + 1 >= alphabet.size()) {
+            result[i] = alphabet.front(); // carry: this digit wraps to min, keep carrying left
+            continue;
+        }
+        result[i] = alphabet[pos + 1];
+        break;
     }
-    lastChar = alphabet[pos + 1];
+    if (i < 0) {
+        return std::string(MAX_CANDIDATE_LEN, alphabet.back());
+    }
 
-    // Pad with spaces to length MAX_CANDIDATE_LEN
+    // Positions beyond input's length are implicitly the max character, which the carry
+    // above already wraps to min - so pad the rest with the min character too.
     result.resize(MAX_CANDIDATE_LEN, ' ');
     return result;
 }
