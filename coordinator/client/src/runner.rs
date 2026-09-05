@@ -40,6 +40,7 @@ pub async fn run_namebreak(
     cmd.current_dir(workdir)
         .arg("bounded")
         .arg(&claim.alphabet)
+        .arg(claim.max_backslash_count.to_string())
         .arg(&claim.lower_bound_filename) // startCandidate: begin exactly at this range's start
         .arg(&claim.prefix)
         .arg(&claim.suffix)

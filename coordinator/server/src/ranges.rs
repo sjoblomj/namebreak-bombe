@@ -32,6 +32,7 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
         hash_a_hex: format!("0x{:08X}", i64_to_u32(target.hash_a)),
         hash_b_hex: format!("0x{:08X}", i64_to_u32(target.hash_b)),
         prune_symbol_runs: target.prune_symbol_runs != 0,
+        max_backslash_count: target.max_backslash_count,
         lower_bound_filename,
         upper_bound_filename,
         alphabet: target.alphabet.clone(),
@@ -521,5 +522,24 @@ mod tests {
         let (exp_lower, exp_upper) = range_bound_filenames(SIZE42, "PRE", ".SUF", 3, 0, space_size(SIZE42, 3));
         assert_eq!(claim.lower_bound_filename, exp_lower);
         assert_eq!(claim.upper_bound_filename, exp_upper);
+    }
+
+    /// A target's max_backslash_count must reach the client via ClaimResponse
+    /// unchanged, since namebreak itself (not the server) is what enforces it.
+    #[tokio::test]
+    async fn claim_includes_the_targets_max_backslash_count() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let target_id = insert_target(&pool, 2, 2).await;
+        sqlx::query("UPDATE targets SET max_backslash_count = ? WHERE id = ?")
+            .bind(3i64)
+            .bind(target_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let config = test_config(space_size(DEFAULT, 2));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(claim.max_backslash_count, 3);
     }
 }

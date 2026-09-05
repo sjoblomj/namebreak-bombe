@@ -28,11 +28,15 @@ pub struct ClaimResponse {
     pub hash_a_hex: String,
     pub hash_b_hex: String,
     pub prune_symbol_runs: bool,
+    /// Max '\' occurrences namebreak will allow in a candidate before discarding
+    /// it unhashed; 0 means unlimited. Passed straight through as `namebreak`'s
+    /// `<maxBackslashCount>` CLI argument.
+    pub max_backslash_count: i64,
     pub lower_bound_filename: String,
     pub upper_bound_filename: String,
     /// The literal alphabet characters for this range's target - passed straight
-    /// through as `namebreak`'s new `<alphabet>` CLI argument. The client never
-    /// needs to know this by name; only the server resolves profile names.
+    /// through as `namebreak`'s `<alphabet>` CLI argument. The client never needs
+    /// to know this by name; only the server resolves profile names.
     pub alphabet: String,
     /// Number of candidates covered by this range - lets the client report
     /// throughput on completion without doing any index math itself.
@@ -93,6 +97,10 @@ pub struct AdminCreateTargetRequest {
     /// (the original default alphabet) when omitted, for backward compatibility.
     #[serde(default)]
     pub alphabet_name: Option<String>,
+    /// Max '\' occurrences allowed in a candidate; 0 (the default when omitted)
+    /// means unlimited.
+    #[serde(default)]
+    pub max_backslash_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

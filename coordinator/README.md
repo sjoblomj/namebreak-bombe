@@ -36,6 +36,13 @@ See the top-level plan/design notes for the full rationale; the short version:
   but it does mean a genuinely new *size* (not just a new named profile at an
   existing size) requires editing `namebreak.cu`'s dispatch and
   recompiling/redistributing the binary to volunteers.
+- **Backslash limiting**: each target also has a `max_backslash_count` (default
+  `0` = unlimited). `namebreak` discards any candidate with more `\` occurrences
+  than this before spending a hash chain on it - the same style of cheap
+  pre-filter as `--prune-symbol-runs`'s "no 3 consecutive symbols" rule, just
+  targeting one specific character instead. To forbid `\` entirely, use an
+  alphabet that doesn't contain it rather than `max_backslash_count: 0` - `0` is
+  the "no limit" sentinel, not "zero allowed".
 - **Progress checkpointing**: every 60s the client heartbeats the most recent
   partial (Hash A only) match `namebreak` has printed for its current range, if
   any. `namebreak` only logs a match after the CUDA batch containing it has
@@ -70,7 +77,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "hash_a_hex": "0xF60F5D90", "hash_b_hex": "0xCE0A9BDB",
     "min_len": 1, "max_len": 8,
     "prune_symbol_runs": true,
-    "alphabet_name": "size49"
+    "alphabet_name": "size49",
+    "max_backslash_count": 0
   }'
 ```
 

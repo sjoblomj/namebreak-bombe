@@ -25,6 +25,7 @@ pub struct Target {
     pub min_len: i64,
     pub max_len: i64,
     pub prune_symbol_runs: i64,
+    pub max_backslash_count: i64,
     pub alphabet_name: String,
     pub alphabet: String,
     pub status: String,

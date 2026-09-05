@@ -129,6 +129,9 @@ pub async fn admin_create_target(
     if req.min_len < 1 || req.max_len < req.min_len {
         return Err(AppError::BadRequest("min_len must be >= 1 and <= max_len".into()));
     }
+    if req.max_backslash_count < 0 {
+        return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
+    }
     let alphabet_name = req.alphabet_name.as_deref().unwrap_or("size49");
     let Some(alphabet) = lookup_predefined_alphabet(alphabet_name) else {
         let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _)| name).collect();
@@ -147,8 +150,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, alphabet_name, alphabet, status, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -158,6 +161,7 @@ pub async fn admin_create_target(
     .bind(req.min_len)
     .bind(req.max_len)
     .bind(req.prune_symbol_runs as i64)
+    .bind(req.max_backslash_count)
     .bind(alphabet_name)
     .bind(alphabet)
     .bind(now)
