@@ -11,12 +11,22 @@
     } \
 } while (0)
 
+// Keep this set in sync with the switch in runCudaBatch (and MAX_ALPHABET_SIZE in
+// constants.h, which must be >= the largest size here). Checked early in main(),
+// before any CUDA setup, so an unsupported size fails fast with a clear message
+// instead of only surfacing deep inside the first batch.
+bool isSupportedAlphabetSize(int size) {
+    return size == 42 || size == 43 || size == 47 || size == 48 || size == 49 || size == 50;
+}
+
 // Terminology:
 // * Candidate = The part of the name that we are brute-forcing
 // * Filename  = The Prefix + Candidate + Suffix
 
-__device__ __constant__ char d_alphabet[ALPHABET_SIZE + 1] = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
-const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
+// Sized to the largest alphabet this build supports (see MAX_ALPHABET_SIZE);
+// populated at runtime via cudaMemcpyToSymbol from the CLI's <alphabet> argument,
+// the same pattern already used for d_prefix/d_suffix below.
+__device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
 
 __device__ volatile int d_foundMatchFlag = 0;
 __device__ __constant__ char d_prefix[64];
@@ -65,10 +75,16 @@ __device__ uint32_t mpqHashSeed2(const char* str) {
     return seed1;
 }
 
+// AlphabetSize is a compile-time template parameter (mirroring PruneSymbolRuns
+// below) so this modulus/division - run once per candidate character, for every
+// thread - stays a cheap compiler-optimized constant instead of a real (much
+// slower) GPU integer division. See runCudaBatch for the fixed set of sizes this
+// gets instantiated for and the runtime dispatch between them.
+template<int AlphabetSize>
 __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCandidate) {
     for (int i = candidateLen - 1; i >= 0; --i) {
-        outCandidate[i] = d_alphabet[index % ALPHABET_SIZE];
-        index /= ALPHABET_SIZE;
+        outCandidate[i] = d_alphabet[index % AlphabetSize];
+        index /= AlphabetSize;
     }
 }
 
@@ -113,8 +129,8 @@ __device__ void buildCompleteFilename(const char* candidate, int candidateLen, c
 // contains no trace of the check (not even a dead branch) and costs zero cycles
 // on this hot path. Which one runs is decided once per batch on the host, in
 // runCudaBatch, so the flag is still a normal runtime toggle from the caller's
-// point of view.
-template<bool PruneSymbolRuns>
+// point of view. AlphabetSize is the same trick applied to indexToCandidate below.
+template<int AlphabetSize, bool PruneSymbolRuns>
 __global__ void bruteForceKernel(
     int candidateLen,
     uint64_t startIdx,
@@ -130,7 +146,7 @@ __global__ void bruteForceKernel(
     idx += startIdx;
 
     char candidate[MAX_CANDIDATE_LEN];
-    indexToCandidate(idx, candidateLen, candidate);
+    indexToCandidate<AlphabetSize>(idx, candidateLen, candidate);
 
     if constexpr (PruneSymbolRuns) {
         if (hasForbiddenSymbolRun(candidate, candidateLen)) return;
@@ -156,7 +172,7 @@ __global__ void bruteForceKernel(
 }
 
 
-int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout, char* d_matches, int* d_matchCount, bool pruneSymbolRuns) {
+int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout, char* d_matches, int* d_matchCount, bool pruneSymbolRuns, int alphabetSize) {
     int h_flag = 0;
     CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
 
@@ -166,15 +182,30 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     int threadsPerBlock = 256;
     int blocks = (count + threadsPerBlock - 1) / threadsPerBlock;
 
-    if (pruneSymbolRuns) {
-        bruteForceKernel<true><<<blocks, threadsPerBlock>>>(
-                candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount
-        );
-    } else {
-        bruteForceKernel<false><<<blocks, threadsPerBlock>>>(
-                candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount
-        );
+    // alphabetSize has to be dispatched to one of a fixed set of compile-time
+    // template instantiations (see indexToCandidate's comment for why) - this is
+    // the whole set this build supports. Add a case (and recompile/redistribute
+    // namebreak to volunteers) to support a new size.
+    #define LAUNCH_WITH_ALPHABET_SIZE(SIZE) \
+        if (pruneSymbolRuns) { \
+            bruteForceKernel<SIZE, true><<<blocks, threadsPerBlock>>>( \
+                    candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount); \
+        } else { \
+            bruteForceKernel<SIZE, false><<<blocks, threadsPerBlock>>>( \
+                    candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount); \
+        }
+    switch (alphabetSize) {
+        case 42: LAUNCH_WITH_ALPHABET_SIZE(42); break;
+        case 43: LAUNCH_WITH_ALPHABET_SIZE(43); break;
+        case 47: LAUNCH_WITH_ALPHABET_SIZE(47); break;
+        case 48: LAUNCH_WITH_ALPHABET_SIZE(48); break;
+        case 49: LAUNCH_WITH_ALPHABET_SIZE(49); break;
+        case 50: LAUNCH_WITH_ALPHABET_SIZE(50); break;
+        default:
+            fprintf(stderr, "Unsupported alphabet size: %d (this build only supports: 42, 43, 47, 48, 49, 50)\n", alphabetSize);
+            exit(1);
     }
+    #undef LAUNCH_WITH_ALPHABET_SIZE
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -194,8 +225,8 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 9 || (strcmp(argv[1], "continuous") != 0 && strcmp(argv[1], "bounded") != 0)) {
-        fprintf(stderr, "Usage: %s <continuous|bounded> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB> [--prune-symbol-runs]\n", argv[0]);
+    if (argc < 10 || (strcmp(argv[1], "continuous") != 0 && strcmp(argv[1], "bounded") != 0)) {
+        fprintf(stderr, "Usage: %s <continuous|bounded> <alphabet> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB> [--prune-symbol-runs]\n", argv[0]);
         return 1;
     }
 
@@ -203,7 +234,7 @@ int main(int argc, char* argv[]) {
     // an explicit opt-in rather than something that silently starts skipping candidates
     // in an existing search.
     bool pruneSymbolRuns = false;
-    for (int i = 9; i < argc; ++i) {
+    for (int i = 10; i < argc; ++i) {
         if (strcmp(argv[i], "--prune-symbol-runs") == 0) {
             pruneSymbolRuns = true;
         } else {
@@ -211,22 +242,28 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    if (alphabet.size() != ALPHABET_SIZE) {
-        // This is just a check to make sure we don't change the alphabet without updating its size
-        fprintf(stderr, "Alphabet size mismatch. Expected %d, got %zu\n", ALPHABET_SIZE, alphabet.size());
+
+    std::string alphabet = argv[2];
+    if (alphabet.empty() || alphabet.size() > MAX_ALPHABET_SIZE) {
+        fprintf(stderr, "Alphabet must be non-empty and at most %d characters (got %zu)\n", MAX_ALPHABET_SIZE, alphabet.size());
+        return 1;
+    }
+    int alphabetSize = (int) alphabet.size();
+    if (!isSupportedAlphabetSize(alphabetSize)) {
+        fprintf(stderr, "Unsupported alphabet size: %d (this build only supports: 42, 43, 47, 48, 49, 50)\n", alphabetSize);
         return 1;
     }
 
     std::string operation = argv[1];
-    std::string prefix = argv[3];
-    std::string suffix = argv[4];
-    std::string start_candidate = getStartCandidate(argv[2], prefix, suffix);
-    std::string lowerBound = argv[5];
-    std::string upperBound = argv[6];
+    std::string prefix = argv[4];
+    std::string suffix = argv[5];
+    std::string start_candidate = getStartCandidate(argv[3], prefix, suffix);
+    std::string lowerBound = argv[6];
+    std::string upperBound = argv[7];
     uint32_t target_hash_A, target_hash_B;
     try {
-        target_hash_A = std::stoul(argv[7], nullptr, 16);
-        target_hash_B = std::stoul(argv[8], nullptr, 16);
+        target_hash_A = std::stoul(argv[8], nullptr, 16);
+        target_hash_B = std::stoul(argv[9], nullptr, 16);
     } catch (const std::exception& e) {
         fprintf(stderr, "Invalid target hash: %s\n", e.what());
         return 1;
@@ -251,13 +288,13 @@ int main(int argc, char* argv[]) {
     // extension of the prefix: their contribution to the hash is folded in once per
     // outer iteration on the CPU (see mpqHashWithPrefixCache_CPU below), so a candidate
     // can grow up to MAX_CANDIDATE_LEN without the per-thread index ever overflowing
-    // uint64_t. Computed from ALPHABET_SIZE/MAX_CANDIDATE_LEN rather than hardcoded, so
-    // it stays correct if either of those change.
+    // uint64_t. Computed from alphabetSize/MAX_CANDIDATE_LEN rather than hardcoded, so
+    // it stays correct if either changes (a smaller alphabet allows a larger window).
     int windowSize = 0;
     {
         uint64_t product = 1;
-        while (windowSize < MAX_CANDIDATE_LEN && product <= UINT64_MAX / ALPHABET_SIZE) {
-            product *= ALPHABET_SIZE;
+        while (windowSize < MAX_CANDIDATE_LEN && product <= UINT64_MAX / alphabetSize) {
+            product *= alphabetSize;
             windowSize++;
         }
     }
@@ -277,10 +314,12 @@ int main(int argc, char* argv[]) {
 
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffix_size, sizeof(suffix_size)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, suffix.c_str(), suffix_size + 1));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, alphabet.c_str(), alphabet.size() + 1));
 
     std::string lowerBoundLimit = getLowerBound(lower, alphabet);
     std::string upperBoundLimit = getUpperBound(upper, alphabet);
 
+    printf("alphabet: '%s' (size %d)\n", alphabet.c_str(), alphabetSize);
     printf("candidate: '%s'\n", start_candidate.c_str());
     printf("prefix: '%s'\n", prefix.c_str());
     printf("suffix: '%s'\n", suffix.c_str());
@@ -314,7 +353,11 @@ int main(int argc, char* argv[]) {
 
     bool found_match = false;
     int candidateLen = start_candidate.size();
-    const uint64_t batchSize = ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE;
+    // A fixed tuning constant (candidates per kernel launch) rather than derived
+    // from alphabetSize (as it implicitly was when this was ALPHABET_SIZE^4) - a
+    // small alphabet would otherwise produce pathologically tiny, overhead-heavy
+    // batches. 49^4, matching this project's original default alphabet size.
+    const uint64_t batchSize = 5'764'801;
 
     while (true) {
         if (candidateLen > MAX_CANDIDATE_LEN) {
@@ -368,7 +411,7 @@ int main(int argc, char* argv[]) {
             CUDA_CHECK(cudaMemcpyToSymbol(d_seed2_start, &seed2_start, sizeof(seed2_start)));
 
             uint64_t trailStart = (leadingIdx == startLeadingIdx) ? stringToIndex(start_full.substr(leadingLen), alphabet) : 0;
-            uint64_t trailEnd   = (leadingIdx == endLeadingIdx)   ? stringToIndex(end_full.substr(leadingLen), alphabet)   : trailSpaceSize;
+            uint64_t trailEnd   = (leadingIdx ==   endLeadingIdx) ? stringToIndex(  end_full.substr(leadingLen), alphabet) : trailSpaceSize;
 
             if ((leadingIdx - startLeadingIdx) % leadingLogInterval == 0) {
                 printf("Leading '%s'. Char length = %d → Trailing combinations: %llu\n",
@@ -377,7 +420,7 @@ int main(int argc, char* argv[]) {
 
             for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
                 uint64_t count = std::min(batchSize, trailEnd - i);
-                if (runCudaBatch(trailingLen, i, count, target_hash_A, target_hash_B, fout, d_matches, d_matchCount, pruneSymbolRuns) == 1) {
+                if (runCudaBatch(trailingLen, i, count, target_hash_A, target_hash_B, fout, d_matches, d_matchCount, pruneSymbolRuns, alphabetSize) == 1) {
                     found_match = true;
                     goto breakfree;
                 }

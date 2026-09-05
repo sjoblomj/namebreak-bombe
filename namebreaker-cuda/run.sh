@@ -1,5 +1,7 @@
 #!/bin/bash
 
+ALPHABET=" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"
+
 if [ ! -f matches.txt ]; then
     last_match="REZ\\ .WAV"
 else
@@ -9,6 +11,7 @@ fi
 # Looking for the real deal
 ./namebreak \
   continuous \
+  "$ALPHABET" \
   "$last_match" \
   "REZ\\" \
   ".WAV" \
@@ -21,6 +24,7 @@ fi
 ## Looking for the real deal
 #./namebreak \
 #  continuous \
+#  "$ALPHABET" \
 #  "$last_match" \
 #  "ART\CHAT_" \
 #  ".PCX" \
@@ -33,6 +37,7 @@ fi
 # Testing
 #./namebreak \
 #  continuous \
+#  "$ALPHABET" \
 #  "$last_match" \
 #  "ART\\UNIT\\OTHER\\" \
 #  ".GRP" \
@@ -43,6 +48,7 @@ fi
 
 #./namebreak \
 #  continuous \
+#  "$ALPHABET" \
 #  "$last_match" \
 #  "REZ\\" \
 #  ".BIN" \
