@@ -1,6 +1,7 @@
 #!/bin/bash
 
 ALPHABET=" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"
+MAX_BACKSLASH_COUNT=0 # 0 = unlimited
 
 if [ ! -f matches.txt ]; then
     last_match="REZ\\ .WAV"
@@ -12,6 +13,7 @@ fi
 ./namebreak \
   continuous \
   "$ALPHABET" \
+  "$MAX_BACKSLASH_COUNT" \
   "$last_match" \
   "REZ\\" \
   ".WAV" \
@@ -25,6 +27,7 @@ fi
 #./namebreak \
 #  continuous \
 #  "$ALPHABET" \
+#  "$MAX_BACKSLASH_COUNT" \
 #  "$last_match" \
 #  "ART\CHAT_" \
 #  ".PCX" \
@@ -38,6 +41,7 @@ fi
 #./namebreak \
 #  continuous \
 #  "$ALPHABET" \
+#  "$MAX_BACKSLASH_COUNT" \
 #  "$last_match" \
 #  "ART\\UNIT\\OTHER\\" \
 #  ".GRP" \
@@ -49,6 +53,7 @@ fi
 #./namebreak \
 #  continuous \
 #  "$ALPHABET" \
+#  "$MAX_BACKSLASH_COUNT" \
 #  "$last_match" \
 #  "REZ\\" \
 #  ".BIN" \

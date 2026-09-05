@@ -35,6 +35,13 @@ __device__ __constant__ short d_prefix_size;
 __device__ __constant__ short d_suffix_size;
 __device__ __constant__ uint32_t d_seed1_start;
 __device__ __constant__ uint32_t d_seed2_start;
+// Max '\' occurrences allowed in a candidate before it's discarded unhashed; 0
+// means unlimited (no candidate is ever discarded on this basis - use an
+// alphabet without '\' in it if none should ever appear at all). A plain
+// runtime constant rather than a template parameter like AlphabetSize: this is
+// just an integer compare, not a division, so there's no compile-time-constant
+// codegen benefit to chase here.
+__device__ __constant__ int d_maxBackslashCount;
 
 __device__ __constant__ uint32_t d_cryptTable[0x500];
 
@@ -111,6 +118,14 @@ __device__ __forceinline__ bool hasForbiddenSymbolRun(const char* candidate, int
     return false;
 }
 
+__device__ __forceinline__ int countBackslashes(const char* candidate, int candidateLen) {
+    int count = 0;
+    for (int i = 0; i < candidateLen; ++i) {
+        if (candidate[i] == '\\') count++;
+    }
+    return count;
+}
+
 __device__ void buildCompleteFilename(const char* candidate, int candidateLen, char* out) {
     memcpy(out, d_prefix, d_prefix_size);
     short i = d_prefix_size;
@@ -151,6 +166,8 @@ __global__ void bruteForceKernel(
     if constexpr (PruneSymbolRuns) {
         if (hasForbiddenSymbolRun(candidate, candidateLen)) return;
     }
+
+    if (d_maxBackslashCount != 0 && countBackslashes(candidate, candidateLen) > d_maxBackslashCount) return;
 
     uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen);
     if (hashA == targetA) {
@@ -225,8 +242,8 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 10 || (strcmp(argv[1], "continuous") != 0 && strcmp(argv[1], "bounded") != 0)) {
-        fprintf(stderr, "Usage: %s <continuous|bounded> <alphabet> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB> [--prune-symbol-runs]\n", argv[0]);
+    if (argc < 11 || (strcmp(argv[1], "continuous") != 0 && strcmp(argv[1], "bounded") != 0)) {
+        fprintf(stderr, "Usage: %s <continuous|bounded> <alphabet> <maxBackslashCount> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB> [--prune-symbol-runs]\n", argv[0]);
         return 1;
     }
 
@@ -234,7 +251,7 @@ int main(int argc, char* argv[]) {
     // an explicit opt-in rather than something that silently starts skipping candidates
     // in an existing search.
     bool pruneSymbolRuns = false;
-    for (int i = 10; i < argc; ++i) {
+    for (int i = 11; i < argc; ++i) {
         if (strcmp(argv[i], "--prune-symbol-runs") == 0) {
             pruneSymbolRuns = true;
         } else {
@@ -254,16 +271,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // 0 means unlimited (see d_maxBackslashCount's declaration comment).
+    int maxBackslashCount;
+    try {
+        maxBackslashCount = std::stoi(argv[3]);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Invalid maxBackslashCount: %s\n", e.what());
+        return 1;
+    }
+    if (maxBackslashCount < 0) {
+        fprintf(stderr, "maxBackslashCount must be >= 0 (0 means unlimited), got %d\n", maxBackslashCount);
+        return 1;
+    }
+
     std::string operation = argv[1];
-    std::string prefix = argv[4];
-    std::string suffix = argv[5];
-    std::string start_candidate = getStartCandidate(argv[3], prefix, suffix);
-    std::string lowerBound = argv[6];
-    std::string upperBound = argv[7];
+    std::string prefix = argv[5];
+    std::string suffix = argv[6];
+    std::string start_candidate = getStartCandidate(argv[4], prefix, suffix);
+    std::string lowerBound = argv[7];
+    std::string upperBound = argv[8];
     uint32_t target_hash_A, target_hash_B;
     try {
-        target_hash_A = std::stoul(argv[8], nullptr, 16);
-        target_hash_B = std::stoul(argv[9], nullptr, 16);
+        target_hash_A = std::stoul(argv[9], nullptr, 16);
+        target_hash_B = std::stoul(argv[10], nullptr, 16);
     } catch (const std::exception& e) {
         fprintf(stderr, "Invalid target hash: %s\n", e.what());
         return 1;
@@ -315,6 +345,7 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffix_size, sizeof(suffix_size)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, suffix.c_str(), suffix_size + 1));
     CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, alphabet.c_str(), alphabet.size() + 1));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_maxBackslashCount, &maxBackslashCount, sizeof(maxBackslashCount)));
 
     std::string lowerBoundLimit = getLowerBound(lower, alphabet);
     std::string upperBoundLimit = getUpperBound(upper, alphabet);
@@ -332,6 +363,7 @@ int main(int argc, char* argv[]) {
     printf("hashA: '%X'\n", target_hash_A);
     printf("hashB: '%X'\n", target_hash_B);
     printf("pruneSymbolRuns: %s\n", pruneSymbolRuns ? "true" : "false");
+    printf("maxBackslashCount: %d%s\n", maxBackslashCount, maxBackslashCount == 0 ? " (unlimited)" : "");
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
