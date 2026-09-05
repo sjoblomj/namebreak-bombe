@@ -1,0 +1,31 @@
+# Deploy from the coordinator/ directory: `fly launch` / `fly deploy` (uses this
+# file's [build] section, so the Dockerfile's relative COPY paths - which expect
+# the whole coordinator/ workspace as build context - resolve correctly).
+app = "namebreak-coordinator" # fly will prompt to rename this if it's taken
+
+primary_region = "arn" # pick whichever fly.io region is closest to your volunteers
+
+[build]
+  dockerfile = "server/Dockerfile"
+
+[env]
+  BIND_ADDR = "0.0.0.0:8080"
+  DATABASE_URL = "sqlite:///data/namebreak.db"
+  # Tune to taste - see coordinator/README.md for what each one does.
+  # TARGET_CHUNK_SECONDS = "900"
+  # DEFAULT_RATE_PER_SEC = "500000000"
+
+[[mounts]]
+  source = "namebreak_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  # SQLite is single-writer - never run more than one machine for this app.
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
