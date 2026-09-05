@@ -72,6 +72,29 @@ __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCand
     }
 }
 
+__device__ __forceinline__ bool isAlnumMpq(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
+}
+
+// Real MPQ filename components essentially never contain three consecutive
+// non-alphanumeric, non-space characters (e.g. "']&_") - used to prune obviously-
+// implausible candidates before spending a hash chain on them. Spaces are exempted
+// since " - " and " & " are common real word separators (e.g. "Arathi - Lake",
+// "Gold Separates East & West") that would otherwise be wrongly pruned. Only
+// inspects the candidate itself, not where it joins the (fixed, user-supplied)
+// prefix/suffix.
+__device__ __forceinline__ bool hasForbiddenSymbolRun(const char* candidate, int candidateLen) {
+    int run = 0;
+    for (int i = 0; i < candidateLen; ++i) {
+        if (isAlnumMpq(candidate[i]) || candidate[i] == ' ') {
+            run = 0;
+        } else if (++run >= 3) {
+            return true;
+        }
+    }
+    return false;
+}
+
 __device__ void buildCompleteFilename(const char* candidate, int candidateLen, char* out) {
     memcpy(out, d_prefix, d_prefix_size);
     short i = d_prefix_size;
@@ -85,6 +108,13 @@ __device__ void buildCompleteFilename(const char* candidate, int candidateLen, c
     out[i] = '\0';
 }
 
+// PruneSymbolRuns is a compile-time template parameter rather than a runtime bool:
+// the two instantiations are separate compiled kernels, so the disabled variant
+// contains no trace of the check (not even a dead branch) and costs zero cycles
+// on this hot path. Which one runs is decided once per batch on the host, in
+// runCudaBatch, so the flag is still a normal runtime toggle from the caller's
+// point of view.
+template<bool PruneSymbolRuns>
 __global__ void bruteForceKernel(
     int candidateLen,
     uint64_t startIdx,
@@ -101,6 +131,10 @@ __global__ void bruteForceKernel(
 
     char candidate[MAX_CANDIDATE_LEN];
     indexToCandidate(idx, candidateLen, candidate);
+
+    if constexpr (PruneSymbolRuns) {
+        if (hasForbiddenSymbolRun(candidate, candidateLen)) return;
+    }
 
     uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen);
     if (hashA == targetA) {
@@ -122,7 +156,7 @@ __global__ void bruteForceKernel(
 }
 
 
-int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout, char* d_matches, int* d_matchCount) {
+int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout, char* d_matches, int* d_matchCount, bool pruneSymbolRuns) {
     int h_flag = 0;
     CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
 
@@ -132,9 +166,15 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     int threadsPerBlock = 256;
     int blocks = (count + threadsPerBlock - 1) / threadsPerBlock;
 
-    bruteForceKernel<<<blocks, threadsPerBlock>>>(
-            candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount
-    );
+    if (pruneSymbolRuns) {
+        bruteForceKernel<true><<<blocks, threadsPerBlock>>>(
+                candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount
+        );
+    } else {
+        bruteForceKernel<false><<<blocks, threadsPerBlock>>>(
+                candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount
+        );
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -155,8 +195,21 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
 
 int main(int argc, char* argv[]) {
     if (argc < 9 || (strcmp(argv[1], "continuous") != 0 && strcmp(argv[1], "bounded") != 0)) {
-        fprintf(stderr, "Usage: %s <continuous|bounded> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <continuous|bounded> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB> [--prune-symbol-runs]\n", argv[0]);
         return 1;
+    }
+
+    // Off by default: it changes which candidates get hashed at all, so it should be
+    // an explicit opt-in rather than something that silently starts skipping candidates
+    // in an existing search.
+    bool pruneSymbolRuns = false;
+    for (int i = 9; i < argc; ++i) {
+        if (strcmp(argv[i], "--prune-symbol-runs") == 0) {
+            pruneSymbolRuns = true;
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            return 1;
+        }
     }
     if (alphabet.size() != ALPHABET_SIZE) {
         // This is just a check to make sure we don't change the alphabet without updating its size
@@ -239,6 +292,7 @@ int main(int argc, char* argv[]) {
     printf("upperBoundLimit: '%s'\n", upperBoundLimit.c_str());
     printf("hashA: '%X'\n", target_hash_A);
     printf("hashB: '%X'\n", target_hash_B);
+    printf("pruneSymbolRuns: %s\n", pruneSymbolRuns ? "true" : "false");
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
@@ -323,7 +377,7 @@ int main(int argc, char* argv[]) {
 
             for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
                 uint64_t count = std::min(batchSize, trailEnd - i);
-                if (runCudaBatch(trailingLen, i, count, target_hash_A, target_hash_B, fout, d_matches, d_matchCount) == 1) {
+                if (runCudaBatch(trailingLen, i, count, target_hash_A, target_hash_B, fout, d_matches, d_matchCount, pruneSymbolRuns) == 1) {
                     found_match = true;
                     goto breakfree;
                 }

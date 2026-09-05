@@ -1,7 +1,7 @@
 #!/bin/bash
 
 if [ ! -f matches.txt ]; then
-    last_match="ART\\CHAT_BNF.PCX"
+    last_match="REZ\\ .WAV"
 else
     last_match=$(awk 'END{print}' matches.txt)
 fi
@@ -10,12 +10,25 @@ fi
 ./namebreak \
   continuous \
   "$last_match" \
-  "ART\CHAT_" \
-  ".PCX" \
-  "ART\CHAT_BNE.PCX" \
-  "ART\CHAT____.PCX" \
-  0x888F1CE2 \
-  0x447C8E70
+  "REZ\\" \
+  ".WAV" \
+  "REZ\\FINZ09BX.TXT" \
+  "REZ\\GAMEMENU.BIN" \
+  0xF60F5D90 \
+  0xCE0A9BDB \
+  --prune-symbol-runs
+
+## Looking for the real deal
+#./namebreak \
+#  continuous \
+#  "$last_match" \
+#  "ART\CHAT_" \
+#  ".PCX" \
+#  "ART\CHAT_BNE.PCX" \
+#  "ART\CHAT____.PCX" \
+#  0x888F1CE2 \
+#  0x447C8E70 \
+#  --prune-symbol-runs
 
 # Testing
 #./namebreak \
