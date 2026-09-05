@@ -25,6 +25,18 @@ See the top-level plan/design notes for the full rationale; the short version:
   user's observed candidates/sec, so a chunk takes roughly `TARGET_CHUNK_SECONDS`
   regardless of GPU speed. A range that isn't completed or heartbeated before
   its lease expires is automatically reassigned to someone else.
+- **Progress checkpointing**: every 60s the client heartbeats the most recent
+  partial (Hash A only) match `namebreak` has printed for its current range, if
+  any. `namebreak` only logs a match after the CUDA batch containing it has
+  finished, so everything up to that candidate is known to be searched - the
+  server records it as the range's `progress_index`. If the range is later
+  reassigned (lease expired, client disconnected), the new client resumes just
+  past that point instead of redoing the whole range; if progress had already
+  reached the end, the range is simply marked complete instead of reassigned.
+  Note this only helps when a Hash A collision happens to occur (roughly one in
+  2^32 candidates), so for smaller ranges a disconnect is often not checkpointed
+  at all and the range gets fully redone - not a correctness problem, just a
+  missed optimization in that case.
 - **Storage**: SQLite on a single Fly Volume. One server instance only - range
   assignment has to be centrally coordinated anyway, so this isn't a real
   limitation.

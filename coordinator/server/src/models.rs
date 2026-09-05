@@ -54,6 +54,7 @@ pub struct Range {
     pub lease_expires_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub created_at: i64,
+    pub progress_index: Option<i64>,
 }
 
 /// Stores a `u32` hash in an `i64` column without sign issues (always non-negative,

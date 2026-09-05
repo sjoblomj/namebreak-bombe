@@ -36,6 +36,18 @@ pub struct ClaimResponse {
     pub lease_seconds: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HeartbeatRequest {
+    /// Full filename (prefix+candidate+suffix) of the most recent partial (Hash A
+    /// only) match `namebreak` has printed for this range so far, if any. The
+    /// server uses this as a progress checkpoint: everything up to and including
+    /// this candidate is known to have been searched (namebreak only logs a match
+    /// after the CUDA batch containing it has finished), so if this range is later
+    /// reassigned, the new client resumes just past it instead of from the start.
+    #[serde(default)]
+    pub last_hash_a_match_filename: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub lease_seconds: i64,

@@ -5,7 +5,14 @@ mod runner;
 use api::ApiClient;
 use clap::Parser;
 use namebreak_protocol::{ClaimResponse, CompleteRequest};
+use runner::LastHashAMatch;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Fixed rather than derived from the range's lease, so progress checkpoints (and
+/// the liveness signal the server's reclaim sweep relies on) land at a steady,
+/// predictable cadence regardless of how big a range is or how fast a client is.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,18 +62,20 @@ async fn run_one(
         "starting range"
     );
 
-    let heartbeat_every = Duration::from_secs((claim.lease_seconds / 3).max(10) as u64);
+    let last_hash_a_match: LastHashAMatch = Arc::new(Mutex::new(None));
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let heartbeat_handle = {
         let api = api.clone();
         let range_id = claim.range_id;
+        let last_hash_a_match = last_hash_a_match.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(heartbeat_every);
+            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
             interval.tick().await; // first tick fires immediately; skip it
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(err) = api.heartbeat(range_id).await {
+                        let latest = last_hash_a_match.lock().unwrap().clone();
+                        if let Err(err) = api.heartbeat(range_id, latest).await {
                             tracing::warn!(%err, range_id, "heartbeat failed");
                         }
                     }
@@ -77,7 +86,7 @@ async fn run_one(
     };
 
     let started = Instant::now();
-    let outcome = runner::run_namebreak(namebreak_bin, workdir, claim).await;
+    let outcome = runner::run_namebreak(namebreak_bin, workdir, claim, last_hash_a_match).await;
     let _ = stop_tx.send(true);
     let _ = heartbeat_handle.await;
     let outcome = outcome?;
@@ -93,16 +102,41 @@ async fn run_one(
         tracing::info!(range_id = claim.range_id, "range exhausted, no match");
     }
 
-    api.complete(
-        claim.range_id,
-        &CompleteRequest {
-            found: outcome.found,
-            filename: outcome.filename,
-            elapsed_seconds,
-            candidates_processed: claim.candidate_count,
-        },
-    )
-    .await?;
+    let filename = outcome.filename;
+    match api
+        .complete(
+            claim.range_id,
+            &CompleteRequest {
+                found: outcome.found,
+                filename: filename.clone(),
+                elapsed_seconds,
+                candidates_processed: claim.candidate_count,
+            },
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(err) if err.status() == Some(reqwest::StatusCode::CONFLICT) => {
+            // This range's ownership moved on before we could report in - almost
+            // certainly a network outage during heartbeating that outlasted the
+            // lease, so the server already reassigned it to someone else.
+            if outcome.found {
+                tracing::error!(
+                    range_id = claim.range_id, filename = ?filename,
+                    "found a match but lost ownership of this range before reporting it - \
+                     the match is still recorded locally in matches.txt, but the server was \
+                     never told about it; check matches.txt manually"
+                );
+            } else {
+                tracing::warn!(
+                    range_id = claim.range_id,
+                    "lost ownership of this range before reporting completion - the server had \
+                     already reassigned it, so this GPU time was redundant but nothing is lost"
+                );
+            }
+        }
+        Err(err) => return Err(err.into()),
+    }
 
     Ok(())
 }

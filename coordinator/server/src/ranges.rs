@@ -5,7 +5,7 @@
 use namebreak_protocol::ClaimResponse;
 use sqlx::SqlitePool;
 
-use crate::alphabet::{range_bound_filenames, space_size};
+use crate::alphabet::{candidate_to_index, range_bound_filenames, space_size, strip_prefix_suffix};
 use crate::error::AppError;
 use crate::models::{i64_to_u32, Range, Target, TargetProgress, User};
 use crate::state::{now_unix, RangeConfig};
@@ -47,21 +47,43 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
     let now = now_unix();
     let rate = effective_rate(config, user);
 
-    // 1) Reassign the oldest reclaimed range, if any.
-    let reclaimed = sqlx::query_as::<_, Range>(
-        "SELECT ranges.* FROM ranges JOIN targets ON targets.id = ranges.target_id \
-         WHERE ranges.status = 'pending' AND targets.status = 'active' \
-         ORDER BY ranges.created_at ASC LIMIT 1",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some(range) = reclaimed {
-        let lease_seconds = lease_seconds_for(config, range.end_index - range.start_index, rate);
-        sqlx::query(
-            "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, assigned_at = ?, \
-             lease_seconds = ?, lease_expires_at = ? WHERE id = ?",
+    // 1) Reassign the oldest reclaimed range, if any - resuming past whatever a
+    // previous client's heartbeats already confirmed searched, per progress_index.
+    loop {
+        let reclaimed = sqlx::query_as::<_, Range>(
+            "SELECT ranges.* FROM ranges JOIN targets ON targets.id = ranges.target_id \
+             WHERE ranges.status = 'pending' AND targets.status = 'active' \
+             ORDER BY ranges.created_at ASC LIMIT 1",
         )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(range) = reclaimed else { break };
+
+        let effective_start = match range.progress_index {
+            Some(p) if p + 1 > range.start_index => p + 1,
+            _ => range.start_index,
+        };
+
+        if effective_start >= range.end_index {
+            // A previous client's heartbeats show this range was already fully
+            // searched (with no full match ever reported) before it was abandoned -
+            // nothing left to hand out. Close it out and look at the next reclaimed
+            // range instead of returning a nonsensical empty range to a client.
+            sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ?, assigned_user_id = NULL WHERE id = ?")
+                .bind(now)
+                .bind(range.id)
+                .execute(&mut *tx)
+                .await?;
+            continue;
+        }
+
+        let lease_seconds = lease_seconds_for(config, range.end_index - effective_start, rate);
+        sqlx::query(
+            "UPDATE ranges SET status = 'in_progress', start_index = ?, progress_index = NULL, \
+             assigned_user_id = ?, assigned_at = ?, lease_seconds = ?, lease_expires_at = ? WHERE id = ?",
+        )
+        .bind(effective_start)
         .bind(user.id)
         .bind(now)
         .bind(lease_seconds)
@@ -75,7 +97,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
-        return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start_index, range.end_index, lease_seconds)));
+        return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, effective_start, range.end_index, lease_seconds)));
     }
 
     // 2) Otherwise carve a fresh chunk off the oldest active target that still has room.
@@ -139,24 +161,81 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
     Ok(None)
 }
 
-pub async fn heartbeat_range(pool: &SqlitePool, user: &User, range_id: i64) -> Result<i64, AppError> {
+pub async fn heartbeat_range(
+    pool: &SqlitePool,
+    user: &User,
+    range_id: i64,
+    last_hash_a_match_filename: Option<String>,
+) -> Result<i64, AppError> {
+    let mut tx = pool.begin().await?;
+
     let range = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?")
         .bind(range_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound)?;
 
     if range.status != "in_progress" || range.assigned_user_id != Some(user.id) {
         return Err(AppError::Conflict("range is not currently assigned to you".into()));
     }
+
+    if let Some(filename) = last_hash_a_match_filename {
+        if let Some(new_progress) = resolve_progress_index(&mut tx, &range, &filename).await? {
+            // Monotonic: never let a late/out-of-order heartbeat move progress backwards.
+            let floor = range.progress_index.unwrap_or(range.start_index - 1);
+            let new_progress = new_progress.max(floor);
+            sqlx::query("UPDATE ranges SET progress_index = ? WHERE id = ?")
+                .bind(new_progress)
+                .bind(range_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
     let lease_seconds = range.lease_seconds.unwrap_or(300);
     let now = now_unix();
     sqlx::query("UPDATE ranges SET lease_expires_at = ? WHERE id = ?")
         .bind(now + lease_seconds)
         .bind(range_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
     Ok(lease_seconds)
+}
+
+/// Turns a client-reported "Hash A matches: <filename>" line into a validated
+/// index within `range`. Returns `None` (rather than an error) for anything that
+/// doesn't check out - a malformed or stale progress report shouldn't fail the
+/// whole heartbeat, since keeping the lease alive matters far more than this
+/// secondary optimization.
+async fn resolve_progress_index(
+    tx: &mut sqlx::SqliteConnection,
+    range: &Range,
+    filename: &str,
+) -> Result<Option<i64>, AppError> {
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
+        .bind(range.target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let Some(candidate) = strip_prefix_suffix(filename, &target.prefix, &target.suffix) else {
+        tracing::warn!(range_id = range.id, filename, "heartbeat match filename doesn't match target's prefix/suffix, ignoring");
+        return Ok(None);
+    };
+    if candidate.chars().count() as i64 != range.candidate_len {
+        tracing::warn!(range_id = range.id, filename, "heartbeat match candidate length doesn't match range, ignoring");
+        return Ok(None);
+    }
+    let Some(index) = candidate_to_index(candidate) else {
+        tracing::warn!(range_id = range.id, filename, "heartbeat match candidate has out-of-alphabet characters, ignoring");
+        return Ok(None);
+    };
+    if index < range.start_index || index >= range.end_index {
+        tracing::warn!(range_id = range.id, filename, index, "heartbeat match index falls outside the range, ignoring");
+        return Ok(None);
+    }
+    Ok(Some(index))
 }
 
 pub struct CompleteOutcome {
@@ -264,20 +343,21 @@ mod tests {
         }
     }
 
-    async fn insert_user(pool: &SqlitePool) -> User {
+    async fn insert_user(pool: &SqlitePool, name: &str) -> User {
         let now = now_unix();
+        let token = format!("{name}-tok");
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO users (username, hostname, token, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
         )
-        .bind("tester")
-        .bind("test-host")
-        .bind("tok")
+        .bind(name)
+        .bind(format!("{name}-host"))
+        .bind(&token)
         .bind(now)
         .bind(now)
         .fetch_one(pool)
         .await
         .unwrap();
-        User { id, username: "tester".into(), hostname: "test-host".into(), token: "tok".into(), ema_rate_per_sec: None, created_at: now, last_seen_at: now }
+        User { id, username: name.into(), hostname: format!("{name}-host"), token, ema_rate_per_sec: None, created_at: now, last_seen_at: now }
     }
 
     /// Creates a target whose candidate length only ever ranges over `min_len..=max_len`,
@@ -314,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn range_carving_crosses_a_candidate_length_boundary_cleanly() {
         let pool = test_pool().await;
-        let user = insert_user(&pool).await;
+        let user = insert_user(&pool, "tester").await;
         insert_target(&pool, 1, 2).await;
 
         // Bigger than either length's full space, so each claim greedily takes all
@@ -335,5 +415,80 @@ mod tests {
 
         let claim3 = claim_range(&pool, &config, &user).await.unwrap();
         assert!(claim3.is_none(), "max_len's space is now fully carved - there must be no length-3 work invented");
+    }
+
+    /// The scenario this whole feature exists for: a client heartbeats a partial
+    /// (Hash A only) match partway through its range, then disconnects. Once the
+    /// server reclaims the abandoned range, whoever claims it next must resume
+    /// just past the checkpointed candidate - not redo the whole range from its
+    /// original start.
+    #[tokio::test]
+    async fn heartbeat_progress_narrows_the_range_on_reassignment() {
+        let pool = test_pool().await;
+        let first_user = insert_user(&pool, "first").await;
+        insert_target(&pool, 3, 3).await; // fixed length, whole space handed out as one range
+
+        let config = test_config(space_size(3));
+        let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
+        assert_eq!(claim.candidate_count, space_size(3));
+
+        let midpoint_index = space_size(3) / 2;
+        let midpoint_filename = format!("PRE{}.SUF", crate::alphabet::index_to_candidate(midpoint_index, 3));
+        heartbeat_range(&pool, &first_user, claim.range_id, Some(midpoint_filename)).await.unwrap();
+
+        // Simulate the client disconnecting: force its lease into the past and run
+        // the same sweep the background task runs.
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
+            .bind(claim.range_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+
+        let second_user = insert_user(&pool, "second").await;
+        let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("range should be reassignable");
+        assert_eq!(resumed.range_id, claim.range_id, "the same range row is reassigned, not a fresh one");
+
+        let expected_start = midpoint_index + 1;
+        let (exp_lower, exp_upper) = range_bound_filenames("PRE", ".SUF", 3, expected_start, space_size(3));
+        assert_eq!(resumed.lower_bound_filename, exp_lower, "must resume just past the checkpointed candidate, not from the original start");
+        assert_eq!(resumed.upper_bound_filename, exp_upper);
+        assert_eq!(resumed.candidate_count, space_size(3) - expected_start);
+    }
+
+    /// If a client's last heartbeat before disconnecting already covered the very
+    /// end of its range, the range has in fact been fully searched (with no full
+    /// match reported) - there's nothing left to reassign, so it should be closed
+    /// out as completed instead of handed to the next claimer as a zero-width range.
+    #[tokio::test]
+    async fn heartbeat_progress_reaching_the_end_completes_the_range_without_reassigning() {
+        let pool = test_pool().await;
+        let first_user = insert_user(&pool, "first").await;
+        insert_target(&pool, 2, 2).await;
+
+        let config = test_config(space_size(2));
+        let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
+
+        let last_index = space_size(2) - 1;
+        let last_filename = format!("PRE{}.SUF", crate::alphabet::index_to_candidate(last_index, 2));
+        heartbeat_range(&pool, &first_user, claim.range_id, Some(last_filename)).await.unwrap();
+
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
+            .bind(claim.range_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+
+        let second_user = insert_user(&pool, "second").await;
+        let claim2 = claim_range(&pool, &config, &second_user).await.unwrap();
+        assert!(claim2.is_none(), "range was already fully searched via heartbeats - nothing should be handed out");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM ranges WHERE id = ?")
+            .bind(claim.range_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "completed");
     }
 }

@@ -1,6 +1,7 @@
 use namebreak_protocol::ClaimResponse;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -15,13 +16,26 @@ pub struct RunOutcome {
     pub filename: Option<String>,
 }
 
-const MATCH_PREFIX: &str = "BOTH HASHES MATCH: ";
+const FULL_MATCH_PREFIX: &str = "BOTH HASHES MATCH: ";
+const PARTIAL_MATCH_PREFIX: &str = "Hash A matches: ";
+
+/// Shared with the heartbeat loop, which reads it at each tick: the most recent
+/// "Hash A matches: <filename>" line namebreak has printed for the range currently
+/// running, if any. Used as a checkpoint - see `HeartbeatRequest` for why it's safe
+/// to treat everything up to this candidate as searched.
+pub type LastHashAMatch = Arc<Mutex<Option<String>>>;
 
 /// Runs `namebreak bounded ...` against exactly the range described by `claim`,
 /// streaming its stdout through to this process's own stdout so the operator can
 /// still watch progress, while also scanning for the "BOTH HASHES MATCH:" line
-/// that namebreak.cu prints on a real find.
-pub async fn run_namebreak(bin: &Path, workdir: &Path, claim: &ClaimResponse) -> anyhow::Result<RunOutcome> {
+/// that namebreak.cu prints on a real find (and updating `last_hash_a_match` as
+/// partial matches stream by, for the heartbeat loop running concurrently with this).
+pub async fn run_namebreak(
+    bin: &Path,
+    workdir: &Path,
+    claim: &ClaimResponse,
+    last_hash_a_match: LastHashAMatch,
+) -> anyhow::Result<RunOutcome> {
     let mut cmd = Command::new(bin);
     cmd.current_dir(workdir)
         .arg("bounded")
@@ -45,8 +59,10 @@ pub async fn run_namebreak(bin: &Path, workdir: &Path, claim: &ClaimResponse) ->
     let mut found_filename = None;
     while let Some(line) = lines.next_line().await? {
         println!("{line}");
-        if let Some(name) = line.strip_prefix(MATCH_PREFIX) {
+        if let Some(name) = line.strip_prefix(FULL_MATCH_PREFIX) {
             found_filename = Some(name.trim().to_string());
+        } else if let Some(name) = line.strip_prefix(PARTIAL_MATCH_PREFIX) {
+            *last_hash_a_match.lock().unwrap() = Some(name.trim().to_string());
         }
     }
 

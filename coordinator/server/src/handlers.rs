@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use namebreak_protocol::{
     AdminCreateTargetRequest, AdminCreateTargetResponse, AdminPatchTargetRequest,
-    CompleteRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
+    CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
 };
 
 use crate::alphabet::max_supported_len;
@@ -69,8 +69,9 @@ pub async fn heartbeat(
     State(state): State<AppState>,
     AuthedUser(user): AuthedUser,
     Path(range_id): Path<i64>,
+    Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
-    let lease_seconds = ranges::heartbeat_range(&state.pool, &user, range_id).await?;
+    let lease_seconds = ranges::heartbeat_range(&state.pool, &user, range_id, req.last_hash_a_match_filename).await?;
     Ok(Json(HeartbeatResponse { lease_seconds }))
 }
 

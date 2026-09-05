@@ -59,6 +59,26 @@ pub fn index_to_candidate(mut index: i64, len: i64) -> String {
     buf.into_iter().collect()
 }
 
+/// Inverse of `index_to_candidate`. Returns `None` if `candidate` contains a
+/// character outside the alphabet (or is implausibly long enough to overflow).
+pub fn candidate_to_index(candidate: &str) -> Option<i64> {
+    let chars = alphabet_chars();
+    let size = alphabet_size();
+    let mut index: i64 = 0;
+    for ch in candidate.chars() {
+        let digit = chars.iter().position(|&c| c == ch)? as i64;
+        index = index.checked_mul(size)?.checked_add(digit)?;
+    }
+    Some(index)
+}
+
+/// Strips a target's prefix/suffix off a full filename to recover the candidate
+/// portion, e.g. for turning a `namebreak`-reported match back into an index via
+/// `candidate_to_index`.
+pub fn strip_prefix_suffix<'a>(filename: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    filename.strip_prefix(prefix)?.strip_suffix(suffix)
+}
+
 /// Builds the `(lowerBoundFilename, upperBoundFilename)` pair to pass to
 /// `namebreak bounded` so it covers exactly the half-open range
 /// `[start_index, end_index)` at the given candidate length.
@@ -111,6 +131,25 @@ mod tests {
         assert_eq!(index_to_candidate(0, 3), "   ");
         let max_index = space_size(3) - 1;
         assert_eq!(index_to_candidate(max_index, 3), "___");
+    }
+
+    #[test]
+    fn candidate_to_index_round_trips_with_index_to_candidate() {
+        for &index in &[0, 1, 48, 49, 2400, space_size(4) - 1] {
+            let candidate = index_to_candidate(index, 4);
+            assert_eq!(candidate_to_index(&candidate), Some(index));
+        }
+    }
+
+    #[test]
+    fn candidate_to_index_rejects_out_of_alphabet_characters() {
+        assert_eq!(candidate_to_index("abc"), None); // lowercase isn't in the alphabet
+    }
+
+    #[test]
+    fn strip_prefix_suffix_recovers_the_candidate() {
+        assert_eq!(strip_prefix_suffix("REZ\\AB.WAV", "REZ\\", ".WAV"), Some("AB"));
+        assert_eq!(strip_prefix_suffix("WRONG\\AB.WAV", "REZ\\", ".WAV"), None);
     }
 
     #[test]
