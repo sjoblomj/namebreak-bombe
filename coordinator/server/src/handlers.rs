@@ -3,11 +3,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use namebreak_protocol::{
-    AdminCreateTargetRequest, AdminCreateTargetResponse, AdminPatchTargetRequest,
+    AdminCreateTargetRequest, AdminCreateTargetResponse, AdminPatchTargetRequest, AlphabetInfo, AlphabetsResponse,
     CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
 };
 
-use crate::alphabet::max_supported_len;
+use crate::alphabet::{alphabet_size, lookup_predefined_alphabet, max_supported_len, PREDEFINED_ALPHABETS};
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
 use crate::models::{parse_hash_hex, u32_to_i64, User};
@@ -110,6 +110,14 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
     Ok(Json(StatusResponse { targets }))
 }
 
+pub async fn alphabets() -> Json<AlphabetsResponse> {
+    let alphabets = PREDEFINED_ALPHABETS
+        .iter()
+        .map(|&(name, characters)| AlphabetInfo { name: name.to_string(), characters: characters.to_string(), size: alphabet_size(characters) })
+        .collect();
+    Json(AlphabetsResponse { alphabets })
+}
+
 pub async fn admin_create_target(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -121,10 +129,15 @@ pub async fn admin_create_target(
     if req.min_len < 1 || req.max_len < req.min_len {
         return Err(AppError::BadRequest("min_len must be >= 1 and <= max_len".into()));
     }
-    let cap = max_supported_len();
+    let alphabet_name = req.alphabet_name.as_deref().unwrap_or("size49");
+    let Some(alphabet) = lookup_predefined_alphabet(alphabet_name) else {
+        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _)| name).collect();
+        return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
+    };
+    let cap = max_supported_len(alphabet);
     if req.max_len > cap {
         return Err(AppError::BadRequest(format!(
-            "max_len ({}) exceeds this server's supported maximum ({cap}) - beyond this a range's index no longer fits an i64",
+            "max_len ({}) exceeds this server's supported maximum for alphabet '{alphabet_name}' ({cap}) - beyond this a range's index no longer fits an i64",
             req.max_len
         )));
     }
@@ -134,8 +147,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, status, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, alphabet_name, alphabet, status, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -145,6 +158,8 @@ pub async fn admin_create_target(
     .bind(req.min_len)
     .bind(req.max_len)
     .bind(req.prune_symbol_runs as i64)
+    .bind(alphabet_name)
+    .bind(alphabet)
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;

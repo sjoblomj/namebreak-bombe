@@ -30,6 +30,10 @@ pub struct ClaimResponse {
     pub prune_symbol_runs: bool,
     pub lower_bound_filename: String,
     pub upper_bound_filename: String,
+    /// The literal alphabet characters for this range's target - passed straight
+    /// through as `namebreak`'s new `<alphabet>` CLI argument. The client never
+    /// needs to know this by name; only the server resolves profile names.
+    pub alphabet: String,
     /// Number of candidates covered by this range - lets the client report
     /// throughput on completion without doing any index math itself.
     pub candidate_count: i64,
@@ -85,6 +89,10 @@ pub struct AdminCreateTargetRequest {
     pub max_len: i64,
     #[serde(default)]
     pub prune_symbol_runs: bool,
+    /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`
+    /// (the original default alphabet) when omitted, for backward compatibility.
+    #[serde(default)]
+    pub alphabet_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +104,18 @@ pub struct AdminCreateTargetResponse {
 pub struct AdminPatchTargetRequest {
     /// "active" or "paused"
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlphabetInfo {
+    pub name: String,
+    pub characters: String,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlphabetsResponse {
+    pub alphabets: Vec<AlphabetInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

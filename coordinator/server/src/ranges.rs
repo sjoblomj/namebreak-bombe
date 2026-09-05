@@ -22,7 +22,7 @@ fn effective_rate(config: &RangeConfig, user: &User) -> f64 {
 
 fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_index: i64, end_index: i64, lease_seconds: i64) -> ClaimResponse {
     let (lower_bound_filename, upper_bound_filename) =
-        range_bound_filenames(&target.prefix, &target.suffix, candidate_len, start_index, end_index);
+        range_bound_filenames(&target.alphabet, &target.prefix, &target.suffix, candidate_len, start_index, end_index);
     ClaimResponse {
         range_id,
         target_id: target.id,
@@ -34,6 +34,7 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
         prune_symbol_runs: target.prune_symbol_runs != 0,
         lower_bound_filename,
         upper_bound_filename,
+        alphabet: target.alphabet.clone(),
         candidate_count: end_index - start_index,
         lease_seconds,
     }
@@ -111,7 +112,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .fetch_one(&mut *tx)
             .await?;
 
-        let remaining = space_size(progress.candidate_len) - progress.next_index;
+        let remaining = space_size(&target.alphabet, progress.candidate_len) - progress.next_index;
         if remaining <= 0 {
             continue; // this target's search space (up to max_len) is fully carved out
         }
@@ -124,7 +125,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
 
         let mut new_len = progress.candidate_len;
         let mut new_next_index = end_index;
-        if new_next_index >= space_size(progress.candidate_len) && new_len < target.max_len {
+        if new_next_index >= space_size(&target.alphabet, progress.candidate_len) && new_len < target.max_len {
             new_len += 1;
             new_next_index = 0;
         }
@@ -227,7 +228,7 @@ async fn resolve_progress_index(
         tracing::warn!(range_id = range.id, filename, "heartbeat match candidate length doesn't match range, ignoring");
         return Ok(None);
     }
-    let Some(index) = candidate_to_index(candidate) else {
+    let Some(index) = candidate_to_index(&target.alphabet, candidate) else {
         tracing::warn!(range_id = range.id, filename, "heartbeat match candidate has out-of-alphabet characters, ignoring");
         return Ok(None);
     };
@@ -319,7 +320,10 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alphabet::{range_bound_filenames, space_size};
+    use crate::alphabet::{index_to_candidate, range_bound_filenames, space_size};
+
+    const DEFAULT: &str = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
+    const SIZE42: &str = " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
 
     async fn test_pool() -> SqlitePool {
         // In-memory DB behind a single connection (same pattern as db::connect) so
@@ -363,13 +367,19 @@ mod tests {
     /// Creates a target whose candidate length only ever ranges over `min_len..=max_len`,
     /// so its whole space is small enough to carve (and exhaust) in a couple of test claims.
     async fn insert_target(pool: &SqlitePool, min_len: i64, max_len: i64) -> i64 {
+        insert_target_with_alphabet(pool, "size49", DEFAULT, min_len, max_len).await
+    }
+
+    async fn insert_target_with_alphabet(pool: &SqlitePool, alphabet_name: &str, alphabet: &str, min_len: i64, max_len: i64) -> i64 {
         let now = now_unix();
         let target_id: i64 = sqlx::query_scalar(
-            "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, status, created_at) \
-             VALUES ('t', 'PRE', '.SUF', 0, 0, ?, ?, 0, 'active', ?) RETURNING id",
+            "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, alphabet_name, alphabet, status, created_at) \
+             VALUES ('t', 'PRE', '.SUF', 0, 0, ?, ?, 0, ?, ?, 'active', ?) RETURNING id",
         )
         .bind(min_len)
         .bind(max_len)
+        .bind(alphabet_name)
+        .bind(alphabet)
         .bind(now)
         .fetch_one(pool)
         .await
@@ -399,19 +409,19 @@ mod tests {
 
         // Bigger than either length's full space, so each claim greedily takes all
         // of what's left at the current length.
-        let config = test_config(space_size(2));
+        let config = test_config(space_size(DEFAULT, 2));
 
         let claim1 = claim_range(&pool, &config, &user).await.unwrap().expect("length 1 should still have work");
-        let (exp_lower1, exp_upper1) = range_bound_filenames("PRE", ".SUF", 1, 0, space_size(1));
+        let (exp_lower1, exp_upper1) = range_bound_filenames(DEFAULT, "PRE", ".SUF", 1, 0, space_size(DEFAULT, 1));
         assert_eq!(claim1.lower_bound_filename, exp_lower1);
         assert_eq!(claim1.upper_bound_filename, exp_upper1);
-        assert_eq!(claim1.candidate_count, space_size(1), "first range should cover the whole (and only the) length-1 space");
+        assert_eq!(claim1.candidate_count, space_size(DEFAULT, 1), "first range should cover the whole (and only the) length-1 space");
 
         let claim2 = claim_range(&pool, &config, &user).await.unwrap().expect("length 2 should now be available");
-        let (exp_lower2, exp_upper2) = range_bound_filenames("PRE", ".SUF", 2, 0, space_size(2));
+        let (exp_lower2, exp_upper2) = range_bound_filenames(DEFAULT, "PRE", ".SUF", 2, 0, space_size(DEFAULT, 2));
         assert_eq!(claim2.lower_bound_filename, exp_lower2, "length-2 work must start at index 0, not skip ahead");
         assert_eq!(claim2.upper_bound_filename, exp_upper2);
-        assert_eq!(claim2.candidate_count, space_size(2), "second range should cover the whole (and only the) length-2 space");
+        assert_eq!(claim2.candidate_count, space_size(DEFAULT, 2), "second range should cover the whole (and only the) length-2 space");
 
         let claim3 = claim_range(&pool, &config, &user).await.unwrap();
         assert!(claim3.is_none(), "max_len's space is now fully carved - there must be no length-3 work invented");
@@ -428,12 +438,12 @@ mod tests {
         let first_user = insert_user(&pool, "first").await;
         insert_target(&pool, 3, 3).await; // fixed length, whole space handed out as one range
 
-        let config = test_config(space_size(3));
+        let config = test_config(space_size(DEFAULT, 3));
         let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
-        assert_eq!(claim.candidate_count, space_size(3));
+        assert_eq!(claim.candidate_count, space_size(DEFAULT, 3));
 
-        let midpoint_index = space_size(3) / 2;
-        let midpoint_filename = format!("PRE{}.SUF", crate::alphabet::index_to_candidate(midpoint_index, 3));
+        let midpoint_index = space_size(DEFAULT, 3) / 2;
+        let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
         heartbeat_range(&pool, &first_user, claim.range_id, Some(midpoint_filename)).await.unwrap();
 
         // Simulate the client disconnecting: force its lease into the past and run
@@ -450,10 +460,10 @@ mod tests {
         assert_eq!(resumed.range_id, claim.range_id, "the same range row is reassigned, not a fresh one");
 
         let expected_start = midpoint_index + 1;
-        let (exp_lower, exp_upper) = range_bound_filenames("PRE", ".SUF", 3, expected_start, space_size(3));
+        let (exp_lower, exp_upper) = range_bound_filenames(DEFAULT, "PRE", ".SUF", 3, expected_start, space_size(DEFAULT, 3));
         assert_eq!(resumed.lower_bound_filename, exp_lower, "must resume just past the checkpointed candidate, not from the original start");
         assert_eq!(resumed.upper_bound_filename, exp_upper);
-        assert_eq!(resumed.candidate_count, space_size(3) - expected_start);
+        assert_eq!(resumed.candidate_count, space_size(DEFAULT, 3) - expected_start);
     }
 
     /// If a client's last heartbeat before disconnecting already covered the very
@@ -466,11 +476,11 @@ mod tests {
         let first_user = insert_user(&pool, "first").await;
         insert_target(&pool, 2, 2).await;
 
-        let config = test_config(space_size(2));
+        let config = test_config(space_size(DEFAULT, 2));
         let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
 
-        let last_index = space_size(2) - 1;
-        let last_filename = format!("PRE{}.SUF", crate::alphabet::index_to_candidate(last_index, 2));
+        let last_index = space_size(DEFAULT, 2) - 1;
+        let last_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, last_index, 2));
         heartbeat_range(&pool, &first_user, claim.range_id, Some(last_filename)).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
@@ -490,5 +500,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "completed");
+    }
+
+    /// Proves the alphabet parameterization actually works end-to-end for a
+    /// non-default alphabet, not just for the one everything else in this file
+    /// happens to use: a target using size42 should get bounds and a candidate
+    /// count computed against a 42-character space, not the default 49.
+    #[tokio::test]
+    async fn claim_uses_the_targets_own_alphabet_not_the_default() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        insert_target_with_alphabet(&pool, "size42", SIZE42, 3, 3).await;
+
+        let config = test_config(space_size(SIZE42, 3));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+
+        assert_eq!(claim.alphabet, SIZE42);
+        assert_eq!(claim.candidate_count, space_size(SIZE42, 3), "should be size42's space (74088), not size49's");
+        assert_ne!(claim.candidate_count, space_size(DEFAULT, 3));
+        let (exp_lower, exp_upper) = range_bound_filenames(SIZE42, "PRE", ".SUF", 3, 0, space_size(SIZE42, 3));
+        assert_eq!(claim.lower_bound_filename, exp_lower);
+        assert_eq!(claim.upper_bound_filename, exp_upper);
     }
 }

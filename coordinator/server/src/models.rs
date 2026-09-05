@@ -25,6 +25,8 @@ pub struct Target {
     pub min_len: i64,
     pub max_len: i64,
     pub prune_symbol_runs: i64,
+    pub alphabet_name: String,
+    pub alphabet: String,
     pub status: String,
     pub found_filename: Option<String>,
     pub found_by_user_id: Option<i64>,

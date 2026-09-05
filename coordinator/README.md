@@ -20,11 +20,22 @@ See the top-level plan/design notes for the full rationale; the short version:
   bearer token. Every other endpoint requires it - this is the only thing
   standing between a real client and a generic bot scraping the API, so it's
   intentionally simple rather than absent.
-- **Ranges**: a target's candidate space (fixed 49-character alphabet, see
-  `server/src/alphabet.rs`) is carved into contiguous chunks sized from each
-  user's observed candidates/sec, so a chunk takes roughly `TARGET_CHUNK_SECONDS`
-  regardless of GPU speed. A range that isn't completed or heartbeated before
-  its lease expires is automatically reassigned to someone else.
+- **Ranges**: a target's candidate space is carved into contiguous chunks sized
+  from each user's observed candidates/sec, so a chunk takes roughly
+  `TARGET_CHUNK_SECONDS` regardless of GPU speed. A range that isn't completed
+  or heartbeated before its lease expires is automatically reassigned to
+  someone else.
+- **Alphabets**: each target picks one of a small set of predefined alphabets
+  (`server/src/alphabet.rs`'s `PREDEFINED_ALPHABETS`, also listable via
+  `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
+  without brackets/backslash and with a reduced punctuation set, currently
+  `size50`, `size49`, `size48`, `size47`, `size43` and `size42`. The set of
+  distinct *sizes* (42/43/47/48/49/50) is compiled into `namebreak.cu` as
+  separate template instantiations (the same zero-cost trick already used for
+  `--prune-symbol-runs`), so picking a different alphabet costs no performance -
+  but it does mean a genuinely new *size* (not just a new named profile at an
+  existing size) requires editing `namebreak.cu`'s dispatch and
+  recompiling/redistributing the binary to volunteers.
 - **Progress checkpointing**: every 60s the client heartbeats the most recent
   partial (Hash A only) match `namebreak` has printed for its current range, if
   any. `namebreak` only logs a match after the CUDA batch containing it has
@@ -58,15 +69,19 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "prefix": "REZ\\", "suffix": ".TXT",
     "hash_a_hex": "0xF60F5D90", "hash_b_hex": "0xCE0A9BDB",
     "min_len": 1, "max_len": 8,
-    "prune_symbol_runs": true
+    "prune_symbol_runs": true,
+    "alphabet_name": "size49"
   }'
 ```
 
 `min_len`/`max_len` are candidate lengths (the brute-forced portion between
 prefix and suffix). `max_len` is capped by the server at whatever length still
-fits a flat 64-bit range index (`alphabet_size^len <= i64::MAX`, currently 11
-for this 49-character alphabet) - well beyond what's realistically
-exhaustible anyway.
+fits a flat 64-bit range index (`alphabet_size^len <= i64::MAX`) for the chosen
+alphabet - well beyond what's realistically exhaustible anyway (11, for every
+alphabet currently in `PREDEFINED_ALPHABETS` - they're all close enough in size
+to land on the same cap; a genuinely smaller alphabet, e.g. a hex-only one,
+would push it noticeably higher). `alphabet_name` defaults to `"size49"` if omitted; see
+`GET /api/v1/alphabets` for the full list.
 
 Check progress:
 

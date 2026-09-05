@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/ranges/{id}/heartbeat", post(handlers::heartbeat))
         .route("/api/v1/ranges/{id}/complete", post(handlers::complete))
         .route("/api/v1/status", get(handlers::status))
+        .route("/api/v1/alphabets", get(handlers::alphabets))
         .route("/api/v1/admin/targets", post(handlers::admin_create_target))
         .route("/api/v1/admin/targets/{id}", patch(handlers::admin_patch_target))
         .with_state(state);
