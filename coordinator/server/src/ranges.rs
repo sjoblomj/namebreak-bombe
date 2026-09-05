@@ -81,25 +81,65 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         }
 
         let lease_seconds = lease_seconds_for(config, range.end_index - effective_start, rate);
-        sqlx::query(
-            "UPDATE ranges SET status = 'in_progress', start_index = ?, progress_index = NULL, \
-             assigned_user_id = ?, assigned_at = ?, lease_seconds = ?, lease_expires_at = ? WHERE id = ?",
-        )
-        .bind(effective_start)
-        .bind(user.id)
-        .bind(now)
-        .bind(lease_seconds)
-        .bind(now + lease_seconds)
-        .bind(range.id)
-        .execute(&mut *tx)
-        .await?;
-
         let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
             .bind(range.target_id)
             .fetch_one(&mut *tx)
             .await?;
+
+        let new_range_id = if effective_start > range.start_index {
+            // Real progress was made by whoever had this range before (still on
+            // `range.last_assigned_user_id`, since that's never cleared). Split the
+            // row instead of just narrowing it in place: finalize [start,
+            // effective_start) as their completed work, and carve a fresh row for
+            // [effective_start, end) to hand to `user` - so each finished portion of
+            // a range stays correctly credited to whoever actually searched it,
+            // rather than the whole thing ending up attributed to the last claimer.
+            sqlx::query(
+                "UPDATE ranges SET end_index = ?, status = 'completed', completed_at = ?, \
+                 progress_index = NULL, assigned_user_id = NULL WHERE id = ?",
+            )
+            .bind(effective_start)
+            .bind(now)
+            .bind(range.id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query_scalar(
+                "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
+                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at) \
+                 VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?) RETURNING id",
+            )
+            .bind(range.target_id)
+            .bind(range.candidate_len)
+            .bind(effective_start)
+            .bind(range.end_index)
+            .bind(user.id)
+            .bind(user.id)
+            .bind(now)
+            .bind(lease_seconds)
+            .bind(now + lease_seconds)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            // No progress was ever checkpointed - reassign the same row as-is.
+            sqlx::query(
+                "UPDATE ranges SET status = 'in_progress', progress_index = NULL, \
+                 assigned_user_id = ?, last_assigned_user_id = ?, assigned_at = ?, lease_seconds = ?, lease_expires_at = ? WHERE id = ?",
+            )
+            .bind(user.id)
+            .bind(user.id)
+            .bind(now)
+            .bind(lease_seconds)
+            .bind(now + lease_seconds)
+            .bind(range.id)
+            .execute(&mut *tx)
+            .await?;
+            range.id
+        };
+
         tx.commit().await?;
-        return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, effective_start, range.end_index, lease_seconds)));
+        return Ok(Some(to_claim_response(&target, new_range_id, range.candidate_len, effective_start, range.end_index, lease_seconds)));
     }
 
     // 2) Otherwise carve a fresh chunk off the oldest active target that still has room.
@@ -140,13 +180,14 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         let lease_seconds = lease_seconds_for(config, chunk, rate);
         let range_id: i64 = sqlx::query_scalar(
             "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-             assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at) \
-             VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?) RETURNING id",
+             assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at) \
+             VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(target.id)
         .bind(progress.candidate_len)
         .bind(start_index)
         .bind(end_index)
+        .bind(user.id)
         .bind(user.id)
         .bind(now)
         .bind(lease_seconds)
@@ -432,9 +473,11 @@ mod tests {
     /// (Hash A only) match partway through its range, then disconnects. Once the
     /// server reclaims the abandoned range, whoever claims it next must resume
     /// just past the checkpointed candidate - not redo the whole range from its
-    /// original start.
+    /// original start. And since the first user genuinely finished their portion,
+    /// it must stay credited to them as a separate completed range rather than
+    /// silently becoming part of whatever the second user ends up owning.
     #[tokio::test]
-    async fn heartbeat_progress_narrows_the_range_on_reassignment() {
+    async fn heartbeat_progress_splits_the_range_crediting_each_user_with_their_part() {
         let pool = test_pool().await;
         let first_user = insert_user(&pool, "first").await;
         insert_target(&pool, 3, 3).await; // fixed length, whole space handed out as one range
@@ -458,13 +501,38 @@ mod tests {
 
         let second_user = insert_user(&pool, "second").await;
         let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("range should be reassignable");
-        assert_eq!(resumed.range_id, claim.range_id, "the same range row is reassigned, not a fresh one");
+        assert_ne!(resumed.range_id, claim.range_id, "the finished first part and the remaining second part must be distinct rows");
 
         let expected_start = midpoint_index + 1;
         let (exp_lower, exp_upper) = range_bound_filenames(DEFAULT, "PRE", ".SUF", 3, expected_start, space_size(DEFAULT, 3));
         assert_eq!(resumed.lower_bound_filename, exp_lower, "must resume just past the checkpointed candidate, not from the original start");
         assert_eq!(resumed.upper_bound_filename, exp_upper);
         assert_eq!(resumed.candidate_count, space_size(DEFAULT, 3) - expected_start);
+
+        // The original row: shrunk to exactly the searched portion, completed, and
+        // still credited to the first user - not overwritten by the reassignment.
+        let (orig_status, orig_start, orig_end, orig_worker): (String, i64, i64, Option<i64>) = sqlx::query_as(
+            "SELECT status, start_index, end_index, last_assigned_user_id FROM ranges WHERE id = ?",
+        )
+        .bind(claim.range_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orig_status, "completed");
+        assert_eq!(orig_start, 0);
+        assert_eq!(orig_end, expected_start);
+        assert_eq!(orig_worker, Some(first_user.id));
+
+        // The new row: the remainder, credited to the second user.
+        let (new_start, new_end, new_worker): (i64, i64, Option<i64>) =
+            sqlx::query_as("SELECT start_index, end_index, last_assigned_user_id FROM ranges WHERE id = ?")
+                .bind(resumed.range_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(new_start, expected_start);
+        assert_eq!(new_end, space_size(DEFAULT, 3));
+        assert_eq!(new_worker, Some(second_user.id));
     }
 
     /// If a client's last heartbeat before disconnecting already covered the very

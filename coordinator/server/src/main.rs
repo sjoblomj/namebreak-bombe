@@ -1,5 +1,6 @@
 mod alphabet;
 mod auth;
+mod dashboard;
 mod db;
 mod error;
 mod handlers;
@@ -31,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
     spawn_reclaim_task(state.clone());
 
     let app = Router::new()
+        .route("/", get(dashboard::dashboard_page))
+        .route("/api/v1/dashboard", get(dashboard::dashboard_data))
         .route("/api/v1/register", post(handlers::register))
         .route("/api/v1/claim", post(handlers::claim))
         .route("/api/v1/ranges/{id}/heartbeat", post(handlers::heartbeat))

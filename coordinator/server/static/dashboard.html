@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>namebreak coordinator</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --card-bg: #ffffff;
+    --border: #dde1e6;
+    --text: #1b1f24;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --pending: #9ca3af;
+    --in-progress: #d97706;
+    --completed: #16a34a;
+    --solved-bg: #fff8e1;
+    --solved-border: #f5c518;
+    --solved-text: #7a5b00;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --card-bg: #1c1f24;
+      --border: #2b2f36;
+      --text: #e7e9ec;
+      --muted: #9aa1ab;
+      --accent: #5b8def;
+      --pending: #7c8290;
+      --in-progress: #e0a13a;
+      --completed: #3ecf6e;
+      --solved-bg: #2c2405;
+      --solved-border: #caa314;
+      --solved-text: #ffd75e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0 0 4px;
+  }
+  .subhead {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+  .subhead #status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--completed);
+    margin-right: 6px;
+  }
+  .subhead.stale #status-dot { background: var(--pending); }
+  .targets {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    max-width: 1100px;
+  }
+  .target-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+  }
+  .target-card.solved {
+    background: var(--solved-bg);
+    border: 2px solid var(--solved-border);
+  }
+  .target-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .target-name {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    color: #fff;
+  }
+  .badge.status-active { background: var(--accent); }
+  .badge.status-paused { background: var(--muted); }
+  .badge.status-solved { background: var(--completed); }
+  .badge.status-pending { background: var(--pending); }
+  .badge.status-in_progress { background: var(--in-progress); }
+  .badge.status-completed { background: var(--completed); }
+  .found-banner {
+    margin-top: 10px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: var(--solved-border);
+    color: #1a1a1a;
+    font-weight: 700;
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .found-banner .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    background: rgba(0,0,0,0.18);
+    padding: 2px 8px;
+    border-radius: 999px;
+  }
+  .found-banner .filename {
+    font-family: var(--mono);
+    background: rgba(255,255,255,0.5);
+    padding: 2px 8px;
+    border-radius: 6px;
+  }
+  .found-banner .found-by {
+    font-weight: 500;
+    font-size: 13px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 14px;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  td.mono, .mono { font-family: var(--mono); }
+  td.worker { color: var(--text); }
+  td.worker.none, .muted { color: var(--muted); font-style: italic; }
+  td.expired { color: #b91c1c; }
+  .empty-ranges {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 10px;
+  }
+  .loading, .error {
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .error { color: #b91c1c; }
+</style>
+</head>
+<body>
+  <h1>namebreak coordinator</h1>
+  <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span></div>
+  <div id="targets" class="targets"></div>
+
+<script>
+(function () {
+  const REFRESH_MS = 8000;
+  const targetsEl = document.getElementById('targets');
+  const statusEl = document.getElementById('status-text');
+  const subheadEl = document.querySelector('.subhead');
+
+  function fmtTime(unixSeconds) {
+    if (unixSeconds === null || unixSeconds === undefined) return null;
+    return new Date(unixSeconds * 1000).toLocaleString();
+  }
+
+  function fmtNum(n) {
+    return Number(n).toLocaleString();
+  }
+
+  function statusBadge(status) {
+    const span = document.createElement('span');
+    span.className = 'badge status-' + status;
+    span.textContent = status.replace('_', ' ');
+    return span;
+  }
+
+  function rangeRow(r) {
+    const tr = document.createElement('tr');
+
+    const tdId = document.createElement('td');
+    tdId.className = 'mono';
+    tdId.textContent = String(r.id);
+    tr.appendChild(tdId);
+
+    const tdStatus = document.createElement('td');
+    tdStatus.appendChild(statusBadge(r.status));
+    tr.appendChild(tdStatus);
+
+    const tdRange = document.createElement('td');
+    tdRange.className = 'mono';
+    tdRange.textContent = `len ${r.candidate_len}: ${fmtNum(r.start_index)} – ${fmtNum(r.end_index)}`;
+    tr.appendChild(tdRange);
+
+    const tdCount = document.createElement('td');
+    tdCount.className = 'mono';
+    tdCount.textContent = fmtNum(r.end_index - r.start_index);
+    tr.appendChild(tdCount);
+
+    const tdWorker = document.createElement('td');
+    tdWorker.className = 'worker' + (r.worker ? '' : ' none');
+    tdWorker.textContent = r.worker || 'nobody yet';
+    tr.appendChild(tdWorker);
+
+    const tdAssigned = document.createElement('td');
+    tdAssigned.textContent = fmtTime(r.assigned_at) || '—';
+    tr.appendChild(tdAssigned);
+
+    const tdLease = document.createElement('td');
+    if (r.status === 'in_progress' && r.lease_expires_at) {
+      const expired = r.lease_expires_at * 1000 < Date.now();
+      tdLease.textContent = fmtTime(r.lease_expires_at);
+      if (expired) tdLease.className = 'expired';
+    } else {
+      tdLease.textContent = '—';
+    }
+    tr.appendChild(tdLease);
+
+    const tdCompleted = document.createElement('td');
+    tdCompleted.textContent = fmtTime(r.completed_at) || '—';
+    tr.appendChild(tdCompleted);
+
+    return tr;
+  }
+
+  function targetCard(t) {
+    const card = document.createElement('div');
+    card.className = 'target-card' + (t.status === 'solved' ? ' solved' : '');
+
+    const head = document.createElement('div');
+    head.className = 'target-head';
+    const name = document.createElement('span');
+    name.className = 'target-name';
+    name.textContent = t.name;
+    head.appendChild(name);
+    head.appendChild(statusBadge(t.status));
+    card.appendChild(head);
+
+    if (t.status === 'solved') {
+      const banner = document.createElement('div');
+      banner.className = 'found-banner';
+      const label = document.createElement('span');
+      label.className = 'label';
+      label.textContent = 'Found';
+      banner.appendChild(label);
+      const fn = document.createElement('span');
+      fn.className = 'filename';
+      fn.textContent = t.found_filename || '(filename not recorded)';
+      banner.appendChild(fn);
+      if (t.found_by) {
+        const by = document.createElement('span');
+        by.className = 'found-by';
+        by.textContent = 'by ' + t.found_by;
+        banner.appendChild(by);
+      }
+      card.appendChild(banner);
+    }
+
+    if (t.ranges.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-ranges';
+      empty.textContent = 'No ranges carved yet.';
+      card.appendChild(empty);
+      return card;
+    }
+
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    thead.innerHTML =
+      '<tr><th>Range</th><th>Status</th><th>Candidates</th><th>Count</th><th>Worker</th>' +
+      '<th>Assigned</th><th>Lease expires</th><th>Completed</th></tr>';
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    for (const r of t.ranges) tbody.appendChild(rangeRow(r));
+    table.appendChild(tbody);
+
+    card.appendChild(table);
+    return card;
+  }
+
+  async function refresh() {
+    try {
+      const resp = await fetch('/api/v1/dashboard', { cache: 'no-store' });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const data = await resp.json();
+
+      // Solved targets first, so a find is never buried below the fold.
+      const targets = data.targets.slice().sort((a, b) => {
+        const aSolved = a.status === 'solved' ? 0 : 1;
+        const bSolved = b.status === 'solved' ? 0 : 1;
+        return aSolved - bSolved;
+      });
+
+      targetsEl.replaceChildren();
+      if (targets.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'loading';
+        empty.textContent = 'No targets yet.';
+        targetsEl.appendChild(empty);
+      } else {
+        for (const t of targets) targetsEl.appendChild(targetCard(t));
+      }
+
+      subheadEl.classList.remove('stale');
+      statusEl.textContent = 'updated ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      subheadEl.classList.add('stale');
+      statusEl.textContent = 'update failed (' + err.message + ') - retrying…';
+    }
+  }
+
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body>
+</html>

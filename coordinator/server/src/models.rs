@@ -52,6 +52,7 @@ pub struct Range {
     pub end_index: i64,
     pub status: String,
     pub assigned_user_id: Option<i64>,
+    pub last_assigned_user_id: Option<i64>,
     pub assigned_at: Option<i64>,
     pub lease_seconds: Option<i64>,
     pub lease_expires_at: Option<i64>,

@@ -14,6 +14,18 @@ coordinator/
   client/     wraps a local `namebreak` binary: claims ranges, runs them, reports back
 ```
 
+Visit the server's base URL in a browser (`GET /`) for a live dashboard - every
+target with its ranges, each range's status and who worked on it (from
+`last_assigned_user_id`, which - unlike `assigned_user_id` - is never cleared on
+reclaim), and a solved target's find called out with a prominent banner. If a
+range was reassigned partway through (see progress checkpointing below), each
+finished portion shows up as its own row credited to whoever actually searched
+it, rather than the whole thing appearing under just the most recent claimer.
+Plain HTML/CSS/JS (`server/static/dashboard.html`, embedded into the binary at
+compile time), polling `GET /api/v1/dashboard` every 8s - no build step, no
+framework. `GET /api/v1/dashboard` and `GET /` are both public (no auth),
+matching `GET /api/v1/status`.
+
 See the top-level plan/design notes for the full rationale; the short version:
 
 - **Auth**: `/register {username, hostname}` (no password) hands back an opaque
@@ -48,13 +60,18 @@ See the top-level plan/design notes for the full rationale; the short version:
   any. `namebreak` only logs a match after the CUDA batch containing it has
   finished, so everything up to that candidate is known to be searched - the
   server records it as the range's `progress_index`. If the range is later
-  reassigned (lease expired, client disconnected), the new client resumes just
-  past that point instead of redoing the whole range; if progress had already
-  reached the end, the range is simply marked complete instead of reassigned.
-  Note this only helps when a Hash A collision happens to occur (roughly one in
-  2^32 candidates), so for smaller ranges a disconnect is often not checkpointed
-  at all and the range gets fully redone - not a correctness problem, just a
-  missed optimization in that case.
+  reassigned (lease expired, client disconnected) with real progress recorded,
+  the original row is shrunk down to exactly the searched portion and marked
+  `completed` (still credited to whoever searched it), and a *new* row is
+  carved for the remainder and handed to the next claimer - so the range is
+  literally split in two, each part correctly attributed, rather than the
+  whole thing ending up credited to whichever client finishes it. If progress
+  had already reached the end, the range is simply marked complete instead of
+  split/reassigned. Note this only helps when a Hash A collision happens to
+  occur (roughly one in 2^32 candidates), so for smaller ranges a disconnect is
+  often not checkpointed at all and the range gets fully redone (as a single
+  reassigned row, same as before) - not a correctness problem, just a missed
+  optimization in that case.
 - **Storage**: SQLite on a single Fly Volume. One server instance only - range
   assignment has to be centrally coordinated anyway, so this isn't a real
   limitation.
