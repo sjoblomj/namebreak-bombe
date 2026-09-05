@@ -1,4 +1,4 @@
-use namebreak_protocol::{ClaimResponse, CompleteRequest, HeartbeatRequest, RegisterRequest, RegisterResponse};
+use namebreak_protocol::{ClaimResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse};
 use std::time::Duration;
 
 /// Well under HEARTBEAT_INTERVAL, so a request that hangs (rather than failing
@@ -43,15 +43,18 @@ impl ApiClient {
         Ok(Some(resp.json::<ClaimResponse>().await?))
     }
 
-    pub async fn heartbeat(&self, range_id: i64, last_hash_a_match_filename: Option<String>) -> anyhow::Result<()> {
-        self.http
+    pub async fn heartbeat(&self, range_id: i64, last_hash_a_match_filename: Option<String>) -> anyhow::Result<HeartbeatResponse> {
+        let resp = self
+            .http
             .post(format!("{}/api/v1/ranges/{range_id}/heartbeat", self.base_url))
             .bearer_auth(&self.token)
             .json(&HeartbeatRequest { last_hash_a_match_filename })
             .send()
             .await?
-            .error_for_status()?;
-        Ok(())
+            .error_for_status()?
+            .json::<HeartbeatResponse>()
+            .await?;
+        Ok(resp)
     }
 
     /// Returns the raw `reqwest::Error` (rather than `anyhow::Error`) so the

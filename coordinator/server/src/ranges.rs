@@ -204,12 +204,17 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
     Ok(None)
 }
 
+pub struct HeartbeatOutcome {
+    pub lease_seconds: i64,
+    pub target_solved: bool,
+}
+
 pub async fn heartbeat_range(
     pool: &SqlitePool,
     user: &User,
     range_id: i64,
     last_hash_a_match_filename: Option<String>,
-) -> Result<i64, AppError> {
+) -> Result<HeartbeatOutcome, AppError> {
     let mut tx = pool.begin().await?;
 
     let range = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?")
@@ -235,16 +240,34 @@ pub async fn heartbeat_range(
         }
     }
 
+    let target_status: String = sqlx::query_scalar("SELECT status FROM targets WHERE id = ?")
+        .bind(range.target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let target_solved = target_status == "solved";
+
     let lease_seconds = range.lease_seconds.unwrap_or(300);
     let now = now_unix();
-    sqlx::query("UPDATE ranges SET lease_expires_at = ? WHERE id = ?")
-        .bind(now + lease_seconds)
-        .bind(range_id)
-        .execute(&mut *tx)
-        .await?;
+    if target_solved {
+        // The client is about to abort and won't be reporting completion for
+        // this range - close it out now instead of leaving it "in_progress"
+        // until its lease eventually times out unclaimed (the target's no
+        // longer 'active', so nothing would ever reassign it anyway).
+        sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(range_id)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("UPDATE ranges SET lease_expires_at = ? WHERE id = ?")
+            .bind(now + lease_seconds)
+            .bind(range_id)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     tx.commit().await?;
-    Ok(lease_seconds)
+    Ok(HeartbeatOutcome { lease_seconds, target_solved })
 }
 
 /// Turns a client-reported "Hash A matches: <filename>" line into a validated
@@ -609,5 +632,46 @@ mod tests {
         let config = test_config(space_size(DEFAULT, 2));
         let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
         assert_eq!(claim.max_backslash_count, 3);
+    }
+
+    /// Once a target is solved (via one range's completion), any other client
+    /// still heartbeating a different in-progress range for the same target must
+    /// be told to abort - and that range should be closed out immediately rather
+    /// than left "in_progress" until its lease eventually times out unclaimed.
+    #[tokio::test]
+    async fn heartbeat_signals_abort_once_the_target_is_solved_elsewhere() {
+        let pool = test_pool().await;
+        let finder = insert_user(&pool, "finder").await;
+        let other = insert_user(&pool, "other").await;
+        insert_target(&pool, 3, 3).await;
+
+        // Small enough that the target's space gets carved into (at least) two ranges.
+        let config = test_config(space_size(DEFAULT, 3) / 2);
+
+        let claim_a = claim_range(&pool, &config, &finder).await.unwrap().expect("first range available");
+        let claim_b = claim_range(&pool, &config, &other).await.unwrap().expect("second range available");
+        assert_ne!(claim_a.range_id, claim_b.range_id);
+
+        // Before anything is found: heartbeat behaves normally.
+        let before = heartbeat_range(&pool, &other, claim_b.range_id, None).await.unwrap();
+        assert!(!before.target_solved);
+
+        // `finder` reports a match, solving the target.
+        let outcome = complete_range(&pool, &config, &finder, claim_a.range_id, true, Some("PRE???.SUF".into()), 1.0, 1)
+            .await
+            .unwrap();
+        assert!(outcome.target_solved);
+
+        // `other`'s next heartbeat must now signal abort, and its range should be
+        // closed out rather than left dangling.
+        let after = heartbeat_range(&pool, &other, claim_b.range_id, None).await.unwrap();
+        assert!(after.target_solved);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM ranges WHERE id = ?")
+            .bind(claim_b.range_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "completed");
     }
 }

@@ -71,8 +71,8 @@ pub async fn heartbeat(
     Path(range_id): Path<i64>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
-    let lease_seconds = ranges::heartbeat_range(&state.pool, &user, range_id, req.last_hash_a_match_filename).await?;
-    Ok(Json(HeartbeatResponse { lease_seconds }))
+    let outcome = ranges::heartbeat_range(&state.pool, &user, range_id, req.last_hash_a_match_filename).await?;
+    Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, target_solved: outcome.target_solved }))
 }
 
 pub async fn complete(

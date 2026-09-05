@@ -72,6 +72,15 @@ See the top-level plan/design notes for the full rationale; the short version:
   often not checkpointed at all and the range gets fully redone (as a single
   reassigned row, same as before) - not a correctness problem, just a missed
   optimization in that case.
+- **Stopping on a find**: the same heartbeat also carries a `target_solved`
+  flag, true once *any* range of that target has been completed with a match.
+  A client still searching a different range of an already-solved target sees
+  this on its next heartbeat (so within `HEARTBEAT_INTERVAL`, 60s) and kills
+  its running `namebreak` - the whole process *group*, not just the direct
+  child, so this also works if `--namebreak-bin` ever points at a wrapper
+  script rather than the real binary directly. That range is closed out
+  server-side at the same moment (no `/complete` round-trip - there's nothing
+  meaningful to report), and the client moves straight on to its next `/claim`.
 - **Storage**: SQLite on a single Fly Volume. One server instance only - range
   assignment has to be centrally coordinated anyway, so this isn't a real
   limitation.

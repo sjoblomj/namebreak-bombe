@@ -59,6 +59,11 @@ pub struct HeartbeatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub lease_seconds: i64,
+    /// True if this range's target has already been solved (by someone else,
+    /// via a different range). The client should kill its running `namebreak`
+    /// subprocess rather than let it keep searching a target that's already
+    /// found - it won't be reporting completion for this range either way.
+    pub target_solved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

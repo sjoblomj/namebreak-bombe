@@ -64,6 +64,7 @@ async fn run_one(
 
     let last_hash_a_match: LastHashAMatch = Arc::new(Mutex::new(None));
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
     let heartbeat_handle = {
         let api = api.clone();
         let range_id = claim.range_id;
@@ -75,8 +76,14 @@ async fn run_one(
                 tokio::select! {
                     _ = interval.tick() => {
                         let latest = last_hash_a_match.lock().unwrap().clone();
-                        if let Err(err) = api.heartbeat(range_id, latest).await {
-                            tracing::warn!(%err, range_id, "heartbeat failed");
+                        match api.heartbeat(range_id, latest).await {
+                            Ok(resp) if resp.target_solved => {
+                                tracing::info!(range_id, "target already solved elsewhere - signaling abort");
+                                let _ = abort_tx.send(true);
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!(%err, range_id, "heartbeat failed"),
                         }
                     }
                     _ = stop_rx.changed() => break,
@@ -86,11 +93,16 @@ async fn run_one(
     };
 
     let started = Instant::now();
-    let outcome = runner::run_namebreak(namebreak_bin, workdir, claim, last_hash_a_match).await;
+    let outcome = runner::run_namebreak(namebreak_bin, workdir, claim, last_hash_a_match, abort_rx).await;
     let _ = stop_tx.send(true);
     let _ = heartbeat_handle.await;
     let outcome = outcome?;
     let elapsed_seconds = started.elapsed().as_secs_f64();
+
+    if outcome.aborted {
+        tracing::info!(range_id = claim.range_id, "range aborted - target was already solved by someone else");
+        return Ok(());
+    }
 
     if !outcome.clean_exit {
         anyhow::bail!("namebreak did not exit cleanly (expected code 0 or 2)");
