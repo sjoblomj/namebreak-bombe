@@ -19,6 +19,8 @@
     --solved-bg: #fff8e1;
     --solved-border: #f5c518;
     --solved-text: #7a5b00;
+    --row-in-progress-bg: #fff4e5;
+    --detail-bg: #f7f8fa;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
@@ -35,6 +37,8 @@
       --solved-bg: #2c2405;
       --solved-border: #caa314;
       --solved-text: #ffd75e;
+      --row-in-progress-bg: rgba(224, 161, 58, 0.14);
+      --detail-bg: rgba(255, 255, 255, 0.04);
     }
   }
   * { box-sizing: border-box; }
@@ -174,6 +178,55 @@
     color: var(--muted);
   }
   .lease-note.expired { color: #b91c1c; font-weight: 600; }
+  tr.range-row.status-in_progress { background: var(--row-in-progress-bg); }
+  tr.range-row {
+    cursor: pointer;
+  }
+  .expand-hint {
+    display: none;
+    margin-left: 6px;
+    color: var(--muted);
+    font-style: normal;
+  }
+  tr.range-row.open .expand-hint { transform: rotate(90deg); display: inline-block; }
+  .detail-row { display: none; }
+  .detail-row.open { display: table-row; }
+  .detail-row td {
+    background: var(--detail-bg);
+    white-space: normal;
+  }
+  .detail-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 28px;
+  }
+  .detail-grid > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .detail-label {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  /* Hide columns narrowest-screens-first, in the order: Count, Completed,
+     Assigned, Worker - the row itself stays clickable to reveal them. */
+  @media (max-width: 1150px) {
+    .col-count { display: none; }
+    .expand-hint { display: inline-block; }
+  }
+  @media (max-width: 950px) {
+    .col-completed { display: none; }
+  }
+  @media (max-width: 780px) {
+    .col-assigned { display: none; }
+  }
+  @media (max-width: 620px) {
+    .col-worker { display: none; }
+  }
   .empty-ranges {
     color: var(--muted);
     font-size: 13px;
@@ -227,12 +280,24 @@
     return span;
   }
 
+  const DETAIL_COLSPAN = 8;
+
+  // The row itself carries the fields that stay visible at every width
+  // (Range, Status, Len, First/last candidate); Count, Worker, Assigned and
+  // Completed get their own "col-*" class so CSS can hide them on narrow
+  // screens, in that order - the collapsible detail row below always carries
+  // all four regardless, so they're never actually lost, just relocated.
   function rangeRow(r) {
     const tr = document.createElement('tr');
+    tr.className = 'range-row status-' + r.status;
 
     const tdId = document.createElement('td');
     tdId.className = 'mono';
     tdId.textContent = String(r.id);
+    const hint = document.createElement('span');
+    hint.className = 'expand-hint';
+    hint.textContent = '›';
+    tdId.appendChild(hint);
     tr.appendChild(tdId);
 
     const tdStatus = document.createElement('td');
@@ -248,30 +313,71 @@
     }
     tr.appendChild(tdStatus);
 
+    const tdLen = document.createElement('td');
+    tdLen.className = 'mono';
+    tdLen.textContent = String(r.candidate_len);
+    tr.appendChild(tdLen);
+
     const tdRange = document.createElement('td');
     tdRange.className = 'mono';
-    tdRange.textContent = `len ${r.candidate_len}: "${r.first_candidate}" – "${r.last_candidate}"`;
+    tdRange.textContent = `"${r.first_candidate}" – "${r.last_candidate}"`;
     tr.appendChild(tdRange);
 
+    const count = fmtNum(r.end_index - r.start_index);
+
     const tdCount = document.createElement('td');
-    tdCount.className = 'mono';
-    tdCount.textContent = fmtNum(r.end_index - r.start_index);
+    tdCount.className = 'mono col-count';
+    tdCount.textContent = count;
     tr.appendChild(tdCount);
 
     const tdWorker = document.createElement('td');
-    tdWorker.className = 'worker' + (r.worker ? '' : ' none');
+    tdWorker.className = 'worker col-worker' + (r.worker ? '' : ' none');
     tdWorker.textContent = r.worker || 'nobody yet';
     tr.appendChild(tdWorker);
 
     const tdAssigned = document.createElement('td');
+    tdAssigned.className = 'col-assigned';
     setTimeCell(tdAssigned, r.assigned_at);
     tr.appendChild(tdAssigned);
 
     const tdCompleted = document.createElement('td');
+    tdCompleted.className = 'col-completed';
     setTimeCell(tdCompleted, r.completed_at);
     tr.appendChild(tdCompleted);
 
-    return tr;
+    const detailRow = document.createElement('tr');
+    detailRow.className = 'detail-row';
+    const detailTd = document.createElement('td');
+    detailTd.colSpan = DETAIL_COLSPAN;
+    const grid = document.createElement('div');
+    grid.className = 'detail-grid';
+    grid.appendChild(detailField('Count', count, true));
+    grid.appendChild(detailField('Worker', r.worker || 'nobody yet'));
+    grid.appendChild(detailField('Assigned', tdAssigned.textContent, false, tdAssigned.title));
+    grid.appendChild(detailField('Completed', tdCompleted.textContent, false, tdCompleted.title));
+    detailTd.appendChild(grid);
+    detailRow.appendChild(detailTd);
+
+    tr.addEventListener('click', () => {
+      tr.classList.toggle('open');
+      detailRow.classList.toggle('open');
+    });
+
+    return [tr, detailRow];
+  }
+
+  function detailField(label, value, mono, title) {
+    const wrap = document.createElement('div');
+    const labelEl = document.createElement('span');
+    labelEl.className = 'detail-label';
+    labelEl.textContent = label;
+    const valueEl = document.createElement('span');
+    if (mono) valueEl.className = 'mono';
+    valueEl.textContent = value;
+    if (title) valueEl.title = title;
+    wrap.appendChild(labelEl);
+    wrap.appendChild(valueEl);
+    return wrap;
   }
 
   function targetCard(t) {
@@ -323,8 +429,9 @@
     const table = document.createElement('table');
     const thead = document.createElement('thead');
     thead.innerHTML =
-      '<tr><th>Range</th><th>Status</th><th>First / last candidate</th><th>Count</th><th>Worker</th>' +
-      '<th>Assigned</th><th>Completed</th></tr>';
+      '<tr><th>Range</th><th>Status</th><th>Len</th><th>First / last candidate</th>' +
+      '<th class="col-count">Count</th><th class="col-worker">Worker</th>' +
+      '<th class="col-assigned">Assigned</th><th class="col-completed">Completed</th></tr>';
     table.appendChild(thead);
 
     // Shorter candidates (fewer characters) before longer ones, since a
@@ -332,7 +439,11 @@
     const sortedRanges = t.ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
 
     const tbody = document.createElement('tbody');
-    for (const r of sortedRanges) tbody.appendChild(rangeRow(r));
+    for (const r of sortedRanges) {
+      const [row, detailRow] = rangeRow(r);
+      tbody.appendChild(row);
+      tbody.appendChild(detailRow);
+    }
     table.appendChild(tbody);
 
     const tableScroll = document.createElement('div');
