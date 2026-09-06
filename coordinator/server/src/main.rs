@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/status", get(handlers::status))
         .route("/api/v1/alphabets", get(handlers::alphabets))
         .route("/api/v1/admin/targets", post(handlers::admin_create_target))
-        .route("/api/v1/admin/targets/{id}", patch(handlers::admin_patch_target))
+        .route("/api/v1/admin/targets/{id}", patch(handlers::admin_patch_target).delete(handlers::admin_delete_target))
         .with_state(state);
 
     tracing::info!(%bind_addr, "starting namebreak coordinator server");

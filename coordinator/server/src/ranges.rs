@@ -383,6 +383,20 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     Ok(result.rows_affected())
 }
 
+/// Permanently removes a target and everything carved for it (its ranges and
+/// carving cursor). SQLite doesn't enforce the `REFERENCES` foreign keys here
+/// (no `PRAGMA foreign_keys = ON` is set), so children have to be deleted
+/// explicitly rather than relying on a cascade. Returns whether a target with
+/// this id actually existed.
+pub async fn delete_target(pool: &SqlitePool, target_id: i64) -> Result<bool, AppError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM ranges WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM target_progress WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
+    let result = sqlx::query("DELETE FROM targets WHERE id = ?").bind(target_id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,5 +747,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "completed");
+    }
+
+    #[tokio::test]
+    async fn delete_target_removes_it_and_its_ranges_and_progress() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let target_id = insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+
+        assert!(delete_target(&pool, target_id).await.unwrap(), "should report the target existed");
+
+        let target_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM targets WHERE id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        let progress_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_progress WHERE target_id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        let range_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(target_count, 0);
+        assert_eq!(progress_count, 0);
+        assert_eq!(range_count, 0);
+
+        // Deleting an id that was never there (or already deleted) is reported
+        // as such, not as an error.
+        assert!(!delete_target(&pool, target_id).await.unwrap());
     }
 }

@@ -218,3 +218,15 @@ pub async fn admin_patch_target(
     }
     Ok(StatusCode::NO_CONTENT)
 }
+
+pub async fn admin_delete_target(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(target_id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    if ranges::delete_target(&state.pool, target_id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
+}

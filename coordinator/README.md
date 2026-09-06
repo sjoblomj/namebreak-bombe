@@ -139,6 +139,13 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
   -d '{"status": "paused"}'
 ```
 
+Delete a target permanently (also removes its ranges and carving cursor - not
+reversible):
+
+```sh
+curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecret'
+```
+
 ## Running a client
 
 Build `namebreak` as usual first (see `../namebreaker-cuda/Makefile`), then:
