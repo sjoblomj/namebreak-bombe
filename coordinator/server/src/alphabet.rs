@@ -149,11 +149,20 @@ fn pad_or_truncate(s: &str, len: usize, pad_with: char) -> String {
 
 /// Whether a target's bounds actually describe a non-empty range: whether
 /// `lower_bound` is not alphabetically after `upper_bound`, checked at
-/// `lower_bound`'s own length (the length carving starts at). Rejects bounds
-/// given in the wrong order (or that otherwise don't overlap) at target
-/// creation, rather than silently carving nothing forever.
+/// `lower_bound`'s own length. That's sufficient, not just convenient: in
+/// plain lexicographic comparison, once two strings diverge at some position
+/// they stay divergent (in the same direction) no matter what's appended
+/// after, and when one is a prefix of the other - the only way this check's
+/// length can fail to reach an actual divergence point - `bound_indices_at_len`
+/// pads the shorter side with the alphabet's own min/max character, which by
+/// definition can't flip the comparison at any length beyond that prefix
+/// either. Capped at `max_supported_len(alphabet)` purely so a `lower_bound`
+/// longer than that (legal - see `admin_create_target`) can't overflow
+/// `bound_indices_at_len`'s index math. Rejects bounds given in the wrong
+/// order (or that otherwise don't overlap) at target creation, rather than
+/// silently carving nothing forever.
 pub fn bounds_are_valid(alphabet: &str, lower_bound: &str, upper_bound: &str) -> bool {
-    let len = lower_bound.chars().count() as i64;
+    let len = (lower_bound.chars().count() as i64).min(max_supported_len(alphabet));
     let (lower_idx, upper_idx) = bound_indices_at_len(alphabet, lower_bound, upper_bound, len);
     lower_idx <= upper_idx
 }
@@ -310,6 +319,18 @@ mod tests {
     fn bounds_are_valid_rejects_reversed_bounds() {
         assert!(bounds_are_valid(DEFAULT, "BLACKSMITH", "CATAPULT"));
         assert!(!bounds_are_valid(DEFAULT, "CATAPULT", "BLACKSMITH"));
+    }
+
+    #[test]
+    fn bounds_are_valid_handles_a_lower_bound_longer_than_max_supported_len_without_panicking() {
+        // A bound can now be an arbitrary known filename used purely for its
+        // alphabetical position (see admin_create_target), so it's no longer
+        // guaranteed to fit within max_supported_len(alphabet) - bounds_are_valid
+        // must clamp its own comparison length rather than handing
+        // bound_indices_at_len a length it can't safely index.
+        let long_lower = "A".repeat((max_supported_len(DEFAULT) + 5) as usize);
+        assert!(bounds_are_valid(DEFAULT, &long_lower, "ZZZZZ"));
+        assert!(!bounds_are_valid(DEFAULT, &long_lower, " "));
     }
 
     #[test]

@@ -101,29 +101,40 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "name": "rez-finz09bx",
     "prefix": "REZ\\", "suffix": ".TXT",
     "hash_a_hex": "0xF60F5D90", "hash_b_hex": "0xCE0A9BDB",
-    "lower_bound_filename": "REZ\\FINZ09BX.TXT",
-    "upper_bound_filename": "REZ\\GAMEMENU.BIN",
+    "lower_bound": "FINZ09BX",
+    "upper_bound": "GAMEMENU",
     "prune_symbol_runs": true,
     "alphabet_name": "size49",
     "max_backslash_count": 0
   }'
 ```
 
-`lower_bound_filename`/`upper_bound_filename` are full filenames (like
-`ClaimResponse`'s bound fields) that tighten the search to exactly that
-alphabetical range at *every* candidate length - not just their own literal
-lengths, and the two don't need to be the same length as each other (e.g.
-`"ART\BLACKSMITH.GRP"` to `"ART\CATAPULT.GRP"`, 10 and 8 characters, is valid:
-every length from 10 up gets searched, each one bounded to candidates starting
-with something between `BLACKSMITH` and `CATAPULT`). There's no `min_len` - the
-server always starts at the literal `lower_bound_filename` candidate - and no
-`max_len`: it always searches as long as the chosen alphabet supports (capped
-at whatever length still fits a flat 64-bit range index,
-`alphabet_size^len <= i64::MAX` - 11 for every alphabet currently in
-`PREDEFINED_ALPHABETS`, since they're all close enough in size to land on the
-same cap; a genuinely smaller alphabet, e.g. a hex-only one, would push it
-noticeably higher). `alphabet_name` defaults to `"size49"` if omitted; see
-`GET /api/v1/alphabets` for the full list.
+`lower_bound`/`upper_bound` tighten the search to exactly that alphabetical
+range at *every* candidate length that gets searched - not just their own
+literal length. They don't need to be the same length as each other (e.g.
+`"BLACKSMITH"` to `"CATAPULT"`, 10 and 8 characters, is valid: at length 10,
+candidates are bounded between `BLACKSMITH` and `CATAPULT` + padding). They
+also don't need to relate to this target's own `prefix`/`suffix` at all, or
+even be candidates a real match of this target could ever equal - a bound is
+often a *different*, already-known filename (a neighboring entry from a
+listfile, or from an adjacent hash-table slot) used purely for its
+alphabetical position, e.g. a target with `suffix: ".WAV"` can legitimately
+have `lower_bound: "GLUE\\PALCS\\DLG.GRP"` and
+`upper_bound: "MUSIC\\MENGSKVICTORY.WAV"` even though neither one ends in
+`.WAV` or has anything to do with this target's actual prefix. A bound longer
+than this server's supported maximum length (below) is fine too - only its
+first that-many characters are ever consulted, the rest is simply never
+truncated into relevance.
+
+There's no `min_len`: the server always starts at length 1 and no `max_len`:
+it always searches up to as long as the chosen alphabet supports (capped at
+whatever length still fits a flat 64-bit range index, `alphabet_size^len <=
+i64::MAX` - 11 for every alphabet currently in `PREDEFINED_ALPHABETS`, since
+they're all close enough in size to land on the same cap; a genuinely smaller
+alphabet, e.g. a hex-only one, would push it noticeably higher) - tightened at
+every length in between by `lower_bound`/`upper_bound`. `alphabet_name`
+defaults to `"size49"` if omitted; see `GET /api/v1/alphabets` for the full
+list.
 
 Check progress:
 

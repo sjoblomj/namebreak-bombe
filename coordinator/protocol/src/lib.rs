@@ -94,14 +94,15 @@ pub struct AdminCreateTargetRequest {
     pub suffix: String,
     pub hash_a_hex: String,
     pub hash_b_hex: String,
-    /// Full filenames (like `ClaimResponse`'s bound fields) - the server
-    /// always starts searching at the very beginning `lower_bound_filename`
-    /// implies and always searches as long as the chosen alphabet supports,
-    /// tightened to exactly this alphabetical range at every candidate length
-    /// in between (the two bounds don't need to be the same length as each
-    /// other - e.g. "ART\BLACKSMITH.GRP" to "ART\CATAPULT.GRP" is valid).
-    pub lower_bound_filename: String,
-    pub upper_bound_filename: String,
+    /// The candidate portion only - no prefix/suffix (unlike `ClaimResponse`'s
+    /// bound fields, which are full filenames). The server always starts
+    /// searching at the very beginning `lower_bound` implies and always
+    /// searches as long as the chosen alphabet supports, tightened to exactly
+    /// this alphabetical range at every candidate length in between (the two
+    /// bounds don't need to be the same length as each other - e.g.
+    /// "BLACKSMITH" to "CATAPULT" is valid).
+    pub lower_bound: String,
+    pub upper_bound: String,
     #[serde(default)]
     pub prune_symbol_runs: bool,
     /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`

@@ -8,7 +8,7 @@ use namebreak_protocol::{
 };
 
 use crate::alphabet::{
-    alphabet_size, bounds_are_valid, candidate_to_index, lookup_predefined_alphabet, max_supported_len, strip_prefix_suffix, PREDEFINED_ALPHABETS,
+    alphabet_size, bound_indices_at_len, bounds_are_valid, candidate_to_index, lookup_predefined_alphabet, max_supported_len, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
@@ -137,30 +137,34 @@ pub async fn admin_create_target(
         return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
     };
 
-    let Some(lower_bound) = strip_prefix_suffix(&req.lower_bound_filename, &req.prefix, &req.suffix) else {
-        return Err(AppError::BadRequest("lower_bound_filename must start with prefix and end with suffix".into()));
-    };
-    let Some(upper_bound) = strip_prefix_suffix(&req.upper_bound_filename, &req.prefix, &req.suffix) else {
-        return Err(AppError::BadRequest("upper_bound_filename must start with prefix and end with suffix".into()));
-    };
-    if lower_bound.is_empty() {
-        return Err(AppError::BadRequest("lower_bound_filename's candidate portion (between prefix and suffix) must not be empty".into()));
+    // Only the first `cap` characters of a bound are ever consulted (carving never
+    // searches past this length, and bound_indices_at_len truncates to whatever
+    // length it's asked about) - so a bound can be longer than this without needing
+    // to fit as a literal candidate itself. That's the point: bounds are often a
+    // neighboring *known* filename from elsewhere (a listfile, an adjacent hash-table
+    // entry) used purely for its alphabetical position, with no relation at all to
+    // this target's own prefix/suffix/length - e.g. lower_bound "GLUE\PALCS\DLG.GRP"
+    // and upper_bound "MUSIC\MENGSKVICTORY.WAV" are both valid even though the actual
+    // target has a completely different (and unknown) prefix and a suffix of ".WAV".
+    // The *stored* bound keeps everything the operator gave it, though (truncation
+    // here is just to keep this character check from overflowing on an oversized
+    // string) - bound_indices_at_len truncates lazily wherever it actually matters,
+    // so pre-truncating what gets stored would only maim it on the dashboard for no
+    // behavioral gain.
+    let cap = max_supported_len(alphabet) as usize;
+    let lower_bound = req.lower_bound.as_str();
+    let upper_bound = req.upper_bound.as_str();
+    let lower_for_validation: String = lower_bound.chars().take(cap).collect();
+    let upper_for_validation: String = upper_bound.chars().take(cap).collect();
+
+    if candidate_to_index(alphabet, &lower_for_validation).is_none() {
+        return Err(AppError::BadRequest("lower_bound contains a character outside the chosen alphabet".into()));
     }
-    let cap = max_supported_len(alphabet);
-    if lower_bound.chars().count() as i64 > cap {
-        return Err(AppError::BadRequest(format!(
-            "lower_bound_filename's candidate portion ({} chars) exceeds this server's supported maximum for alphabet '{alphabet_name}' ({cap} chars) - beyond this a range's index no longer fits an i64",
-            lower_bound.chars().count()
-        )));
-    }
-    if candidate_to_index(alphabet, lower_bound).is_none() {
-        return Err(AppError::BadRequest("lower_bound_filename's candidate portion contains a character outside the chosen alphabet".into()));
-    }
-    if candidate_to_index(alphabet, upper_bound).is_none() {
-        return Err(AppError::BadRequest("upper_bound_filename's candidate portion contains a character outside the chosen alphabet (or is too long)".into()));
+    if candidate_to_index(alphabet, &upper_for_validation).is_none() {
+        return Err(AppError::BadRequest("upper_bound contains a character outside the chosen alphabet".into()));
     }
     if !bounds_are_valid(alphabet, lower_bound, upper_bound) {
-        return Err(AppError::BadRequest("lower_bound_filename must be alphabetically before upper_bound_filename".into()));
+        return Err(AppError::BadRequest("lower_bound must be alphabetically before upper_bound".into()));
     }
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
@@ -186,8 +190,13 @@ pub async fn admin_create_target(
     .fetch_one(&mut *tx)
     .await?;
 
-    let start_len = lower_bound.chars().count() as i64;
-    let start_index = candidate_to_index(alphabet, lower_bound).expect("already validated above");
+    // Always start at the shortest possible candidate length, symmetric with always
+    // searching up to max_supported_len at the top end - a bound doesn't get to skip
+    // short lengths just because it's itself longer (see the comment above: at length
+    // 1, bound_indices_at_len simply truncates each bound down to its first
+    // character, which is exactly the right constraint there too).
+    let start_len = 1i64;
+    let start_index = bound_indices_at_len(alphabet, lower_bound, upper_bound, start_len).0;
     sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, ?)")
         .bind(target_id)
         .bind(start_len)

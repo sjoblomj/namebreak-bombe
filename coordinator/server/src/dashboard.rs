@@ -20,11 +20,13 @@ pub struct DashboardTarget {
     pub id: i64,
     pub name: String,
     pub status: String,
-    /// The bounds the target was created with (full filenames, prefix+bound+suffix) -
-    /// the primary way a target's scope is defined now that there's no separate
-    /// min_len/max_len.
-    pub lower_bound_filename: String,
-    pub upper_bound_filename: String,
+    /// The bounds the target was created with, exactly as given - the primary way a
+    /// target's scope is defined now that there's no separate min_len/max_len. Not
+    /// wrapped in prefix/suffix: a bound doesn't have to relate to either (see
+    /// `admin_create_target`), so doing that would often produce a nonsensical
+    /// filename (e.g. a double extension) rather than a real one.
+    pub lower_bound: String,
+    pub upper_bound: String,
     pub found_filename: Option<String>,
     pub found_by: Option<String>,
     pub ranges: Vec<DashboardRange>,
@@ -54,8 +56,8 @@ fn display_name(username: Option<String>, hostname: Option<String>) -> Option<St
 }
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
-    let target_rows: Vec<(i64, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT targets.id, targets.name, targets.status, targets.prefix, targets.suffix, \
+    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT targets.id, targets.name, targets.status, \
                 targets.lower_bound, targets.upper_bound, targets.found_filename, \
                 found_user.username, found_user.hostname \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
@@ -65,7 +67,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     .await?;
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, prefix, suffix, lower_bound, upper_bound, found_filename, found_username, found_hostname) in target_rows {
+    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname) in target_rows {
         let range_rows: Vec<(i64, String, i64, i64, i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
             "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
                     worker.username, worker.hostname, \
@@ -102,8 +104,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             id,
             name,
             status,
-            lower_bound_filename: format!("{prefix}{lower_bound}{suffix}"),
-            upper_bound_filename: format!("{prefix}{upper_bound}{suffix}"),
+            lower_bound,
+            upper_bound,
             found_filename,
             found_by: display_name(found_username, found_hostname),
             ranges,
