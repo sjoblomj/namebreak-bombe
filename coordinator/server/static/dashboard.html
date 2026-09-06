@@ -167,7 +167,13 @@
   td.mono, .mono { font-family: var(--mono); }
   td.worker { color: var(--text); }
   td.worker.none, .muted { color: var(--muted); font-style: italic; }
-  td.expired { color: #b91c1c; }
+  .lease-note {
+    display: block;
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .lease-note.expired { color: #b91c1c; font-weight: 600; }
   .empty-ranges {
     color: var(--muted);
     font-size: 13px;
@@ -231,6 +237,15 @@
 
     const tdStatus = document.createElement('td');
     tdStatus.appendChild(statusBadge(r.status));
+    if (r.status === 'in_progress' && r.lease_expires_at) {
+      const t = fmtTime(r.lease_expires_at);
+      const expired = r.lease_expires_at * 1000 < Date.now();
+      const note = document.createElement('span');
+      note.className = 'lease-note' + (expired ? ' expired' : '');
+      note.textContent = 'expires ' + t.display.slice(11);
+      note.title = t.iso;
+      tdStatus.appendChild(note);
+    }
     tr.appendChild(tdStatus);
 
     const tdRange = document.createElement('td');
@@ -251,16 +266,6 @@
     const tdAssigned = document.createElement('td');
     setTimeCell(tdAssigned, r.assigned_at);
     tr.appendChild(tdAssigned);
-
-    const tdLease = document.createElement('td');
-    if (r.status === 'in_progress' && r.lease_expires_at) {
-      const expired = r.lease_expires_at * 1000 < Date.now();
-      setTimeCell(tdLease, r.lease_expires_at);
-      if (expired) tdLease.className = 'expired';
-    } else {
-      tdLease.textContent = '—';
-    }
-    tr.appendChild(tdLease);
 
     const tdCompleted = document.createElement('td');
     setTimeCell(tdCompleted, r.completed_at);
@@ -319,7 +324,7 @@
     const thead = document.createElement('thead');
     thead.innerHTML =
       '<tr><th>Range</th><th>Status</th><th>First / last candidate</th><th>Count</th><th>Worker</th>' +
-      '<th>Assigned</th><th>Lease expires</th><th>Completed</th></tr>';
+      '<th>Assigned</th><th>Completed</th></tr>';
     table.appendChild(thead);
 
     // Shorter candidates (fewer characters) before longer ones, since a
