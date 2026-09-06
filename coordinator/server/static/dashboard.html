@@ -67,7 +67,7 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
-    max-width: 1100px;
+    max-width: 1800px;
   }
   .target-card {
     background: var(--card-bg);
@@ -187,14 +187,27 @@
 
 <script>
 (function () {
-  const REFRESH_MS = 8000;
   const targetsEl = document.getElementById('targets');
   const statusEl = document.getElementById('status-text');
   const subheadEl = document.querySelector('.subhead');
 
+  // Displayed as "YYYY-mm-dd HH:MM:ss" (always UTC, like the underlying
+  // timestamp); the full ISO-8601 string (with T, Z and milliseconds) goes in
+  // a tooltip for anyone who needs the precise value.
   function fmtTime(unixSeconds) {
     if (unixSeconds === null || unixSeconds === undefined) return null;
-    return new Date(unixSeconds * 1000).toISOString();
+    const iso = new Date(unixSeconds * 1000).toISOString();
+    return { display: iso.slice(0, 19).replace('T', ' '), iso };
+  }
+
+  function setTimeCell(td, unixSeconds) {
+    const t = fmtTime(unixSeconds);
+    if (t) {
+      td.textContent = t.display;
+      td.title = t.iso;
+    } else {
+      td.textContent = '—';
+    }
   }
 
   function fmtNum(n) {
@@ -236,13 +249,13 @@
     tr.appendChild(tdWorker);
 
     const tdAssigned = document.createElement('td');
-    tdAssigned.textContent = fmtTime(r.assigned_at) || '—';
+    setTimeCell(tdAssigned, r.assigned_at);
     tr.appendChild(tdAssigned);
 
     const tdLease = document.createElement('td');
     if (r.status === 'in_progress' && r.lease_expires_at) {
       const expired = r.lease_expires_at * 1000 < Date.now();
-      tdLease.textContent = fmtTime(r.lease_expires_at);
+      setTimeCell(tdLease, r.lease_expires_at);
       if (expired) tdLease.className = 'expired';
     } else {
       tdLease.textContent = '—';
@@ -250,7 +263,7 @@
     tr.appendChild(tdLease);
 
     const tdCompleted = document.createElement('td');
-    tdCompleted.textContent = fmtTime(r.completed_at) || '—';
+    setTimeCell(tdCompleted, r.completed_at);
     tr.appendChild(tdCompleted);
 
     return tr;
@@ -348,15 +361,17 @@
       }
 
       subheadEl.classList.remove('stale');
-      statusEl.textContent = 'updated ' + new Date().toISOString();
+      const now = fmtTime(Math.floor(Date.now() / 1000));
+      statusEl.textContent = 'updated ' + now.display;
+      statusEl.title = now.iso;
     } catch (err) {
       subheadEl.classList.add('stale');
-      statusEl.textContent = 'update failed (' + err.message + ') - retrying…';
+      statusEl.textContent = 'update failed (' + err.message + ') - reload to retry';
+      statusEl.removeAttribute('title');
     }
   }
 
   refresh();
-  setInterval(refresh, REFRESH_MS);
 })();
 </script>
 </body>
