@@ -190,7 +190,7 @@
 
   function fmtTime(unixSeconds) {
     if (unixSeconds === null || unixSeconds === undefined) return null;
-    return new Date(unixSeconds * 1000).toLocaleString();
+    return new Date(unixSeconds * 1000).toISOString();
   }
 
   function fmtNum(n) {
@@ -218,7 +218,7 @@
 
     const tdRange = document.createElement('td');
     tdRange.className = 'mono';
-    tdRange.textContent = `len ${r.candidate_len}: ${fmtNum(r.start_index)} – ${fmtNum(r.end_index)}`;
+    tdRange.textContent = `len ${r.candidate_len}: "${r.first_candidate}" – "${r.last_candidate}"`;
     tr.appendChild(tdRange);
 
     const tdCount = document.createElement('td');
@@ -301,7 +301,7 @@
     const table = document.createElement('table');
     const thead = document.createElement('thead');
     thead.innerHTML =
-      '<tr><th>Range</th><th>Status</th><th>Candidates</th><th>Count</th><th>Worker</th>' +
+      '<tr><th>Range</th><th>Status</th><th>First / last candidate</th><th>Count</th><th>Worker</th>' +
       '<th>Assigned</th><th>Lease expires</th><th>Completed</th></tr>';
     table.appendChild(thead);
 
@@ -337,7 +337,7 @@
       }
 
       subheadEl.classList.remove('stale');
-      statusEl.textContent = 'updated ' + new Date().toLocaleTimeString();
+      statusEl.textContent = 'updated ' + new Date().toISOString();
     } catch (err) {
       subheadEl.classList.add('stale');
       statusEl.textContent = 'update failed (' + err.message + ') - retrying…';
