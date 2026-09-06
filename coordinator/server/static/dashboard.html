@@ -89,6 +89,11 @@
     font-size: 16px;
     font-weight: 600;
   }
+  .target-bounds {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 4px;
+  }
   .badge {
     display: inline-block;
     font-size: 11px;
@@ -259,6 +264,11 @@
     head.appendChild(name);
     head.appendChild(statusBadge(t.status));
     card.appendChild(head);
+
+    const bounds = document.createElement('div');
+    bounds.className = 'target-bounds mono';
+    bounds.textContent = `${t.lower_bound_filename} → ${t.upper_bound_filename}`;
+    card.appendChild(bounds);
 
     if (t.status === 'solved') {
       const banner = document.createElement('div');

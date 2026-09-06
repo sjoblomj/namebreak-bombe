@@ -5,7 +5,7 @@
 use namebreak_protocol::ClaimResponse;
 use sqlx::SqlitePool;
 
-use crate::alphabet::{candidate_to_index, range_bound_filenames, space_size, strip_prefix_suffix};
+use crate::alphabet::{bound_indices_at_len, candidate_to_index, max_supported_len, range_bound_filenames, strip_prefix_suffix};
 use crate::error::AppError;
 use crate::models::{i64_to_u32, Range, Target, TargetProgress, User};
 use crate::state::{now_unix, RangeConfig};
@@ -153,9 +153,10 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .fetch_one(&mut *tx)
             .await?;
 
-        let remaining = space_size(&target.alphabet, progress.candidate_len) - progress.next_index;
+        let (_, upper_at_len) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
+        let remaining = upper_at_len - progress.next_index + 1; // inclusive upper bound
         if remaining <= 0 {
-            continue; // this target's search space (up to max_len) is fully carved out
+            continue; // this target's bounds are fully carved out at this length (and, if this is its last length, entirely)
         }
 
         let desired = (rate * config.target_chunk_seconds).round() as i64;
@@ -166,9 +167,9 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
 
         let mut new_len = progress.candidate_len;
         let mut new_next_index = end_index;
-        if new_next_index >= space_size(&target.alphabet, progress.candidate_len) && new_len < target.max_len {
+        if new_next_index > upper_at_len && new_len < max_supported_len(&target.alphabet) {
             new_len += 1;
-            new_next_index = 0;
+            new_next_index = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, new_len).0;
         }
         sqlx::query("UPDATE target_progress SET candidate_len = ?, next_index = ? WHERE target_id = ?")
             .bind(new_len)
@@ -385,7 +386,7 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alphabet::{index_to_candidate, range_bound_filenames, space_size};
+    use crate::alphabet::{index_to_candidate, max_supported_len, range_bound_filenames, space_size};
 
     const DEFAULT: &str = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
     const SIZE42: &str = " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
@@ -429,48 +430,61 @@ mod tests {
         User { id, username: name.into(), hostname: format!("{name}-host"), token, ema_rate_per_sec: None, created_at: now, last_seen_at: now }
     }
 
-    /// Creates a target whose candidate length only ever ranges over `min_len..=max_len`,
-    /// so its whole space is small enough to carve (and exhaust) in a couple of test claims.
-    async fn insert_target(pool: &SqlitePool, min_len: i64, max_len: i64) -> i64 {
-        insert_target_with_alphabet(pool, "size49", DEFAULT, min_len, max_len).await
+    /// Bounds spanning the *entire* space at a single fixed length - the
+    /// simplest possible bounds, for tests that just want "the whole space at
+    /// length N" with no interest in the bound-tightening behavior itself.
+    fn full_bounds(alphabet: &str, len: i64) -> (String, String) {
+        let min_char = alphabet.chars().next().unwrap();
+        let max_char = alphabet.chars().last().unwrap();
+        (min_char.to_string().repeat(len as usize), max_char.to_string().repeat(len as usize))
     }
 
-    async fn insert_target_with_alphabet(pool: &SqlitePool, alphabet_name: &str, alphabet: &str, min_len: i64, max_len: i64) -> i64 {
+    /// Creates a target bounded by `[lower_bound, upper_bound]` (candidate
+    /// strings, already stripped of prefix/suffix).
+    async fn insert_target(pool: &SqlitePool, lower_bound: &str, upper_bound: &str) -> i64 {
+        insert_target_with_alphabet(pool, "size49", DEFAULT, lower_bound, upper_bound).await
+    }
+
+    async fn insert_target_with_alphabet(pool: &SqlitePool, alphabet_name: &str, alphabet: &str, lower_bound: &str, upper_bound: &str) -> i64 {
         let now = now_unix();
         let target_id: i64 = sqlx::query_scalar(
-            "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, alphabet_name, alphabet, status, created_at) \
+            "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, alphabet_name, alphabet, status, created_at) \
              VALUES ('t', 'PRE', '.SUF', 0, 0, ?, ?, 0, ?, ?, 'active', ?) RETURNING id",
         )
-        .bind(min_len)
-        .bind(max_len)
+        .bind(lower_bound)
+        .bind(upper_bound)
         .bind(alphabet_name)
         .bind(alphabet)
         .bind(now)
         .fetch_one(pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, 0)")
+        let start_len = lower_bound.chars().count() as i64;
+        let start_index = crate::alphabet::candidate_to_index(alphabet, lower_bound).unwrap();
+        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, ?)")
             .bind(target_id)
-            .bind(min_len)
+            .bind(start_len)
+            .bind(start_index)
             .execute(pool)
             .await
             .unwrap();
         target_id
     }
 
-    /// A target's candidate length can only grow one length at a time (min_len=1,
-    /// max_len=2 here), and `namebreak bounded` itself only ever searches a single
-    /// fixed length per invocation - so a correct range can never straddle two
-    /// lengths. This exercises exactly that boundary: the first claim must exactly
-    /// exhaust length 1's whole space (no leftover, nothing skipped), the second
-    /// must pick up length 2 starting exactly at index 0 (no gap), and once length
-    /// 2's space (== max_len) is exhausted too, claiming must stop entirely rather
-    /// than inventing a length 3.
+    /// `namebreak bounded` itself only ever searches a single fixed length per
+    /// invocation, so a correct range can never straddle two lengths. This
+    /// exercises exactly that boundary: the first claim must exactly exhaust
+    /// length 1's whole space (no leftover, nothing skipped), and the second
+    /// must pick up length 2 starting exactly at index 0 (no gap) - using
+    /// bounds (a single min-char to a single max-char) that span the *entire*
+    /// space at every length, so what's being tested is purely the crossing
+    /// itself, not any particular stopping point.
     #[tokio::test]
     async fn range_carving_crosses_a_candidate_length_boundary_cleanly() {
         let pool = test_pool().await;
         let user = insert_user(&pool, "tester").await;
-        insert_target(&pool, 1, 2).await;
+        let (lower1, upper1) = full_bounds(DEFAULT, 1);
+        insert_target(&pool, &lower1, &upper1).await;
 
         // Bigger than either length's full space, so each claim greedily takes all
         // of what's left at the current length.
@@ -487,9 +501,45 @@ mod tests {
         assert_eq!(claim2.lower_bound_filename, exp_lower2, "length-2 work must start at index 0, not skip ahead");
         assert_eq!(claim2.upper_bound_filename, exp_upper2);
         assert_eq!(claim2.candidate_count, space_size(DEFAULT, 2), "second range should cover the whole (and only the) length-2 space");
+    }
+
+    /// There's no admin-supplied max_len anymore ("always go as long as
+    /// possible") - the only real ceiling is `max_supported_len`, the largest
+    /// length whose index still fits an i64. Starts the target's bounds one
+    /// length below that ceiling (full space at both lengths) so only two
+    /// claims are needed to reach it and confirm claiming genuinely stops
+    /// there rather than inventing a length beyond what the server can index.
+    #[tokio::test]
+    async fn range_carving_stops_at_the_true_max_supported_length() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let cap = max_supported_len(DEFAULT);
+        let (lower, upper) = full_bounds(DEFAULT, cap - 1);
+        insert_target(&pool, &lower, &upper).await;
+
+        // Not test_config(): its fixed default_rate_per_sec=1.0 combined with a
+        // chunk size this large would blow lease_seconds past i64::MAX. Use a
+        // rate proportional to the chunk size instead, so the computed lease
+        // stays sane regardless of which length's chunk is being leased.
+        let huge = space_size(DEFAULT, cap);
+        let config = RangeConfig {
+            target_chunk_seconds: 1.0,
+            default_rate_per_sec: huge as f64,
+            min_chunk_candidates: huge,
+            max_chunk_candidates: huge,
+            lease_grace_multiplier: 3.0,
+            reclaim_interval_secs: 30,
+            ema_alpha: 0.3,
+        };
+
+        let claim1 = claim_range(&pool, &config, &user).await.unwrap().expect(&format!("length {} should have work", cap - 1));
+        assert_eq!(claim1.candidate_count, space_size(DEFAULT, cap - 1));
+
+        let claim2 = claim_range(&pool, &config, &user).await.unwrap().expect(&format!("length {cap} (the ceiling) should have work"));
+        assert_eq!(claim2.candidate_count, space_size(DEFAULT, cap));
 
         let claim3 = claim_range(&pool, &config, &user).await.unwrap();
-        assert!(claim3.is_none(), "max_len's space is now fully carved - there must be no length-3 work invented");
+        assert!(claim3.is_none(), "max_supported_len is now fully carved - there must be no work beyond the true ceiling");
     }
 
     /// The scenario this whole feature exists for: a client heartbeats a partial
@@ -503,7 +553,8 @@ mod tests {
     async fn heartbeat_progress_splits_the_range_crediting_each_user_with_their_part() {
         let pool = test_pool().await;
         let first_user = insert_user(&pool, "first").await;
-        insert_target(&pool, 3, 3).await; // fixed length, whole space handed out as one range
+        let (lower, upper) = full_bounds(DEFAULT, 3); // fixed length, whole space handed out as one range
+        insert_target(&pool, &lower, &upper).await;
 
         let config = test_config(space_size(DEFAULT, 3));
         let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
@@ -560,13 +611,15 @@ mod tests {
 
     /// If a client's last heartbeat before disconnecting already covered the very
     /// end of its range, the range has in fact been fully searched (with no full
-    /// match reported) - there's nothing left to reassign, so it should be closed
-    /// out as completed instead of handed to the next claimer as a zero-width range.
+    /// match reported) - it should be closed out as completed on its own, rather
+    /// than handed to the next claimer as a zero-width range (or, worse, silently
+    /// reassigned and redone).
     #[tokio::test]
     async fn heartbeat_progress_reaching_the_end_completes_the_range_without_reassigning() {
         let pool = test_pool().await;
         let first_user = insert_user(&pool, "first").await;
-        insert_target(&pool, 2, 2).await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        insert_target(&pool, &lower, &upper).await;
 
         let config = test_config(space_size(DEFAULT, 2));
         let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
@@ -582,9 +635,13 @@ mod tests {
             .unwrap();
         assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
 
+        // The reclaimed range itself must be closed out, not handed back out again -
+        // even though the target still has longer lengths to search under "always
+        // go as long as possible", so a subsequent claim legitimately returns fresh
+        // work there rather than nothing at all.
         let second_user = insert_user(&pool, "second").await;
-        let claim2 = claim_range(&pool, &config, &second_user).await.unwrap();
-        assert!(claim2.is_none(), "range was already fully searched via heartbeats - nothing should be handed out");
+        let claim2 = claim_range(&pool, &config, &second_user).await.unwrap().expect("target still has longer lengths to search");
+        assert_ne!(claim2.range_id, claim.range_id, "the already-fully-searched range must not be reassigned");
 
         let status: String = sqlx::query_scalar("SELECT status FROM ranges WHERE id = ?")
             .bind(claim.range_id)
@@ -602,7 +659,8 @@ mod tests {
     async fn claim_uses_the_targets_own_alphabet_not_the_default() {
         let pool = test_pool().await;
         let user = insert_user(&pool, "tester").await;
-        insert_target_with_alphabet(&pool, "size42", SIZE42, 3, 3).await;
+        let (lower, upper) = full_bounds(SIZE42, 3);
+        insert_target_with_alphabet(&pool, "size42", SIZE42, &lower, &upper).await;
 
         let config = test_config(space_size(SIZE42, 3));
         let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
@@ -621,7 +679,8 @@ mod tests {
     async fn claim_includes_the_targets_max_backslash_count() {
         let pool = test_pool().await;
         let user = insert_user(&pool, "tester").await;
-        let target_id = insert_target(&pool, 2, 2).await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let target_id = insert_target(&pool, &lower, &upper).await;
         sqlx::query("UPDATE targets SET max_backslash_count = ? WHERE id = ?")
             .bind(3i64)
             .bind(target_id)
@@ -643,7 +702,8 @@ mod tests {
         let pool = test_pool().await;
         let finder = insert_user(&pool, "finder").await;
         let other = insert_user(&pool, "other").await;
-        insert_target(&pool, 3, 3).await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
 
         // Small enough that the target's space gets carved into (at least) two ranges.
         let config = test_config(space_size(DEFAULT, 3) / 2);

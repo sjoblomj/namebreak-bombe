@@ -7,7 +7,9 @@ use namebreak_protocol::{
     CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
 };
 
-use crate::alphabet::{alphabet_size, lookup_predefined_alphabet, max_supported_len, PREDEFINED_ALPHABETS};
+use crate::alphabet::{
+    alphabet_size, bounds_are_valid, candidate_to_index, lookup_predefined_alphabet, max_supported_len, strip_prefix_suffix, PREDEFINED_ALPHABETS,
+};
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
 use crate::models::{parse_hash_hex, u32_to_i64, User};
@@ -126,9 +128,6 @@ pub async fn admin_create_target(
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
     }
-    if req.min_len < 1 || req.max_len < req.min_len {
-        return Err(AppError::BadRequest("min_len must be >= 1 and <= max_len".into()));
-    }
     if req.max_backslash_count < 0 {
         return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
     }
@@ -137,12 +136,31 @@ pub async fn admin_create_target(
         let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _)| name).collect();
         return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
     };
+
+    let Some(lower_bound) = strip_prefix_suffix(&req.lower_bound_filename, &req.prefix, &req.suffix) else {
+        return Err(AppError::BadRequest("lower_bound_filename must start with prefix and end with suffix".into()));
+    };
+    let Some(upper_bound) = strip_prefix_suffix(&req.upper_bound_filename, &req.prefix, &req.suffix) else {
+        return Err(AppError::BadRequest("upper_bound_filename must start with prefix and end with suffix".into()));
+    };
+    if lower_bound.is_empty() {
+        return Err(AppError::BadRequest("lower_bound_filename's candidate portion (between prefix and suffix) must not be empty".into()));
+    }
     let cap = max_supported_len(alphabet);
-    if req.max_len > cap {
+    if lower_bound.chars().count() as i64 > cap {
         return Err(AppError::BadRequest(format!(
-            "max_len ({}) exceeds this server's supported maximum for alphabet '{alphabet_name}' ({cap}) - beyond this a range's index no longer fits an i64",
-            req.max_len
+            "lower_bound_filename's candidate portion ({} chars) exceeds this server's supported maximum for alphabet '{alphabet_name}' ({cap} chars) - beyond this a range's index no longer fits an i64",
+            lower_bound.chars().count()
         )));
+    }
+    if candidate_to_index(alphabet, lower_bound).is_none() {
+        return Err(AppError::BadRequest("lower_bound_filename's candidate portion contains a character outside the chosen alphabet".into()));
+    }
+    if candidate_to_index(alphabet, upper_bound).is_none() {
+        return Err(AppError::BadRequest("upper_bound_filename's candidate portion contains a character outside the chosen alphabet (or is too long)".into()));
+    }
+    if !bounds_are_valid(alphabet, lower_bound, upper_bound) {
+        return Err(AppError::BadRequest("lower_bound_filename must be alphabetically before upper_bound_filename".into()));
     }
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
@@ -150,7 +168,7 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, min_len, max_len, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, created_at) \
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) RETURNING id",
     )
     .bind(&req.name)
@@ -158,8 +176,8 @@ pub async fn admin_create_target(
     .bind(&req.suffix)
     .bind(u32_to_i64(hash_a))
     .bind(u32_to_i64(hash_b))
-    .bind(req.min_len)
-    .bind(req.max_len)
+    .bind(lower_bound)
+    .bind(upper_bound)
     .bind(req.prune_symbol_runs as i64)
     .bind(req.max_backslash_count)
     .bind(alphabet_name)
@@ -168,9 +186,12 @@ pub async fn admin_create_target(
     .fetch_one(&mut *tx)
     .await?;
 
-    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, 0)")
+    let start_len = lower_bound.chars().count() as i64;
+    let start_index = candidate_to_index(alphabet, lower_bound).expect("already validated above");
+    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, ?)")
         .bind(target_id)
-        .bind(req.min_len)
+        .bind(start_len)
+        .bind(start_index)
         .execute(&mut *tx)
         .await?;
 

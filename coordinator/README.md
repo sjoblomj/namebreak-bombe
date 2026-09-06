@@ -15,7 +15,7 @@ coordinator/
 ```
 
 Visit the server's base URL in a browser (`GET /`) for a live dashboard - every
-target with its ranges, each range's status and who worked on it (from
+target with its bound filenames, its ranges, each range's status and who worked on it (from
 `last_assigned_user_id`, which - unlike `assigned_user_id` - is never cleared on
 reclaim), and a solved target's find called out with a prominent banner. If a
 range was reassigned partway through (see progress checkpointing below), each
@@ -101,20 +101,28 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "name": "rez-finz09bx",
     "prefix": "REZ\\", "suffix": ".TXT",
     "hash_a_hex": "0xF60F5D90", "hash_b_hex": "0xCE0A9BDB",
-    "min_len": 1, "max_len": 8,
+    "lower_bound_filename": "REZ\\FINZ09BX.TXT",
+    "upper_bound_filename": "REZ\\GAMEMENU.BIN",
     "prune_symbol_runs": true,
     "alphabet_name": "size49",
     "max_backslash_count": 0
   }'
 ```
 
-`min_len`/`max_len` are candidate lengths (the brute-forced portion between
-prefix and suffix). `max_len` is capped by the server at whatever length still
-fits a flat 64-bit range index (`alphabet_size^len <= i64::MAX`) for the chosen
-alphabet - well beyond what's realistically exhaustible anyway (11, for every
-alphabet currently in `PREDEFINED_ALPHABETS` - they're all close enough in size
-to land on the same cap; a genuinely smaller alphabet, e.g. a hex-only one,
-would push it noticeably higher). `alphabet_name` defaults to `"size49"` if omitted; see
+`lower_bound_filename`/`upper_bound_filename` are full filenames (like
+`ClaimResponse`'s bound fields) that tighten the search to exactly that
+alphabetical range at *every* candidate length - not just their own literal
+lengths, and the two don't need to be the same length as each other (e.g.
+`"ART\BLACKSMITH.GRP"` to `"ART\CATAPULT.GRP"`, 10 and 8 characters, is valid:
+every length from 10 up gets searched, each one bounded to candidates starting
+with something between `BLACKSMITH` and `CATAPULT`). There's no `min_len` - the
+server always starts at the literal `lower_bound_filename` candidate - and no
+`max_len`: it always searches as long as the chosen alphabet supports (capped
+at whatever length still fits a flat 64-bit range index,
+`alphabet_size^len <= i64::MAX` - 11 for every alphabet currently in
+`PREDEFINED_ALPHABETS`, since they're all close enough in size to land on the
+same cap; a genuinely smaller alphabet, e.g. a hex-only one, would push it
+noticeably higher). `alphabet_name` defaults to `"size49"` if omitted; see
 `GET /api/v1/alphabets` for the full list.
 
 Check progress:

@@ -43,9 +43,10 @@ fn alphabet_chars(alphabet: &str) -> Vec<char> {
 /// `[start_index, end_index)` pair without overflow. `namebreak.cu` sidesteps this
 /// same limit (there, for u64) by splitting long candidates into a CPU-enumerated
 /// leading part and a GPU-indexed trailing part; the server doesn't replicate that
-/// split, so target `max_len` is capped at this value. In practice this is a
-/// non-issue: exhaustively searching anywhere near this length is already
-/// computationally infeasible. A smaller alphabet permits a larger max length.
+/// split, so a target's search is capped at this length (see `bound_indices_at_len`
+/// and `ranges::claim_range`, which stop carving once it's reached). In practice
+/// this is a non-issue: exhaustively searching anywhere near this length is
+/// already computationally infeasible. A smaller alphabet permits a larger cap.
 pub fn max_supported_len(alphabet: &str) -> i64 {
     let size = alphabet_size(alphabet) as i128;
     let mut len = 0i64;
@@ -58,7 +59,11 @@ pub fn max_supported_len(alphabet: &str) -> i64 {
 }
 
 /// Total number of distinct candidates of the given length. Caller must ensure
-/// `len <= max_supported_len(alphabet)`.
+/// `len <= max_supported_len(alphabet)`. No longer used by production carving
+/// logic since target bounds replaced whole-space carving (see
+/// `bound_indices_at_len`), but still a natural, directly-tested primitive and
+/// heavily used by the test suite to compute expected values independently.
+#[allow(dead_code)]
 pub fn space_size(alphabet: &str, len: i64) -> i64 {
     let size = alphabet_size(alphabet) as i128;
     let mut space: i128 = 1;
@@ -93,6 +98,64 @@ pub fn candidate_to_index(alphabet: &str, candidate: &str) -> Option<i64> {
         index = index.checked_mul(size)?.checked_add(digit)?;
     }
     Some(index)
+}
+
+/// The alphabet's first and last characters - used to right-pad a bound
+/// candidate that's shorter than the length currently being searched. The
+/// lower bound pads with the minimum character (permissive on the low side:
+/// "this, or anything continuing from it"); the upper bound pads with the
+/// maximum character (permissive on the high side). Mirrors `namebreak.cu`'s
+/// `getLowerBound`/`getUpperBound` convention.
+fn min_max_chars(alphabet: &str) -> (char, char) {
+    let mut chars = alphabet.chars();
+    let min = chars.next().expect("alphabet must be non-empty");
+    let max = chars.last().unwrap_or(min);
+    (min, max)
+}
+
+/// The inclusive index range `[lower_at(len), upper_at(len)]` that a target's
+/// `[lower_bound, upper_bound]` candidate strings imply at a specific candidate
+/// length: whichever bound is shorter than `len` gets right-padded (lower with
+/// the alphabet's minimum character, upper with its maximum); whichever is
+/// longer gets truncated to `len` characters. This is the only primitive the
+/// carving logic needs - it never has to represent "the bound at this length"
+/// as a string, only as these two indices, so it's always safe from overflow
+/// as long as `len <= max_supported_len(alphabet)` (the only case it's ever
+/// called with).
+pub fn bound_indices_at_len(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64) -> (i64, i64) {
+    let (min_char, max_char) = min_max_chars(alphabet);
+    let len = len as usize;
+
+    let lower_str: String = pad_or_truncate(lower_bound, len, min_char);
+    let upper_str: String = pad_or_truncate(upper_bound, len, max_char);
+
+    // Both strings are built only from `alphabet`'s own characters (plus
+    // whichever characters `lower_bound`/`upper_bound` already contain, which
+    // callers must have validated against the alphabet at target-creation
+    // time), so these can't fail in practice.
+    let lower_idx = candidate_to_index(alphabet, &lower_str).expect("bound candidate contains a character outside the alphabet");
+    let upper_idx = candidate_to_index(alphabet, &upper_str).expect("bound candidate contains a character outside the alphabet");
+    (lower_idx, upper_idx)
+}
+
+fn pad_or_truncate(s: &str, len: usize, pad_with: char) -> String {
+    let count = s.chars().count();
+    if len <= count {
+        s.chars().take(len).collect()
+    } else {
+        s.chars().chain(std::iter::repeat(pad_with).take(len - count)).collect()
+    }
+}
+
+/// Whether a target's bounds actually describe a non-empty range: whether
+/// `lower_bound` is not alphabetically after `upper_bound`, checked at
+/// `lower_bound`'s own length (the length carving starts at). Rejects bounds
+/// given in the wrong order (or that otherwise don't overlap) at target
+/// creation, rather than silently carving nothing forever.
+pub fn bounds_are_valid(alphabet: &str, lower_bound: &str, upper_bound: &str) -> bool {
+    let len = lower_bound.chars().count() as i64;
+    let (lower_idx, upper_idx) = bound_indices_at_len(alphabet, lower_bound, upper_bound, len);
+    lower_idx <= upper_idx
 }
 
 /// Strips a target's prefix/suffix off a full filename to recover the candidate
@@ -207,6 +270,46 @@ mod tests {
     fn candidate_to_index_rejects_out_of_alphabet_characters() {
         assert_eq!(candidate_to_index(DEFAULT, "abc"), None); // lowercase isn't in the alphabet
         assert_eq!(candidate_to_index(SIZE42, "A!"), None); // '!' isn't in SIZE42's reduced punctuation
+    }
+
+    #[test]
+    fn bound_indices_at_len_pads_the_shorter_bound_and_truncates_the_longer_one() {
+        // The motivating example: "BLACKSMITH" (10 chars) to "CATAPULT" (8
+        // chars) - upper bound shorter than lower bound.
+        let lower = "BLACKSMITH";
+        let upper = "CATAPULT";
+
+        // At length 10 (lower's own length): lower is used as-is; upper (2
+        // chars short) is padded with 2 max characters.
+        let (lo, hi) = bound_indices_at_len(DEFAULT, lower, upper, 10);
+        assert_eq!(lo, candidate_to_index(DEFAULT, lower).unwrap());
+        assert_eq!(hi, candidate_to_index(DEFAULT, &format!("{upper}__")).unwrap());
+        assert!(lo <= hi, "BLACKSMITH must sort before CATAPULT + padding");
+
+        // At length 11: lower gets 1 min-char, upper gets 3 max-chars.
+        let (lo11, hi11) = bound_indices_at_len(DEFAULT, lower, upper, 11);
+        assert_eq!(lo11, candidate_to_index(DEFAULT, &format!("{lower} ")).unwrap());
+        assert_eq!(hi11, candidate_to_index(DEFAULT, &format!("{upper}___")).unwrap());
+
+        // Growing into an already-padded length is exactly a base shift.
+        assert_eq!(lo11, lo * alphabet_size(DEFAULT));
+    }
+
+    #[test]
+    fn bound_indices_at_len_handles_a_longer_upper_bound_too() {
+        // Symmetric case: upper bound longer than lower bound.
+        let lower = "CAT";
+        let upper = "CATAPULTMK2";
+        let (lo, hi) = bound_indices_at_len(DEFAULT, lower, upper, 3);
+        assert_eq!(lo, candidate_to_index(DEFAULT, lower).unwrap());
+        assert_eq!(hi, candidate_to_index(DEFAULT, "CAT").unwrap()); // upper truncated to 3 chars
+        assert_eq!(lo, hi, "only 'CAT' itself is in range at this length");
+    }
+
+    #[test]
+    fn bounds_are_valid_rejects_reversed_bounds() {
+        assert!(bounds_are_valid(DEFAULT, "BLACKSMITH", "CATAPULT"));
+        assert!(!bounds_are_valid(DEFAULT, "CATAPULT", "BLACKSMITH"));
     }
 
     #[test]
