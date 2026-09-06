@@ -24,6 +24,18 @@ async fn main() -> anyhow::Result<()> {
     let hostname = cli::resolve_hostname(args.hostname.clone());
     tokio::fs::create_dir_all(&args.workdir).await.ok();
 
+    // Resolve to an absolute path up front, before `run_namebreak` ever calls
+    // `.current_dir(workdir)` on the spawned Command: a relative program path
+    // given to `Command` is resolved against the *new* (post-chdir) working
+    // directory on Unix, not this process's cwd - so a relative --namebreak-bin
+    // combined with a relative --workdir can silently point at the wrong file
+    // (ENOENT) depending on how the two paths relate. Canonicalizing here also
+    // fails fast with a clear error if the binary doesn't exist at all, instead
+    // of that surfacing as a mysterious ENOENT from inside the spawn loop.
+    let namebreak_bin = args.namebreak_bin.canonicalize().map_err(|err| {
+        anyhow::anyhow!("--namebreak-bin {:?} not found: {err}", args.namebreak_bin)
+    })?;
+
     let api = ApiClient::register(&args.server_url, &args.username, &hostname).await?;
     let poll_interval = Duration::from_secs(args.poll_interval_secs);
 
@@ -42,8 +54,12 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        if let Err(err) = run_one(&api, &args.namebreak_bin, &args.workdir, &claim).await {
+        if let Err(err) = run_one(&api, &namebreak_bin, &args.workdir, &claim).await {
             tracing::error!(%err, range_id = claim.range_id, "range run failed - letting the lease expire so it gets reassigned");
+            // Without this, a persistent local failure (bad binary, missing CUDA
+            // driver, etc.) turns into a tight claim/fail loop that hammers the
+            // server - unlike the claim-error branch above, which already backs off.
+            tokio::time::sleep(poll_interval).await;
         }
     }
 }
