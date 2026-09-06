@@ -141,10 +141,14 @@
     font-weight: 500;
     font-size: 13px;
   }
+  .table-scroll {
+    overflow-x: auto;
+    max-width: 100%;
+    margin-top: 14px;
+  }
   table {
     width: 100%;
     border-collapse: collapse;
-    margin-top: 14px;
     font-size: 13px;
   }
   th, td {
@@ -305,11 +309,18 @@
       '<th>Assigned</th><th>Lease expires</th><th>Completed</th></tr>';
     table.appendChild(thead);
 
+    // Shorter candidates (fewer characters) before longer ones, since a
+    // target's search always works through lengths in that order.
+    const sortedRanges = t.ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
+
     const tbody = document.createElement('tbody');
-    for (const r of t.ranges) tbody.appendChild(rangeRow(r));
+    for (const r of sortedRanges) tbody.appendChild(rangeRow(r));
     table.appendChild(tbody);
 
-    card.appendChild(table);
+    const tableScroll = document.createElement('div');
+    tableScroll.className = 'table-scroll';
+    tableScroll.appendChild(table);
+    card.appendChild(tableScroll);
     return card;
   }
 
