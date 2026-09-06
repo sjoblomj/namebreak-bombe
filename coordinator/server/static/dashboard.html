@@ -247,7 +247,7 @@
 <script>
 (function () {
   const targetsEl = document.getElementById('targets');
-  const statusEl = document.getElementById('status-text');
+  const statusEl  = document.getElementById('status-text');
   const subheadEl = document.querySelector('.subhead');
 
   // Displayed as "YYYY-mm-dd HH:MM:ss" (always UTC, like the underlying
@@ -320,7 +320,7 @@
 
     const tdRange = document.createElement('td');
     tdRange.className = 'mono';
-    tdRange.textContent = `"${r.first_candidate}" – "${r.last_candidate}"`;
+    tdRange.textContent = `${r.first_candidate} – ${r.last_candidate}`;
     tr.appendChild(tdRange);
 
     const count = fmtNum(r.end_index - r.start_index);
