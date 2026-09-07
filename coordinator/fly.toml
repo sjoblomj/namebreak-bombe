@@ -12,6 +12,8 @@ primary_region = 'arn'
 [env]
   BIND_ADDR = '0.0.0.0:8080'
   DATABASE_URL = 'sqlite:///data/namebreak.db'
+  TARGET_CHUNK_SECONDS = '3600'
+  MAX_CHUNK_CANDIDATES = '1000000000000000'
 
 [[mounts]]
   source = 'namebreak_data'
