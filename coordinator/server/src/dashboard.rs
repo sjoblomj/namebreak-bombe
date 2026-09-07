@@ -45,6 +45,11 @@ pub struct DashboardRange {
     /// is decoded from `end_index - 1`.
     pub first_candidate: String,
     pub last_candidate: String,
+    /// The candidate at the last heartbeat-reported progress index, if any -
+    /// how far into the range its current (or last) worker has actually
+    /// searched, as opposed to `first_candidate`/`last_candidate` which just
+    /// describe the range's bounds.
+    pub progress_candidate: Option<String>,
     /// "username@hostname" of whoever last claimed this range, even if it was
     /// since reclaimed - see the migration adding `last_assigned_user_id`.
     pub worker: Option<String>,
@@ -74,9 +79,9 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
 
     let mut targets = Vec::with_capacity(target_rows.len());
     for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet) in target_rows {
-        let range_rows: Vec<(i64, String, i64, i64, i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+        let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
             "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
-                    worker.username, worker.hostname, \
+                    ranges.progress_index, worker.username, worker.hostname, \
                     ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at \
              FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
              WHERE ranges.target_id = ? \
@@ -89,7 +94,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         let ranges = range_rows
             .into_iter()
             .map(
-                |(range_id, r_status, candidate_len, start_index, end_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at)| {
+                |(range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at)| {
                     DashboardRange {
                         id: range_id,
                         status: r_status,
@@ -98,6 +103,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                         end_index,
                         first_candidate: index_to_candidate(&alphabet, start_index, candidate_len),
                         last_candidate: index_to_candidate(&alphabet, end_index - 1, candidate_len),
+                        progress_candidate: progress_index.map(|p| index_to_candidate(&alphabet, p, candidate_len)),
                         worker: display_name(worker_username, worker_hostname),
                         assigned_at,
                         lease_expires_at,

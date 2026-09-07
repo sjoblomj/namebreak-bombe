@@ -178,6 +178,12 @@
     color: var(--muted);
   }
   .lease-note.expired { color: #b91c1c; font-weight: 600; }
+  .progress-note {
+    display: block;
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--muted);
+  }
   tr.range-row.status-in_progress { background: var(--row-in-progress-bg); }
   tr.range-row {
     cursor: pointer;
@@ -321,6 +327,12 @@
     const tdRange = document.createElement('td');
     tdRange.className = 'mono';
     tdRange.textContent = `${r.first_candidate} – ${r.last_candidate}`;
+    if (r.status === 'in_progress' && r.progress_candidate) {
+      const note = document.createElement('span');
+      note.className = 'progress-note mono';
+      note.textContent = 'progress: ' + r.progress_candidate;
+      tdRange.appendChild(note);
+    }
     tr.appendChild(tdRange);
 
     const count = fmtNum(r.end_index - r.start_index);
@@ -352,6 +364,9 @@
     const grid = document.createElement('div');
     grid.className = 'detail-grid';
     grid.appendChild(detailField('Count', count, true));
+    if (r.status === 'in_progress') {
+      grid.appendChild(detailField('Progress', r.progress_candidate || 'no heartbeat yet', true));
+    }
     grid.appendChild(detailField('Worker', r.worker || 'nobody yet'));
     grid.appendChild(detailField('Assigned', tdAssigned.textContent, false, tdAssigned.title));
     grid.appendChild(detailField('Completed', tdCompleted.textContent, false, tdCompleted.title));
