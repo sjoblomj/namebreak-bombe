@@ -1,0 +1,45 @@
+#ifndef NAMEBREAK_CUDA_COORDINATOR_CLIENT_H
+#define NAMEBREAK_CUDA_COORDINATOR_CLIENT_H
+
+#include <cstdint>
+#include <optional>
+#include <string>
+
+#include "http_client.h"
+#include "protocol.h"
+
+// Talks to the coordinator server's HTTP API - mirrors
+// coordinator/client/src/api.rs. Not thread-safe: each thread that needs to
+// make requests (the coordinator loop and its heartbeat thread both do)
+// should use its own instance, sharing the token via `setToken`/`token`.
+class CoordinatorClient {
+public:
+    explicit CoordinatorClient(std::string baseUrl) : baseUrl_(std::move(baseUrl)) {}
+
+    // Registers with the server. On success, stores the returned token for
+    // subsequent calls (also retrievable via token()) and returns true.
+    bool registerClient(const std::string& username, const std::string& hostname, int64_t& outUserId, std::string& error);
+
+    void setToken(std::string token) { token_ = std::move(token); }
+    const std::string& token() const { return token_; }
+
+    // std::nullopt means "no work available" (server returned 204 No
+    // Content) - not an error.
+    bool claim(std::optional<ClaimResponse>& out, std::string& error);
+
+    bool heartbeat(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, HeartbeatResponse& out, std::string& error);
+
+    // Distinguishes a 409 (this range's ownership already moved on - e.g. a
+    // network outage during heartbeating outlasted the lease and the server
+    // already reassigned it) from other failures, mirroring api.rs's
+    // `err.status() == CONFLICT` check.
+    enum class CompleteOutcome { Ok, Conflict, Error };
+    CompleteOutcome complete(int64_t rangeId, const CompleteRequest& req, std::string& error);
+
+private:
+    std::string baseUrl_;
+    std::string token_;
+    HttpClient http_;
+};
+
+#endif // NAMEBREAK_CUDA_COORDINATOR_CLIENT_H
