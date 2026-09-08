@@ -497,8 +497,6 @@ breakfree:
     return result;
 }
 
-static const char* kConfigPath = "config.conf";
-
 int main(int argc, char* argv[]) {
     // The only argument namebreak takes: an optional mode, overriding
     // config.conf's own `mode = ...` (see config.h). Everything else - which

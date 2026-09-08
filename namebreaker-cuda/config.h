@@ -7,6 +7,11 @@
 
 #include "search.h"
 
+// The one, fixed location namebreak reads its config from - see ConfigFile
+// below. Shared so every file that needs to reference it (for error
+// messages, or to write a discovered value back into it) agrees on it.
+inline constexpr const char* kConfigPath = "config.conf";
+
 // namebreak's on-disk config.conf - always read from "./config.conf" (the
 // current working directory), never pointed to via a flag. A flat key=value
 // file with exactly two possible [section] headers:
@@ -34,6 +39,14 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
 // false with `error` set if a required key is missing or a value doesn't
 // parse.
 bool buildSearchRequest(const std::map<std::string, std::string>& section, bool continuous, SearchRequest& out, std::string& error);
+
+// Inserts `key = value` (with a short explanatory comment above it) right
+// after `[sectionName]`'s header line in the file at `path`, leaving every
+// other line untouched - used to persist an interactively-confirmed value
+// (see coordinator_runner.cpp's identity prompt) without disturbing the
+// rest of a hand-edited config.conf. Returns false (nothing written) if the
+// file can't be read/written or the section doesn't exist in it.
+bool appendKeyToConfigSection(const std::string& path, const std::string& sectionName, const std::string& key, const std::string& value);
 
 // Small helper for reading a config section by known key names while
 // catching typos: tracks which keys were actually looked up, so a caller

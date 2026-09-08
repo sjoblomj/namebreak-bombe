@@ -4,11 +4,15 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <iostream>
 #include <mutex>
 #include <optional>
+#include <pwd.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include <curl/curl.h>
 
@@ -25,14 +29,90 @@ namespace {
 // client is - matches the old Rust client's HEARTBEAT_INTERVAL.
 constexpr int kHeartbeatIntervalSeconds = 60;
 
-std::string resolveHostname(const std::string& given) {
-    if (!given.empty()) return given;
+std::string trimLine(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+std::string resolveHostname() {
     char buf[256];
     if (gethostname(buf, sizeof(buf)) == 0) {
         buf[sizeof(buf) - 1] = '\0';
         if (buf[0] != '\0') return std::string(buf);
     }
     return "unknown-host";
+}
+
+// The OS's notion of "the currently logged-in user" - getpwuid(geteuid())
+// is authoritative (doesn't depend on a shell having set $USER/$LOGNAME, and
+// works the same whether or not there's a controlling terminal), so it's
+// tried first; the env vars are only a fallback for the unusual case where
+// the passwd lookup itself fails.
+std::string resolveUsername() {
+    if (struct passwd* pw = getpwuid(geteuid())) {
+        if (pw->pw_name && pw->pw_name[0] != '\0') return pw->pw_name;
+    }
+    if (const char* env = std::getenv("USER"); env && env[0] != '\0') return env;
+    if (const char* env = std::getenv("LOGNAME"); env && env[0] != '\0') return env;
+    return "unknown-user";
+}
+
+// Interactively confirms (or lets the user override) auto-discovered values
+// for whichever of `args`'s username/hostname were left unset by
+// config.conf, then persists the final values back into the file - so this
+// only ever prompts once per machine (future runs find both keys already
+// set there). Falls back to silently using the discovered defaults with no
+// prompt/write when stdin isn't a terminal (e.g. a cron job or systemd
+// service), so a missing config never hangs a non-interactive run.
+void resolveMissingIdentity(CoordinatorArgs& args) {
+    struct Field {
+        std::string key;
+        std::string* value;
+    };
+    std::vector<Field> missing;
+    if (args.username.empty()) missing.push_back({"username", &args.username});
+    if (args.hostname.empty()) missing.push_back({"hostname", &args.hostname});
+    if (missing.empty()) return;
+
+    for (Field& f : missing) {
+        *f.value = (f.key == "username") ? resolveUsername() : resolveHostname();
+    }
+
+    if (!isatty(fileno(stdin))) {
+        for (const Field& f : missing) {
+            fprintf(stderr, "[coordinator] no %s configured - using detected value '%s' (run interactively to save this to %s)\n",
+                    f.key.c_str(), f.value->c_str(), kConfigPath);
+        }
+        return;
+    }
+
+    printf("No %s configured in %s. Detected:\n", missing.size() == 2 ? "username/hostname" : missing[0].key.c_str(), kConfigPath);
+    for (const Field& f : missing) printf("  %s = %s\n", f.key.c_str(), f.value->c_str());
+    printf("Use %s? [Y/n]: ", missing.size() == 2 ? "these" : "this");
+    fflush(stdout);
+
+    std::string line;
+    std::getline(std::cin, line);
+    line = trimLine(line);
+    bool accepted = line.empty() || line == "y" || line == "Y" || line == "yes" || line == "Yes";
+
+    for (Field& f : missing) {
+        if (!accepted) {
+            printf("Enter %s [%s]: ", f.key.c_str(), f.value->c_str());
+            fflush(stdout);
+            std::string entered;
+            std::getline(std::cin, entered);
+            entered = trimLine(entered);
+            if (!entered.empty()) *f.value = entered;
+        }
+        if (appendKeyToConfigSection(kConfigPath, "coordinator", f.key, *f.value)) {
+            printf("[coordinator] saved %s = %s to %s\n", f.key.c_str(), f.value->c_str(), kConfigPath);
+        } else {
+            fprintf(stderr, "[coordinator] warning: could not save %s to %s - you'll be asked again next time\n", f.key.c_str(), kConfigPath);
+        }
+    }
 }
 
 SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
@@ -177,7 +257,9 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
 bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, CoordinatorArgs& out, std::string& error) {
     ConfigSectionReader r(section);
     if (!r.getRequired("server_url", out.serverUrl, error)) return false;
-    if (!r.getRequired("username", out.username, error)) return false;
+    // Left "" if absent - resolveMissingIdentity (called from runCoordinator)
+    // auto-detects and interactively confirms/persists a value for either.
+    out.username = r.getOptional("username", "");
     out.hostname = r.getOptional("hostname", "");
     std::string pollStr = r.getOptional("poll_interval_secs", "30");
 
@@ -193,11 +275,12 @@ bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, Coo
         error = "invalid poll_interval_secs: " + pollStr;
         return false;
     }
-    out.hostname = resolveHostname(out.hostname);
     return true;
 }
 
-int runCoordinator(const CoordinatorArgs& args) {
+int runCoordinator(CoordinatorArgs args) {
+    resolveMissingIdentity(args);
+
     // Not thread-safe to call lazily once the heartbeat thread may already
     // be making requests concurrently with the main thread - do it once,
     // up front, before any thread touches libcurl.

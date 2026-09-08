@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <fstream>
+#include <vector>
 
 #include "cpu-utils.h"
 
@@ -25,6 +26,15 @@ bool parseBool(const std::string& s, bool& out) {
     if (lower == "true" || lower == "1") { out = true; return true; }
     if (lower == "false" || lower == "0") { out = false; return true; }
     return false;
+}
+
+// Inverse of unquote() above: wraps `s` in "..." only if writing it plain
+// would lose meaningful leading/trailing whitespace when re-read.
+std::string quoteIfNeeded(const std::string& s) {
+    if (!s.empty() && (std::isspace((unsigned char) s.front()) || std::isspace((unsigned char) s.back()))) {
+        return "\"" + s + "\"";
+    }
+    return s;
 }
 
 } // namespace
@@ -131,5 +141,33 @@ bool buildSearchRequest(const std::map<std::string, std::string>& section, bool 
     out.lowerBound = remove_prefix_and_suffix(lowerFilename, prefix, suffix);
     out.upperBound = remove_prefix_and_suffix(upperFilename, prefix, suffix);
     out.continuous = continuous;
+    return true;
+}
+
+bool appendKeyToConfigSection(const std::string& path, const std::string& sectionName, const std::string& key, const std::string& value) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) lines.push_back(line);
+    in.close();
+
+    int sectionLine = -1;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (trim(lines[i]) == "[" + sectionName + "]") {
+            sectionLine = (int) i;
+            break;
+        }
+    }
+    if (sectionLine < 0) return false;
+
+    lines.insert(lines.begin() + sectionLine + 1, {
+        "# Auto-detected - remove this line to be asked again next time.",
+        key + " = " + quoteIfNeeded(value),
+    });
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return false;
+    for (const auto& l : lines) out << l << "\n";
     return true;
 }
