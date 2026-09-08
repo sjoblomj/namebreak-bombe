@@ -3,15 +3,19 @@
 Distributes `namebreak` (see `../namebreaker-cuda`) across multiple volunteers'
 GPUs. A central **server** tracks a set of *targets* (a prefix/suffix + hash
 pair to search for), carves each target's candidate space into time-boxed
-*ranges*, and hands ranges out to **clients** over HTTP. Clients run the
-existing `namebreak` CUDA binary as a subprocess against exactly the range
-they were given and report back when it's done.
+*ranges*, and hands ranges out to clients over HTTP. The client side lives
+directly in `namebreak` itself (`../namebreaker-cuda`) as its `coordinator`
+mode: it registers, claims a range, searches it in-process (no subprocess),
+heartbeats progress, and reports back when it's done - see
+`../namebreaker-cuda/coordinator_runner.h` for that loop and
+`../namebreaker-cuda/protocol.h` for the wire types, kept in sync by hand with
+this directory's `protocol/` crate below (same JSON shapes, same server).
 
 ```
 coordinator/
-  protocol/   shared HTTP API types (used by both server and client)
+  protocol/   shared HTTP API types (used by the server; namebreak's own
+              protocol.h mirrors these same shapes for the client side)
   server/     axum + sqlx(SQLite) coordinator - owns all range bookkeeping
-  client/     wraps a local `namebreak` binary: claims ranges, runs them, reports back
 ```
 
 Visit the server's base URL in a browser (`GET /`) for a live dashboard - every
@@ -75,12 +79,10 @@ See the top-level plan/design notes for the full rationale; the short version:
 - **Stopping on a find**: the same heartbeat also carries a `target_solved`
   flag, true once *any* range of that target has been completed with a match.
   A client still searching a different range of an already-solved target sees
-  this on its next heartbeat (so within `HEARTBEAT_INTERVAL`, 60s) and kills
-  its running `namebreak` - the whole process *group*, not just the direct
-  child, so this also works if `--namebreak-bin` ever points at a wrapper
-  script rather than the real binary directly. That range is closed out
-  server-side at the same moment (no `/complete` round-trip - there's nothing
-  meaningful to report), and the client moves straight on to its next `/claim`.
+  this on its next heartbeat (so within 60s) and aborts its in-progress
+  search. That range is closed out server-side at the same moment (no
+  `/complete` round-trip - there's nothing meaningful to report), and the
+  client moves straight on to its next `/claim`.
 - **Storage**: SQLite on a single Fly Volume. One server instance only - range
   assignment has to be centrally coordinated anyway, so this isn't a real
   limitation.
@@ -159,20 +161,22 @@ curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecre
 
 ## Running a client
 
-Build `namebreak` as usual first (see `../namebreaker-cuda/Makefile`), then:
+Build `namebreak` as usual first (see `../namebreaker-cuda/Makefile` - the
+default build includes coordinator support; `make NETWORK=0` omits it), then
+run its `coordinator` mode from wherever you want `matches.txt` written:
 
 ```sh
-cargo run -p namebreak-client -- \
+cd run   # or any working directory of your choice
+../namebreaker-cuda/namebreak coordinator \
   --server-url http://localhost:8080 \
-  --username yourname \
-  --namebreak-bin ../namebreaker-cuda/namebreak \
-  --workdir ./run
+  --username yourname
 ```
 
-`--hostname` defaults to the machine's actual hostname. The client
-re-registers (idempotently) on every start, claims a range, runs `namebreak
-bounded` against exactly that range, reports the result, and loops. If
-`namebreak` doesn't exit cleanly (crash, CUDA error, wrong args), the client
+`--hostname` defaults to the machine's actual hostname (`--server-url`/
+`--username` can also come from `NAMEBREAK_SERVER_URL`/`NAMEBREAK_USERNAME`).
+It re-registers (idempotently) on every start, claims a range, searches it
+in-process against exactly that range, reports the result, and loops. If the
+search fails to even start (bad claim data, matches.txt not writable), it
 skips reporting completion and lets the range's lease expire so the server
 reassigns it - it won't report success or silently drop bad work.
 
@@ -200,5 +204,6 @@ fly secrets set ADMIN_TOKEN=<a real secret>
 fly deploy
 ```
 
-The client is not part of the server image - volunteers build/run it locally
-against `--server-url https://<your-app>.fly.dev`.
+The client is not part of the server image - volunteers build `namebreak`
+(`../namebreaker-cuda`) locally and run its `coordinator` mode against
+`--server-url https://<your-app>.fly.dev`.
