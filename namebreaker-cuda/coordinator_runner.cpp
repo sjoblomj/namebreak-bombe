@@ -8,11 +8,28 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
-#include <pwd.h>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+// The only OS-specific calls in this whole client: discovering the
+// machine's hostname and the logged-in user's name, and checking whether
+// stdin is an interactive terminal (see resolveHostname/resolveUsername/
+// resolveMissingIdentity below). Everything else in coordinator mode
+// (libcurl, JSON, threading, file I/O) is already portable C++17.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // GetComputerNameA, GetUserNameA - link against Advapi32 for the latter
+#include <io.h>      // _isatty, _fileno
+#else
+#include <pwd.h>     // getpwuid
+#include <unistd.h>  // gethostname, isatty, fileno, geteuid
+#endif
 
 #include <curl/curl.h>
 
@@ -38,24 +55,36 @@ std::string trimLine(const std::string& s) {
 
 std::string resolveHostname() {
     char buf[256];
+#ifdef _WIN32
+    DWORD size = sizeof(buf);
+    if (GetComputerNameA(buf, &size) && buf[0] != '\0') return std::string(buf);
+#else
     if (gethostname(buf, sizeof(buf)) == 0) {
         buf[sizeof(buf) - 1] = '\0';
         if (buf[0] != '\0') return std::string(buf);
     }
+#endif
     return "unknown-host";
 }
 
-// The OS's notion of "the currently logged-in user" - getpwuid(geteuid())
-// is authoritative (doesn't depend on a shell having set $USER/$LOGNAME, and
-// works the same whether or not there's a controlling terminal), so it's
-// tried first; the env vars are only a fallback for the unusual case where
-// the passwd lookup itself fails.
+// The OS's notion of "the currently logged-in user" - getpwuid(geteuid())/
+// GetUserNameA are authoritative (don't depend on a shell having set an env
+// var, and work the same whether or not there's a controlling terminal), so
+// they're tried first; the env vars are only a fallback for the unusual
+// case where that OS-level lookup itself fails.
 std::string resolveUsername() {
+#ifdef _WIN32
+    char buf[256];
+    DWORD size = sizeof(buf);
+    if (GetUserNameA(buf, &size) && buf[0] != '\0') return std::string(buf);
+#else
     if (struct passwd* pw = getpwuid(geteuid())) {
         if (pw->pw_name && pw->pw_name[0] != '\0') return pw->pw_name;
     }
+#endif
     if (const char* env = std::getenv("USER"); env && env[0] != '\0') return env;
     if (const char* env = std::getenv("LOGNAME"); env && env[0] != '\0') return env;
+    if (const char* env = std::getenv("USERNAME"); env && env[0] != '\0') return env; // Windows' equivalent of $USER
     return "unknown-user";
 }
 
@@ -80,7 +109,12 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
         *f.value = (f.key == "username") ? resolveUsername() : resolveHostname();
     }
 
-    if (!isatty(fileno(stdin))) {
+#ifdef _WIN32
+    bool interactive = _isatty(_fileno(stdin));
+#else
+    bool interactive = isatty(fileno(stdin));
+#endif
+    if (!interactive) {
         for (const Field& f : missing) {
             fprintf(stderr, "[coordinator] no %s configured - using detected value '%s' (run interactively to save this to %s)\n",
                     f.key.c_str(), f.value->c_str(), kConfigPath);
