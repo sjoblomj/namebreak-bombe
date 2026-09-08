@@ -182,3 +182,15 @@ std::string getUpperBound(const std::string& input, std::string alphabet) {
     result.resize(MAX_CANDIDATE_LEN, ' ');
     return result;
 }
+
+bool hexToU32(const std::string& s, uint32_t& out) {
+    try {
+        size_t consumed = 0;
+        unsigned long value = std::stoul(s, &consumed, 16);
+        if (consumed != s.size()) return false; // trailing garbage
+        out = (uint32_t) value;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}

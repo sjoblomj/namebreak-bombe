@@ -162,23 +162,29 @@ curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecre
 ## Running a client
 
 Build `namebreak` as usual first (see `../namebreaker-cuda/Makefile` - the
-default build includes coordinator support; `make NETWORK=0` omits it), then
-run its `coordinator` mode from wherever you want `matches.txt` written:
+default build includes coordinator support; `make NETWORK=0` omits it). Then,
+from wherever you want `matches.txt` written, create a `config.conf` (see
+`../namebreaker-cuda/config.h`) with a `[coordinator]` section:
 
 ```sh
 cd run   # or any working directory of your choice
-../namebreaker-cuda/namebreak coordinator \
-  --server-url http://localhost:8080 \
-  --username yourname
+cat > config.conf <<EOF
+mode = coordinator
+
+[coordinator]
+server_url = http://localhost:8080
+username = yourname
+EOF
+../namebreaker-cuda/namebreak
 ```
 
-`--hostname` defaults to the machine's actual hostname (`--server-url`/
-`--username` can also come from `NAMEBREAK_SERVER_URL`/`NAMEBREAK_USERNAME`).
-It re-registers (idempotently) on every start, claims a range, searches it
-in-process against exactly that range, reports the result, and loops. If the
-search fails to even start (bad claim data, matches.txt not writable), it
-skips reporting completion and lets the range's lease expire so the server
-reassigns it - it won't report success or silently drop bad work.
+`hostname` (optional) defaults to the machine's actual hostname;
+`poll_interval_secs` (optional) defaults to 30. namebreak re-registers
+(idempotently) on every start, claims a range, searches it in-process against
+exactly that range, reports the result, and loops. If the search fails to
+even start (bad claim data, matches.txt not writable), it skips reporting
+completion and lets the range's lease expire so the server reassigns it - it
+won't report success or silently drop bad work.
 
 ## Server configuration (env vars)
 
@@ -205,5 +211,5 @@ fly deploy
 ```
 
 The client is not part of the server image - volunteers build `namebreak`
-(`../namebreaker-cuda`) locally and run its `coordinator` mode against
-`--server-url https://<your-app>.fly.dev`.
+(`../namebreaker-cuda`) locally and run its `coordinator` mode with
+`server_url = https://<your-app>.fly.dev` in their `config.conf`.

@@ -4,8 +4,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -14,6 +12,7 @@
 
 #include <curl/curl.h>
 
+#include "config.h"
 #include "coordinator_client.h"
 #include "cpu-utils.h"
 #include "search.h"
@@ -26,18 +25,6 @@ namespace {
 // client is - matches the old Rust client's HEARTBEAT_INTERVAL.
 constexpr int kHeartbeatIntervalSeconds = 60;
 
-struct CoordinatorArgs {
-    std::string serverUrl;
-    std::string username;
-    std::string hostname;
-    int pollIntervalSecs = 30;
-};
-
-std::string envOr(const char* name, const std::string& fallback) {
-    const char* v = std::getenv(name);
-    return v ? std::string(v) : fallback;
-}
-
 std::string resolveHostname(const std::string& given) {
     if (!given.empty()) return given;
     char buf[256];
@@ -46,61 +33,6 @@ std::string resolveHostname(const std::string& given) {
         if (buf[0] != '\0') return std::string(buf);
     }
     return "unknown-host";
-}
-
-bool parseArgs(int argc, char** argv, CoordinatorArgs& out, std::string& error) {
-    out.serverUrl = envOr("NAMEBREAK_SERVER_URL", "");
-    out.username = envOr("NAMEBREAK_USERNAME", "");
-    out.hostname = envOr("NAMEBREAK_HOSTNAME", "");
-
-    // argv[0]=binary, argv[1]="coordinator", flags start at argv[2].
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
-        auto nextValue = [&](const char* flagName) -> std::string {
-            if (i + 1 >= argc) {
-                error = std::string(flagName) + " requires a value";
-                return "";
-            }
-            return argv[++i];
-        };
-        if (arg == "--server-url") {
-            out.serverUrl = nextValue("--server-url");
-        } else if (arg == "--username") {
-            out.username = nextValue("--username");
-        } else if (arg == "--hostname") {
-            out.hostname = nextValue("--hostname");
-        } else if (arg == "--poll-interval-secs") {
-            std::string v = nextValue("--poll-interval-secs");
-            if (!error.empty()) return false;
-            try {
-                out.pollIntervalSecs = std::stoi(v);
-            } catch (const std::exception&) {
-                error = "invalid --poll-interval-secs: " + v;
-                return false;
-            }
-        } else {
-            error = "unknown argument: " + arg;
-            return false;
-        }
-        if (!error.empty()) return false;
-    }
-
-    if (out.serverUrl.empty()) { error = "--server-url (or NAMEBREAK_SERVER_URL) is required"; return false; }
-    if (out.username.empty()) { error = "--username (or NAMEBREAK_USERNAME) is required"; return false; }
-    out.hostname = resolveHostname(out.hostname);
-    return true;
-}
-
-// hexToU32 mirrors main()'s CLI hash parsing (std::stoul(..., 16), which
-// tolerates an optional "0x"/"0X" prefix) - the server sends hashes as
-// "0x{:08X}" strings (see ClaimResponse::hashAHex/hashBHex).
-bool hexToU32(const std::string& s, uint32_t& out) {
-    try {
-        out = (uint32_t) std::stoul(s, nullptr, 16);
-        return true;
-    } catch (const std::exception&) {
-        return false;
-    }
 }
 
 SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
@@ -242,18 +174,30 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
 
 } // namespace
 
-int runCoordinator(int argc, char** argv) {
-    CoordinatorArgs args;
-    std::string error;
-    if (!parseArgs(argc, argv, args, error)) {
-        fprintf(stderr, "%s\n", error.c_str());
-        fprintf(stderr,
-                "Usage: %s coordinator --server-url <url> --username <name> [--hostname <name>] [--poll-interval-secs <n>]\n"
-                "(--server-url/--username may also come from NAMEBREAK_SERVER_URL/NAMEBREAK_USERNAME)\n",
-                argv[0]);
-        return 1;
+bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, CoordinatorArgs& out, std::string& error) {
+    ConfigSectionReader r(section);
+    if (!r.getRequired("server_url", out.serverUrl, error)) return false;
+    if (!r.getRequired("username", out.username, error)) return false;
+    out.hostname = r.getOptional("hostname", "");
+    std::string pollStr = r.getOptional("poll_interval_secs", "30");
+
+    std::string unknown = r.firstUnknownKey();
+    if (!unknown.empty()) {
+        error = "unknown key '" + unknown + "' in [coordinator] section";
+        return false;
     }
 
+    try {
+        out.pollIntervalSecs = std::stoi(pollStr);
+    } catch (const std::exception&) {
+        error = "invalid poll_interval_secs: " + pollStr;
+        return false;
+    }
+    out.hostname = resolveHostname(out.hostname);
+    return true;
+}
+
+int runCoordinator(const CoordinatorArgs& args) {
     // Not thread-safe to call lazily once the heartbeat thread may already
     // be making requests concurrently with the main thread - do it once,
     // up front, before any thread touches libcurl.
@@ -261,6 +205,7 @@ int runCoordinator(int argc, char** argv) {
 
     CoordinatorClient client(args.serverUrl);
     int64_t userId = 0;
+    std::string error;
     if (!client.registerClient(args.username, args.hostname, userId, error)) {
         fprintf(stderr, "failed to register with coordinator: %s\n", error.c_str());
         return 1;

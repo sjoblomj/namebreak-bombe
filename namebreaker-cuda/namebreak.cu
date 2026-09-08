@@ -9,6 +9,7 @@
 #include "cpu-utils.h"
 #include "constants.h"
 #include "search.h"
+#include "config.h"
 #ifdef NAMEBREAK_WITH_NETWORK
 #include "coordinator_runner.h"
 #endif
@@ -496,17 +497,45 @@ breakfree:
     return result;
 }
 
+static const char* kConfigPath = "config.conf";
+
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <continuous|bounded> <alphabet> <maxBackslashCount> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB> [--prune-symbol-runs]\n", argv[0]);
+    // The only argument namebreak takes: an optional mode, overriding
+    // config.conf's own `mode = ...` (see config.h). Everything else - which
+    // used to be nine positional/flag arguments differing per mode - now
+    // lives in config.conf.
+    std::string modeOverride = (argc >= 2) ? argv[1] : "";
+    if (argc > 2 || (argc == 2 && modeOverride != "continuous" && modeOverride != "bounded" && modeOverride != "coordinator")) {
+        fprintf(stderr, "Usage: %s [continuous|bounded|coordinator]\n"
+                         "Reads %s from the current directory for everything else; the argument above,\n"
+                         "if given, overrides that file's own 'mode = ...'.\n",
+                argv[0], kConfigPath);
         return 1;
     }
 
-    std::string mode = argv[1];
+    ConfigFile config;
+    std::string error;
+    if (!loadConfigFile(kConfigPath, config, error)) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
+
+    std::string mode = !modeOverride.empty() ? modeOverride : config.mode;
+    if (mode != "continuous" && mode != "bounded" && mode != "coordinator") {
+        fprintf(stderr, "Unknown or missing mode '%s' - expected continuous, bounded, or coordinator "
+                         "(set %s's 'mode = ...', or pass one as this program's argument)\n",
+                mode.c_str(), kConfigPath);
+        return 1;
+    }
 
 #ifdef NAMEBREAK_WITH_NETWORK
     if (mode == "coordinator") {
-        return runCoordinator(argc, argv);
+        CoordinatorArgs cargs;
+        if (!buildCoordinatorArgs(config.coordinator, cargs, error)) {
+            fprintf(stderr, "%s [coordinator]: %s\n", kConfigPath, error.c_str());
+            return 1;
+        }
+        return runCoordinator(cargs);
     }
 #else
     if (mode == "coordinator") {
@@ -515,50 +544,11 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    if ((mode != "continuous" && mode != "bounded") || argc < 11) {
-        fprintf(stderr, "Usage: %s <continuous|bounded> <alphabet> <maxBackslashCount> <startCandidate> <prefix> <suffix> <lowerBound> <upperBound> <targetHashA> <targetHashB> [--prune-symbol-runs]\n", argv[0]);
-        return 1;
-    }
-
-    // Off by default: it changes which candidates get hashed at all, so it should be
-    // an explicit opt-in rather than something that silently starts skipping candidates
-    // in an existing search.
-    bool pruneSymbolRuns = false;
-    for (int i = 11; i < argc; ++i) {
-        if (strcmp(argv[i], "--prune-symbol-runs") == 0) {
-            pruneSymbolRuns = true;
-        } else {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            return 1;
-        }
-    }
-
     SearchRequest req;
-    req.alphabet = argv[2];
-
-    try {
-        req.maxBackslashCount = std::stoi(argv[3]);
-    } catch (const std::exception& e) {
-        fprintf(stderr, "Invalid maxBackslashCount: %s\n", e.what());
+    if (!buildSearchRequest(config.search, mode == "continuous", req, error)) {
+        fprintf(stderr, "%s [search]: %s\n", kConfigPath, error.c_str());
         return 1;
     }
-
-    req.prefix = argv[5];
-    req.suffix = argv[6];
-    req.startCandidate = getStartCandidate(argv[4], req.prefix, req.suffix);
-
-    try {
-        req.targetHashA = (uint32_t) std::stoul(argv[9], nullptr, 16);
-        req.targetHashB = (uint32_t) std::stoul(argv[10], nullptr, 16);
-    } catch (const std::exception& e) {
-        fprintf(stderr, "Invalid target hash: %s\n", e.what());
-        return 1;
-    }
-
-    req.lowerBound = remove_prefix_and_suffix(argv[7], req.prefix, req.suffix);
-    req.upperBound = remove_prefix_and_suffix(argv[8], req.prefix, req.suffix);
-    req.pruneSymbolRuns = pruneSymbolRuns;
-    req.continuous = (mode == "continuous");
 
     SearchResult result = runSearch(req);
 

@@ -18,4 +18,10 @@ std::string remove_prefix_and_suffix(std::string base, std::string prefix, std::
 std::string getLowerBound(const std::string& input, std::string alphabet);
 std::string getUpperBound(const std::string& input, std::string alphabet);
 
+// Parses a hex string into a uint32_t - tolerates (but doesn't require) a
+// leading "0x"/"0X", matching how target hashes are written everywhere in
+// this project (CLI args, config.conf, the coordinator's JSON). Returns
+// false (rather than throwing) on anything that doesn't parse.
+bool hexToU32(const std::string& s, uint32_t& out);
+
 #endif //NAMEBREAK_CUDA_CPU_UTILS_H
