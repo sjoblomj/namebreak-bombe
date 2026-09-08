@@ -40,9 +40,9 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
 // parse.
 bool buildSearchRequest(const std::map<std::string, std::string>& section, bool continuous, SearchRequest& out, std::string& error);
 
-// Inserts `key = value` (with a short explanatory comment above it) right
-// after `[sectionName]`'s header line in the file at `path`, leaving every
-// other line untouched - used to persist an interactively-confirmed value
+// Inserts `key = value` right after `[sectionName]`'s header line in the
+// file at `path`, leaving every other line untouched - used to persist an
+// interactively-confirmed value
 // (see coordinator_runner.cpp's identity prompt) without disturbing the
 // rest of a hand-edited config.conf. Returns false (nothing written) if the
 // file can't be read/written or the section doesn't exist in it.

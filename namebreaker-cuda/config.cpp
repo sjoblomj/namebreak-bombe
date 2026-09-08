@@ -161,10 +161,7 @@ bool appendKeyToConfigSection(const std::string& path, const std::string& sectio
     }
     if (sectionLine < 0) return false;
 
-    lines.insert(lines.begin() + sectionLine + 1, {
-        "# Auto-detected - remove this line to be asked again next time.",
-        key + " = " + quoteIfNeeded(value),
-    });
+    lines.insert(lines.begin() + sectionLine + 1, key + " = " + quoteIfNeeded(value));
 
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;
