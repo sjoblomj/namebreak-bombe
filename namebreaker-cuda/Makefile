@@ -15,8 +15,8 @@ HEADERS := cpu-utils.h constants.h search.h config.h
 # `coordinator` mode unavailable at runtime): make NETWORK=0
 NETWORK ?= 1
 ifeq ($(NETWORK),1)
-SOURCES += coordinator_runner.cpp coordinator_client.cpp http_client.cpp protocol.cpp
-HEADERS += coordinator_runner.h coordinator_client.h http_client.h protocol.h
+SOURCES += coordinator_runner.cpp coordinator_client.cpp http_client.cpp protocol.cpp platform.cpp
+HEADERS += coordinator_runner.h coordinator_client.h http_client.h protocol.h platform.h
 NVCC_FLAGS += -DNAMEBREAK_WITH_NETWORK
 LDFLAGS += -lcurl -lpthread
 endif
