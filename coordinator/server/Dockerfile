@@ -3,7 +3,6 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY protocol ./protocol
 COPY server ./server
-COPY client ./client
 RUN cargo build --release -p namebreak-server
 
 FROM debian:bookworm-slim
