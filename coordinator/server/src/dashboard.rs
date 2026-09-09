@@ -50,6 +50,10 @@ pub struct DashboardRange {
     /// searched, as opposed to `first_candidate`/`last_candidate` which just
     /// describe the range's bounds.
     pub progress_candidate: Option<String>,
+    /// How far into the range (0-100) `progress_candidate` represents -
+    /// `(progress_index - start_index + 1) / (end_index - start_index)`, i.e.
+    /// what fraction of this range's candidates are behind the checkpoint.
+    pub progress_percent: Option<f64>,
     /// "username@hostname" of whoever last claimed this range, even if it was
     /// since reclaimed - see the migration adding `last_assigned_user_id`.
     pub worker: Option<String>,
@@ -104,6 +108,9 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                         first_candidate: index_to_candidate(&alphabet, start_index, candidate_len),
                         last_candidate: index_to_candidate(&alphabet, end_index - 1, candidate_len),
                         progress_candidate: progress_index.map(|p| index_to_candidate(&alphabet, p, candidate_len)),
+                        progress_percent: progress_index.map(|p| {
+                            (p - start_index + 1) as f64 / (end_index - start_index) as f64 * 100.0
+                        }),
                         worker: display_name(worker_username, worker_hostname),
                         assigned_at,
                         lease_expires_at,
