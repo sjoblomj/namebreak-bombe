@@ -370,8 +370,8 @@
     grid.className = 'detail-grid';
     grid.appendChild(detailField('Count', count, true));
     if (r.status === 'in_progress') {
-      grid.appendChild(detailField('Progress',
-        r.progress_candidate ? `${r.progress_candidate} (${fmtPercent(r.progress_percent)})` : 'no heartbeat yet', true));
+      const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
+      grid.appendChild(detailField(progressLabel, r.progress_candidate || 'no heartbeat yet', true));
     }
     grid.appendChild(detailField('Worker', r.worker || 'nobody yet'));
     grid.appendChild(detailField('Assigned', tdAssigned.textContent, false, tdAssigned.title));
