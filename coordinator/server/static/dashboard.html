@@ -219,18 +219,25 @@
     letter-spacing: 0.03em;
   }
   /* Hide columns narrowest-screens-first, in the order: Count, Completed,
-     Assigned, Worker - the row itself stays clickable to reveal them. */
-  @media (max-width: 1150px) {
+     Assigned, Worker - the row itself stays clickable to reveal them.
+     Thresholds are the measured intrinsic minimum width of each column
+     configuration (worst-case content: a long in-progress status badge with
+     a percentage, a 10-character candidate range, a long worker name) plus
+     the ~90px of fixed card/table chrome around the scrollable area - so
+     each breakpoint fires exactly when the previous configuration would
+     otherwise start overflowing, with no gap of unavoidable horizontal
+     scroll in between. */
+  @media (max-width: 1230px) {
     .col-count { display: none; }
     .expand-hint { display: inline-block; }
   }
-  @media (max-width: 950px) {
+  @media (max-width: 1120px) {
     .col-completed { display: none; }
   }
-  @media (max-width: 780px) {
+  @media (max-width: 1030px) {
     .col-assigned { display: none; }
   }
-  @media (max-width: 620px) {
+  @media (max-width: 890px) {
     .col-worker { display: none; }
   }
   .empty-ranges {
