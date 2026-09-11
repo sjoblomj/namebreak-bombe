@@ -157,10 +157,11 @@
   }
   th, td {
     text-align: left;
-    padding: 6px 10px;
+    padding: 6px 8px;
     border-bottom: 1px solid var(--border);
     white-space: nowrap;
   }
+  td.worker { white-space: normal; }
   th {
     color: var(--muted);
     font-weight: 600;
@@ -219,14 +220,17 @@
     letter-spacing: 0.03em;
   }
   /* Hide columns narrowest-screens-first, in the order: Count, Completed,
-     Assigned, Worker - the row itself stays clickable to reveal them.
-     Thresholds are the measured intrinsic minimum width of each column
-     configuration (worst-case content: a long in-progress status badge with
-     a percentage, a 10-character candidate range, a long worker name) plus
-     the ~90px of fixed card/table chrome around the scrollable area - so
-     each breakpoint fires exactly when the previous configuration would
-     otherwise start overflowing, with no gap of unavoidable horizontal
-     scroll in between. */
+     Assigned, Worker, Range - the row itself stays clickable to reveal them
+     (the expand hint that signals this lives in the Status column, which is
+     never hidden, rather than in Range itself). Thresholds are the measured
+     intrinsic minimum width of each column configuration (worst-case content:
+     a long in-progress status badge with a percentage, a 10-character
+     candidate range, a long worker name) plus the ~90px of fixed card/table
+     chrome around the scrollable area - so each breakpoint fires exactly when
+     the previous configuration would otherwise start overflowing, with no gap
+     of unavoidable horizontal scroll in between. The final, mobile-width
+     breakpoint drops Range too, since Status/Len/First-last alone are still
+     too wide for a phone screen otherwise. */
   @media (max-width: 1230px) {
     .col-count { display: none; }
     .expand-hint { display: inline-block; }
@@ -239,6 +243,10 @@
   }
   @media (max-width: 890px) {
     .col-worker { display: none; }
+  }
+  @media (max-width: 600px) {
+    .col-range { display: none; }
+    th, td { padding: 6px 4px; }
   }
   .empty-ranges {
     color: var(--muted);
@@ -305,24 +313,41 @@
     return span;
   }
 
+  // "username@hostname" (see dashboard.rs's display_name) rendered as
+  // "username @ hostname" with a <wbr> right before the hostname, so it only
+  // breaks onto its own line when the column is actually too narrow for it.
+  function workerFragment(worker) {
+    const frag = document.createDocumentFragment();
+    if (!worker) {
+      frag.append('nobody yet');
+      return frag;
+    }
+    const atIndex = worker.indexOf('@');
+    if (atIndex === -1) {
+      frag.append(worker);
+      return frag;
+    }
+    frag.append(worker.slice(0, atIndex) + ' @ ');
+    frag.appendChild(document.createElement('wbr'));
+    frag.append(worker.slice(atIndex + 1));
+    return frag;
+  }
+
   const DETAIL_COLSPAN = 8;
 
   // The row itself carries the fields that stay visible at every width
-  // (Range, Status, Len, First/last candidate); Count, Worker, Assigned and
-  // Completed get their own "col-*" class so CSS can hide them on narrow
-  // screens, in that order - the collapsible detail row below always carries
-  // all four regardless, so they're never actually lost, just relocated.
+  // (Status, Len, First/last candidate); Count, Worker, Assigned, Completed
+  // and (last, at mobile widths) Range get their own "col-*" class so CSS can
+  // hide them on narrow screens, in that order - the collapsible detail row
+  // below always carries Count/Worker/Assigned/Completed regardless, so
+  // they're never actually lost, just relocated.
   function rangeRow(r) {
     const tr = document.createElement('tr');
     tr.className = 'range-row status-' + r.status;
 
     const tdId = document.createElement('td');
-    tdId.className = 'mono';
+    tdId.className = 'mono col-range';
     tdId.textContent = String(r.id);
-    const hint = document.createElement('span');
-    hint.className = 'expand-hint';
-    hint.textContent = '›';
-    tdId.appendChild(hint);
     tr.appendChild(tdId);
 
     const tdStatus = document.createElement('td');
@@ -339,6 +364,10 @@
       note.title = t.iso;
       tdStatus.appendChild(note);
     }
+    const hint = document.createElement('span');
+    hint.className = 'expand-hint';
+    hint.textContent = '›';
+    tdStatus.appendChild(hint);
     tr.appendChild(tdStatus);
 
     const tdLen = document.createElement('td');
@@ -367,7 +396,7 @@
 
     const tdWorker = document.createElement('td');
     tdWorker.className = 'worker col-worker' + (r.worker ? '' : ' none');
-    tdWorker.textContent = r.worker || 'nobody yet';
+    tdWorker.appendChild(workerFragment(r.worker));
     tr.appendChild(tdWorker);
 
     const tdAssigned = document.createElement('td');
@@ -391,7 +420,7 @@
       const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
       grid.appendChild(detailField(progressLabel, r.progress_candidate || 'no heartbeat yet', true));
     }
-    grid.appendChild(detailField('Worker', r.worker || 'nobody yet'));
+    grid.appendChild(detailField('Worker', workerFragment(r.worker)));
     grid.appendChild(detailField('Assigned', tdAssigned.textContent, false, tdAssigned.title));
     grid.appendChild(detailField('Completed', tdCompleted.textContent, false, tdCompleted.title));
     detailTd.appendChild(grid);
@@ -412,7 +441,11 @@
     labelEl.textContent = label;
     const valueEl = document.createElement('span');
     if (mono) valueEl.className = 'mono';
-    valueEl.textContent = value;
+    if (value instanceof Node) {
+      valueEl.appendChild(value);
+    } else {
+      valueEl.textContent = value;
+    }
     if (title) valueEl.title = title;
     wrap.appendChild(labelEl);
     wrap.appendChild(valueEl);
@@ -468,7 +501,7 @@
     const table = document.createElement('table');
     const thead = document.createElement('thead');
     thead.innerHTML =
-      '<tr><th>Range</th><th>Status</th><th>Len</th><th>First / last candidate</th>' +
+      '<tr><th class="col-range">Range</th><th>Status</th><th>Len</th><th>First / last candidate</th>' +
       '<th class="col-count">Count</th><th class="col-worker">Worker</th>' +
       '<th class="col-assigned">Assigned</th><th class="col-completed">Completed</th></tr>';
     table.appendChild(thead);
