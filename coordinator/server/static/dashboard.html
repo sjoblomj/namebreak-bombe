@@ -195,7 +195,7 @@
     font-size: 11px;
     color: var(--muted);
   }
-  .lease-note.expired { color: #b91c1c; font-weight: 600; }
+  .expired-text { color: #b91c1c; font-weight: 600; }
   .progress-note {
     display: block;
     margin-top: 2px;
@@ -240,30 +240,41 @@
      Assigned, Worker, Range - the row itself stays clickable to reveal them
      (the expand hint that signals this lives in the Status column, which is
      never hidden, rather than in Range itself). Thresholds are the measured
-     intrinsic minimum width of each column configuration (worst-case content:
-     a long in-progress status badge with a percentage, a 10-character
-     candidate range, a long worker name) plus the ~90px of fixed card/table
-     chrome around the scrollable area - so each breakpoint fires exactly when
-     the previous configuration would otherwise start overflowing, with no gap
-     of unavoidable horizontal scroll in between. The final, mobile-width
-     breakpoint drops Range too, since Status/Len/First-last alone are still
-     too wide for a phone screen otherwise. */
-  @media (max-width: 1230px) {
+     intrinsic minimum width of each column configuration (a 10-character
+     candidate range and a long worker name, plus the Status column's *typical*
+     content - "PENDING"/"DONE", not the longer "IN PROGRESS: 100%") plus the
+     ~90px of fixed card/table chrome around the scrollable area - so each
+     breakpoint fires exactly when the previous configuration would otherwise
+     start overflowing for that typical content, with no gap of unavoidable
+     horizontal scroll in between. Sizing around the Status column's typical
+     rather than worst-case content is a deliberate tradeoff: it keeps more
+     columns visible on an ordinary board (mostly pending/completed ranges),
+     at the cost of the table needing its own horizontal scroll (inside
+     .table-scroll) on a board with many simultaneous long in-progress badges.
+     The final, mobile-width breakpoint drops Range too, since Status/Len/
+     First-last alone are still too wide for a phone screen otherwise. */
+  @media (max-width: 1150px) {
     .col-count { display: none; }
     .expand-hint { display: inline-block; }
   }
-  @media (max-width: 1120px) {
+  @media (max-width: 1040px) {
     .col-completed { display: none; }
   }
-  @media (max-width: 1030px) {
+  @media (max-width: 950px) {
     .col-assigned { display: none; }
   }
-  @media (max-width: 890px) {
+  @media (max-width: 810px) {
     .col-worker { display: none; }
   }
   @media (max-width: 600px) {
     .col-range { display: none; }
     th, td { padding: 6px 4px; }
+    /* Keep the badge itself but trim it to just the percentage, and move the
+       lease's expiry out of the collapsed row entirely - both are still
+       available (the full "In progress: xx%" wording, and "Expires HH:MM")
+       in the detail row a tap on the row reveals. */
+    .badge-prefix { display: none; }
+    .lease-note { display: none; }
   }
   .empty-ranges {
     color: var(--muted);
@@ -326,8 +337,25 @@
   function statusBadge(status, label) {
     const span = document.createElement('span');
     span.className = 'badge status-' + status;
-    span.textContent = label || status.replace('_', ' ');
+    if (label instanceof Node) {
+      span.appendChild(label);
+    } else {
+      span.textContent = label || status.replace('_', ' ');
+    }
     return span;
+  }
+
+  // "In progress: 42%", with the "In progress: " part wrapped so CSS can
+  // drop it on very small screens and leave just the percentage. No
+  // heartbeat yet (percent == null) reads as 0%, not a bare "in progress".
+  function inProgressLabel(percent) {
+    const frag = document.createDocumentFragment();
+    const prefix = document.createElement('span');
+    prefix.className = 'badge-prefix';
+    prefix.textContent = 'In progress: ';
+    frag.appendChild(prefix);
+    frag.append(fmtPercentRounded(percent != null ? percent : 0));
+    return frag;
   }
 
   // "username@hostname" (see dashboard.rs's display_name) rendered as
@@ -368,15 +396,15 @@
     tr.appendChild(tdId);
 
     const tdStatus = document.createElement('td');
-    const statusLabel = (r.status === 'in_progress' && r.progress_percent != null)
-      ? `In progress: ${fmtPercentRounded(r.progress_percent)}`
-      : undefined;
+    const statusLabel = r.status === 'in_progress'
+      ? inProgressLabel(r.progress_percent)
+      : (r.status === 'completed' ? 'Done' : undefined);
     tdStatus.appendChild(statusBadge(r.status, statusLabel));
     if (r.status === 'in_progress' && r.lease_expires_at) {
       const t = fmtTime(r.lease_expires_at);
       const expired = r.lease_expires_at * 1000 < Date.now();
       const note = document.createElement('span');
-      note.className = 'lease-note' + (expired ? ' expired' : '');
+      note.className = 'lease-note' + (expired ? ' expired-text' : '');
       note.textContent = 'Expires ' + t.display.slice(11, 16);
       note.title = t.iso;
       tdStatus.appendChild(note);
@@ -432,10 +460,20 @@
     detailTd.colSpan = DETAIL_COLSPAN;
     const grid = document.createElement('div');
     grid.className = 'detail-grid';
+    grid.appendChild(detailField('Range', String(r.id), true));
     grid.appendChild(detailField('Count', count, true));
     if (r.status === 'in_progress') {
       const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
       grid.appendChild(detailField(progressLabel, r.progress_candidate || 'no heartbeat yet', true));
+      if (r.lease_expires_at) {
+        const t = fmtTime(r.lease_expires_at);
+        const expired = r.lease_expires_at * 1000 < Date.now();
+        const expiresValue = document.createElement('span');
+        if (expired) expiresValue.className = 'expired-text';
+        expiresValue.textContent = t.display.slice(11, 16);
+        expiresValue.title = t.iso;
+        grid.appendChild(detailField('Expires', expiresValue));
+      }
     }
     grid.appendChild(detailField('Worker', workerFragment(r.worker)));
     grid.appendChild(detailField('Assigned', tdAssigned.textContent, false, tdAssigned.title));
