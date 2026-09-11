@@ -34,6 +34,9 @@ pub struct Target {
     pub created_at: i64,
     /// Higher claims first - see ranges::claim_range. Defaults to 0.
     pub priority: i64,
+    /// Operator note shown on the target's dashboard card, rendered as raw
+    /// HTML there - see dashboard.html.
+    pub description: Option<String>,
 }
 
 #[allow(dead_code)]

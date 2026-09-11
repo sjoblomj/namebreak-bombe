@@ -118,6 +118,11 @@ pub struct AdminCreateTargetRequest {
     /// omitted, so an unset target just competes on creation order as before.
     #[serde(default)]
     pub priority: i64,
+    /// Optional operator note shown on the target's dashboard card. Rendered
+    /// there as raw HTML, not escaped - e.g. `<b>` tags come out bold - so
+    /// only ever set this from trusted, operator-supplied text.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,9 +135,13 @@ pub struct AdminPatchTargetRequest {
     /// "active" or "paused". Leave unset to change only `priority`.
     #[serde(default)]
     pub status: Option<String>,
-    /// See `AdminCreateTargetRequest::priority`. Leave unset to change only `status`.
+    /// See `AdminCreateTargetRequest::priority`. Leave unset to leave priority unchanged.
     #[serde(default)]
     pub priority: Option<i64>,
+    /// See `AdminCreateTargetRequest::description`. Leave unset to leave the
+    /// description unchanged; pass `""` to clear it.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

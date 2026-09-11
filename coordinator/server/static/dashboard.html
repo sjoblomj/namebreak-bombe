@@ -98,6 +98,13 @@
     font-size: 12px;
     margin-top: 4px;
   }
+  .target-description {
+    color: var(--text);
+    font-size: 13px;
+    margin-top: 6px;
+  }
+  .target-description :first-child { margin-top: 0; }
+  .target-description :last-child { margin-bottom: 0; }
   .badge {
     display: inline-block;
     font-size: 11px;
@@ -481,6 +488,16 @@
       head.appendChild(prio);
     }
     card.appendChild(head);
+
+    if (t.description) {
+      const description = document.createElement('div');
+      description.className = 'target-description';
+      // Operator-authored HTML (e.g. "<b>...</b>"), rendered as markup on
+      // purpose - see admin_create_target/dashboard.rs. Only ever set via
+      // the ADMIN_TOKEN-protected admin API, never from untrusted input.
+      description.innerHTML = t.description;
+      card.appendChild(description);
+    }
 
     const bounds = document.createElement('div');
     bounds.className = 'target-bounds mono';

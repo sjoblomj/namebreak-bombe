@@ -108,7 +108,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "prune_symbol_runs": true,
     "alphabet_name": "size49",
     "max_backslash_count": 0,
-    "priority": 0
+    "priority": 0,
+    "description": "From the <b>1998</b> demo listing"
   }'
 ```
 
@@ -148,21 +149,27 @@ untouched for as long as a higher-priority one still has anything claimable.
 Targets sharing a priority (including the default) fall back to plain
 creation-order FIFO among themselves.
 
+`description` (optional) is an operator note shown in the target's card
+header on the dashboard. It's rendered there as raw HTML, not escaped - tags
+like `<b>` come out formatted - so only ever set it from text you trust,
+since it's never sanitized.
+
 Check progress:
 
 ```sh
 curl localhost:8080/api/v1/status
 ```
 
-Pause/resume a target, and/or change its priority:
+Pause/resume a target, and/or change its priority or description:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
   -H 'X-Admin-Token: devsecret' -H 'Content-Type: application/json' \
-  -d '{"status": "paused", "priority": 5}'
+  -d '{"status": "paused", "priority": 5, "description": "<b>Bumped</b> for the weekend"}'
 ```
 
-Either field can be omitted to leave it unchanged, but at least one must be given.
+Any field can be omitted to leave it unchanged (pass `"description": ""` to
+clear an existing one), but at least one must be given.
 
 Delete a target permanently (also removes its ranges and carving cursor - not
 reversible):
