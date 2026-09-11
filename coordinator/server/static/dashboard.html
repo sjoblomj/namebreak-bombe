@@ -179,7 +179,7 @@
     text-transform: uppercase;
     letter-spacing: 0.03em;
   }
-  td.mono, .mono { font-family: var(--mono); }
+  td.mono, .mono { font-family: var(--mono); white-space: pre; }
   td.worker { color: var(--text); }
   td.worker.none, .muted { color: var(--muted); font-style: italic; }
   .lease-note {
@@ -471,6 +471,7 @@
     const name = document.createElement('span');
     name.className = 'target-name';
     name.textContent = t.name;
+    name.title = 'id ' + t.id;
     head.appendChild(name);
     head.appendChild(statusBadge(t.status));
     if (t.priority) {
