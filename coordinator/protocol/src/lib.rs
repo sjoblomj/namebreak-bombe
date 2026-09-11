@@ -113,6 +113,11 @@ pub struct AdminCreateTargetRequest {
     /// means unlimited.
     #[serde(default)]
     pub max_backslash_count: i64,
+    /// Higher-priority active targets have their claimable work handed out
+    /// first, ahead of any lower-priority target's. Defaults to 0 when
+    /// omitted, so an unset target just competes on creation order as before.
+    #[serde(default)]
+    pub priority: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,10 +125,14 @@ pub struct AdminCreateTargetResponse {
     pub target_id: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdminPatchTargetRequest {
-    /// "active" or "paused"
-    pub status: String,
+    /// "active" or "paused". Leave unset to change only `priority`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// See `AdminCreateTargetRequest::priority`. Leave unset to change only `status`.
+    #[serde(default)]
+    pub priority: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

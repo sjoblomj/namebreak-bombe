@@ -30,6 +30,8 @@ pub struct DashboardTarget {
     pub upper_bound: String,
     pub found_filename: Option<String>,
     pub found_by: Option<String>,
+    /// Higher claims first - see ranges::claim_range. Defaults to 0.
+    pub priority: i64,
     pub ranges: Vec<DashboardRange>,
 }
 
@@ -71,18 +73,18 @@ fn display_name(username: Option<String>, hostname: Option<String>) -> Option<St
 }
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
-    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>, String)> = sqlx::query_as(
+    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>, String, i64)> = sqlx::query_as(
         "SELECT targets.id, targets.name, targets.status, \
                 targets.lower_bound, targets.upper_bound, targets.found_filename, \
-                found_user.username, found_user.hostname, targets.alphabet \
+                found_user.username, found_user.hostname, targets.alphabet, targets.priority \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
-         ORDER BY targets.created_at ASC",
+         ORDER BY targets.priority DESC, targets.created_at ASC",
     )
     .fetch_all(&state.pool)
     .await?;
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet) in target_rows {
+    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet, priority) in target_rows {
         let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
             "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
                     ranges.progress_index, worker.username, worker.hostname, \
@@ -129,6 +131,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             upper_bound,
             found_filename,
             found_by: display_name(found_username, found_hostname),
+            priority,
             ranges,
         });
     }

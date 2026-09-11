@@ -41,59 +41,64 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
     }
 }
 
-/// Tries to hand `user` a unit of work: first an already-carved pending range,
-/// else a freshly carved slice of the highest-priority active target with room
-/// left. Returns `None` when there is nothing available at all.
+/// Tries to hand `user` a unit of work: for the highest-priority active target
+/// that has any, either an already-carved pending range of its own, or else a
+/// freshly carved slice of its remaining space. Returns `None` when there is
+/// nothing available on any active target.
+///
+/// Priority is strict, not weighted: targets are walked highest-priority
+/// first (ties broken by creation order), and the walk stops at the first one
+/// with claimable work - a pending range or room left to carve. A
+/// lower-priority target is never touched while a higher-priority one still
+/// has either, even if the higher-priority target's own claimable work is
+/// just a leftover pending range rather than fresh space; it can starve
+/// completely while a higher-priority target is still being worked.
 pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -> Result<Option<ClaimResponse>, AppError> {
     let mut tx = pool.begin().await?;
     let now = now_unix();
     let rate = effective_rate(config, user);
 
-    // 1) Hand out the oldest pending range, if any - either a fresh chunk
-    // nobody's claimed yet, or the unsearched remainder of a range whose
-    // previous claimant's lease expired. Either way it's already a clean,
-    // ready-to-run slice: reclaim_expired resolves the progress-based resume
-    // point (and splits off any already-searched portion as its own completed
-    // row) as soon as it detects the expiry, so a 'pending' row's start_index
-    // is always correct here - there's nothing left to compute.
-    let pending = sqlx::query_as::<_, Range>(
-        "SELECT ranges.* FROM ranges JOIN targets ON targets.id = ranges.target_id \
-         WHERE ranges.status = 'pending' AND targets.status = 'active' \
-         ORDER BY ranges.created_at ASC LIMIT 1",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some(range) = pending {
-        let lease_seconds = lease_seconds_for(config, range.end_index - range.start_index, rate);
-        let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
-            .bind(range.target_id)
-            .fetch_one(&mut *tx)
-            .await?;
-
-        sqlx::query(
-            "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
-             assigned_at = ?, lease_seconds = ?, lease_expires_at = ? WHERE id = ?",
-        )
-        .bind(user.id)
-        .bind(user.id)
-        .bind(now)
-        .bind(lease_seconds)
-        .bind(now + lease_seconds)
-        .bind(range.id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start_index, range.end_index, lease_seconds)));
-    }
-
-    // 2) Otherwise carve a fresh chunk off the oldest active target that still has room.
-    let targets = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' ORDER BY created_at ASC")
+    let targets = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' ORDER BY priority DESC, created_at ASC")
         .fetch_all(&mut *tx)
         .await?;
 
     for target in targets {
+        // 1) Reuse this target's own oldest pending range, if it has one -
+        // either a fresh chunk nobody's claimed yet, or the unsearched
+        // remainder of a range whose previous claimant's lease expired.
+        // Either way it's already a clean, ready-to-run slice: reclaim_expired
+        // resolves the progress-based resume point (and splits off any
+        // already-searched portion as its own completed row) as soon as it
+        // detects the expiry, so a 'pending' row's start_index is always
+        // correct here - there's nothing left to compute.
+        let pending = sqlx::query_as::<_, Range>(
+            "SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(target.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(range) = pending {
+            let lease_seconds = lease_seconds_for(config, range.end_index - range.start_index, rate);
+
+            sqlx::query(
+                "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
+                 assigned_at = ?, lease_seconds = ?, lease_expires_at = ? WHERE id = ?",
+            )
+            .bind(user.id)
+            .bind(user.id)
+            .bind(now)
+            .bind(lease_seconds)
+            .bind(now + lease_seconds)
+            .bind(range.id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start_index, range.end_index, lease_seconds)));
+        }
+
+        // 2) Otherwise carve a fresh chunk off this target's cursor, if it still has room.
         let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
             .bind(target.id)
             .fetch_one(&mut *tx)
@@ -102,7 +107,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         let (_, upper_at_len) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
         let remaining = upper_at_len - progress.next_index + 1; // inclusive upper bound
         if remaining <= 0 {
-            continue; // this target's bounds are fully carved out at this length (and, if this is its last length, entirely)
+            continue; // this target's bounds are fully carved out at this length (and, if this is its last length, entirely) - try the next target
         }
 
         let desired = (rate * config.target_chunk_seconds).round() as i64;
@@ -855,5 +860,72 @@ mod tests {
         // Deleting an id that was never there (or already deleted) is reported
         // as such, not as an error.
         assert!(!delete_target(&pool, target_id).await.unwrap());
+    }
+
+    async fn set_priority(pool: &SqlitePool, target_id: i64, priority: i64) {
+        sqlx::query("UPDATE targets SET priority = ? WHERE id = ?").bind(priority).bind(target_id).execute(pool).await.unwrap();
+    }
+
+    /// Priority must win over creation order: `a` is created (and so would
+    /// win on age alone) before `b` is given a higher priority, but `b` must
+    /// still be claimed first - and once `b` no longer has any claimable work
+    /// (simulated here by pausing it, rather than actually exhausting its
+    /// space - a "full bounds" target's space isn't capped at the length its
+    /// bounds happen to be written at, it keeps growing up to
+    /// `max_supported_len`, so genuinely exhausting one in a test is
+    /// impractical), the claim must fall through to `a`.
+    #[tokio::test]
+    async fn claim_range_prefers_the_higher_priority_target_over_the_older_one() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        let target_a = insert_target(&pool, &lower, &upper).await;
+        let target_b = insert_target(&pool, &lower, &upper).await;
+        set_priority(&pool, target_b, 10).await;
+
+        let config = test_config(10);
+
+        let first = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(first.target_id, target_b, "the higher-priority target must be claimed first even though it's the newer one");
+
+        sqlx::query("UPDATE targets SET status = 'paused' WHERE id = ?").bind(target_b).execute(&pool).await.unwrap();
+
+        let second = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(second.target_id, target_a, "falls through to the lower-priority target once the higher one no longer has claimable work");
+    }
+
+    /// A higher-priority target's own unclaimed fresh space must win out over
+    /// a *lower*-priority target's leftover pending range - priority is
+    /// decided target-by-target before either kind of claimable work is
+    /// considered, not by picking whichever pending range happens to be
+    /// oldest across every target.
+    #[tokio::test]
+    async fn claim_range_prefers_higher_priority_fresh_space_over_lower_priority_pending_leftover() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        let target_low = insert_target(&pool, &lower, &upper).await;
+        let target_high = insert_target(&pool, &lower, &upper).await;
+        set_priority(&pool, target_high, 10).await;
+
+        // Simulate a leftover pending range on the low-priority target (e.g. the
+        // unsearched remainder of a reclaimed lease) without needing to run a
+        // whole claim/heartbeat/expire cycle to produce one.
+        sqlx::query(
+            "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, created_at) \
+             VALUES (?, 3, 0, 100, 'pending', ?)",
+        )
+        .bind(target_low)
+        .bind(now_unix())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let config = test_config(10);
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(claim.target_id, target_high, "the higher-priority target's own fresh space must be preferred");
+
+        let pending_status: String = sqlx::query_scalar("SELECT status FROM ranges WHERE target_id = ? AND start_index = 0").bind(target_low).fetch_one(&pool).await.unwrap();
+        assert_eq!(pending_status, "pending", "the lower-priority target's leftover must be left untouched");
     }
 }

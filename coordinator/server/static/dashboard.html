@@ -114,6 +114,16 @@
   .badge.status-pending { background: var(--pending); }
   .badge.status-in_progress { background: var(--in-progress); }
   .badge.status-completed { background: var(--completed); }
+  .priority-chip {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+  }
   .found-banner {
     margin-top: 10px;
     padding: 10px 14px;
@@ -463,6 +473,12 @@
     name.textContent = t.name;
     head.appendChild(name);
     head.appendChild(statusBadge(t.status));
+    if (t.priority) {
+      const prio = document.createElement('span');
+      prio.className = 'priority-chip';
+      prio.textContent = 'priority ' + t.priority;
+      head.appendChild(prio);
+    }
     card.appendChild(head);
 
     const bounds = document.createElement('div');
@@ -531,11 +547,14 @@
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
 
-      // Solved targets first, so a find is never buried below the fold.
+      // Solved targets first, so a find is never buried below the fold; then
+      // by priority (highest first), matching the order the server itself
+      // claims work in.
       const targets = data.targets.slice().sort((a, b) => {
         const aSolved = a.status === 'solved' ? 0 : 1;
         const bSolved = b.status === 'solved' ? 0 : 1;
-        return aSolved - bSolved;
+        if (aSolved !== bSolved) return aSolved - bSolved;
+        return (b.priority || 0) - (a.priority || 0);
       });
 
       targetsEl.replaceChildren();

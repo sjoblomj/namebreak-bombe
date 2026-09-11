@@ -32,6 +32,8 @@ pub struct Target {
     pub found_filename: Option<String>,
     pub found_by_user_id: Option<i64>,
     pub created_at: i64,
+    /// Higher claims first - see ranges::claim_range. Defaults to 0.
+    pub priority: i64,
 }
 
 #[allow(dead_code)]

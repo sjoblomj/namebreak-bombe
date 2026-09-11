@@ -172,8 +172,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, priority, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -186,6 +186,7 @@ pub async fn admin_create_target(
     .bind(req.max_backslash_count)
     .bind(alphabet_name)
     .bind(alphabet)
+    .bind(req.priority)
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
@@ -214,14 +215,23 @@ pub async fn admin_patch_target(
     Path(target_id): Path<i64>,
     Json(req): Json<AdminPatchTargetRequest>,
 ) -> Result<StatusCode, AppError> {
-    if req.status != "active" && req.status != "paused" {
-        return Err(AppError::BadRequest("status must be 'active' or 'paused'".into()));
+    if let Some(status) = &req.status {
+        if status != "active" && status != "paused" {
+            return Err(AppError::BadRequest("status must be 'active' or 'paused'".into()));
+        }
     }
-    let result = sqlx::query("UPDATE targets SET status = ? WHERE id = ? AND status != 'solved'")
-        .bind(&req.status)
-        .bind(target_id)
-        .execute(&state.pool)
-        .await?;
+    if req.status.is_none() && req.priority.is_none() {
+        return Err(AppError::BadRequest("at least one of status or priority must be provided".into()));
+    }
+    let result = sqlx::query(
+        "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority) \
+         WHERE id = ? AND status != 'solved'",
+    )
+    .bind(&req.status)
+    .bind(req.priority)
+    .bind(target_id)
+    .execute(&state.pool)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }

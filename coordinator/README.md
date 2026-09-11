@@ -107,7 +107,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "upper_bound": "GAMEMENU",
     "prune_symbol_runs": true,
     "alphabet_name": "size49",
-    "max_backslash_count": 0
+    "max_backslash_count": 0,
+    "priority": 0
   }'
 ```
 
@@ -138,19 +139,30 @@ every length in between by `lower_bound`/`upper_bound`. `alphabet_name`
 defaults to `"size49"` if omitted; see `GET /api/v1/alphabets` for the full
 list.
 
+`priority` (default 0, omit for normal priority) decides which target's work
+gets claimed first when more than one is active: a worker's `/claim` always
+takes a higher-priority target's claimable work - a pending range, or fresh
+space still to carve - over a lower-priority target's, no matter which target
+is older. It's strict, not weighted: a lower-priority target can go completely
+untouched for as long as a higher-priority one still has anything claimable.
+Targets sharing a priority (including the default) fall back to plain
+creation-order FIFO among themselves.
+
 Check progress:
 
 ```sh
 curl localhost:8080/api/v1/status
 ```
 
-Pause/resume a target:
+Pause/resume a target, and/or change its priority:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
   -H 'X-Admin-Token: devsecret' -H 'Content-Type: application/json' \
-  -d '{"status": "paused"}'
+  -d '{"status": "paused", "priority": 5}'
 ```
+
+Either field can be omitted to leave it unchanged, but at least one must be given.
 
 Delete a target permanently (also removes its ranges and carving cursor - not
 reversible):
