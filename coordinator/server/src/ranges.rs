@@ -922,7 +922,12 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
             if let Some((skip_start, skip_end)) = transition.skip {
                 insert_skip_range(&mut *tx, target_id, pr.candidate_len, skip_start, skip_end, &pr.alphabet_name, &pr.alphabet, Some(pr.id), now).await?;
             }
-            transition.new_next_index
+            // A priority range has no next length to bump to (unlike the
+            // main cursor) - if transition_alphabet_cursor reports nothing
+            // representable left at all, clamp down to new_end so next_index
+            // stays within its usual [start_index, end_index] invariant
+            // instead of storing transition_alphabet_cursor's raw sentinel.
+            transition.new_next_index.min(new_end)
         };
 
         sqlx::query("UPDATE priority_ranges SET start_index = ?, end_index = ?, next_index = ?, alphabet_name = ?, alphabet = ? WHERE id = ?")
@@ -1519,7 +1524,7 @@ mod tests {
                 .expect("the old-alphabet remainder of the ABC block must be persisted as a skipped range");
         assert_eq!(skip_status, "skipped");
         assert_eq!(skip_start, cursor_index);
-        assert_eq!(skip_end, crate::alphabet::candidate_to_index(old_alphabet, "ABCZZZ").unwrap() + 1);
+        assert_eq!(skip_end, crate::alphabet::candidate_to_index(old_alphabet, "ABCAAA").unwrap(), "skip runs exactly up to the resume point, not the whole shared prefix block");
         assert_eq!(skip_alphabet, old_alphabet, "the skip range is denominated in the OLD alphabet, not the target's current one");
 
         let (progress_alphabet_name, progress_alphabet): (String, String) =

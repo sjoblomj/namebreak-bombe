@@ -58,12 +58,12 @@ pub fn max_supported_len(alphabet: &str) -> i64 {
     len
 }
 
-/// Total number of distinct candidates of the given length. Caller must ensure
-/// `len <= max_supported_len(alphabet)`. No longer used by production carving
-/// logic since target bounds replaced whole-space carving (see
-/// `bound_indices_at_len`), but still a natural, directly-tested primitive and
-/// heavily used by the test suite to compute expected values independently.
-#[allow(dead_code)]
+/// Total number of distinct candidates of the given length. Caller must
+/// ensure `len <= max_supported_len(alphabet)`. Used by
+/// `transition_alphabet_cursor` as a sentinel "past this length's entire
+/// space, in any alphabet" value when nothing at all is left to translate a
+/// cursor to; otherwise a natural, directly-tested primitive also heavily
+/// used by the test suite to compute expected values independently.
 pub fn space_size(alphabet: &str, len: i64) -> i64 {
     let size = alphabet_size(alphabet) as i128;
     let mut space: i128 = 1;
@@ -384,30 +384,46 @@ pub fn expand_priority_pattern(alphabet: &str, pattern: &str) -> Result<Vec<Stri
 /// the same way a skip-regex run is only ever materialized once carving
 /// actually reaches it (see `find_skip_run`), rather than retroactively.
 ///
-/// The old cursor sits at some candidate string of `candidate_len`
-/// characters. If every one of those characters also exists in
-/// `new_alphabet`, the exact same string is simply reinterpreted under the
-/// new alphabet - nothing is lost, nothing needs to be skipped. Otherwise,
-/// the first character (scanning left to right) that isn't in `new_alphabet`
-/// marks the point past which the old cursor's position can no longer be
-/// expressed: everything still sharing that prefix, under `old_alphabet`, is
-/// skipped (clipped to the target's own upper bound at this length, so the
-/// skip is never wider than what's actually left to carve), and the new
-/// cursor resumes at that same prefix with the remaining positions reset to
-/// `new_alphabet`'s own lowest character - e.g. old alphabet digits+letters,
-/// new alphabet letters-only, old cursor "ABC001" -> skip "ABC001".."ABC999"
-/// (old alphabet), resume at "ABCAAA" (new alphabet).
+/// Finds the smallest candidate, expressible entirely in `new_alphabet`,
+/// whose position in `old_alphabet`'s own ordering is still `>= old_next_index`,
+/// i.e. the earliest candidate the old alphabet's sweep hasn't already
+/// completed that the new alphabet can actually produce. This is standard
+/// "round up to the nearest value expressible with a restricted character
+/// set" arithmetic: scanning positions from the *last* toward the *first*,
+/// it looks for the rightmost position that can be bumped up to some larger
+/// `new_alphabet` character while every position before it stays exactly as
+/// the old candidate already has it (padding everything after with
+/// `new_alphabet`'s own smallest character then gives the smallest valid
+/// completion), falling back to an earlier position only when a later one
+/// has nothing bigger available in `new_alphabet` to bump up to.
+///
+/// Picking the *rightmost* such position, rather than simply the first
+/// character that doesn't exist in `new_alphabet` and resetting everything
+/// after it to `new_alphabet`'s own minimum character, matters: consider
+/// dropping a character that sorts *early* in the alphabet - e.g. going from
+/// `size49` to `size42` drops `!`, which sorts right after the space
+/// character. A cursor candidate starting with `!` would, if resumed with
+/// `new_alphabet`'s own minimum character (space) at every position, land
+/// *before* the cursor - re-offering content the old alphabet's sweep had
+/// already completed (everything starting with space sorts before anything
+/// starting with `!`). Finding the smallest character in `new_alphabet`
+/// that's still *greater* than the offending one - `(` in this example, not
+/// space - keeps the result safely ahead of the cursor instead.
 pub struct AlphabetTransition {
     /// `[start_index, end_index)` under `old_alphabet`, at the same
-    /// `candidate_len` as the old cursor, to persist as a `skipped` range.
+    /// `candidate_len` as the old cursor, to persist as a `skipped` range -
+    /// exactly the candidates that are provably neither already completed
+    /// (they're `>= old_next_index`) nor ever expressible in `new_alphabet`
+    /// (nothing smaller than `new_next_index` qualifies, by construction).
     /// `None` when the old cursor's candidate is already fully expressible
     /// in the new alphabet, so nothing needs skipping.
     pub skip: Option<(i64, i64)>,
     /// Where carving should resume, under `new_alphabet`, at the same
-    /// `candidate_len` as the old cursor. The caller is still responsible
-    /// for bumping past this length if this index turns out to already be
-    /// beyond the target's upper bound at this length under the new
-    /// alphabet - exactly as it already does for ordinary carving, via
+    /// `candidate_len` as the old cursor - or an index already known to be
+    /// past this length's own space entirely (see `alphabet::space_size`),
+    /// if nothing `new_alphabet` can express is left at this length at all.
+    /// The caller is still responsible for bumping past this length in that
+    /// case - exactly as it already does for ordinary carving, via
     /// `bump_length_if_exhausted`.
     pub new_next_index: i64,
 }
@@ -425,32 +441,78 @@ pub fn transition_alphabet_cursor(
     candidate_len: i64,
     old_next_index: i64,
 ) -> AlphabetTransition {
-    let old_candidate = index_to_candidate(old_alphabet, old_next_index, candidate_len);
+    let old_candidate: Vec<char> = index_to_candidate(old_alphabet, old_next_index, candidate_len).chars().collect();
+    let len = old_candidate.len();
+    let new_chars = alphabet_chars(new_alphabet);
+    let (new_min_char, _) = min_max_chars(new_alphabet);
+    // Every character involved here - old_candidate's own, and every
+    // character of new_alphabet - is itself a member of old_alphabet (the
+    // latter because a target's alphabet is only ever patched to another
+    // *predefined* alphabet, and every predefined alphabet's characters
+    // appear in the same relative order within any other that's a superset
+    // of it - see PREDEFINED_ALPHABETS). That's what makes comparing them
+    // all via old_alphabet's own ordinal rank meaningful.
+    let old_rank = |c: char| candidate_to_index(old_alphabet, &c.to_string()).expect("character must be a member of old_alphabet");
+    let is_new = |c: char| new_chars.contains(&c);
 
-    let divergence = old_candidate.chars().position(|ch| candidate_to_index(new_alphabet, &ch.to_string()).is_none());
-
-    let Some(divergence) = divergence else {
-        // Fully expressible as-is - just reinterpret the same string under the new alphabet.
-        let new_next_index =
-            candidate_to_index(new_alphabet, &old_candidate).expect("just confirmed every character of old_candidate is in new_alphabet");
+    // Fully expressible as-is - just reinterpret the same string under the new alphabet, nothing to skip.
+    if old_candidate.iter().copied().all(is_new) {
+        let s: String = old_candidate.iter().collect();
+        let new_next_index = candidate_to_index(new_alphabet, &s).expect("just confirmed every character is in new_alphabet");
         return AlphabetTransition { skip: None, new_next_index };
+    }
+
+    // prefix_representable[k] = whether old_candidate[0..k] are all
+    // expressible in new_alphabet - i.e. whether pivoting at position k
+    // (see below) can validly preserve that much of the original candidate.
+    let mut prefix_representable = vec![true; len + 1];
+    for i in 0..len {
+        prefix_representable[i + 1] = prefix_representable[i] && is_new(old_candidate[i]);
+    }
+
+    let mut found: Option<(usize, char)> = None;
+    for k in (0..len).rev() {
+        if !prefix_representable[k] {
+            continue;
+        }
+        let threshold = old_rank(old_candidate[k]);
+        let bump_to = new_chars.iter().copied().filter(|&c| old_rank(c) > threshold).min_by_key(|&c| old_rank(c));
+        if let Some(c) = bump_to {
+            found = Some((k, c));
+            break;
+        }
+    }
+
+    let (_, upper_at_len) = bound_indices_at_len(old_alphabet, lower_bound, upper_bound, candidate_len);
+
+    let Some((k, bumped_char)) = found else {
+        // Nothing new_alphabet can express is left anywhere in this length,
+        // from old_next_index onward - skip the whole remainder, and report
+        // an index already past this length's space in any alphabet, so the
+        // caller's bump_length_if_exhausted moves on exactly as it would for
+        // ordinary exhaustion.
+        return AlphabetTransition { skip: Some((old_next_index, upper_at_len + 1)), new_next_index: space_size(new_alphabet, candidate_len) };
     };
 
-    let prefix: String = old_candidate.chars().take(divergence).collect();
-    let suffix_len = candidate_len as usize - divergence;
+    let mut new_candidate: Vec<char> = old_candidate[..k].to_vec();
+    new_candidate.push(bumped_char);
+    new_candidate.extend(std::iter::repeat(new_min_char).take(len - k - 1));
+    let new_candidate: String = new_candidate.into_iter().collect();
 
-    let (_, old_max_char) = min_max_chars(old_alphabet);
-    let skip_end_candidate = format!("{prefix}{}", old_max_char.to_string().repeat(suffix_len));
-    let skip_end_index = candidate_to_index(old_alphabet, &skip_end_candidate).expect("built only from old_alphabet's own characters");
-    let (_, upper_at_len) = bound_indices_at_len(old_alphabet, lower_bound, upper_bound, candidate_len);
-    let skip_end_index = skip_end_index.min(upper_at_len);
+    let new_next_index = candidate_to_index(new_alphabet, &new_candidate).expect("built only from new_alphabet's own characters");
+    // Exactly the candidates that are provably neither already completed
+    // (old_next_index is where the old sweep left off) nor ever expressible
+    // in new_alphabet (new_candidate is the smallest one that is, by
+    // construction of the rightmost-pivot search above) - so this is the
+    // tightest correct skip, not merely "the rest of the shared prefix's
+    // whole block" (which would also be correct, just far wider than
+    // necessary, since most of that block's own candidates end up covered
+    // separately by new_alphabet's own future walk anyway).
+    let skip_end = candidate_to_index(old_alphabet, &new_candidate)
+        .expect("new_candidate's characters are all in new_alphabet, itself a subset of old_alphabet")
+        .min(upper_at_len + 1);
 
-    let (new_min_char, _) = min_max_chars(new_alphabet);
-    let new_candidate = format!("{prefix}{}", new_min_char.to_string().repeat(suffix_len));
-    let new_next_index = candidate_to_index(new_alphabet, &new_candidate)
-        .expect("built only from new_alphabet's own characters - prefix chars were confirmed present by the divergence scan above");
-
-    AlphabetTransition { skip: Some((old_next_index, skip_end_index + 1)), new_next_index }
+    AlphabetTransition { skip: Some((old_next_index, skip_end)), new_next_index }
 }
 
 /// Builds the `(lowerBoundFilename, upperBoundFilename)` pair to pass to
@@ -666,14 +728,14 @@ mod tests {
 
     #[test]
     fn transition_alphabet_cursor_skips_the_shared_prefix_block_when_the_cursor_diverges() {
-        // Loosely the feature spec's motivating example (digits+letters ->
-        // letters-only), except the skip runs to "ABCZZZ" (the true end of
-        // the "ABC"-prefixed block under the old alphabet), not just
-        // "ABC999" - "ABC00A" is just as unrepresentable in the new alphabet
-        // as "ABC001" is, so it has to be covered by the same skip. Nothing
-        // is lost either way: every letters-only candidate in that span
-        // (like "ABCAAA" itself) still gets searched, just via the new
-        // alphabet's own walk starting at new_next_index, not the old one's.
+        // The feature spec's motivating example: digits+letters -> letters-only.
+        // The skip runs exactly up to "ABCAAA" (the smallest letters-only
+        // candidate sharing the "ABC" prefix), not all the way to "ABCZZZ"
+        // (the end of the whole "ABC"-prefixed block under the old
+        // alphabet) - everything in between is either also unrepresentable
+        // (still correctly excluded by the new alphabet's own walk never
+        // producing it) or would itself have been an even smaller valid
+        // resume point, contradicting "ABCAAA" being the smallest one.
         let old = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let new = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let old_index = candidate_to_index(old, "ABC001").unwrap();
@@ -684,7 +746,7 @@ mod tests {
 
         let (skip_start, skip_end) = transition.skip.expect("digits aren't in the new alphabet - a skip is required");
         assert_eq!(skip_start, old_index);
-        assert_eq!(skip_end, candidate_to_index(old, "ABCZZZ").unwrap() + 1);
+        assert_eq!(skip_end, candidate_to_index(old, "ABCAAA").unwrap());
         assert_eq!(transition.new_next_index, candidate_to_index(new, "ABCAAA").unwrap());
     }
 
@@ -723,8 +785,58 @@ mod tests {
 
         let (skip_start, skip_end) = transition.skip.unwrap();
         assert_eq!(skip_start, old_index);
-        assert_eq!(skip_end, candidate_to_index(old, "ZZZ").unwrap() + 1, "nothing of the old cursor's candidate survives - skip runs to this length's very end");
+        assert_eq!(skip_end, candidate_to_index(old, "AAA").unwrap(), "skip runs exactly up to the smallest representable candidate, \"AAA\"");
         assert_eq!(transition.new_next_index, candidate_to_index(new, "AAA").unwrap());
+    }
+
+    /// Regression test for the real bug this rewrite fixes: size49 -> size42
+    /// drops '!', which sorts right after the space character - resuming at
+    /// new_alphabet's own minimum character (space) would land *before* the
+    /// old cursor, re-offering content the old alphabet's sweep had already
+    /// completed (everything starting with space sorts before anything
+    /// starting with '!'). The fix must instead resume at the smallest
+    /// new_alphabet character that's still bigger than '!' itself.
+    #[test]
+    fn transition_alphabet_cursor_does_not_jump_backward_when_a_dropped_character_sorts_early() {
+        let old = " !ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // '!' dropped, everything else unchanged
+        let old_index = candidate_to_index(old, "!A").unwrap();
+
+        let transition = transition_alphabet_cursor(old, new, "  ", "ZZ", 2, old_index);
+
+        // The decisive check: comparing both under old_alphabet's own
+        // ordering (valid since new_alphabet's characters are a subset of
+        // old_alphabet's) the resume point must land strictly *after* the
+        // old cursor - never at or before it, which is exactly the bug this
+        // rewrite fixes.
+        let resumed_candidate = index_to_candidate(new, transition.new_next_index, 2);
+        let resumed_old_index = candidate_to_index(old, &resumed_candidate).unwrap();
+        assert!(resumed_old_index > old_index, "must not resume at a position the old alphabet's sweep already passed");
+
+        assert_eq!(resumed_candidate, "A ", "'A' is the smallest new_alphabet character bigger than the dropped '!'");
+        let (skip_start, skip_end) = transition.skip.expect("'!' isn't in the new alphabet - a skip is required");
+        assert_eq!(skip_start, old_index);
+        assert_eq!(skip_end, resumed_old_index, "the skip must run exactly up to (not past) the resume point");
+    }
+
+    /// When nothing in `new_alphabet` is even bigger than the old cursor's
+    /// very first character, there's no candidate at this length, in any
+    /// position, that's both `>= old_next_index` and expressible in the new
+    /// alphabet - the whole remainder of the length must be skipped, and the
+    /// caller told (via the same sentinel ordinary exhaustion produces) to
+    /// bump to the next length instead of resuming here at all.
+    #[test]
+    fn transition_alphabet_cursor_reports_nothing_left_when_no_new_alphabet_character_is_big_enough() {
+        let old = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new = "0123456789"; // digits only - smaller than any letter
+        let old_index = candidate_to_index(old, "Z").unwrap(); // the very last candidate at length 1
+
+        let transition = transition_alphabet_cursor(old, new, "0", "Z", 1, old_index);
+
+        let (skip_start, skip_end) = transition.skip.expect("nothing after 'Z' can be expressed in a digits-only alphabet");
+        assert_eq!(skip_start, old_index);
+        assert_eq!(skip_end, candidate_to_index(old, "Z").unwrap() + 1, "skips to this length's own upper bound");
+        assert_eq!(transition.new_next_index, space_size(new, 1), "signals bump_length_if_exhausted the same way ordinary exhaustion does");
     }
 
     #[test]
