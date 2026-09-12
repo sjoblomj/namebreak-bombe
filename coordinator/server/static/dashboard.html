@@ -140,29 +140,12 @@
     border-radius: 999px;
     padding: 2px 8px;
   }
-  .alphabet-chip {
+  .target-alphabet {
     color: var(--muted);
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 2px 8px;
-    cursor: help;
+    font-size: 12px;
+    margin-top: 4px;
   }
-  .alphabet-chip-row {
-    display: block;
-    border: none;
-    padding: 0;
-    margin-top: 2px;
-    font-size: 10px;
-    font-weight: 500;
-    text-transform: none;
-    letter-spacing: normal;
-    color: var(--muted);
-    cursor: help;
-  }
+  .target-alphabet .mono { cursor: help; }
   .found-banner {
     margin-top: 10px;
     padding: 10px 14px;
@@ -268,6 +251,36 @@
     text-transform: uppercase;
     letter-spacing: 0.03em;
   }
+  tr.collapsed-row td {
+    background: var(--detail-bg);
+    white-space: normal;
+  }
+  .collapsed-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 12px;
+    padding: 2px 0;
+  }
+  .collapsed-dots {
+    font-weight: 700;
+    font-size: 16px;
+    line-height: 1;
+  }
+  .collapsed-btn {
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 10px;
+    cursor: pointer;
+  }
+  .collapsed-btn:hover { background: var(--card-bg); }
   /* Hide columns narrowest-screens-first, in the order: Count, Completed,
      Assigned, Worker, Range - the row itself stays clickable to reveal them
      (the expand hint that signals this lives in the Status column, which is
@@ -450,13 +463,6 @@
     const tdLen = document.createElement('td');
     tdLen.className = 'mono';
     tdLen.textContent = String(r.candidate_len);
-    if (r.alphabet_name) {
-      const alpha = document.createElement('span');
-      alpha.className = 'alphabet-chip-row';
-      alpha.textContent = r.alphabet_name;
-      alpha.title = `"${r.alphabet}"`;
-      tdLen.appendChild(alpha);
-    }
     tr.appendChild(tdLen);
 
     const tdRange = document.createElement('td');
@@ -501,6 +507,9 @@
     grid.className = 'detail-grid';
     grid.appendChild(detailField('Range', String(r.id), true));
     grid.appendChild(detailField('Count', count, true));
+    if (r.alphabet_name) {
+      grid.appendChild(detailField('Alphabet', r.alphabet_name, false, `"${r.alphabet}"`));
+    }
     if (r.status === 'in_progress') {
       const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
       grid.appendChild(detailField(progressLabel, r.progress_candidate || 'not started', true));
@@ -546,6 +555,114 @@
     return wrap;
   }
 
+  // A run of more than this many consecutive same-status, same-length ranges
+  // collapses down to its first and last plus one placeholder row, so a
+  // board with thousands of routine completed/skipped ranges at one length
+  // doesn't bury the handful of rows that actually need a look.
+  const COLLAPSE_THRESHOLD = 5;
+  const REVEAL_BATCH = 10;
+
+  function statusWord(status) {
+    switch (status) {
+      case 'in_progress': return 'in-progress';
+      default: return status;
+    }
+  }
+
+  // Walks `sortedRanges` (already ordered by candidate_len then start_index)
+  // and folds any run of more than COLLAPSE_THRESHOLD consecutive ranges
+  // sharing the same status and length down to {first, collapsed-middle,
+  // last}. Only consecutive runs are folded - a status that briefly
+  // interrupts an otherwise-long run (e.g. a reclaimed split) starts a run
+  // of its own rather than being absorbed into a neighboring one.
+  function groupRanges(sortedRanges) {
+    const groups = [];
+    let i = 0;
+    while (i < sortedRanges.length) {
+      let j = i + 1;
+      while (j < sortedRanges.length && sortedRanges[j].status === sortedRanges[i].status && sortedRanges[j].candidate_len === sortedRanges[i].candidate_len) {
+        j++;
+      }
+      const run = sortedRanges.slice(i, j);
+      if (run.length > COLLAPSE_THRESHOLD) {
+        groups.push({ kind: 'range', range: run[0] });
+        groups.push({ kind: 'collapsed', status: run[0].status, candidateLen: run[0].candidate_len, hidden: run.slice(1, -1) });
+        groups.push({ kind: 'range', range: run[run.length - 1] });
+      } else {
+        for (const r of run) groups.push({ kind: 'range', range: r });
+      }
+      i = j;
+    }
+    return groups;
+  }
+
+  function insertRangeRows(parent, beforeNode, ranges) {
+    const frag = document.createDocumentFragment();
+    for (const r of ranges) {
+      const [tr, detailRow] = rangeRow(r);
+      frag.appendChild(tr);
+      frag.appendChild(detailRow);
+    }
+    parent.insertBefore(frag, beforeNode);
+  }
+
+  // The placeholder standing in for a collapsed run's hidden middle: reveals
+  // batches of REVEAL_BATCH from whichever end the viewer asks for, inserted
+  // right where those rows belong (just above the placeholder for "first",
+  // just below it for "last"), and removes itself once nothing is hidden.
+  function collapsedRow(group) {
+    const hidden = group.hidden;
+    const tr = document.createElement('tr');
+    tr.className = 'collapsed-row';
+    const td = document.createElement('td');
+    td.colSpan = DETAIL_COLSPAN;
+    const wrap = document.createElement('div');
+    wrap.className = 'collapsed-wrap';
+
+    const dots = document.createElement('span');
+    dots.className = 'collapsed-dots';
+    dots.textContent = '⋮';
+    wrap.appendChild(dots);
+
+    const label = document.createElement('span');
+    wrap.appendChild(label);
+
+    const btnFirst = document.createElement('button');
+    btnFirst.type = 'button';
+    btnFirst.className = 'collapsed-btn';
+    wrap.appendChild(btnFirst);
+
+    const btnLast = document.createElement('button');
+    btnLast.type = 'button';
+    btnLast.className = 'collapsed-btn';
+    wrap.appendChild(btnLast);
+
+    function refresh() {
+      if (hidden.length === 0) {
+        tr.remove();
+        return;
+      }
+      label.textContent = `${hidden.length} more ${statusWord(group.status)} · length ${group.candidateLen}`;
+      const n = Math.min(REVEAL_BATCH, hidden.length);
+      btnFirst.textContent = `Show first ${n}`;
+      btnLast.textContent = `Show last ${n}`;
+    }
+    refresh();
+
+    btnFirst.addEventListener('click', () => {
+      insertRangeRows(tr.parentNode, tr, hidden.splice(0, REVEAL_BATCH));
+      refresh();
+    });
+    btnLast.addEventListener('click', () => {
+      insertRangeRows(tr.parentNode, tr.nextSibling, hidden.splice(Math.max(0, hidden.length - REVEAL_BATCH), REVEAL_BATCH));
+      refresh();
+    });
+
+    td.appendChild(wrap);
+    tr.appendChild(td);
+    return tr;
+  }
+
   function targetCard(t) {
     const card = document.createElement('div');
     card.className = 'target-card' + (t.status === 'solved' ? ' solved' : '');
@@ -564,14 +681,19 @@
       prio.textContent = 'priority ' + t.priority;
       head.appendChild(prio);
     }
-    if (t.alphabet_name) {
-      const alpha = document.createElement('span');
-      alpha.className = 'alphabet-chip';
-      alpha.textContent = t.alphabet_name;
-      alpha.title = `"${t.alphabet}"`;
-      head.appendChild(alpha);
-    }
     card.appendChild(head);
+
+    if (t.alphabet_name) {
+      const alphaLine = document.createElement('div');
+      alphaLine.className = 'target-alphabet';
+      alphaLine.append('Alphabet: ');
+      const alphaName = document.createElement('span');
+      alphaName.className = 'mono';
+      alphaName.textContent = t.alphabet_name;
+      alphaName.title = `"${t.alphabet}"`;
+      alphaLine.appendChild(alphaName);
+      card.appendChild(alphaLine);
+    }
 
     if (t.description) {
       const description = document.createElement('div');
@@ -640,10 +762,14 @@
     const sortedRanges = t.ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
 
     const tbody = document.createElement('tbody');
-    for (const r of sortedRanges) {
-      const [row, detailRow] = rangeRow(r);
-      tbody.appendChild(row);
-      tbody.appendChild(detailRow);
+    for (const group of groupRanges(sortedRanges)) {
+      if (group.kind === 'range') {
+        const [row, detailRow] = rangeRow(group.range);
+        tbody.appendChild(row);
+        tbody.appendChild(detailRow);
+      } else {
+        tbody.appendChild(collapsedRow(group));
+      }
     }
     table.appendChild(tbody);
 
