@@ -109,7 +109,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "alphabet_name": "size49",
     "max_backslash_count": 0,
     "priority": 0,
-    "description": "From the <b>1998</b> demo listing"
+    "description": "From the <b>1998</b> demo listing",
+    "skip_regex": "[M-Q]"
   }'
 ```
 
@@ -154,13 +155,24 @@ header on the dashboard. It's rendered there as raw HTML, not escaped - tags
 like `<b>` come out formatted - so only ever set it from text you trust,
 since it's never sanitized.
 
+`skip_regex` (optional) excludes part of the search space from ever being
+carved out and handed to a worker. It's matched only against a candidate's
+*leading character*, independent of candidate length - `"[M-Q]"` skips every
+candidate starting with `M` through `Q`, at every length the target searches.
+It must compile as a regex or the request is rejected; it can't match
+anything deeper than the first character (e.g. `"^AB"` behaves exactly like
+`"^A"` - only the leading character is ever tested). A skipped stretch is
+carved as its own range with `status: "skipped"` (shown as "Skip" on the
+dashboard) the moment carving actually reaches it - never in advance, and
+never retroactively against ranges carved before the regex was set.
+
 Check progress:
 
 ```sh
 curl localhost:8080/api/v1/status
 ```
 
-Pause/resume a target, and/or change its priority or description:
+Pause/resume a target, and/or change its priority, description or skip_regex:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -168,8 +180,9 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
   -d '{"status": "paused", "priority": 5, "description": "<b>Bumped</b> for the weekend"}'
 ```
 
-Any field can be omitted to leave it unchanged (pass `"description": ""` to
-clear an existing one), but at least one must be given.
+Any field can be omitted to leave it unchanged (pass `"description": ""` or
+`"skip_regex": ""` to clear an existing one), but at least one must be given.
+A changed `skip_regex` only affects ranges carved after the patch.
 
 Delete a target permanently (also removes its ranges and carving cursor - not
 reversible):

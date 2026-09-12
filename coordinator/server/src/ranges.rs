@@ -5,7 +5,10 @@
 use namebreak_protocol::ClaimResponse;
 use sqlx::SqlitePool;
 
-use crate::alphabet::{bound_indices_at_len, candidate_to_index, max_supported_len, range_bound_filenames, strip_prefix_suffix};
+use crate::alphabet::{
+    alphabet_size, bound_indices_at_len, candidate_to_index, compile_skip_regex, find_skip_run, max_supported_len, range_bound_filenames,
+    skip_char_mask, strip_prefix_suffix,
+};
 use crate::error::AppError;
 use crate::models::{i64_to_u32, Range, Target, TargetProgress, User};
 use crate::state::{now_unix, RangeConfig};
@@ -39,6 +42,51 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
         candidate_count: end_index - start_index,
         lease_seconds,
     }
+}
+
+/// If `next_index` has run past this length's upper bound, advances the
+/// cursor to the start of the next candidate length (mirrors the pre-skip
+/// carving logic, just pulled out so both the "skip swallows the whole
+/// cursor" and "skip trims a handed-out chunk" branches in `claim_range` can
+/// share it). A no-op once `len` has already reached `max_supported_len`.
+fn bump_length_if_exhausted(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64, next_index: i64, upper_at_len: i64) -> (i64, i64) {
+    if next_index > upper_at_len && len < max_supported_len(alphabet) {
+        let new_len = len + 1;
+        let new_next_index = bound_indices_at_len(alphabet, lower_bound, upper_bound, new_len).0;
+        (new_len, new_next_index)
+    } else {
+        (len, next_index)
+    }
+}
+
+async fn persist_progress(tx: &mut sqlx::SqliteConnection, target_id: i64, candidate_len: i64, next_index: i64) -> Result<(), AppError> {
+    sqlx::query("UPDATE target_progress SET candidate_len = ?, next_index = ? WHERE target_id = ?")
+        .bind(candidate_len)
+        .bind(next_index)
+        .bind(target_id)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+/// Records a skip run as its own permanently unclaimable range, the moment
+/// it's actually about to be reached by carving - see `claim_range`. Shown on
+/// the dashboard as "Skip" (dashboard.html); never selected by the `pending`
+/// reuse query in `claim_range` or the `in_progress` sweep in
+/// `reclaim_expired`, so it needs no further handling once inserted.
+async fn insert_skip_range(tx: &mut sqlx::SqliteConnection, target_id: i64, candidate_len: i64, start_index: i64, end_index: i64, now: i64) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, created_at) \
+         VALUES (?, ?, ?, ?, 'skipped', ?)",
+    )
+    .bind(target_id)
+    .bind(candidate_len)
+    .bind(start_index)
+    .bind(end_index)
+    .bind(now)
+    .execute(tx)
+    .await?;
+    Ok(())
 }
 
 /// Tries to hand `user` a unit of work: for the highest-priority active target
@@ -99,57 +147,108 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         }
 
         // 2) Otherwise carve a fresh chunk off this target's cursor, if it still has room.
-        let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
+        //
+        // If the target has a skip regex, precompute which leading characters it
+        // marks skip once per target (not per loop iteration below) - see
+        // `skip_char_mask`.
+        let skip_chars = target
+            .skip_regex
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(compile_skip_regex)
+            .map(|re| skip_char_mask(&target.alphabet, &re));
+
+        // Loops rather than a single pass because a skip run can sit right at
+        // the cursor (nothing to hand out until it's stepped over) or can run
+        // all the way to a length's end (advancing the cursor into the next
+        // length, which might itself start inside another skip run) - either
+        // case needs to reconsider the (now-advanced) cursor from scratch
+        // rather than being resolved in one shot.
+        'carve: loop {
+            let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
+                .bind(target.id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+            let (_, upper_at_len) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
+            let remaining = upper_at_len - progress.next_index + 1; // inclusive upper bound
+            if remaining <= 0 {
+                break 'carve; // this target's bounds are fully carved out at this length (and, if this is its last length, entirely) - try the next target
+            }
+
+            let skip_run = skip_chars.as_ref().and_then(|chars| {
+                find_skip_run(alphabet_size(&target.alphabet), chars, progress.candidate_len, progress.next_index, upper_at_len + 1)
+            });
+
+            // The cursor itself sits inside a skip run: nothing claimable
+            // before it, so just record the skip and step past it, without
+            // handing anything out this iteration.
+            if let Some((skip_start, skip_end)) = skip_run {
+                if skip_start == progress.next_index {
+                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, now).await?;
+                    let (new_len, new_next_index) =
+                        bump_length_if_exhausted(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len, skip_end, upper_at_len);
+                    persist_progress(&mut tx, target.id, new_len, new_next_index).await?;
+                    continue 'carve;
+                }
+            }
+
+            let desired = (rate * config.target_chunk_seconds).round() as i64;
+            let natural_chunk = desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates).min(remaining);
+            let start_index = progress.next_index;
+            let natural_end = start_index + natural_chunk;
+
+            // Only truncate at the skip boundary if the chunk that would
+            // otherwise have been handed out actually reaches it - a skip run
+            // further out than what this claim would carve anyway is left
+            // for a future claim to discover, per "these should be created
+            // when they fall within a range that would otherwise be handed
+            // out; they should not be created in advance".
+            let (end_index, skip_to_insert) = match skip_run {
+                Some((skip_start, skip_end)) if natural_end >= skip_start => (skip_start, Some((skip_start, skip_end))),
+                _ => (natural_end, None),
+            };
+            let chunk = end_index - start_index;
+
+            let next_index_before_bump = match skip_to_insert {
+                Some((skip_start, skip_end)) => {
+                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, now).await?;
+                    skip_end
+                }
+                None => end_index,
+            };
+            let (new_len, new_next_index) = bump_length_if_exhausted(
+                &target.alphabet,
+                &target.lower_bound,
+                &target.upper_bound,
+                progress.candidate_len,
+                next_index_before_bump,
+                upper_at_len,
+            );
+            persist_progress(&mut tx, target.id, new_len, new_next_index).await?;
+
+            let lease_seconds = lease_seconds_for(config, chunk, rate);
+            let range_id: i64 = sqlx::query_scalar(
+                "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
+                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at) \
+                 VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?) RETURNING id",
+            )
             .bind(target.id)
+            .bind(progress.candidate_len)
+            .bind(start_index)
+            .bind(end_index)
+            .bind(user.id)
+            .bind(user.id)
+            .bind(now)
+            .bind(lease_seconds)
+            .bind(now + lease_seconds)
+            .bind(now)
             .fetch_one(&mut *tx)
             .await?;
 
-        let (_, upper_at_len) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
-        let remaining = upper_at_len - progress.next_index + 1; // inclusive upper bound
-        if remaining <= 0 {
-            continue; // this target's bounds are fully carved out at this length (and, if this is its last length, entirely) - try the next target
+            tx.commit().await?;
+            return Ok(Some(to_claim_response(&target, range_id, progress.candidate_len, start_index, end_index, lease_seconds)));
         }
-
-        let desired = (rate * config.target_chunk_seconds).round() as i64;
-        let chunk = desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates).min(remaining);
-
-        let start_index = progress.next_index;
-        let end_index = start_index + chunk;
-
-        let mut new_len = progress.candidate_len;
-        let mut new_next_index = end_index;
-        if new_next_index > upper_at_len && new_len < max_supported_len(&target.alphabet) {
-            new_len += 1;
-            new_next_index = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, new_len).0;
-        }
-        sqlx::query("UPDATE target_progress SET candidate_len = ?, next_index = ? WHERE target_id = ?")
-            .bind(new_len)
-            .bind(new_next_index)
-            .bind(target.id)
-            .execute(&mut *tx)
-            .await?;
-
-        let lease_seconds = lease_seconds_for(config, chunk, rate);
-        let range_id: i64 = sqlx::query_scalar(
-            "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-             assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at) \
-             VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
-        .bind(target.id)
-        .bind(progress.candidate_len)
-        .bind(start_index)
-        .bind(end_index)
-        .bind(user.id)
-        .bind(user.id)
-        .bind(now)
-        .bind(lease_seconds)
-        .bind(now + lease_seconds)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        return Ok(Some(to_claim_response(&target, range_id, progress.candidate_len, start_index, end_index, lease_seconds)));
     }
 
     tx.commit().await?;
@@ -511,6 +610,118 @@ mod tests {
             .await
             .unwrap();
         target_id
+    }
+
+    async fn insert_target_with_skip_regex(pool: &SqlitePool, alphabet: &str, lower_bound: &str, upper_bound: &str, skip_regex: &str) -> i64 {
+        let now = now_unix();
+        let target_id: i64 = sqlx::query_scalar(
+            "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, alphabet_name, alphabet, status, skip_regex, created_at) \
+             VALUES ('t', 'PRE', '.SUF', 0, 0, ?, ?, 0, 'custom', ?, 'active', ?, ?) RETURNING id",
+        )
+        .bind(lower_bound)
+        .bind(upper_bound)
+        .bind(alphabet)
+        .bind(skip_regex)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let start_len = lower_bound.chars().count() as i64;
+        let start_index = crate::alphabet::candidate_to_index(alphabet, lower_bound).unwrap();
+        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, ?)")
+            .bind(target_id)
+            .bind(start_len)
+            .bind(start_index)
+            .execute(pool)
+            .await
+            .unwrap();
+        target_id
+    }
+
+    /// The scenario the skip-regex feature exists for: a target that would
+    /// normally hand out its whole A-Z space in one claim instead splits
+    /// around a skipped middle chunk - A-L handed out, M-Q recorded as a
+    /// "skipped" range immediately (not in advance, and not waiting for a
+    /// worker to reach it), and R-Z left for the *next* claim rather than
+    /// bundled into this one.
+    #[tokio::test]
+    async fn claim_range_splits_around_a_skip_regex_match_and_defers_the_remainder() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_skip_regex(&pool, letters, "A", "Z", "[M-Q]").await;
+
+        // Bigger than the whole 26-candidate space, so the first claim would
+        // otherwise greedily take all of A-Z in one go.
+        let config = test_config(30);
+
+        let claim1 = claim_range(&pool, &config, &user).await.unwrap().expect("A-L should be claimable");
+        assert_eq!(claim1.target_id, target_id);
+        assert_eq!(claim1.lower_bound_filename, "PREA.SUF");
+        assert_eq!(claim1.upper_bound_filename, "PREL.SUF");
+        assert_eq!(claim1.candidate_count, 12);
+
+        let (skip_status, skip_start, skip_end): (String, i64, i64) =
+            sqlx::query_as("SELECT status, start_index, end_index FROM ranges WHERE target_id = ? AND status = 'skipped'")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the M-Q skip range must already exist, before anyone claims past it");
+        assert_eq!(skip_status, "skipped");
+        assert_eq!(skip_start, 12); // 'M'
+        assert_eq!(skip_end, 17); // one past 'Q'
+
+        let claim2 = claim_range(&pool, &config, &user).await.unwrap().expect("R-Z should be claimable next");
+        assert_eq!(claim2.lower_bound_filename, "PRER.SUF");
+        assert_eq!(claim2.upper_bound_filename, "PREZ.SUF");
+        assert_eq!(claim2.candidate_count, 9);
+
+        let skip_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ranges WHERE target_id = ? AND status = 'skipped'")
+            .bind(target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(skip_count, 1, "no extra skip ranges should appear once R-Z is claimed");
+    }
+
+    /// When the cursor starts *inside* a skip run (here: right at the very
+    /// beginning, because the target's own lower_bound falls in the skipped
+    /// prefix), `claim_range` must record the skip and keep going within the
+    /// same call rather than returning nothing - and running the whole
+    /// skipped length out to its end must advance the cursor into the next
+    /// candidate length, exactly like exhausting a length normally does.
+    #[tokio::test]
+    async fn claim_range_steps_over_a_skip_run_starting_at_the_cursor_within_one_call() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_skip_regex(&pool, letters, "A", "Z", "[A-L]").await;
+
+        let config = test_config(30);
+
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("M-Z should be claimable, past the skipped A-L prefix");
+        assert_eq!(claim.lower_bound_filename, "PREM.SUF");
+        assert_eq!(claim.upper_bound_filename, "PREZ.SUF");
+        assert_eq!(claim.candidate_count, 14);
+
+        let (skip_start, skip_end): (i64, i64) =
+            sqlx::query_as("SELECT start_index, end_index FROM ranges WHERE target_id = ? AND status = 'skipped'")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the A-L skip range must exist even though it produced no claimable work of its own");
+        assert_eq!((skip_start, skip_end), (0, 12));
+
+        // The cursor must have advanced into length 2 (there's no length-1
+        // work left: 0..12 was skipped, 12..26 was just claimed above).
+        let (candidate_len, next_index): (i64, i64) =
+            sqlx::query_as("SELECT candidate_len, next_index FROM target_progress WHERE target_id = ?")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(candidate_len, 2);
+        assert_eq!(next_index, 0);
     }
 
     /// `namebreak bounded` itself only ever searches a single fixed length per

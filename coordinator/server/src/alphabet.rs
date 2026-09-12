@@ -174,6 +174,76 @@ pub fn strip_prefix_suffix<'a>(filename: &'a str, prefix: &str, suffix: &str) ->
     filename.strip_prefix(prefix)?.strip_suffix(suffix)
 }
 
+/// Compiles an operator-supplied "skip regex" into the form actually
+/// evaluated: forced to anchor at the very start of the candidate regardless
+/// of whether the pattern itself starts with `^`, since a skip decision is
+/// only ever made from a candidate's *leading character* - see
+/// `skip_char_mask`. Returns `None` if the pattern doesn't compile as a regex
+/// at all (callers reject target creation/patches in that case).
+pub fn compile_skip_regex(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(&format!("^(?:{pattern})")).ok()
+}
+
+/// For each character of `alphabet` (in order), whether a lone candidate
+/// consisting of just that character matches `skip_regex` - i.e. whether any
+/// candidate starting with that character should be skipped. This is the only
+/// shape of skip regex the carving logic supports: a pattern like `^AB`
+/// matches the string "AB", but the mask is computed by testing "A" alone, so
+/// it's evaluated as "skip everything starting with A", not "starting with
+/// AB" - deliberately weaker than what the regex syntax itself can express,
+/// in exchange for a skip decision being a single per-character lookup rather
+/// than something that has to inspect individual candidates one at a time
+/// (`find_skip_run`'s block search relies on this).
+pub fn skip_char_mask(alphabet: &str, skip_regex: &regex::Regex) -> Vec<bool> {
+    alphabet_chars(alphabet).iter().map(|c| skip_regex.is_match(&c.to_string())).collect()
+}
+
+/// Finds the first run of consecutive skip-marked alphabet characters at or
+/// after `lo_index`, restricted to `[lo_index, hi_index_exclusive)`. Returns
+/// that run's half-open index range `[skip_start, skip_end)`, or `None` if
+/// there's no skip run in that span.
+///
+/// Every alphabet character skips (or doesn't) as a whole contiguous block of
+/// `alphabet_size^(candidate_len - 1)` indices, since `index_to_candidate`
+/// orders candidates by leading character first - so this only ever has to
+/// walk the (at most `alphabet_size`, typically under 50) characters, never
+/// individual candidates within a block.
+pub fn find_skip_run(alphabet_size: i64, skip_chars: &[bool], candidate_len: i64, lo_index: i64, hi_index_exclusive: i64) -> Option<(i64, i64)> {
+    if lo_index >= hi_index_exclusive {
+        return None;
+    }
+    let block_size = pow_i64(alphabet_size, candidate_len - 1);
+    let mut char_idx = (lo_index / block_size) as usize;
+    while char_idx < skip_chars.len() {
+        let block_start = char_idx as i64 * block_size;
+        if block_start >= hi_index_exclusive {
+            break;
+        }
+        if skip_chars[char_idx] {
+            let skip_start = block_start.max(lo_index);
+            let mut end_char_idx = char_idx;
+            while end_char_idx + 1 < skip_chars.len() && skip_chars[end_char_idx + 1] {
+                end_char_idx += 1;
+            }
+            let skip_end = ((end_char_idx as i64 + 1) * block_size).min(hi_index_exclusive);
+            return Some((skip_start, skip_end));
+        }
+        char_idx += 1;
+    }
+    None
+}
+
+/// `base^exp` via `i128` so it can't silently wrap before the final cast -
+/// callers only ever pass an `exp` (`candidate_len - 1`) small enough that the
+/// true result already fits `i64` (see `max_supported_len`).
+fn pow_i64(base: i64, exp: i64) -> i64 {
+    let mut result: i128 = 1;
+    for _ in 0..exp {
+        result *= base as i128;
+    }
+    result as i64
+}
+
 /// Builds the `(lowerBoundFilename, upperBoundFilename)` pair to pass to
 /// `namebreak bounded` so it covers exactly the half-open range
 /// `[start_index, end_index)` at the given candidate length.
@@ -337,6 +407,52 @@ mod tests {
     fn strip_prefix_suffix_recovers_the_candidate() {
         assert_eq!(strip_prefix_suffix("REZ\\AB.WAV", "REZ\\", ".WAV"), Some("AB"));
         assert_eq!(strip_prefix_suffix("WRONG\\AB.WAV", "REZ\\", ".WAV"), None);
+    }
+
+    #[test]
+    fn compile_skip_regex_rejects_invalid_patterns_but_accepts_valid_ones() {
+        assert!(compile_skip_regex("[M-Q]").is_some());
+        assert!(compile_skip_regex("[").is_none(), "unclosed character class must not compile");
+    }
+
+    #[test]
+    fn skip_char_mask_marks_exactly_the_characters_the_regex_matches() {
+        let regex = compile_skip_regex("[M-Q]").unwrap();
+        let mask = skip_char_mask(DEFAULT, &regex);
+        let chars = alphabet_chars(DEFAULT);
+        for (c, &skip) in chars.iter().zip(mask.iter()) {
+            assert_eq!(skip, ('M'..='Q').contains(c), "mismatch for {c:?}");
+        }
+    }
+
+    #[test]
+    fn find_skip_run_locates_the_first_run_at_or_after_lo_index() {
+        // 26-letter alphabet, length-1 candidates so block_size == 1 and
+        // "leading character" is just the candidate itself.
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let regex = compile_skip_regex("[M-Q]").unwrap();
+        let mask = skip_char_mask(letters, &regex);
+
+        // Searching the whole space finds M(12)..Q(16) inclusive, i.e. [12, 17).
+        assert_eq!(find_skip_run(26, &mask, 1, 0, 26), Some((12, 17)));
+        // Starting already inside the run clips skip_start to lo_index.
+        assert_eq!(find_skip_run(26, &mask, 1, 14, 26), Some((14, 17)));
+        // Starting after the run finds nothing.
+        assert_eq!(find_skip_run(26, &mask, 1, 17, 26), None);
+        // A hi bound that cuts the run off is respected.
+        assert_eq!(find_skip_run(26, &mask, 1, 0, 15), Some((12, 15)));
+    }
+
+    #[test]
+    fn find_skip_run_operates_on_whole_leading_character_blocks_at_longer_lengths() {
+        // At length 2 over a 26-letter alphabet, each leading character owns a
+        // block of 26 indices - skipping "M" must skip all 26 of "MA".."MZ",
+        // not just the single index that would apply at length 1.
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let regex = compile_skip_regex("^M").unwrap();
+        let mask = skip_char_mask(letters, &regex);
+        let hi = 26 * 26;
+        assert_eq!(find_skip_run(26, &mask, 2, 0, hi), Some((12 * 26, 13 * 26)));
     }
 
     #[test]

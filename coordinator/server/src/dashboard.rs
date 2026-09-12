@@ -35,6 +35,9 @@ pub struct DashboardTarget {
     /// Operator note shown in the target's card header. Rendered as raw
     /// HTML by the dashboard, not escaped - see admin_create_target.
     pub description: Option<String>,
+    /// See `alphabet::compile_skip_regex` - shown on the target card so an
+    /// operator can see what's configured without a separate API call.
+    pub skip_regex: Option<String>,
     pub ranges: Vec<DashboardRange>,
 }
 
@@ -76,11 +79,11 @@ fn display_name(username: Option<String>, hostname: Option<String>) -> Option<St
 }
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
-    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>, String, i64, Option<String>)> = sqlx::query_as(
+    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT targets.id, targets.name, targets.status, \
                 targets.lower_bound, targets.upper_bound, targets.found_filename, \
                 found_user.username, found_user.hostname, targets.alphabet, targets.priority, \
-                targets.description \
+                targets.description, targets.skip_regex \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
          ORDER BY targets.priority DESC, targets.created_at ASC",
     )
@@ -88,7 +91,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     .await?;
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet, priority, description) in target_rows {
+    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet, priority, description, skip_regex) in target_rows {
         let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
             "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
                     ranges.progress_index, worker.username, worker.hostname, \
@@ -137,6 +140,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             found_by: display_name(found_username, found_hostname),
             priority,
             description,
+            skip_regex,
             ranges,
         });
     }

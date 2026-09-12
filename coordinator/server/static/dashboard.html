@@ -16,6 +16,7 @@
     --pending: #9ca3af;
     --in-progress: #d97706;
     --completed: #16a34a;
+    --skipped: #7c3aed;
     --solved-bg: #fff8e1;
     --solved-border: #f5c518;
     --solved-text: #7a5b00;
@@ -34,6 +35,7 @@
       --pending: #7c8290;
       --in-progress: #e0a13a;
       --completed: #3ecf6e;
+      --skipped: #a78bfa;
       --solved-bg: #2c2405;
       --solved-border: #caa314;
       --solved-text: #ffd75e;
@@ -98,6 +100,12 @@
     font-size: 12px;
     margin-top: 4px;
   }
+  .target-skip {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 2px;
+  }
+  .target-skip .mono { color: var(--skipped); }
   .target-description {
     color: var(--text);
     font-size: 13px;
@@ -121,6 +129,7 @@
   .badge.status-pending { background: var(--pending); }
   .badge.status-in_progress { background: var(--in-progress); }
   .badge.status-completed { background: var(--completed); }
+  .badge.status-skipped { background: var(--skipped); }
   .priority-chip {
     color: var(--muted);
     font-size: 11px;
@@ -398,7 +407,7 @@
     const tdStatus = document.createElement('td');
     const statusLabel = r.status === 'in_progress'
       ? inProgressLabel(r.progress_percent)
-      : (r.status === 'completed' ? 'Done' : undefined);
+      : (r.status === 'completed' ? 'Done' : (r.status === 'skipped' ? 'Skip' : undefined));
     tdStatus.appendChild(statusBadge(r.status, statusLabel));
     if (r.status === 'in_progress' && r.lease_expires_at) {
       const t = fmtTime(r.lease_expires_at);
@@ -541,6 +550,17 @@
     bounds.className = 'target-bounds mono';
     bounds.textContent = `${t.lower_bound} → ${t.upper_bound}`;
     card.appendChild(bounds);
+
+    if (t.skip_regex) {
+      const skip = document.createElement('div');
+      skip.className = 'target-skip';
+      skip.append('Skipping candidates starting with ');
+      const pattern = document.createElement('span');
+      pattern.className = 'mono';
+      pattern.textContent = t.skip_regex;
+      skip.appendChild(pattern);
+      card.appendChild(skip);
+    }
 
     if (t.status === 'solved') {
       const banner = document.createElement('div');

@@ -123,6 +123,13 @@ pub struct AdminCreateTargetRequest {
     /// only ever set this from trusted, operator-supplied text.
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional regex excluding part of the search space from ever being
+    /// carved out and handed to a worker. Matched only against a candidate's
+    /// *leading character* (independent of candidate length) - e.g. "[M-Q]"
+    /// skips every candidate starting with M through Q. Must compile as a
+    /// regex or target creation is rejected; empty/omitted means no skipping.
+    #[serde(default)]
+    pub skip_regex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +149,11 @@ pub struct AdminPatchTargetRequest {
     /// description unchanged; pass `""` to clear it.
     #[serde(default)]
     pub description: Option<String>,
+    /// See `AdminCreateTargetRequest::skip_regex`. Leave unset to leave it
+    /// unchanged; pass `""` to clear it. A new value only takes effect for
+    /// ranges carved after the patch - see `ranges::claim_range`.
+    #[serde(default)]
+    pub skip_regex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -37,6 +37,9 @@ pub struct Target {
     /// Operator note shown on the target's dashboard card, rendered as raw
     /// HTML there - see dashboard.html.
     pub description: Option<String>,
+    /// See `alphabet::compile_skip_regex`/`find_skip_run` - checked only when
+    /// carving fresh ranges, never against already-carved ones.
+    pub skip_regex: Option<String>,
 }
 
 #[allow(dead_code)]

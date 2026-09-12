@@ -8,7 +8,8 @@ use namebreak_protocol::{
 };
 
 use crate::alphabet::{
-    alphabet_size, bound_indices_at_len, bounds_are_valid, candidate_to_index, lookup_predefined_alphabet, max_supported_len, PREDEFINED_ALPHABETS,
+    alphabet_size, bound_indices_at_len, bounds_are_valid, candidate_to_index, compile_skip_regex, lookup_predefined_alphabet, max_supported_len,
+    PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
@@ -120,6 +121,18 @@ pub async fn alphabets() -> Json<AlphabetsResponse> {
     Json(AlphabetsResponse { alphabets })
 }
 
+/// Rejects a skip_regex that doesn't compile as a regex (see
+/// `alphabet::compile_skip_regex`). `None` or an empty/blank string is valid -
+/// both mean "no skipping".
+fn validate_skip_regex(skip_regex: &Option<String>) -> Result<(), AppError> {
+    if let Some(pattern) = skip_regex {
+        if !pattern.trim().is_empty() && compile_skip_regex(pattern).is_none() {
+            return Err(AppError::BadRequest("skip_regex is not a valid regex".into()));
+        }
+    }
+    Ok(())
+}
+
 pub async fn admin_create_target(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -168,12 +181,13 @@ pub async fn admin_create_target(
     }
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
+    validate_skip_regex(&req.skip_regex)?;
 
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, priority, description, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, priority, description, skip_regex, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -188,6 +202,7 @@ pub async fn admin_create_target(
     .bind(alphabet)
     .bind(req.priority)
     .bind(&req.description)
+    .bind(&req.skip_regex)
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
@@ -221,16 +236,18 @@ pub async fn admin_patch_target(
             return Err(AppError::BadRequest("status must be 'active' or 'paused'".into()));
         }
     }
-    if req.status.is_none() && req.priority.is_none() && req.description.is_none() {
-        return Err(AppError::BadRequest("at least one of status, priority or description must be provided".into()));
+    if req.status.is_none() && req.priority.is_none() && req.description.is_none() && req.skip_regex.is_none() {
+        return Err(AppError::BadRequest("at least one of status, priority, description or skip_regex must be provided".into()));
     }
+    validate_skip_regex(&req.skip_regex)?;
     let result = sqlx::query(
         "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority), \
-         description = COALESCE(?, description) WHERE id = ? AND status != 'solved'",
+         description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex) WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.status)
     .bind(req.priority)
     .bind(&req.description)
+    .bind(&req.skip_regex)
     .bind(target_id)
     .execute(&state.pool)
     .await?;
