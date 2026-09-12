@@ -40,6 +40,22 @@ HttpResponse HttpClient::post(const std::string& url, const std::vector<std::str
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, kDefaultTimeoutSeconds);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    // curl_easy_reset() (above) restores every *option* to its default, but
+    // it does NOT touch this handle's cached connection - by default curl
+    // keeps a request's TCP connection open and reuses it on the handle's
+    // next perform(). If a network glitch (interface drop, VPN reconnect,
+    // NAT rebind) kills that connection without a clean FIN/RST, the cached
+    // socket looks fine to curl but is actually dead: every subsequent
+    // request silently tries to reuse it, hangs until CURLOPT_TIMEOUT, and
+    // fails again - forever, even once connectivity is back - since nothing
+    // ever prompts curl to open a fresh connection. A CoordinatorClient (and
+    // the CURL handle it owns) lives for an entire range's worth of
+    // heartbeats, or the whole process for claim/register, so this isn't a
+    // one-off: one glitch permanently wedges every future request on that
+    // handle. Forcing the connection closed after every transfer trades a
+    // fresh TCP(+TLS) handshake per request - negligible next to a 60s
+    // heartbeat/30s poll cadence - for never getting stuck on a dead one.
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
 
     CURLcode rc = curl_easy_perform(curl);
     curl_slist_free_all(headerList);
