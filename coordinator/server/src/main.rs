@@ -42,6 +42,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/alphabets", get(handlers::alphabets))
         .route("/api/v1/admin/targets", post(handlers::admin_create_target))
         .route("/api/v1/admin/targets/{id}", patch(handlers::admin_patch_target).delete(handlers::admin_delete_target))
+        .route("/api/v1/admin/targets/{id}/priority-ranges", post(handlers::admin_create_priority_range))
+        .route("/api/v1/admin/priority-ranges/{id}", axum::routing::delete(handlers::admin_delete_priority_range))
         .with_state(state);
 
     tracing::info!(%bind_addr, "starting namebreak coordinator server");

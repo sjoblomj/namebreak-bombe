@@ -46,7 +46,33 @@ pub struct DashboardTarget {
     /// The resolved characters behind `alphabet_name`, for the dashboard's
     /// hover tooltip.
     pub alphabet: String,
+    /// Where the target's own main sweep currently is - see
+    /// `models::TargetProgress`. Compared against each `DashboardPriorityRange`
+    /// so the dashboard can show the (never persisted - see
+    /// `ranges::find_priority_boundary`) gap between them.
+    pub cursor_candidate_len: i64,
+    pub cursor_next_index: i64,
+    pub cursor_candidate: String,
+    pub priority_ranges: Vec<DashboardPriorityRange>,
     pub ranges: Vec<DashboardRange>,
+}
+
+#[derive(Serialize)]
+pub struct DashboardPriorityRange {
+    pub id: i64,
+    pub priority: i64,
+    pub pattern: String,
+    pub candidate_len: i64,
+    pub start_index: i64,
+    pub end_index: i64,
+    pub next_index: i64,
+    pub first_candidate: String,
+    pub last_candidate: String,
+    /// `None` once this priority range is exhausted (`next_index == end_index`)
+    /// - see `ranges::claim_priority_range_chunk`.
+    pub next_candidate: Option<String>,
+    pub alphabet_name: String,
+    pub alphabet: String,
 }
 
 #[derive(Serialize)]
@@ -85,6 +111,9 @@ pub struct DashboardRange {
     /// The resolved characters behind `alphabet_name`, for the dashboard's
     /// hover tooltip.
     pub alphabet: String,
+    /// Which `DashboardPriorityRange` (if any) this range was carved from -
+    /// see `models::Range::priority_range_id`. Display only.
+    pub priority_range_id: Option<i64>,
 }
 
 fn display_name(username: Option<String>, hostname: Option<String>) -> Option<String> {
@@ -110,11 +139,11 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     let mut targets = Vec::with_capacity(target_rows.len());
     for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
         #[allow(clippy::type_complexity)]
-        let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String)> = sqlx::query_as(
+        let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String, Option<i64>)> = sqlx::query_as(
             "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
                     ranges.progress_index, worker.username, worker.hostname, \
                     ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
-                    ranges.alphabet_name, ranges.alphabet \
+                    ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id \
              FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
              WHERE ranges.target_id = ? \
              ORDER BY ranges.created_at DESC",
@@ -126,7 +155,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         let ranges = range_rows
             .into_iter()
             .map(
-                |(range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet)| {
+                |(range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet, priority_range_id)| {
                     // Each range is decoded with its OWN alphabet, not the
                     // target's current one - a range carved before the
                     // target's alphabet was last patched (see
@@ -151,9 +180,43 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                         created_at,
                         alphabet_name: range_alphabet_name,
                         alphabet: range_alphabet,
+                        priority_range_id,
                     }
                 },
             )
+            .collect();
+
+        let (cursor_candidate_len, cursor_next_index, cursor_alphabet): (i64, i64, String) =
+            sqlx::query_as("SELECT candidate_len, next_index, alphabet FROM target_progress WHERE target_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await?;
+        let cursor_candidate = index_to_candidate(&cursor_alphabet, cursor_next_index, cursor_candidate_len);
+
+        #[allow(clippy::type_complexity)]
+        let priority_range_rows: Vec<(i64, i64, String, i64, i64, i64, i64, String, String)> = sqlx::query_as(
+            "SELECT id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet \
+             FROM priority_ranges WHERE target_id = ? ORDER BY priority DESC, created_at ASC",
+        )
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await?;
+        let priority_ranges = priority_range_rows
+            .into_iter()
+            .map(|(pr_id, pr_priority, pattern, candidate_len, start_index, end_index, next_index, pr_alphabet_name, pr_alphabet)| DashboardPriorityRange {
+                id: pr_id,
+                priority: pr_priority,
+                pattern,
+                candidate_len,
+                start_index,
+                end_index,
+                next_index,
+                first_candidate: index_to_candidate(&pr_alphabet, start_index, candidate_len),
+                last_candidate: index_to_candidate(&pr_alphabet, end_index - 1, candidate_len),
+                next_candidate: (next_index < end_index).then(|| index_to_candidate(&pr_alphabet, next_index, candidate_len)),
+                alphabet_name: pr_alphabet_name,
+                alphabet: pr_alphabet,
+            })
             .collect();
 
         targets.push(DashboardTarget {
@@ -169,6 +232,10 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             skip_regex,
             alphabet_name,
             alphabet,
+            cursor_candidate_len,
+            cursor_next_index,
+            cursor_candidate,
+            priority_ranges,
             ranges,
         });
     }

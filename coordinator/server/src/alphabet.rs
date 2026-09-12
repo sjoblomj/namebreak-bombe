@@ -244,6 +244,138 @@ fn pow_i64(base: i64, exp: i64) -> i64 {
     result as i64
 }
 
+/// Cap on how many concrete prefixes a single priority-range pattern (see
+/// `expand_priority_pattern`) may expand into, so a careless wide character
+/// class at several positions can't silently explode into an unmanageable
+/// number of `priority_ranges` rows - each one is its own extra cursor
+/// `ranges::claim_range` has to check on every claim.
+pub const MAX_PRIORITY_PATTERN_EXPANSIONS: usize = 200;
+
+/// Splits a priority-range pattern into its per-position atoms, each of
+/// which matches exactly one character. Unlike `compile_skip_regex` (a
+/// single regex tested only against a candidate's leading character), a
+/// priority pattern is meant to pin down *several* leading positions at
+/// once - e.g. `"[ _-]S"` means "space, underscore or hyphen, followed by
+/// S", not one combined regex tested some other way. Splitting it into
+/// atoms up front lets each position's matching characters be computed
+/// independently (via the same single-character-testing technique
+/// `skip_char_mask` already uses - see `expand_priority_pattern`) and then
+/// combined into the cross-product of concrete literal prefixes.
+///
+/// Supported per position: a literal character, `.` (any character), a
+/// backslash escape (`\d`, `\.`, ...), or a full `[...]` bracket expression
+/// (ranges and negation both work, since the bracket's contents are handed
+/// to `regex` unchanged). Quantifiers (`+ * ? {m,n}`) and alternation (`|`)
+/// are deliberately rejected: they'd make a pattern's matched length
+/// ambiguous, and the whole point here is a fixed, known prefix depth -
+/// wanting several different lengths or alternative prefixes just means
+/// creating several priority ranges (which can freely share a priority
+/// value to be treated as one tier).
+fn tokenize_pattern_atoms(pattern: &str) -> Result<Vec<String>, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut atoms = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '[' => {
+                let start = i;
+                i += 1;
+                if i < chars.len() && chars[i] == '^' {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == ']' {
+                    i += 1; // a ']' right after '[' (or '[^') is a literal member, not the closing bracket
+                }
+                while i < chars.len() && chars[i] != ']' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return Err("unterminated '[' in priority pattern".into());
+                }
+                i += 1; // consume the closing ']'
+                atoms.push(chars[start..i].iter().collect());
+            }
+            '\\' => {
+                if i + 1 >= chars.len() {
+                    return Err("priority pattern ends with a trailing '\\'".into());
+                }
+                atoms.push(chars[i..i + 2].iter().collect());
+                i += 2;
+            }
+            '.' => {
+                atoms.push(".".to_string());
+                i += 1;
+            }
+            c @ ('+' | '*' | '?' | '|' | '(' | ')' | '{' | '}' | '^' | '$') => {
+                return Err(format!(
+                    "unsupported character '{c}' in priority pattern - only literal characters, '.', backslash escapes, \
+                     and '[...]' character classes are allowed (no quantifiers, alternation, groups or anchors)"
+                ));
+            }
+            c => {
+                atoms.push(c.to_string());
+                i += 1;
+            }
+        }
+    }
+    if atoms.is_empty() {
+        return Err("priority pattern must not be empty".into());
+    }
+    Ok(atoms)
+}
+
+/// Expands a priority-range pattern into the concrete literal prefixes it
+/// matches against `alphabet` - see `tokenize_pattern_atoms` for the
+/// supported syntax. Each atom is compiled as its own single-character
+/// regex (anchored at *both* ends, unlike `compile_skip_regex` - a priority
+/// atom must match exactly one character, not "starts with") and tested
+/// against every character of `alphabet`; the per-position matching-character
+/// lists are then combined into their cross-product. Every returned prefix
+/// has the same length (the atom count) - this is what makes a fixed,
+/// unambiguous prefix depth possible.
+///
+/// Returns an error if any atom fails to compile, if any position matches no
+/// character in `alphabet` at all (a dead pattern), or if the cross-product
+/// would exceed `MAX_PRIORITY_PATTERN_EXPANSIONS`.
+pub fn expand_priority_pattern(alphabet: &str, pattern: &str) -> Result<Vec<String>, String> {
+    let atoms = tokenize_pattern_atoms(pattern)?;
+    let chars = alphabet_chars(alphabet);
+
+    let mut per_position: Vec<Vec<char>> = Vec::with_capacity(atoms.len());
+    for atom in &atoms {
+        let re = regex::Regex::new(&format!("^(?:{atom})$")).map_err(|_| format!("'{atom}' is not a valid pattern"))?;
+        let matching: Vec<char> = chars.iter().copied().filter(|c| re.is_match(&c.to_string())).collect();
+        if matching.is_empty() {
+            return Err(format!("'{atom}' doesn't match any character in the target's alphabet"));
+        }
+        per_position.push(matching);
+    }
+
+    let total: usize = per_position.iter().map(|m| m.len()).product();
+    if total > MAX_PRIORITY_PATTERN_EXPANSIONS {
+        return Err(format!(
+            "priority pattern expands to {total} concrete prefixes, which is more than the limit of {MAX_PRIORITY_PATTERN_EXPANSIONS} - use a narrower pattern"
+        ));
+    }
+
+    let mut prefixes = vec![String::new()];
+    for matching in &per_position {
+        let mut next = Vec::with_capacity(prefixes.len() * matching.len());
+        for prefix in &prefixes {
+            for &c in matching {
+                let mut p = prefix.clone();
+                p.push(c);
+                next.push(p);
+            }
+        }
+        prefixes = next;
+    }
+    Ok(prefixes)
+}
+
 /// The outcome of moving a target's carving cursor from `old_alphabet` to
 /// `new_alphabet`, needed once `handlers::admin_patch_target` changes a
 /// target's alphabet: any range already carved keeps its own stored alphabet
@@ -593,6 +725,66 @@ mod tests {
         assert_eq!(skip_start, old_index);
         assert_eq!(skip_end, candidate_to_index(old, "ZZZ").unwrap() + 1, "nothing of the old cursor's candidate survives - skip runs to this length's very end");
         assert_eq!(transition.new_next_index, candidate_to_index(new, "AAA").unwrap());
+    }
+
+    #[test]
+    fn expand_priority_pattern_cross_products_a_bracket_class_with_a_literal() {
+        // The feature's motivating example: "[ _-]S" over the default alphabet.
+        let mut prefixes = expand_priority_pattern(DEFAULT, "[ _-]S").unwrap();
+        prefixes.sort();
+        let mut expected = vec![" S".to_string(), "_S".to_string(), "-S".to_string()];
+        expected.sort();
+        assert_eq!(prefixes, expected);
+    }
+
+    #[test]
+    fn expand_priority_pattern_handles_a_single_literal_atom() {
+        assert_eq!(expand_priority_pattern(DEFAULT, "S").unwrap(), vec!["S".to_string()]);
+    }
+
+    #[test]
+    fn expand_priority_pattern_supports_dot_and_backslash_escapes() {
+        // "." matches every character in the alphabet; "\d" only the digits.
+        let dot = expand_priority_pattern(SIZE42, ".").unwrap();
+        assert_eq!(dot.len(), alphabet_size(SIZE42) as usize);
+
+        let digits = expand_priority_pattern(SIZE42, "\\d").unwrap();
+        let mut digits_sorted = digits.clone();
+        digits_sorted.sort();
+        assert_eq!(digits_sorted, vec!["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+    }
+
+    #[test]
+    fn expand_priority_pattern_rejects_a_dead_position() {
+        // SIZE42 has no lowercase letters at all.
+        let err = expand_priority_pattern(SIZE42, "z").unwrap_err();
+        assert!(err.contains('z'), "error should name the offending atom: {err}");
+    }
+
+    #[test]
+    fn expand_priority_pattern_rejects_quantifiers_and_alternation() {
+        assert!(expand_priority_pattern(DEFAULT, "A+").is_err());
+        assert!(expand_priority_pattern(DEFAULT, "A*").is_err());
+        assert!(expand_priority_pattern(DEFAULT, "A|B").is_err());
+        assert!(expand_priority_pattern(DEFAULT, "(AB)").is_err());
+        assert!(expand_priority_pattern(DEFAULT, "A{2,3}").is_err());
+    }
+
+    #[test]
+    fn expand_priority_pattern_rejects_an_unterminated_bracket() {
+        assert!(expand_priority_pattern(DEFAULT, "[AB").is_err());
+    }
+
+    #[test]
+    fn expand_priority_pattern_rejects_an_empty_pattern() {
+        assert!(expand_priority_pattern(DEFAULT, "").is_err());
+    }
+
+    #[test]
+    fn expand_priority_pattern_rejects_an_oversized_expansion() {
+        // Every position matches broadly, so the cross-product blows well past the cap.
+        let err = expand_priority_pattern(DEFAULT, "...").unwrap_err();
+        assert!(err.contains("200"), "error should mention the limit: {err}");
     }
 
     #[test]

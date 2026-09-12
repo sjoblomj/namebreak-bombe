@@ -177,6 +177,39 @@
     font-weight: 500;
     font-size: 13px;
   }
+  .priority-section {
+    margin-top: 14px;
+  }
+  .priority-heading {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .priority-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .priority-table th, .priority-table td {
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .priority-table th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  tr.gap-row td {
+    color: var(--muted);
+    font-style: italic;
+    background: var(--detail-bg);
+  }
   .table-scroll {
     overflow-x: auto;
     max-width: 100%;
@@ -510,6 +543,9 @@
     if (r.alphabet_name) {
       grid.appendChild(detailField('Alphabet', r.alphabet_name, false, `"${r.alphabet}"`));
     }
+    if (r.priority_range_id) {
+      grid.appendChild(detailField('Priority range', '#' + r.priority_range_id, true));
+    }
     if (r.status === 'in_progress') {
       const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
       grid.appendChild(detailField(progressLabel, r.progress_candidate || 'not started', true));
@@ -663,6 +699,95 @@
     return tr;
   }
 
+  // The gap between wherever the target's main sweep currently is
+  // (t.cursor_candidate_len/cursor_next_index) and a not-yet-reached
+  // priority range is never persisted server-side (see
+  // ranges::find_priority_boundary) - it's computed here, purely for
+  // display, from the two cursors the dashboard API already sends. Only
+  // rendered when it's actually bounded (same length as the main sweep);
+  // a priority range at a longer, not-yet-reached length just gets a plain
+  // "not yet reached" note instead, since the true gap there could span
+  // several whole lengths and isn't a single meaningful address range.
+  function priorityGapRow(t, pr) {
+    let text = null;
+    if (t.cursor_candidate_len === pr.candidate_len && t.cursor_next_index < pr.start_index) {
+      text = `Unclaimed: ${t.cursor_candidate} → ${pr.first_candidate} (not yet carved)`;
+    } else if (t.cursor_candidate_len < pr.candidate_len) {
+      text = `Not yet reached – main sweep is at length ${t.cursor_candidate_len} (${t.cursor_candidate})`;
+    }
+    if (!text) return null;
+
+    const tr = document.createElement('tr');
+    tr.className = 'gap-row';
+    const td = document.createElement('td');
+    td.colSpan = 4;
+    td.className = 'mono';
+    td.textContent = text;
+    tr.appendChild(td);
+    return tr;
+  }
+
+  // A small table of the target's priority ranges (see
+  // models::PriorityRange), address-ordered (by length then start) rather
+  // than by their own priority field, so it reads like a timeline of the
+  // target's search space - with the gap ahead of each not-yet-reached one
+  // shown inline via priorityGapRow. Returns null when the target has none.
+  function priorityRangeSection(t) {
+    if (!t.priority_ranges || t.priority_ranges.length === 0) return null;
+
+    const section = document.createElement('div');
+    section.className = 'priority-section';
+
+    const heading = document.createElement('div');
+    heading.className = 'priority-heading';
+    heading.textContent = 'Priority ranges';
+    section.appendChild(heading);
+
+    const table = document.createElement('table');
+    table.className = 'priority-table';
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th>Pattern</th><th>Len</th><th>Priority</th><th>Progress</th></tr>';
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    const sorted = t.priority_ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
+    for (const pr of sorted) {
+      const gapRow = priorityGapRow(t, pr);
+      if (gapRow) tbody.appendChild(gapRow);
+
+      const tr = document.createElement('tr');
+
+      const tdPattern = document.createElement('td');
+      tdPattern.className = 'mono';
+      tdPattern.textContent = pr.pattern;
+      tdPattern.title = `"${pr.alphabet}"`;
+      tr.appendChild(tdPattern);
+
+      const tdLen = document.createElement('td');
+      tdLen.className = 'mono';
+      tdLen.textContent = String(pr.candidate_len);
+      tr.appendChild(tdLen);
+
+      const tdPriority = document.createElement('td');
+      tdPriority.className = 'mono';
+      tdPriority.textContent = String(pr.priority);
+      tr.appendChild(tdPriority);
+
+      const tdProgress = document.createElement('td');
+      const total = pr.end_index - pr.start_index;
+      const done = pr.next_index - pr.start_index;
+      tdProgress.textContent = pr.next_candidate
+        ? `${fmtNum(done)} / ${fmtNum(total)} (next: ${pr.next_candidate})`
+        : `Done (${fmtNum(total)})`;
+      tr.appendChild(tdProgress);
+
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    section.appendChild(table);
+    return section;
+  }
+
   function targetCard(t) {
     const card = document.createElement('div');
     card.className = 'target-card' + (t.status === 'solved' ? ' solved' : '');
@@ -740,6 +865,9 @@
       }
       card.appendChild(banner);
     }
+
+    const prioritySection = priorityRangeSection(t);
+    if (prioritySection) card.appendChild(prioritySection);
 
     if (t.ranges.length === 0) {
       const empty = document.createElement('div');

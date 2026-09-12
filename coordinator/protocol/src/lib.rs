@@ -165,6 +165,40 @@ pub struct AdminPatchTargetRequest {
     pub alphabet_name: Option<String>,
 }
 
+/// Fast-tracks a specific, bounded slice of a target's search space ahead of
+/// its normal sequential sweep - see `ranges::claim_range`. Unlike
+/// `AdminCreateTargetRequest::skip_regex`, this never removes anything from
+/// the search, it only reorders when it happens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminCreatePriorityRangeRequest {
+    /// A short, regex-*style* pattern describing the leading characters to
+    /// prioritize, one position per "atom" - a literal character, `.`, a
+    /// backslash escape, or a full `[...]` bracket class (ranges and
+    /// negation both work). E.g. `"[ _-]S"` means "space, underscore or
+    /// hyphen, followed by S". No quantifiers, alternation, groups or
+    /// anchors - each pattern has one single, unambiguous length (its atom
+    /// count), which must not exceed `length` below. A pattern with more
+    /// than one matching character at some position (e.g. the bracket class
+    /// above) expands into that many separate priority ranges, one per
+    /// concrete prefix, all sharing this request's `priority`.
+    pub pattern: String,
+    /// The exact candidate length this priority range applies to - not a
+    /// range of lengths. Wanting several lengths (e.g. both 9 and 10
+    /// characters) means sending this request once per length.
+    pub length: i64,
+    /// Higher claims first, same convention as `AdminCreateTargetRequest::priority`.
+    /// Multiple priority ranges may share a priority value.
+    #[serde(default)]
+    pub priority: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminCreatePriorityRangeResponse {
+    /// One id per concrete prefix `pattern` expanded into - see
+    /// `AdminCreatePriorityRangeRequest::pattern`.
+    pub priority_range_ids: Vec<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlphabetInfo {
     pub name: String,

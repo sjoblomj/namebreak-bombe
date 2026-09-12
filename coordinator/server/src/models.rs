@@ -82,6 +82,39 @@ pub struct Range {
     /// resolution, building a `ClaimResponse`).
     pub alphabet_name: String,
     pub alphabet: String,
+    /// Which `PriorityRange` (if any) this range was carved from - `None`
+    /// for anything produced by the target's own main sweep. Purely for
+    /// dashboard labeling; claim/heartbeat/complete/reclaim logic treats
+    /// every range the same regardless of origin.
+    pub priority_range_id: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PriorityRange {
+    pub id: i64,
+    pub target_id: i64,
+    /// Higher claims first, same convention as `Target::priority`. Ties
+    /// break by `created_at`. See `ranges::claim_range`.
+    pub priority: i64,
+    /// The operator-supplied pattern this row's prefix was expanded from -
+    /// see `alphabet::expand_priority_pattern`. Display only.
+    pub pattern: String,
+    /// A priority range is always scoped to exactly one candidate length -
+    /// see `alphabet::expand_priority_pattern`'s doc comment for why.
+    pub candidate_len: i64,
+    pub start_index: i64,
+    pub end_index: i64,
+    /// This row's own cursor within `[start_index, end_index)`. Once it
+    /// reaches `end_index` the row is permanently exhausted - unlike
+    /// `TargetProgress`, there's no next length to bump to.
+    pub next_index: i64,
+    /// Frozen at creation - independent of the target's own alphabet, and
+    /// unaffected by a later `admin_patch_target` alphabet change. See the
+    /// migration that creates this table.
+    pub alphabet_name: String,
+    pub alphabet: String,
+    pub created_at: i64,
 }
 
 /// Stores a `u32` hash in an `i64` column without sign issues (always non-negative,

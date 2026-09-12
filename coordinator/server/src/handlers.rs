@@ -3,18 +3,18 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use namebreak_protocol::{
-    AdminCreateTargetRequest, AdminCreateTargetResponse, AdminPatchTargetRequest, AlphabetInfo, AlphabetsResponse,
-    CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
+    AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateTargetRequest, AdminCreateTargetResponse, AdminPatchTargetRequest,
+    AlphabetInfo, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
 };
 
 use crate::alphabet::{
-    alphabet_size, bound_indices_at_len, bounds_are_valid, candidate_to_index, compile_skip_regex, lookup_predefined_alphabet, max_supported_len,
-    PREDEFINED_ALPHABETS,
+    alphabet_size, bound_indices_at_len, bounds_are_valid, candidate_to_index, compile_skip_regex, expand_priority_pattern, lookup_predefined_alphabet,
+    max_supported_len, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
-use crate::models::{parse_hash_hex, u32_to_i64, Target, User};
-use crate::ranges;
+use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User};
+use crate::ranges::{self, PriorityRangeRemoval};
 use crate::state::{generate_token, now_unix, AppState};
 
 pub async fn register(
@@ -309,5 +309,122 @@ pub async fn admin_delete_target(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
+    }
+}
+
+/// Fast-tracks a specific, bounded slice of a target's search space ahead of
+/// its normal sequential sweep - see `ranges::claim_range`,
+/// `ranges::claim_priority_range_chunk`. `req.pattern` may expand (via
+/// `alphabet::expand_priority_pattern`) into several concrete prefixes, each
+/// becoming its own `priority_ranges` row sharing `req.priority` and
+/// `req.length`.
+pub async fn admin_create_priority_range(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(target_id): Path<i64>,
+    Json(req): Json<AdminCreatePriorityRangeRequest>,
+) -> Result<Json<AdminCreatePriorityRangeResponse>, AppError> {
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
+        .bind(target_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if req.length <= 0 {
+        return Err(AppError::BadRequest("length must be positive".into()));
+    }
+    let cap = max_supported_len(&target.alphabet);
+    if req.length > cap {
+        return Err(AppError::BadRequest(format!("length {} exceeds this target's alphabet's max supported length ({cap})", req.length)));
+    }
+
+    let prefixes = expand_priority_pattern(&target.alphabet, &req.pattern).map_err(AppError::BadRequest)?;
+    // Every expansion shares the same atom count (see expand_priority_pattern), so any one of them tells us the pattern's length.
+    let pattern_len = prefixes[0].chars().count() as i64;
+    if pattern_len > req.length {
+        return Err(AppError::BadRequest(format!(
+            "priority pattern is {pattern_len} characters long, which is longer than the requested length ({})",
+            req.length
+        )));
+    }
+
+    // A priority range only makes sense ahead of where the target's own
+    // cursor already reached - see alphabet::expand_priority_pattern's doc
+    // comment. Everything before that has already been fully searched by
+    // the main sweep, under its own bookkeeping; there's nothing left here
+    // to fast-track.
+    let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
+        .bind(target_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if req.length < progress.candidate_len {
+        return Err(AppError::BadRequest(format!(
+            "the target has already fully searched every {}-character candidate - nothing left to prioritize there",
+            req.length
+        )));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let now = now_unix();
+    let mut priority_range_ids = Vec::with_capacity(prefixes.len());
+
+    for prefix in &prefixes {
+        let (start_index, end_index_inclusive) = bound_indices_at_len(&target.alphabet, prefix, prefix, req.length);
+        let end_index = end_index_inclusive + 1;
+        let next_index = if req.length == progress.candidate_len { start_index.max(progress.next_index) } else { start_index };
+        if next_index >= end_index {
+            return Err(AppError::BadRequest(format!(
+                "prefix '{prefix}' at length {} has already been fully searched by the main sweep - nothing left to prioritize",
+                req.length
+            )));
+        }
+
+        // Each priority range permanently owns its declared span (see
+        // ranges::find_priority_boundary) - two overlapping ones at the same
+        // length would double-book the same addresses.
+        let overlap: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND start_index < ? AND end_index > ?",
+        )
+        .bind(target_id)
+        .bind(req.length)
+        .bind(end_index)
+        .bind(start_index)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((existing_id,)) = overlap {
+            return Err(AppError::BadRequest(format!("prefix '{prefix}' at length {} overlaps existing priority range #{existing_id}", req.length)));
+        }
+
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(target_id)
+        .bind(req.priority)
+        .bind(&req.pattern)
+        .bind(req.length)
+        .bind(start_index)
+        .bind(end_index)
+        .bind(next_index)
+        .bind(&target.alphabet_name)
+        .bind(&target.alphabet)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        priority_range_ids.push(id);
+    }
+
+    tx.commit().await?;
+    Ok(Json(AdminCreatePriorityRangeResponse { priority_range_ids }))
+}
+
+pub async fn admin_delete_priority_range(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(priority_range_id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    match ranges::retire_or_delete_priority_range(&state.pool, priority_range_id).await? {
+        Some(PriorityRangeRemoval::Deleted) | Some(PriorityRangeRemoval::Retired) => Ok(StatusCode::NO_CONTENT),
+        None => Err(AppError::NotFound),
     }
 }

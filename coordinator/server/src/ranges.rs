@@ -10,7 +10,7 @@ use crate::alphabet::{
     skip_char_mask, strip_prefix_suffix, transition_alphabet_cursor,
 };
 use crate::error::AppError;
-use crate::models::{i64_to_u32, Range, Target, TargetProgress, User};
+use crate::models::{i64_to_u32, PriorityRange, Range, Target, TargetProgress, User};
 use crate::state::{now_unix, RangeConfig};
 
 fn lease_seconds_for(config: &RangeConfig, range_size: i64, effective_rate: f64) -> i64 {
@@ -86,6 +86,9 @@ async fn persist_progress(
 /// the dashboard as "Skip" (dashboard.html); never selected by the `pending`
 /// reuse query in `claim_range` or the `in_progress` sweep in
 /// `reclaim_expired`, so it needs no further handling once inserted.
+/// `priority_range_id` is `Some` when this skip run was found while carving
+/// a priority range rather than the target's own main sweep - see
+/// `claim_priority_range_chunk` - purely for dashboard labeling.
 #[allow(clippy::too_many_arguments)]
 async fn insert_skip_range(
     tx: &mut sqlx::SqliteConnection,
@@ -95,11 +98,12 @@ async fn insert_skip_range(
     end_index: i64,
     alphabet_name: &str,
     alphabet: &str,
+    priority_range_id: Option<i64>,
     now: i64,
 ) -> Result<(), AppError> {
     sqlx::query(
-        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, created_at, alphabet_name, alphabet) \
-         VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?)",
+        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, created_at, alphabet_name, alphabet, priority_range_id) \
+         VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?, ?)",
     )
     .bind(target_id)
     .bind(candidate_len)
@@ -108,9 +112,159 @@ async fn insert_skip_range(
     .bind(now)
     .bind(alphabet_name)
     .bind(alphabet)
+    .bind(priority_range_id)
     .execute(tx)
     .await?;
     Ok(())
+}
+
+/// Finds the earliest existing `PriorityRange` (see `models::PriorityRange`)
+/// at `target_id` + `candidate_len`, frozen under `alphabet_name`, whose
+/// declared span overlaps `[lo_index, hi_index_exclusive)` - the boundary
+/// the target's own main sweep must never cross without jumping straight
+/// over it (see `claim_range`). Only priority ranges frozen under the exact
+/// alphabet the cursor is currently walking in are considered: one created
+/// under an alphabet this target has since moved away from (via
+/// `handlers::admin_patch_target`) stores indices that are no longer
+/// comparable to the cursor's, so it's left out here rather than risking a
+/// wrong comparison - a rare, narrow edge case (a priority range plus a
+/// later alphabet patch on the very same target) that's flagged rather than
+/// silently mishandled.
+async fn find_priority_boundary(
+    tx: &mut sqlx::SqliteConnection,
+    target_id: i64,
+    candidate_len: i64,
+    alphabet_name: &str,
+    lo_index: i64,
+    hi_index_exclusive: i64,
+) -> Result<Option<(i64, i64)>, AppError> {
+    let priority_ranges = sqlx::query_as::<_, PriorityRange>(
+        "SELECT * FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ?",
+    )
+    .bind(target_id)
+    .bind(candidate_len)
+    .bind(alphabet_name)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    Ok(priority_ranges
+        .into_iter()
+        .filter_map(|pr| {
+            let lo = pr.start_index.max(lo_index);
+            let hi = pr.end_index.min(hi_index_exclusive);
+            if lo < hi {
+                Some((lo, hi))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|&(lo, _)| lo))
+}
+
+/// Tries to carve a fresh chunk from one of `target`'s priority ranges (see
+/// `models::PriorityRange`), highest priority first (ties broken by creation
+/// order, the same convention `targets.priority` already uses). Returns
+/// `None` once none of them has any claimable work left.
+///
+/// A priority range is always scoped to exactly one candidate_len (see
+/// `alphabet::expand_priority_pattern`'s doc comment on why), so - unlike
+/// the target's own cursor - there's no "bump to the next length" once one
+/// is exhausted: it just permanently stops being claimable, and the next
+/// iteration of the loop below moves on to the next-highest-priority one
+/// instead (or falls through to `None`, letting `claim_range` continue with
+/// the target's own main sweep).
+///
+/// Never re-validates a priority range's `[start_index, end_index)` against
+/// the target's own cursor: that was already done once, and if needed
+/// clamped, at creation time (see `handlers::admin_create_priority_range`) -
+/// from here on its span is a permanent exclusion zone the main sweep never
+/// enters (`find_priority_boundary`), so there's nothing left to reconcile
+/// on every claim.
+async fn claim_priority_range_chunk(
+    tx: &mut sqlx::SqliteConnection,
+    config: &RangeConfig,
+    target: &Target,
+    user: &User,
+    rate: f64,
+    now: i64,
+) -> Result<Option<ClaimResponse>, AppError> {
+    loop {
+        let pr = sqlx::query_as::<_, PriorityRange>(
+            "SELECT * FROM priority_ranges WHERE target_id = ? AND next_index < end_index ORDER BY priority DESC, created_at ASC LIMIT 1",
+        )
+        .bind(target.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(pr) = pr else {
+            return Ok(None);
+        };
+
+        // skip_regex still applies within a priority range's own space: a
+        // candidate being uninteresting doesn't stop being true just because
+        // it's also prioritized.
+        let skip_chars = target
+            .skip_regex
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(compile_skip_regex)
+            .map(|re| skip_char_mask(&pr.alphabet, &re));
+        let skip_run =
+            skip_chars.as_ref().and_then(|chars| find_skip_run(alphabet_size(&pr.alphabet), chars, pr.candidate_len, pr.next_index, pr.end_index));
+
+        if let Some((skip_start, skip_end)) = skip_run {
+            if skip_start == pr.next_index {
+                insert_skip_range(&mut *tx, target.id, pr.candidate_len, skip_start, skip_end, &pr.alphabet_name, &pr.alphabet, Some(pr.id), now).await?;
+                sqlx::query("UPDATE priority_ranges SET next_index = ? WHERE id = ?").bind(skip_end).bind(pr.id).execute(&mut *tx).await?;
+                continue; // this priority range may have room left after the skip, or may now be exhausted - reconsider from the top either way
+            }
+        }
+
+        let remaining = pr.end_index - pr.next_index;
+        let desired = (rate * config.target_chunk_seconds).round() as i64;
+        let natural_chunk = desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates).min(remaining);
+        let start_index = pr.next_index;
+        let natural_end = start_index + natural_chunk;
+
+        let (end_index, skip_to_insert) = match skip_run {
+            Some((skip_start, skip_end)) if natural_end >= skip_start => (skip_start, Some((skip_start, skip_end))),
+            _ => (natural_end, None),
+        };
+        let chunk = end_index - start_index;
+
+        let next_index = match skip_to_insert {
+            Some((skip_start, skip_end)) => {
+                insert_skip_range(&mut *tx, target.id, pr.candidate_len, skip_start, skip_end, &pr.alphabet_name, &pr.alphabet, Some(pr.id), now).await?;
+                skip_end
+            }
+            None => end_index,
+        };
+        sqlx::query("UPDATE priority_ranges SET next_index = ? WHERE id = ?").bind(next_index).bind(pr.id).execute(&mut *tx).await?;
+
+        let lease_seconds = lease_seconds_for(config, chunk, rate);
+        let range_id: i64 = sqlx::query_scalar(
+            "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
+             assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id) \
+             VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(target.id)
+        .bind(pr.candidate_len)
+        .bind(start_index)
+        .bind(end_index)
+        .bind(user.id)
+        .bind(user.id)
+        .bind(now)
+        .bind(lease_seconds)
+        .bind(now + lease_seconds)
+        .bind(now)
+        .bind(&pr.alphabet_name)
+        .bind(&pr.alphabet)
+        .bind(pr.id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        return Ok(Some(to_claim_response(target, range_id, pr.candidate_len, start_index, end_index, lease_seconds, &pr.alphabet)));
+    }
 }
 
 /// Tries to hand `user` a unit of work: for the highest-priority active target
@@ -170,7 +324,15 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start_index, range.end_index, lease_seconds, &range.alphabet)));
         }
 
-        // 2) Otherwise carve a fresh chunk off this target's cursor, if it still has room.
+        // 2) Otherwise, try this target's priority ranges (see
+        // `models::PriorityRange`) before its own main sweep, highest
+        // priority first - see `claim_priority_range_chunk`.
+        if let Some(claim) = claim_priority_range_chunk(&mut tx, config, &target, user, rate, now).await? {
+            tx.commit().await?;
+            return Ok(Some(claim));
+        }
+
+        // 3) Otherwise carve a fresh chunk off this target's own cursor, if it still has room.
         //
         // Loops rather than a single pass because a skip run can sit right at
         // the cursor (nothing to hand out until it's stepped over), a length
@@ -215,14 +377,38 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                 .as_ref()
                 .and_then(|chars| find_skip_run(alphabet_size(active_alphabet), chars, progress.candidate_len, progress.next_index, upper_at_len + 1));
 
-            // The cursor itself sits inside a skip run: nothing claimable
-            // before it, so just record the skip and step past it, without
-            // handing anything out this iteration.
-            if let Some((skip_start, skip_end)) = skip_run {
-                if skip_start == progress.next_index {
-                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, active_alphabet_name, active_alphabet, now).await?;
+            // A priority range (see `models::PriorityRange`) permanently
+            // excludes its own declared span from the main sweep at its
+            // exact candidate_len, without ever persisting anything for the
+            // gap - see `claim_priority_range_chunk`'s doc comment. Only
+            // matched against priority ranges frozen under this same
+            // alphabet: one created under an alphabet this target has since
+            // moved away from is no longer index-comparable to the cursor,
+            // so it's (harmlessly, if rarely) left for a future pass to sort
+            // out rather than risking a wrong comparison here.
+            let priority_boundary = find_priority_boundary(&mut tx, target.id, progress.candidate_len, active_alphabet_name, progress.next_index, upper_at_len + 1).await?;
+
+            // Whichever of the two starts first is this iteration's boundary
+            // - `is_skip` says which, since only a skip run gets persisted
+            // as its own row when the cursor is jumped straight over it.
+            let boundary = match (skip_run, priority_boundary) {
+                (Some((s0, _)), Some((p0, p1))) if p0 < s0 => Some((p0, p1, false)),
+                (Some((s0, s1)), _) => Some((s0, s1, true)),
+                (None, Some((p0, p1))) => Some((p0, p1, false)),
+                (None, None) => None,
+            };
+
+            // The cursor itself sits right at the boundary: nothing
+            // claimable before it, so just step past it - recording the
+            // skip if that's what it is - without handing anything out this
+            // iteration.
+            if let Some((b_start, b_end, is_skip)) = boundary {
+                if b_start == progress.next_index {
+                    if is_skip {
+                        insert_skip_range(&mut tx, target.id, progress.candidate_len, b_start, b_end, active_alphabet_name, active_alphabet, None, now).await?;
+                    }
                     let (new_len, new_next_index) =
-                        bump_length_if_exhausted(active_alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len, skip_end, upper_at_len);
+                        bump_length_if_exhausted(active_alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len, b_end, upper_at_len);
                     persist_progress(&mut tx, target.id, new_len, new_next_index, active_alphabet_name, active_alphabet).await?;
                     continue 'carve;
                 }
@@ -255,7 +441,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                     progress.next_index,
                 );
                 if let Some((skip_start, skip_end)) = transition.skip {
-                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, active_alphabet_name, active_alphabet, now).await?;
+                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, active_alphabet_name, active_alphabet, None, now).await?;
                 }
                 let (_, new_upper_at_len) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
                 let (new_len, new_next_index) = bump_length_if_exhausted(
@@ -275,23 +461,25 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             let start_index = progress.next_index;
             let natural_end = start_index + natural_chunk;
 
-            // Only truncate at the skip boundary if the chunk that would
-            // otherwise have been handed out actually reaches it - a skip run
-            // further out than what this claim would carve anyway is left
-            // for a future claim to discover, per "these should be created
-            // when they fall within a range that would otherwise be handed
-            // out; they should not be created in advance".
-            let (end_index, skip_to_insert) = match skip_run {
-                Some((skip_start, skip_end)) if natural_end >= skip_start => (skip_start, Some((skip_start, skip_end))),
+            // Only truncate at the boundary if the chunk that would
+            // otherwise have been handed out actually reaches it - a skip
+            // run or priority range further out than what this claim would
+            // carve anyway is left for a future claim to discover, per
+            // "these should be created when they fall within a range that
+            // would otherwise be handed out; they should not be created in
+            // advance".
+            let (end_index, boundary_to_apply) = match boundary {
+                Some((b_start, b_end, is_skip)) if natural_end >= b_start => (b_start, Some((b_start, b_end, is_skip))),
                 _ => (natural_end, None),
             };
             let chunk = end_index - start_index;
 
-            let next_index_before_bump = match skip_to_insert {
-                Some((skip_start, skip_end)) => {
-                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, &target.alphabet_name, &target.alphabet, now).await?;
-                    skip_end
+            let next_index_before_bump = match boundary_to_apply {
+                Some((b_start, b_end, true)) => {
+                    insert_skip_range(&mut tx, target.id, progress.candidate_len, b_start, b_end, &target.alphabet_name, &target.alphabet, None, now).await?;
+                    b_end
                 }
+                Some((_, b_end, false)) => b_end, // priority range: jump straight over it, no row inserted
                 None => end_index,
             };
             let (new_len, new_next_index) = bump_length_if_exhausted(
@@ -562,14 +750,16 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
             .execute(&mut *tx)
             .await?;
 
-            // Carries the original range's own alphabet forward, not the
-            // target's current one - the target's alphabet may have been
-            // patched since this range was originally carved (see
-            // `models::Range::alphabet`).
+            // Carries the original range's own alphabet and priority-range
+            // origin forward, not the target's current alphabet - the
+            // target's alphabet may have been patched since this range was
+            // originally carved (see `models::Range::alphabet`), and this
+            // remainder is still the same priority range's work if the
+            // original was (see `models::Range::priority_range_id`).
             sqlx::query(
                 "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet) \
-                 VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?)",
+                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id) \
+                 VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?)",
             )
             .bind(range.target_id)
             .bind(range.candidate_len)
@@ -578,6 +768,7 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
             .bind(now)
             .bind(&range.alphabet_name)
             .bind(&range.alphabet)
+            .bind(range.priority_range_id)
             .execute(&mut *tx)
             .await?;
         } else {
@@ -606,9 +797,46 @@ pub async fn delete_target(pool: &SqlitePool, target_id: i64) -> Result<bool, Ap
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM ranges WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM target_progress WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM priority_ranges WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
     let result = sqlx::query("DELETE FROM targets WHERE id = ?").bind(target_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// The outcome of removing a priority range - see `retire_or_delete_priority_range`.
+pub enum PriorityRangeRemoval {
+    /// Never claimed anything, so it was safe to remove outright with no trace.
+    Deleted,
+    /// Already produced real `ranges` rows, so it was left in place (with
+    /// `next_index` forced to `end_index`) rather than actually deleted.
+    Retired,
+}
+
+/// Removes an admin's priority-range hint. If it's never been touched by
+/// carving (`next_index == start_index`), it's genuinely safe to delete
+/// outright - nothing anywhere refers to it yet. Otherwise it's *retired* in
+/// place instead: `next_index` is forced to `end_index` (so it never offers
+/// fresh work again) but the row itself is kept, because `claim_range`'s
+/// main-sweep exclusion (`find_priority_boundary`) is keyed off this row's
+/// mere existence, not whether it still has remaining work - deleting it
+/// outright would let the main sweep re-carve (and so duplicate) whatever
+/// this priority range already produced. Returns `None` if no such row exists.
+pub async fn retire_or_delete_priority_range(pool: &SqlitePool, priority_range_id: i64) -> Result<Option<PriorityRangeRemoval>, AppError> {
+    let pr = sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE id = ?")
+        .bind(priority_range_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(pr) = pr else {
+        return Ok(None);
+    };
+
+    if pr.next_index == pr.start_index {
+        sqlx::query("DELETE FROM priority_ranges WHERE id = ?").bind(priority_range_id).execute(pool).await?;
+        Ok(Some(PriorityRangeRemoval::Deleted))
+    } else {
+        sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id = ?").bind(priority_range_id).execute(pool).await?;
+        Ok(Some(PriorityRangeRemoval::Retired))
+    }
 }
 
 #[cfg(test)]
@@ -726,6 +954,37 @@ mod tests {
             .await
             .unwrap();
         target_id
+    }
+
+    /// Inserts a `priority_ranges` row directly (bypassing
+    /// `handlers::admin_create_priority_range`'s validation, same as the
+    /// other `insert_*` fixtures here bypass their own admin handler) whose
+    /// bounds are `prefix` padded out to `candidate_len` with `alphabet`'s
+    /// own min/max characters - i.e. exactly the block `expand_priority_pattern`
+    /// plus this same padding trick would have produced for that literal
+    /// prefix. Passing `""` as `prefix` covers the entire `candidate_len`
+    /// space, which is handy for tests that don't care about narrowing it.
+    async fn insert_priority_range(pool: &SqlitePool, target_id: i64, alphabet: &str, alphabet_name: &str, priority: i64, prefix: &str, candidate_len: i64) -> i64 {
+        let (start_index, end_index_inclusive) = crate::alphabet::bound_indices_at_len(alphabet, prefix, prefix, candidate_len);
+        let end_index = end_index_inclusive + 1;
+        let now = now_unix();
+        sqlx::query_scalar(
+            "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(target_id)
+        .bind(priority)
+        .bind(prefix)
+        .bind(candidate_len)
+        .bind(start_index)
+        .bind(end_index)
+        .bind(start_index)
+        .bind(alphabet_name)
+        .bind(alphabet)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     /// The scenario the skip-regex feature exists for: a target that would
@@ -1139,6 +1398,159 @@ mod tests {
                 .unwrap();
         assert_eq!(progress_alphabet_name, "letters_only", "the cursor itself must now be stamped with the new alphabet");
         assert_eq!(progress_alphabet, new_alphabet);
+    }
+
+    /// The core scheduling behavior a priority range exists for: it's
+    /// claimed before the target's own main sweep even though both would
+    /// otherwise compete for the very same length-1 space, and once it's
+    /// exhausted the main sweep's own chunk is truncated to stop just short
+    /// of it - jumping straight over the single candidate it owns without
+    /// leaving any row behind for that gap.
+    #[tokio::test]
+    async fn claim_range_serves_a_priority_range_before_the_targets_own_main_sweep() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+        let priority_range_id = insert_priority_range(&pool, target_id, letters, "letters", 10, "Z", 1).await;
+
+        let config = test_config(100); // bigger than the whole 26-candidate length-1 space
+
+        let claim1 = claim_range(&pool, &config, &user).await.unwrap().expect("the priority range should be claimed first");
+        assert_eq!(claim1.lower_bound_filename, "PREZ.SUF");
+        assert_eq!(claim1.upper_bound_filename, "PREZ.SUF");
+        assert_eq!(claim1.candidate_count, 1);
+
+        let (priority_range_ref,): (Option<i64>,) =
+            sqlx::query_as("SELECT priority_range_id FROM ranges WHERE id = ?").bind(claim1.range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(priority_range_ref, Some(priority_range_id), "the claimed range should carry its priority-range provenance");
+
+        let (pr_next_index,): (i64,) =
+            sqlx::query_as("SELECT next_index FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(pr_next_index, 26, "the priority range's own cursor should now be exhausted");
+
+        let claim2 = claim_range(&pool, &config, &user).await.unwrap().expect("the main sweep should now be claimable");
+        assert_eq!(claim2.lower_bound_filename, "PREA.SUF");
+        assert_eq!(claim2.upper_bound_filename, "PREY.SUF", "must stop just short of 'Z', which the priority range already owns");
+        assert_eq!(claim2.candidate_count, 25);
+
+        let skip_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ranges WHERE target_id = ? AND status = 'skipped'").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(skip_count, 0, "the priority range's gap must not be persisted as its own row");
+    }
+
+    /// Several priority ranges on the same target are walked highest
+    /// priority first, ties broken by creation order - the same convention
+    /// `targets.priority` already uses.
+    #[tokio::test]
+    async fn claim_priority_range_chunk_prefers_higher_priority_then_creation_order() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+
+        let low_id = insert_priority_range(&pool, target_id, letters, "letters", 1, "A", 1).await;
+        let high_id = insert_priority_range(&pool, target_id, letters, "letters", 10, "M", 1).await;
+        let tie_id = insert_priority_range(&pool, target_id, letters, "letters", 10, "N", 1).await;
+
+        let config = test_config(1); // exactly one candidate per claim
+
+        for expected in [high_id, tie_id, low_id] {
+            let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+            let (priority_range_ref,): (Option<i64>,) =
+                sqlx::query_as("SELECT priority_range_id FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+            assert_eq!(priority_range_ref, Some(expected));
+        }
+    }
+
+    /// skip_regex still excludes matching candidates *within* a priority
+    /// range's own space - being prioritized doesn't stop a candidate from
+    /// also being uninteresting.
+    #[tokio::test]
+    async fn claim_priority_range_chunk_still_applies_the_targets_skip_regex() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_skip_regex(&pool, letters, "A", "Z", "[M-Q]").await;
+        // Covers the entire length-1 space, so it overlaps the skip zone.
+        insert_priority_range(&pool, target_id, letters, "custom", 10, "", 1).await;
+
+        let config = test_config(30); // bigger than the whole 26-candidate space
+
+        let claim1 = claim_range(&pool, &config, &user).await.unwrap().expect("A-L should be claimable from the priority range");
+        assert_eq!(claim1.lower_bound_filename, "PREA.SUF");
+        assert_eq!(claim1.upper_bound_filename, "PREL.SUF");
+
+        let (skip_status, skip_start, skip_end, skip_priority_range_id): (String, i64, i64, Option<i64>) =
+            sqlx::query_as("SELECT status, start_index, end_index, priority_range_id FROM ranges WHERE target_id = ? AND status = 'skipped'")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the M-Q skip must be recorded even though it happened inside a priority range");
+        assert_eq!(skip_status, "skipped");
+        assert_eq!((skip_start, skip_end), (12, 17));
+        assert!(skip_priority_range_id.is_some(), "the skip should be tagged with the priority range it happened in");
+
+        let claim2 = claim_range(&pool, &config, &user).await.unwrap().expect("R-Z should be claimable next, still from the priority range");
+        assert_eq!(claim2.lower_bound_filename, "PRER.SUF");
+        assert_eq!(claim2.upper_bound_filename, "PREZ.SUF");
+    }
+
+    /// A reclaimed, split-off remainder must still point back at whichever
+    /// priority range the original (now-shrunk, completed) row came from -
+    /// otherwise re-claiming it would silently look like ordinary main-sweep
+    /// work on the dashboard.
+    #[tokio::test]
+    async fn reclaim_expired_carries_the_priority_range_id_forward_on_a_split_remainder() {
+        let pool = test_pool().await;
+        let first_user = insert_user(&pool, "first").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "AAA", "ZZZ").await;
+        let priority_range_id = insert_priority_range(&pool, target_id, letters, "letters", 10, "A", 3).await;
+
+        let config = test_config(676); // the whole "A??" block at length 3
+        let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("priority range should be claimable");
+        assert_eq!(claim.candidate_count, 676);
+
+        let (start_index,): (i64,) = sqlx::query_as("SELECT start_index FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(letters, start_index + 338, 3));
+        heartbeat_range(&pool, &first_user, claim.range_id, Some(midpoint_filename)).await.unwrap();
+
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+
+        let (new_priority_range_id,): (Option<i64>,) =
+            sqlx::query_as("SELECT priority_range_id FROM ranges WHERE target_id = ? AND status = 'pending'").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(new_priority_range_id, Some(priority_range_id));
+    }
+
+    /// An untouched priority range (nothing ever carved from it) is safe to
+    /// remove outright; one that's already produced real ranges must be
+    /// retired in place instead, so the main sweep's exclusion of its span
+    /// stays intact forever (see `find_priority_boundary`).
+    #[tokio::test]
+    async fn retire_or_delete_priority_range_deletes_when_untouched_but_retires_once_claimed() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+
+        let untouched_id = insert_priority_range(&pool, target_id, letters, "letters", 5, "A", 1).await;
+        let touched_id = insert_priority_range(&pool, target_id, letters, "letters", 10, "M", 1).await;
+
+        let config = test_config(1);
+        claim_range(&pool, &config, &user).await.unwrap().expect("should claim the higher-priority one");
+
+        assert!(matches!(retire_or_delete_priority_range(&pool, untouched_id).await.unwrap(), Some(PriorityRangeRemoval::Deleted)));
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM priority_ranges WHERE id = ?").bind(untouched_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(remaining, 0);
+
+        assert!(matches!(retire_or_delete_priority_range(&pool, touched_id).await.unwrap(), Some(PriorityRangeRemoval::Retired)));
+        let (next_index, end_index): (i64, i64) =
+            sqlx::query_as("SELECT next_index, end_index FROM priority_ranges WHERE id = ?").bind(touched_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(next_index, end_index, "retiring forces next_index to end_index so it never offers fresh work again");
+
+        assert!(retire_or_delete_priority_range(&pool, 999_999).await.unwrap().is_none());
     }
 
     /// A target's max_backslash_count must reach the client via ClaimResponse
