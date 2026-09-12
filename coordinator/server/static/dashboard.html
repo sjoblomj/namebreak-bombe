@@ -140,6 +140,29 @@
     border-radius: 999px;
     padding: 2px 8px;
   }
+  .alphabet-chip {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    cursor: help;
+  }
+  .alphabet-chip-row {
+    display: block;
+    border: none;
+    padding: 0;
+    margin-top: 2px;
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--muted);
+    cursor: help;
+  }
   .found-banner {
     margin-top: 10px;
     padding: 10px 14px;
@@ -427,6 +450,13 @@
     const tdLen = document.createElement('td');
     tdLen.className = 'mono';
     tdLen.textContent = String(r.candidate_len);
+    if (r.alphabet_name) {
+      const alpha = document.createElement('span');
+      alpha.className = 'alphabet-chip-row';
+      alpha.textContent = r.alphabet_name;
+      alpha.title = `"${r.alphabet}"`;
+      tdLen.appendChild(alpha);
+    }
     tr.appendChild(tdLen);
 
     const tdRange = document.createElement('td');
@@ -533,6 +563,13 @@
       prio.className = 'priority-chip';
       prio.textContent = 'priority ' + t.priority;
       head.appendChild(prio);
+    }
+    if (t.alphabet_name) {
+      const alpha = document.createElement('span');
+      alpha.className = 'alphabet-chip';
+      alpha.textContent = t.alphabet_name;
+      alpha.title = `"${t.alphabet}"`;
+      head.appendChild(alpha);
     }
     card.appendChild(head);
 

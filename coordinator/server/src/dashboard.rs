@@ -38,6 +38,14 @@ pub struct DashboardTarget {
     /// See `alphabet::compile_skip_regex` - shown on the target card so an
     /// operator can see what's configured without a separate API call.
     pub skip_regex: Option<String>,
+    /// The target's *current* alphabet - i.e. what future ranges will be
+    /// carved with (see `handlers::admin_patch_target`). Individual ranges
+    /// may have been carved under a different (older) one - see
+    /// `DashboardRange::alphabet_name`.
+    pub alphabet_name: String,
+    /// The resolved characters behind `alphabet_name`, for the dashboard's
+    /// hover tooltip.
+    pub alphabet: String,
     pub ranges: Vec<DashboardRange>,
 }
 
@@ -69,6 +77,14 @@ pub struct DashboardRange {
     pub lease_expires_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub created_at: i64,
+    /// The alphabet this specific range was carved with - see
+    /// `models::Range::alphabet`. Not necessarily the target's current
+    /// alphabet (`DashboardTarget::alphabet_name`) if the target was patched
+    /// since this range was carved.
+    pub alphabet_name: String,
+    /// The resolved characters behind `alphabet_name`, for the dashboard's
+    /// hover tooltip.
+    pub alphabet: String,
 }
 
 fn display_name(username: Option<String>, hostname: Option<String>) -> Option<String> {
@@ -79,10 +95,11 @@ fn display_name(username: Option<String>, hostname: Option<String>) -> Option<St
 }
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
-    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>, String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT targets.id, targets.name, targets.status, \
                 targets.lower_bound, targets.upper_bound, targets.found_filename, \
-                found_user.username, found_user.hostname, targets.alphabet, targets.priority, \
+                found_user.username, found_user.hostname, targets.alphabet_name, targets.alphabet, targets.priority, \
                 targets.description, targets.skip_regex \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
          ORDER BY targets.priority DESC, targets.created_at ASC",
@@ -91,11 +108,13 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     .await?;
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet, priority, description, skip_regex) in target_rows {
-        let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
+        #[allow(clippy::type_complexity)]
+        let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String)> = sqlx::query_as(
             "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
                     ranges.progress_index, worker.username, worker.hostname, \
-                    ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at \
+                    ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
+                    ranges.alphabet_name, ranges.alphabet \
              FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
              WHERE ranges.target_id = ? \
              ORDER BY ranges.created_at DESC",
@@ -107,16 +126,21 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         let ranges = range_rows
             .into_iter()
             .map(
-                |(range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at)| {
+                |(range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet)| {
+                    // Each range is decoded with its OWN alphabet, not the
+                    // target's current one - a range carved before the
+                    // target's alphabet was last patched (see
+                    // handlers::admin_patch_target) must still be shown with
+                    // the alphabet it actually holds candidates in.
                     DashboardRange {
                         id: range_id,
                         status: r_status,
                         candidate_len,
                         start_index,
                         end_index,
-                        first_candidate: index_to_candidate(&alphabet, start_index, candidate_len),
-                        last_candidate: index_to_candidate(&alphabet, end_index - 1, candidate_len),
-                        progress_candidate: progress_index.map(|p| index_to_candidate(&alphabet, p, candidate_len)),
+                        first_candidate: index_to_candidate(&range_alphabet, start_index, candidate_len),
+                        last_candidate: index_to_candidate(&range_alphabet, end_index - 1, candidate_len),
+                        progress_candidate: progress_index.map(|p| index_to_candidate(&range_alphabet, p, candidate_len)),
                         progress_percent: progress_index.map(|p| {
                             (p - start_index + 1) as f64 / (end_index - start_index) as f64 * 100.0
                         }),
@@ -125,6 +149,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                         lease_expires_at,
                         completed_at,
                         created_at,
+                        alphabet_name: range_alphabet_name,
+                        alphabet: range_alphabet,
                     }
                 },
             )
@@ -141,6 +167,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             priority,
             description,
             skip_regex,
+            alphabet_name,
+            alphabet,
             ranges,
         });
     }

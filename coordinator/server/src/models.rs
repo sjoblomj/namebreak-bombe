@@ -48,6 +48,13 @@ pub struct TargetProgress {
     pub target_id: i64,
     pub candidate_len: i64,
     pub next_index: i64,
+    /// Which alphabet `candidate_len`/`next_index` are denominated in - not
+    /// necessarily `targets.alphabet` if the target's alphabet was patched
+    /// since carving last touched this cursor. See
+    /// `alphabet::transition_alphabet_cursor` and `ranges::claim_range`,
+    /// which lazily reconciles the two the next time it carves.
+    pub alphabet_name: String,
+    pub alphabet: String,
 }
 
 #[allow(dead_code)]
@@ -67,6 +74,14 @@ pub struct Range {
     pub completed_at: Option<i64>,
     pub created_at: i64,
     pub progress_index: Option<i64>,
+    /// The alphabet this specific range was carved with - not necessarily
+    /// `targets.alphabet`, since a target's alphabet can be patched after
+    /// some of its ranges already exist (see `handlers::admin_patch_target`).
+    /// Always used in place of the target's own alphabet when decoding this
+    /// range's candidates (dashboard rendering, heartbeat progress
+    /// resolution, building a `ClaimResponse`).
+    pub alphabet_name: String,
+    pub alphabet: String,
 }
 
 /// Stores a `u32` hash in an `i64` column without sign issues (always non-negative,

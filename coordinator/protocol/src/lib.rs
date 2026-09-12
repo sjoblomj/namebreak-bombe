@@ -154,6 +154,15 @@ pub struct AdminPatchTargetRequest {
     /// ranges carved after the patch - see `ranges::claim_range`.
     #[serde(default)]
     pub skip_regex: Option<String>,
+    /// See `AdminCreateTargetRequest::alphabet_name`. Leave unset to leave
+    /// the alphabet unchanged. Rejected if the name is unknown, or if the
+    /// target's own (immutable) bounds contain a character outside the new
+    /// alphabet. Ranges already carved - in progress, pending, completed or
+    /// skipped - keep whatever alphabet they were carved with; only the
+    /// carving cursor is affected, and only lazily, the next time fresh work
+    /// is carved for this target (see `ranges::claim_range`).
+    #[serde(default)]
+    pub alphabet_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

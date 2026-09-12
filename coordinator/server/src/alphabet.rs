@@ -244,6 +244,83 @@ fn pow_i64(base: i64, exp: i64) -> i64 {
     result as i64
 }
 
+/// The outcome of moving a target's carving cursor from `old_alphabet` to
+/// `new_alphabet`, needed once `handlers::admin_patch_target` changes a
+/// target's alphabet: any range already carved keeps its own stored alphabet
+/// (see `models::Range::alphabet`), but the cursor (`target_progress`) has to
+/// be translated the first time carving reaches it after the patch - lazily,
+/// the same way a skip-regex run is only ever materialized once carving
+/// actually reaches it (see `find_skip_run`), rather than retroactively.
+///
+/// The old cursor sits at some candidate string of `candidate_len`
+/// characters. If every one of those characters also exists in
+/// `new_alphabet`, the exact same string is simply reinterpreted under the
+/// new alphabet - nothing is lost, nothing needs to be skipped. Otherwise,
+/// the first character (scanning left to right) that isn't in `new_alphabet`
+/// marks the point past which the old cursor's position can no longer be
+/// expressed: everything still sharing that prefix, under `old_alphabet`, is
+/// skipped (clipped to the target's own upper bound at this length, so the
+/// skip is never wider than what's actually left to carve), and the new
+/// cursor resumes at that same prefix with the remaining positions reset to
+/// `new_alphabet`'s own lowest character - e.g. old alphabet digits+letters,
+/// new alphabet letters-only, old cursor "ABC001" -> skip "ABC001".."ABC999"
+/// (old alphabet), resume at "ABCAAA" (new alphabet).
+pub struct AlphabetTransition {
+    /// `[start_index, end_index)` under `old_alphabet`, at the same
+    /// `candidate_len` as the old cursor, to persist as a `skipped` range.
+    /// `None` when the old cursor's candidate is already fully expressible
+    /// in the new alphabet, so nothing needs skipping.
+    pub skip: Option<(i64, i64)>,
+    /// Where carving should resume, under `new_alphabet`, at the same
+    /// `candidate_len` as the old cursor. The caller is still responsible
+    /// for bumping past this length if this index turns out to already be
+    /// beyond the target's upper bound at this length under the new
+    /// alphabet - exactly as it already does for ordinary carving, via
+    /// `bump_length_if_exhausted`.
+    pub new_next_index: i64,
+}
+
+/// Computes an `AlphabetTransition` for a cursor currently at
+/// `(candidate_len, old_next_index)` under `old_alphabet`. Caller must ensure
+/// `old_next_index` is still within this length's remaining space under
+/// `old_alphabet` (i.e. hasn't already been fully carved) - `claim_range`
+/// already checks this before doing anything else on a fresh loop iteration.
+pub fn transition_alphabet_cursor(
+    old_alphabet: &str,
+    new_alphabet: &str,
+    lower_bound: &str,
+    upper_bound: &str,
+    candidate_len: i64,
+    old_next_index: i64,
+) -> AlphabetTransition {
+    let old_candidate = index_to_candidate(old_alphabet, old_next_index, candidate_len);
+
+    let divergence = old_candidate.chars().position(|ch| candidate_to_index(new_alphabet, &ch.to_string()).is_none());
+
+    let Some(divergence) = divergence else {
+        // Fully expressible as-is - just reinterpret the same string under the new alphabet.
+        let new_next_index =
+            candidate_to_index(new_alphabet, &old_candidate).expect("just confirmed every character of old_candidate is in new_alphabet");
+        return AlphabetTransition { skip: None, new_next_index };
+    };
+
+    let prefix: String = old_candidate.chars().take(divergence).collect();
+    let suffix_len = candidate_len as usize - divergence;
+
+    let (_, old_max_char) = min_max_chars(old_alphabet);
+    let skip_end_candidate = format!("{prefix}{}", old_max_char.to_string().repeat(suffix_len));
+    let skip_end_index = candidate_to_index(old_alphabet, &skip_end_candidate).expect("built only from old_alphabet's own characters");
+    let (_, upper_at_len) = bound_indices_at_len(old_alphabet, lower_bound, upper_bound, candidate_len);
+    let skip_end_index = skip_end_index.min(upper_at_len);
+
+    let (new_min_char, _) = min_max_chars(new_alphabet);
+    let new_candidate = format!("{prefix}{}", new_min_char.to_string().repeat(suffix_len));
+    let new_next_index = candidate_to_index(new_alphabet, &new_candidate)
+        .expect("built only from new_alphabet's own characters - prefix chars were confirmed present by the divergence scan above");
+
+    AlphabetTransition { skip: Some((old_next_index, skip_end_index + 1)), new_next_index }
+}
+
 /// Builds the `(lowerBoundFilename, upperBoundFilename)` pair to pass to
 /// `namebreak bounded` so it covers exactly the half-open range
 /// `[start_index, end_index)` at the given candidate length.
@@ -453,6 +530,69 @@ mod tests {
         let mask = skip_char_mask(letters, &regex);
         let hi = 26 * 26;
         assert_eq!(find_skip_run(26, &mask, 2, 0, hi), Some((12 * 26, 13 * 26)));
+    }
+
+    #[test]
+    fn transition_alphabet_cursor_skips_the_shared_prefix_block_when_the_cursor_diverges() {
+        // Loosely the feature spec's motivating example (digits+letters ->
+        // letters-only), except the skip runs to "ABCZZZ" (the true end of
+        // the "ABC"-prefixed block under the old alphabet), not just
+        // "ABC999" - "ABC00A" is just as unrepresentable in the new alphabet
+        // as "ABC001" is, so it has to be covered by the same skip. Nothing
+        // is lost either way: every letters-only candidate in that span
+        // (like "ABCAAA" itself) still gets searched, just via the new
+        // alphabet's own walk starting at new_next_index, not the old one's.
+        let old = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let old_index = candidate_to_index(old, "ABC001").unwrap();
+        let full_bounds_lower = "AAA000";
+        let full_bounds_upper = "ZZZZZZ";
+
+        let transition = transition_alphabet_cursor(old, new, full_bounds_lower, full_bounds_upper, 6, old_index);
+
+        let (skip_start, skip_end) = transition.skip.expect("digits aren't in the new alphabet - a skip is required");
+        assert_eq!(skip_start, old_index);
+        assert_eq!(skip_end, candidate_to_index(old, "ABCZZZ").unwrap() + 1);
+        assert_eq!(transition.new_next_index, candidate_to_index(new, "ABCAAA").unwrap());
+    }
+
+    #[test]
+    fn transition_alphabet_cursor_clips_the_skip_to_the_targets_own_upper_bound() {
+        let old = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let old_index = candidate_to_index(old, "ABC001").unwrap();
+        // Upper bound cuts off partway through the "ABC" block instead of at its natural end.
+        let transition = transition_alphabet_cursor(old, new, "AAA000", "ABC500", 6, old_index);
+
+        let (_, skip_end) = transition.skip.unwrap();
+        assert_eq!(skip_end, candidate_to_index(old, "ABC500").unwrap() + 1, "must not skip past the target's own upper bound");
+    }
+
+    #[test]
+    fn transition_alphabet_cursor_needs_no_skip_when_the_cursor_is_already_expressible() {
+        // Shrinking size49 -> size42 (dropping punctuation the cursor doesn't use).
+        let old = DEFAULT;
+        let new = SIZE42;
+        let old_index = candidate_to_index(old, "ABC").unwrap();
+
+        let transition = transition_alphabet_cursor(old, new, "AAA", "ZZZ", 3, old_index);
+
+        assert!(transition.skip.is_none(), "\"ABC\" is expressible in size42 too - nothing to skip");
+        assert_eq!(transition.new_next_index, candidate_to_index(new, "ABC").unwrap());
+    }
+
+    #[test]
+    fn transition_alphabet_cursor_handles_divergence_at_the_very_first_character() {
+        let old = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let old_index = candidate_to_index(old, "5XY").unwrap();
+
+        let transition = transition_alphabet_cursor(old, new, "000", "ZZZ", 3, old_index);
+
+        let (skip_start, skip_end) = transition.skip.unwrap();
+        assert_eq!(skip_start, old_index);
+        assert_eq!(skip_end, candidate_to_index(old, "ZZZ").unwrap() + 1, "nothing of the old cursor's candidate survives - skip runs to this length's very end");
+        assert_eq!(transition.new_next_index, candidate_to_index(new, "AAA").unwrap());
     }
 
     #[test]

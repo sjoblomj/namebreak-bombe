@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 
 use crate::alphabet::{
     alphabet_size, bound_indices_at_len, candidate_to_index, compile_skip_regex, find_skip_run, max_supported_len, range_bound_filenames,
-    skip_char_mask, strip_prefix_suffix,
+    skip_char_mask, strip_prefix_suffix, transition_alphabet_cursor,
 };
 use crate::error::AppError;
 use crate::models::{i64_to_u32, Range, Target, TargetProgress, User};
@@ -23,9 +23,12 @@ fn effective_rate(config: &RangeConfig, user: &User) -> f64 {
     user.ema_rate_per_sec.unwrap_or(config.default_rate_per_sec)
 }
 
-fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_index: i64, end_index: i64, lease_seconds: i64) -> ClaimResponse {
-    let (lower_bound_filename, upper_bound_filename) =
-        range_bound_filenames(&target.alphabet, &target.prefix, &target.suffix, candidate_len, start_index, end_index);
+/// `alphabet` is the range's own alphabet (`Range::alphabet`), not
+/// necessarily `target.alphabet` - a range carved before the target's
+/// alphabet was last patched must still be served (and decoded) with
+/// whatever alphabet it was actually carved under.
+fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_index: i64, end_index: i64, lease_seconds: i64, alphabet: &str) -> ClaimResponse {
+    let (lower_bound_filename, upper_bound_filename) = range_bound_filenames(alphabet, &target.prefix, &target.suffix, candidate_len, start_index, end_index);
     ClaimResponse {
         range_id,
         target_id: target.id,
@@ -38,7 +41,7 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
         max_backslash_count: target.max_backslash_count,
         lower_bound_filename,
         upper_bound_filename,
-        alphabet: target.alphabet.clone(),
+        alphabet: alphabet.to_string(),
         candidate_count: end_index - start_index,
         lease_seconds,
     }
@@ -59,10 +62,19 @@ fn bump_length_if_exhausted(alphabet: &str, lower_bound: &str, upper_bound: &str
     }
 }
 
-async fn persist_progress(tx: &mut sqlx::SqliteConnection, target_id: i64, candidate_len: i64, next_index: i64) -> Result<(), AppError> {
-    sqlx::query("UPDATE target_progress SET candidate_len = ?, next_index = ? WHERE target_id = ?")
+async fn persist_progress(
+    tx: &mut sqlx::SqliteConnection,
+    target_id: i64,
+    candidate_len: i64,
+    next_index: i64,
+    alphabet_name: &str,
+    alphabet: &str,
+) -> Result<(), AppError> {
+    sqlx::query("UPDATE target_progress SET candidate_len = ?, next_index = ?, alphabet_name = ?, alphabet = ? WHERE target_id = ?")
         .bind(candidate_len)
         .bind(next_index)
+        .bind(alphabet_name)
+        .bind(alphabet)
         .bind(target_id)
         .execute(tx)
         .await?;
@@ -74,16 +86,28 @@ async fn persist_progress(tx: &mut sqlx::SqliteConnection, target_id: i64, candi
 /// the dashboard as "Skip" (dashboard.html); never selected by the `pending`
 /// reuse query in `claim_range` or the `in_progress` sweep in
 /// `reclaim_expired`, so it needs no further handling once inserted.
-async fn insert_skip_range(tx: &mut sqlx::SqliteConnection, target_id: i64, candidate_len: i64, start_index: i64, end_index: i64, now: i64) -> Result<(), AppError> {
+#[allow(clippy::too_many_arguments)]
+async fn insert_skip_range(
+    tx: &mut sqlx::SqliteConnection,
+    target_id: i64,
+    candidate_len: i64,
+    start_index: i64,
+    end_index: i64,
+    alphabet_name: &str,
+    alphabet: &str,
+    now: i64,
+) -> Result<(), AppError> {
     sqlx::query(
-        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, created_at) \
-         VALUES (?, ?, ?, ?, 'skipped', ?)",
+        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, created_at, alphabet_name, alphabet) \
+         VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?)",
     )
     .bind(target_id)
     .bind(candidate_len)
     .bind(start_index)
     .bind(end_index)
     .bind(now)
+    .bind(alphabet_name)
+    .bind(alphabet)
     .execute(tx)
     .await?;
     Ok(())
@@ -143,26 +167,18 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .await?;
 
             tx.commit().await?;
-            return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start_index, range.end_index, lease_seconds)));
+            return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start_index, range.end_index, lease_seconds, &range.alphabet)));
         }
 
         // 2) Otherwise carve a fresh chunk off this target's cursor, if it still has room.
         //
-        // If the target has a skip regex, precompute which leading characters it
-        // marks skip once per target (not per loop iteration below) - see
-        // `skip_char_mask`.
-        let skip_chars = target
-            .skip_regex
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .and_then(compile_skip_regex)
-            .map(|re| skip_char_mask(&target.alphabet, &re));
-
         // Loops rather than a single pass because a skip run can sit right at
-        // the cursor (nothing to hand out until it's stepped over) or can run
-        // all the way to a length's end (advancing the cursor into the next
-        // length, which might itself start inside another skip run) - either
-        // case needs to reconsider the (now-advanced) cursor from scratch
+        // the cursor (nothing to hand out until it's stepped over), a length
+        // can be exhausted (advancing the cursor into the next length, which
+        // might itself start inside another skip run), or the cursor's
+        // alphabet can still be an old one pending translation onto the
+        // target's current alphabet (see the mismatch check below) - any of
+        // these needs to reconsider the (now-advanced) cursor from scratch
         // rather than being resolved in one shot.
         'carve: loop {
             let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
@@ -170,27 +186,88 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                 .fetch_one(&mut *tx)
                 .await?;
 
-            let (_, upper_at_len) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
+            // The cursor might still be denominated in a previous alphabet if
+            // this target was patched (handlers::admin_patch_target) since
+            // carving last touched it. Every computation this iteration must
+            // use the cursor's OWN (possibly old) alphabet, not the target's
+            // current one, until the mismatch is resolved below.
+            let active_alphabet_name = progress.alphabet_name.as_str();
+            let active_alphabet = progress.alphabet.as_str();
+
+            let (_, upper_at_len) = bound_indices_at_len(active_alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
             let remaining = upper_at_len - progress.next_index + 1; // inclusive upper bound
             if remaining <= 0 {
                 break 'carve; // this target's bounds are fully carved out at this length (and, if this is its last length, entirely) - try the next target
             }
 
-            let skip_run = skip_chars.as_ref().and_then(|chars| {
-                find_skip_run(alphabet_size(&target.alphabet), chars, progress.candidate_len, progress.next_index, upper_at_len + 1)
-            });
+            // Recomputed every iteration (cheap: at most alphabet_size regex
+            // matches against single characters) rather than hoisted above
+            // the loop, since the alphabet it must be built against can
+            // change mid-loop (the mismatch branch below).
+            let skip_chars = target
+                .skip_regex
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .and_then(compile_skip_regex)
+                .map(|re| skip_char_mask(active_alphabet, &re));
+
+            let skip_run = skip_chars
+                .as_ref()
+                .and_then(|chars| find_skip_run(alphabet_size(active_alphabet), chars, progress.candidate_len, progress.next_index, upper_at_len + 1));
 
             // The cursor itself sits inside a skip run: nothing claimable
             // before it, so just record the skip and step past it, without
             // handing anything out this iteration.
             if let Some((skip_start, skip_end)) = skip_run {
                 if skip_start == progress.next_index {
-                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, now).await?;
+                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, active_alphabet_name, active_alphabet, now).await?;
                     let (new_len, new_next_index) =
-                        bump_length_if_exhausted(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len, skip_end, upper_at_len);
-                    persist_progress(&mut tx, target.id, new_len, new_next_index).await?;
+                        bump_length_if_exhausted(active_alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len, skip_end, upper_at_len);
+                    persist_progress(&mut tx, target.id, new_len, new_next_index, active_alphabet_name, active_alphabet).await?;
                     continue 'carve;
                 }
+            }
+
+            // The cursor is clear of any old-alphabet skip run; if the
+            // target's alphabet has since been patched, this is the moment
+            // to translate the cursor onto the new one - see
+            // alphabet::transition_alphabet_cursor. Nothing already carved
+            // (pending, in-progress, completed or skipped ranges) is
+            // touched; only the cursor moves.
+            if active_alphabet_name != target.alphabet_name {
+                if progress.candidate_len > max_supported_len(&target.alphabet) {
+                    // The new alphabet can't represent a candidate this long
+                    // (a smaller alphabet has a *larger* max_supported_len,
+                    // not smaller - so this only happens moving to a bigger
+                    // alphabet after carving has already gone this deep).
+                    // There's no length to bump to and nothing safe to
+                    // translate, so this target simply has no more fresh
+                    // work to hand out until an operator intervenes; ranges
+                    // already carved are entirely unaffected.
+                    break 'carve;
+                }
+                let transition = transition_alphabet_cursor(
+                    active_alphabet,
+                    &target.alphabet,
+                    &target.lower_bound,
+                    &target.upper_bound,
+                    progress.candidate_len,
+                    progress.next_index,
+                );
+                if let Some((skip_start, skip_end)) = transition.skip {
+                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, active_alphabet_name, active_alphabet, now).await?;
+                }
+                let (_, new_upper_at_len) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
+                let (new_len, new_next_index) = bump_length_if_exhausted(
+                    &target.alphabet,
+                    &target.lower_bound,
+                    &target.upper_bound,
+                    progress.candidate_len,
+                    transition.new_next_index,
+                    new_upper_at_len,
+                );
+                persist_progress(&mut tx, target.id, new_len, new_next_index, &target.alphabet_name, &target.alphabet).await?;
+                continue 'carve;
             }
 
             let desired = (rate * config.target_chunk_seconds).round() as i64;
@@ -212,7 +289,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
 
             let next_index_before_bump = match skip_to_insert {
                 Some((skip_start, skip_end)) => {
-                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, now).await?;
+                    insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, &target.alphabet_name, &target.alphabet, now).await?;
                     skip_end
                 }
                 None => end_index,
@@ -225,13 +302,13 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                 next_index_before_bump,
                 upper_at_len,
             );
-            persist_progress(&mut tx, target.id, new_len, new_next_index).await?;
+            persist_progress(&mut tx, target.id, new_len, new_next_index, &target.alphabet_name, &target.alphabet).await?;
 
             let lease_seconds = lease_seconds_for(config, chunk, rate);
             let range_id: i64 = sqlx::query_scalar(
                 "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at) \
-                 VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?) RETURNING id",
+                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet) \
+                 VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
             )
             .bind(target.id)
             .bind(progress.candidate_len)
@@ -243,11 +320,13 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .bind(lease_seconds)
             .bind(now + lease_seconds)
             .bind(now)
+            .bind(&target.alphabet_name)
+            .bind(&target.alphabet)
             .fetch_one(&mut *tx)
             .await?;
 
             tx.commit().await?;
-            return Ok(Some(to_claim_response(&target, range_id, progress.candidate_len, start_index, end_index, lease_seconds)));
+            return Ok(Some(to_claim_response(&target, range_id, progress.candidate_len, start_index, end_index, lease_seconds, &target.alphabet)));
         }
     }
 
@@ -344,7 +423,9 @@ async fn resolve_progress_index(
         tracing::warn!(range_id = range.id, filename, "heartbeat match candidate length doesn't match range, ignoring");
         return Ok(None);
     }
-    let Some(index) = candidate_to_index(&target.alphabet, candidate) else {
+    // The range's own alphabet, not the target's current one - see
+    // `models::Range::alphabet`.
+    let Some(index) = candidate_to_index(&range.alphabet, candidate) else {
         tracing::warn!(range_id = range.id, filename, "heartbeat match candidate has out-of-alphabet characters, ignoring");
         return Ok(None);
     };
@@ -481,16 +562,22 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
             .execute(&mut *tx)
             .await?;
 
+            // Carries the original range's own alphabet forward, not the
+            // target's current one - the target's alphabet may have been
+            // patched since this range was originally carved (see
+            // `models::Range::alphabet`).
             sqlx::query(
                 "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at) \
-                 VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?)",
+                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet) \
+                 VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?)",
             )
             .bind(range.target_id)
             .bind(range.candidate_len)
             .bind(effective_start)
             .bind(range.end_index)
             .bind(now)
+            .bind(&range.alphabet_name)
+            .bind(&range.alphabet)
             .execute(&mut *tx)
             .await?;
         } else {
@@ -602,10 +689,12 @@ mod tests {
         .unwrap();
         let start_len = lower_bound.chars().count() as i64;
         let start_index = crate::alphabet::candidate_to_index(alphabet, lower_bound).unwrap();
-        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, ?, ?)")
             .bind(target_id)
             .bind(start_len)
             .bind(start_index)
+            .bind(alphabet_name)
+            .bind(alphabet)
             .execute(pool)
             .await
             .unwrap();
@@ -628,10 +717,11 @@ mod tests {
         .unwrap();
         let start_len = lower_bound.chars().count() as i64;
         let start_index = crate::alphabet::candidate_to_index(alphabet, lower_bound).unwrap();
-        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, 'custom', ?)")
             .bind(target_id)
             .bind(start_len)
             .bind(start_index)
+            .bind(alphabet)
             .execute(pool)
             .await
             .unwrap();
@@ -984,6 +1074,71 @@ mod tests {
         let (exp_lower, exp_upper) = range_bound_filenames(SIZE42, "PRE", ".SUF", 3, 0, space_size(SIZE42, 3));
         assert_eq!(claim.lower_bound_filename, exp_lower);
         assert_eq!(claim.upper_bound_filename, exp_upper);
+    }
+
+    /// The scenario admin_patch_target's alphabet change exists for: a target
+    /// already carved partway through a candidate length under one alphabet
+    /// gets patched to a smaller one, and the very next claim (not the patch
+    /// itself - see transition_alphabet_cursor's doc comment) must: leave
+    /// every already-carved range alone, record a `skipped` range under the
+    /// OLD alphabet for the portion of the current block that can no longer
+    /// be expressed, and hand out fresh work under the NEW alphabet starting
+    /// from the first candidate that actually is.
+    #[tokio::test]
+    async fn claim_range_transitions_the_cursor_lazily_after_an_alphabet_patch() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        // Bounds must stay expressible in whatever alphabet is active - since
+        // they're immutable, they have to work under both the old alphabet
+        // and the new (letters-only) one this test patches to.
+        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAAAAA", "ZZZZZZ").await;
+
+        // Simulate carving having already reached "ABC001" under the old alphabet.
+        let cursor_index = crate::alphabet::candidate_to_index(old_alphabet, "ABC001").unwrap();
+        sqlx::query("UPDATE target_progress SET candidate_len = 6, next_index = ? WHERE target_id = ?")
+            .bind(cursor_index)
+            .bind(target_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Simulate an admin PATCH: only the target's own alphabet flips - the
+        // cursor stays denominated in the old alphabet until claim_range
+        // itself reaches it (see target_progress.alphabet).
+        sqlx::query("UPDATE targets SET alphabet_name = 'letters_only', alphabet = ? WHERE id = ?")
+            .bind(new_alphabet)
+            .bind(target_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let config = test_config(1_000_000);
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available under the new alphabet");
+
+        assert_eq!(claim.alphabet, new_alphabet, "the freshly carved range must use the new alphabet");
+        assert_eq!(claim.lower_bound_filename, "PREABCAAA.SUF", "must resume at the first candidate expressible in the new alphabet");
+
+        let (skip_status, skip_start, skip_end, skip_alphabet): (String, i64, i64, String) =
+            sqlx::query_as("SELECT status, start_index, end_index, alphabet FROM ranges WHERE target_id = ? AND status = 'skipped'")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the old-alphabet remainder of the ABC block must be persisted as a skipped range");
+        assert_eq!(skip_status, "skipped");
+        assert_eq!(skip_start, cursor_index);
+        assert_eq!(skip_end, crate::alphabet::candidate_to_index(old_alphabet, "ABCZZZ").unwrap() + 1);
+        assert_eq!(skip_alphabet, old_alphabet, "the skip range is denominated in the OLD alphabet, not the target's current one");
+
+        let (progress_alphabet_name, progress_alphabet): (String, String) =
+            sqlx::query_as("SELECT alphabet_name, alphabet FROM target_progress WHERE target_id = ?")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(progress_alphabet_name, "letters_only", "the cursor itself must now be stamped with the new alphabet");
+        assert_eq!(progress_alphabet, new_alphabet);
     }
 
     /// A target's max_backslash_count must reach the client via ClaimResponse

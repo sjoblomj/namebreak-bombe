@@ -13,7 +13,7 @@ use crate::alphabet::{
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
-use crate::models::{parse_hash_hex, u32_to_i64, User};
+use crate::models::{parse_hash_hex, u32_to_i64, Target, User};
 use crate::ranges;
 use crate::state::{generate_token, now_unix, AppState};
 
@@ -214,15 +214,45 @@ pub async fn admin_create_target(
     // character, which is exactly the right constraint there too).
     let start_len = 1i64;
     let start_index = bound_indices_at_len(alphabet, lower_bound, upper_bound, start_len).0;
-    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, ?, ?)")
         .bind(target_id)
         .bind(start_len)
         .bind(start_index)
+        .bind(alphabet_name)
+        .bind(alphabet)
         .execute(&mut *tx)
         .await?;
 
     tx.commit().await?;
     Ok(Json(AdminCreateTargetResponse { target_id }))
+}
+
+/// Resolves an `alphabet_name` patch into the `(alphabet_name, alphabet)` pair
+/// to store, validating it the same way `admin_create_target` validates a
+/// brand-new target: the name must be one of `PREDEFINED_ALPHABETS`, and the
+/// target's own (immutable) bounds must still consist of characters in it.
+/// Already-carved ranges and the carving cursor are untouched here - the
+/// cursor is only translated onto the new alphabet lazily, the first time
+/// `ranges::claim_range` next carves fresh work for this target (see
+/// `alphabet::transition_alphabet_cursor`).
+async fn resolve_alphabet_patch(pool: &sqlx::SqlitePool, target_id: i64, alphabet_name: &str) -> Result<(String, String), AppError> {
+    let Some(alphabet) = lookup_predefined_alphabet(alphabet_name) else {
+        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _)| name).collect();
+        return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
+    };
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_optional(pool).await?.ok_or(AppError::NotFound)?;
+
+    let cap = max_supported_len(alphabet) as usize;
+    let lower_for_validation: String = target.lower_bound.chars().take(cap).collect();
+    let upper_for_validation: String = target.upper_bound.chars().take(cap).collect();
+    if candidate_to_index(alphabet, &lower_for_validation).is_none() {
+        return Err(AppError::BadRequest("target's lower_bound contains a character outside the new alphabet".into()));
+    }
+    if candidate_to_index(alphabet, &upper_for_validation).is_none() {
+        return Err(AppError::BadRequest("target's upper_bound contains a character outside the new alphabet".into()));
+    }
+
+    Ok((alphabet_name.to_string(), alphabet.to_string()))
 }
 
 pub async fn admin_patch_target(
@@ -236,18 +266,31 @@ pub async fn admin_patch_target(
             return Err(AppError::BadRequest("status must be 'active' or 'paused'".into()));
         }
     }
-    if req.status.is_none() && req.priority.is_none() && req.description.is_none() && req.skip_regex.is_none() {
-        return Err(AppError::BadRequest("at least one of status, priority, description or skip_regex must be provided".into()));
+    if req.status.is_none() && req.priority.is_none() && req.description.is_none() && req.skip_regex.is_none() && req.alphabet_name.is_none() {
+        return Err(AppError::BadRequest("at least one of status, priority, description, skip_regex or alphabet_name must be provided".into()));
     }
     validate_skip_regex(&req.skip_regex)?;
+
+    let (alphabet_name, alphabet) = match &req.alphabet_name {
+        Some(name) => {
+            let (name, chars) = resolve_alphabet_patch(&state.pool, target_id, name).await?;
+            (Some(name), Some(chars))
+        }
+        None => (None, None),
+    };
+
     let result = sqlx::query(
         "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority), \
-         description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex) WHERE id = ? AND status != 'solved'",
+         description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex), \
+         alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet) \
+         WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.status)
     .bind(req.priority)
     .bind(&req.description)
     .bind(&req.skip_regex)
+    .bind(&alphabet_name)
+    .bind(&alphabet)
     .bind(target_id)
     .execute(&state.pool)
     .await?;
