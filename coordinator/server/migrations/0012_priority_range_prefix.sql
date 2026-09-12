@@ -1,0 +1,15 @@
+-- Priority ranges need to remember their own literal prefix, not just the
+-- resolved start_index/end_index, so a later alphabet patch can translate
+-- them onto the new alphabet - see ranges::migrate_priority_ranges_to_new_alphabet,
+-- called from handlers::admin_patch_target. Every row created from here on
+-- always has one (see handlers::admin_create_priority_range).
+--
+-- Nullable, with no backfill for pre-existing rows: unlike alphabet_name/alphabet
+-- (0010_range_target_progress_alphabet.sql), which could be backfilled by a
+-- plain copy from the owning target, there's no way to recover a row's
+-- literal prefix from data already in the table without re-deriving it via
+-- full base-N candidate decoding, which isn't reasonably expressible in
+-- SQL. migrate_priority_ranges_to_new_alphabet simply leaves a prefix-less
+-- row's alphabet as it was (the original, narrower limitation this column
+-- exists to close) rather than guessing.
+ALTER TABLE priority_ranges ADD COLUMN prefix TEXT;

@@ -858,6 +858,87 @@ pub async fn retire_or_delete_priority_range(pool: &SqlitePool, priority_range_i
     }
 }
 
+/// Translates every one of `target_id`'s priority ranges still frozen under
+/// a stale alphabet onto `new_alphabet_name`/`new_alphabet` - called eagerly,
+/// as part of the same transaction `handlers::admin_patch_target` uses to
+/// apply an alphabet change. Unlike the target's own main cursor (see
+/// `transition_alphabet_cursor`, applied lazily the next time carving
+/// reaches it), this can't wait: `find_priority_boundary` re-checks every
+/// priority range on *every* claim, so leaving one stale would leave the
+/// main sweep unable to exclude it for as long as it stays untouched -
+/// possibly indefinitely, if a higher-priority range keeps winning the
+/// queue ahead of it. Doing all of them up front is cheap given how few of
+/// these exist per target in practice.
+///
+/// A priority range with no stored `prefix` (only possible for a row from
+/// before `migrations/0012_priority_range_prefix.sql`) is left exactly as
+/// it was - there's nothing to safely translate it with, so it keeps the
+/// same limitation this function otherwise closes.
+pub async fn migrate_priority_ranges_to_new_alphabet(
+    tx: &mut sqlx::SqliteConnection,
+    target_id: i64,
+    new_alphabet_name: &str,
+    new_alphabet: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    let stale = sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE target_id = ? AND alphabet_name != ?")
+        .bind(target_id)
+        .bind(new_alphabet_name)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    for pr in stale {
+        let Some(prefix) = pr.prefix.as_deref() else {
+            continue;
+        };
+
+        // Nothing under this prefix can ever be produced by the new
+        // alphabet's own walk - either the length itself no longer fits, or
+        // the prefix uses a character the new alphabet dropped - so there's
+        // no exclusion needed for it going forward either; just stop
+        // offering it as fresh work and leave its bounds as a historical
+        // record under the alphabet it actually holds candidates in.
+        let representable =
+            pr.candidate_len <= max_supported_len(new_alphabet) && prefix.chars().all(|c| candidate_to_index(new_alphabet, &c.to_string()).is_some());
+        if !representable {
+            sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id = ?").bind(pr.id).execute(&mut *tx).await?;
+            continue;
+        }
+
+        let (new_start, new_end_inclusive) = bound_indices_at_len(new_alphabet, prefix, prefix, pr.candidate_len);
+        let new_end = new_end_inclusive + 1;
+
+        let new_next_index = if pr.next_index >= pr.end_index {
+            // Already fully exhausted under the old alphabet - nothing to
+            // resume, just carry the "done" state over to the new bounds.
+            new_end
+        } else {
+            // Scoped to this priority range's own prefix (passed as both
+            // bounds) rather than the target's overall bounds, so the skip
+            // this can produce is clipped to this row's own block, not the
+            // whole target's space - see transition_alphabet_cursor's own
+            // doc comment for the general algorithm.
+            let transition = transition_alphabet_cursor(&pr.alphabet, new_alphabet, prefix, prefix, pr.candidate_len, pr.next_index);
+            if let Some((skip_start, skip_end)) = transition.skip {
+                insert_skip_range(&mut *tx, target_id, pr.candidate_len, skip_start, skip_end, &pr.alphabet_name, &pr.alphabet, Some(pr.id), now).await?;
+            }
+            transition.new_next_index
+        };
+
+        sqlx::query("UPDATE priority_ranges SET start_index = ?, end_index = ?, next_index = ?, alphabet_name = ?, alphabet = ? WHERE id = ?")
+            .bind(new_start)
+            .bind(new_end)
+            .bind(new_next_index)
+            .bind(new_alphabet_name)
+            .bind(new_alphabet)
+            .bind(pr.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,11 +1100,12 @@ mod tests {
         let end_index = end_index_inclusive + 1;
         let now = now_unix();
         sqlx::query_scalar(
-            "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO priority_ranges (target_id, priority, pattern, prefix, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(target_id)
         .bind(priority)
+        .bind(prefix)
         .bind(prefix)
         .bind(candidate_len)
         .bind(start_index)
@@ -1639,6 +1721,131 @@ mod tests {
         let remaining: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    /// The core scenario migrate_priority_ranges_to_new_alphabet exists for:
+    /// a priority range partway through its own carving, under an alphabet
+    /// the target has since moved away from, gets its bounds and cursor
+    /// translated onto the new alphabet - including recording a skip range
+    /// (under the OLD alphabet) for whatever part of its own block can no
+    /// longer be expressed, exactly mirroring transition_alphabet_cursor's
+    /// behavior for the target's own main cursor, just scoped to this one
+    /// priority range's own prefix instead of the whole target.
+    #[tokio::test]
+    async fn migrate_priority_ranges_to_new_alphabet_translates_a_still_open_range() {
+        let pool = test_pool().await;
+        let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAA000", "ZZZZZZ").await;
+        let priority_range_id = insert_priority_range(&pool, target_id, old_alphabet, "digits_and_letters", 10, "ABC", 6).await;
+
+        // Simulate this priority range having already carved partway through its own block.
+        let cursor_index = crate::alphabet::candidate_to_index(old_alphabet, "ABC001").unwrap();
+        sqlx::query("UPDATE priority_ranges SET next_index = ? WHERE id = ?").bind(cursor_index).bind(priority_range_id).execute(&pool).await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, "letters_only", new_alphabet, now_unix()).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let (start_index, end_index, next_index, alphabet_name, alphabet): (i64, i64, i64, String, String) =
+            sqlx::query_as("SELECT start_index, end_index, next_index, alphabet_name, alphabet FROM priority_ranges WHERE id = ?")
+                .bind(priority_range_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(alphabet_name, "letters_only");
+        assert_eq!(alphabet, new_alphabet);
+        let (exp_start, exp_end_inclusive) = crate::alphabet::bound_indices_at_len(new_alphabet, "ABC", "ABC", 6);
+        assert_eq!(start_index, exp_start, "bounds must be recomputed for the same prefix under the new alphabet");
+        assert_eq!(end_index, exp_end_inclusive + 1);
+        assert_eq!(next_index, crate::alphabet::candidate_to_index(new_alphabet, "ABCAAA").unwrap(), "resumes at the first candidate expressible in the new alphabet");
+
+        let (skip_status, skip_alphabet, skip_priority_range_id): (String, String, Option<i64>) =
+            sqlx::query_as("SELECT status, alphabet, priority_range_id FROM ranges WHERE target_id = ? AND status = 'skipped'")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the old-alphabet remainder of this priority range's own block must be persisted as a skipped range");
+        assert_eq!(skip_status, "skipped");
+        assert_eq!(skip_alphabet, old_alphabet, "the skip is denominated in the OLD alphabet, not the target's current one");
+        assert_eq!(skip_priority_range_id, Some(priority_range_id));
+    }
+
+    /// A priority range whose prefix uses a character the new alphabet
+    /// simply doesn't have at all can't be translated to anything - it must
+    /// be permanently retired (no more fresh work offered) rather than
+    /// panicking or silently producing nonsense bounds.
+    #[tokio::test]
+    async fn migrate_priority_ranges_to_new_alphabet_retires_a_prefix_the_new_alphabet_cant_express() {
+        let pool = test_pool().await;
+        let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // no digits at all
+        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "A0", "ZZ").await;
+        let priority_range_id = insert_priority_range(&pool, target_id, old_alphabet, "digits_and_letters", 10, "A0", 2).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, "letters_only", new_alphabet, now_unix()).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let (next_index, end_index, alphabet_name): (i64, i64, String) =
+            sqlx::query_as("SELECT next_index, end_index, alphabet_name FROM priority_ranges WHERE id = ?")
+                .bind(priority_range_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(next_index, end_index, "must be permanently retired, not translated");
+        assert_eq!(alphabet_name, "digits_and_letters", "left as a historical record under the alphabet it actually holds candidates in");
+    }
+
+    /// A priority range that was already fully exhausted before the patch
+    /// still needs its start/end translated (even though it has no cursor
+    /// left to resume) - otherwise the main sweep's exclusion would forget
+    /// about the space it already covered, once it looks under the new
+    /// alphabet's name.
+    #[tokio::test]
+    async fn migrate_priority_ranges_to_new_alphabet_translates_bounds_of_an_already_exhausted_range() {
+        let pool = test_pool().await;
+        let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAA", "ZZZ").await;
+        let priority_range_id = insert_priority_range(&pool, target_id, old_alphabet, "digits_and_letters", 10, "ABC", 3).await;
+        sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id = ?").bind(priority_range_id).execute(&pool).await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, "letters_only", new_alphabet, now_unix()).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let (start_index, end_index, next_index, alphabet_name): (i64, i64, i64, String) =
+            sqlx::query_as("SELECT start_index, end_index, next_index, alphabet_name FROM priority_ranges WHERE id = ?")
+                .bind(priority_range_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(alphabet_name, "letters_only");
+        let (exp_start, exp_end_inclusive) = crate::alphabet::bound_indices_at_len(new_alphabet, "ABC", "ABC", 3);
+        assert_eq!(start_index, exp_start);
+        assert_eq!(end_index, exp_end_inclusive + 1);
+        assert_eq!(next_index, end_index, "stays exhausted under the new bounds too");
+    }
+
+    /// A row with no stored prefix (only possible pre-migration) is left
+    /// entirely untouched rather than guessed at.
+    #[tokio::test]
+    async fn migrate_priority_ranges_to_new_alphabet_leaves_a_prefix_less_row_alone() {
+        let pool = test_pool().await;
+        let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "A", "Z").await;
+        let priority_range_id = insert_priority_range(&pool, target_id, old_alphabet, "digits_and_letters", 10, "A", 1).await;
+        sqlx::query("UPDATE priority_ranges SET prefix = NULL WHERE id = ?").bind(priority_range_id).execute(&pool).await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, "letters_only", new_alphabet, now_unix()).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let alphabet_name: String =
+            sqlx::query_scalar("SELECT alphabet_name FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(alphabet_name, "digits_and_letters", "left completely untouched with no prefix to translate it by");
     }
 
     /// A target's max_backslash_count must reach the client via ClaimResponse

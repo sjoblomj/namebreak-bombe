@@ -279,6 +279,8 @@ pub async fn admin_patch_target(
         None => (None, None),
     };
 
+    let mut tx = state.pool.begin().await?;
+
     let result = sqlx::query(
         "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority), \
          description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex), \
@@ -292,11 +294,21 @@ pub async fn admin_patch_target(
     .bind(&alphabet_name)
     .bind(&alphabet)
     .bind(target_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
+
+    // Priority ranges are translated eagerly, in the same transaction as
+    // the alphabet change itself - see
+    // ranges::migrate_priority_ranges_to_new_alphabet's doc comment for why
+    // this can't be deferred the way the target's own cursor transition is.
+    if let (Some(name), Some(chars)) = (&alphabet_name, &alphabet) {
+        ranges::migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, name, chars, now_unix()).await?;
+    }
+
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -417,12 +429,13 @@ pub async fn admin_create_priority_range(
         }
 
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO priority_ranges (target_id, priority, pattern, prefix, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(target_id)
         .bind(req.priority)
         .bind(&req.pattern)
+        .bind(prefix)
         .bind(req.length)
         .bind(start_index)
         .bind(end_index)

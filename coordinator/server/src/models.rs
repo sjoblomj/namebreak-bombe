@@ -100,6 +100,13 @@ pub struct PriorityRange {
     /// The operator-supplied pattern this row's prefix was expanded from -
     /// see `alphabet::expand_priority_pattern`. Display only.
     pub pattern: String,
+    /// The one concrete literal prefix (out of `pattern`'s possibly several
+    /// expansions) this specific row covers - `None` only for a row that
+    /// predates this column (see `migrations/0012_priority_range_prefix.sql`).
+    /// Needed to translate `start_index`/`end_index`/`next_index` onto a new
+    /// alphabet if the target's is ever patched - see
+    /// `ranges::migrate_priority_ranges_to_new_alphabet`.
+    pub prefix: Option<String>,
     /// A priority range is always scoped to exactly one candidate length -
     /// see `alphabet::expand_priority_pattern`'s doc comment for why.
     pub candidate_len: i64,
@@ -109,9 +116,11 @@ pub struct PriorityRange {
     /// reaches `end_index` the row is permanently exhausted - unlike
     /// `TargetProgress`, there's no next length to bump to.
     pub next_index: i64,
-    /// Frozen at creation - independent of the target's own alphabet, and
-    /// unaffected by a later `admin_patch_target` alphabet change. See the
-    /// migration that creates this table.
+    /// Frozen at creation, but not permanently: a later `admin_patch_target`
+    /// alphabet change translates `start_index`/`end_index`/`next_index`
+    /// onto the new alphabet (or permanently retires this row, if `prefix`
+    /// can no longer be expressed in it) - see
+    /// `ranges::migrate_priority_ranges_to_new_alphabet`.
     pub alphabet_name: String,
     pub alphabet: String,
     pub created_at: i64,
