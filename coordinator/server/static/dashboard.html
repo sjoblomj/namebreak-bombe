@@ -373,7 +373,7 @@
   function workerFragment(worker) {
     const frag = document.createDocumentFragment();
     if (!worker) {
-      frag.append('nobody yet');
+      frag.append('Nobody');
       return frag;
     }
     const atIndex = worker.indexOf('@');
@@ -435,7 +435,7 @@
     if (r.status === 'in_progress' && r.progress_candidate) {
       const note = document.createElement('span');
       note.className = 'progress-note mono';
-      note.textContent = 'progress: ' + r.progress_candidate +
+      note.textContent = 'Progress: ' + r.progress_candidate +
         (r.progress_percent != null ? ' (' + fmtPercent(r.progress_percent) + ')' : '');
       tdRange.appendChild(note);
     }
@@ -473,7 +473,7 @@
     grid.appendChild(detailField('Count', count, true));
     if (r.status === 'in_progress') {
       const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
-      grid.appendChild(detailField(progressLabel, r.progress_candidate || 'no heartbeat yet', true));
+      grid.appendChild(detailField(progressLabel, r.progress_candidate || 'not started', true));
       if (r.lease_expires_at) {
         const t = fmtTime(r.lease_expires_at);
         const expired = r.lease_expires_at * 1000 < Date.now();
