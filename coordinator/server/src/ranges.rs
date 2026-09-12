@@ -670,14 +670,25 @@ pub async fn complete_range(
             .await?;
     }
 
+    // Different targets can share the same hash_a/hash_b (e.g. the same
+    // underlying file cataloged under more than one naming convention) - a
+    // match against one of them is, by construction, a match against all of
+    // them, so every other still-active target with the same hash pair is
+    // solved right alongside this one, with the same found_filename/finder
+    // credited (it's the same real file either way). Each of those targets'
+    // own in-progress ranges get closed out lazily, the same way this one's
+    // sibling ranges already are - see heartbeat_range's `target_solved` check.
     let mut target_solved = false;
     if found {
         let result = sqlx::query(
             "UPDATE targets SET status = 'solved', found_filename = ?, found_by_user_id = ? \
-             WHERE id = ? AND status = 'active'",
+             WHERE status = 'active' \
+             AND hash_a = (SELECT hash_a FROM targets WHERE id = ?) \
+             AND hash_b = (SELECT hash_b FROM targets WHERE id = ?)",
         )
         .bind(&filename)
         .bind(user.id)
+        .bind(range.target_id)
         .bind(range.target_id)
         .execute(&mut *tx)
         .await?;
@@ -923,6 +934,37 @@ mod tests {
             .bind(start_index)
             .bind(alphabet_name)
             .bind(alphabet)
+            .execute(pool)
+            .await
+            .unwrap();
+        target_id
+    }
+
+    /// Like `insert_target`, but with explicit `hash_a`/`hash_b` instead of
+    /// the fixed `0, 0` every other fixture here uses - for tests about
+    /// multiple targets sharing (or not sharing) the same hash pair.
+    async fn insert_target_with_hash(pool: &SqlitePool, hash_a: i64, hash_b: i64, lower_bound: &str, upper_bound: &str) -> i64 {
+        let now = now_unix();
+        let target_id: i64 = sqlx::query_scalar(
+            "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, alphabet_name, alphabet, status, created_at) \
+             VALUES ('t', 'PRE', '.SUF', ?, ?, ?, ?, 0, 'size49', ?, 'active', ?) RETURNING id",
+        )
+        .bind(hash_a)
+        .bind(hash_b)
+        .bind(lower_bound)
+        .bind(upper_bound)
+        .bind(DEFAULT)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let start_len = lower_bound.chars().count() as i64;
+        let start_index = crate::alphabet::candidate_to_index(DEFAULT, lower_bound).unwrap();
+        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, 'size49', ?)")
+            .bind(target_id)
+            .bind(start_len)
+            .bind(start_index)
+            .bind(DEFAULT)
             .execute(pool)
             .await
             .unwrap();
@@ -1613,6 +1655,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "completed");
+    }
+
+    /// Different targets can share the same hash_a/hash_b (e.g. the same
+    /// underlying file cataloged under more than one naming convention) -
+    /// finding it via one must solve every other still-active target with
+    /// that same hash pair too, crediting the same finder and filename,
+    /// while a target with a *different* hash pair is left untouched.
+    #[tokio::test]
+    async fn complete_range_solves_every_target_sharing_the_same_hash_pair() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "finder").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+
+        let sibling_a = insert_target_with_hash(&pool, 42, 99, &lower, &upper).await;
+        let sibling_b = insert_target_with_hash(&pool, 42, 99, &lower, &upper).await;
+        let unrelated = insert_target_with_hash(&pool, 42, 100, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(claim.target_id, sibling_a, "the oldest active target should be claimed first");
+
+        let outcome = complete_range(&pool, &config, &user, claim.range_id, true, Some("PREXY.SUF".into()), 1.0, 1).await.unwrap();
+        assert!(outcome.target_solved);
+
+        for (target_id, should_be_solved) in [(sibling_a, true), (sibling_b, true), (unrelated, false)] {
+            let (status, found_filename, found_by_user_id): (String, Option<String>, Option<i64>) =
+                sqlx::query_as("SELECT status, found_filename, found_by_user_id FROM targets WHERE id = ?")
+                    .bind(target_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if should_be_solved {
+                assert_eq!(status, "solved");
+                assert_eq!(found_filename, Some("PREXY.SUF".to_string()));
+                assert_eq!(found_by_user_id, Some(user.id));
+            } else {
+                assert_eq!(status, "active", "a target with a different hash pair must be untouched");
+                assert!(found_filename.is_none());
+            }
+        }
     }
 
     #[tokio::test]
