@@ -95,6 +95,11 @@
     font-size: 16px;
     font-weight: 600;
   }
+  .target-hashes {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 4px;
+  }
   .target-bounds {
     color: var(--muted);
     font-size: 12px;
@@ -807,6 +812,11 @@
       head.appendChild(prio);
     }
     card.appendChild(head);
+
+    const hashes = document.createElement('div');
+    hashes.className = 'target-hashes mono';
+    hashes.textContent = `Hash A: ${t.hash_a_hex}  ·  Hash B: ${t.hash_b_hex}`;
+    card.appendChild(hashes);
 
     if (t.alphabet_name) {
       const alphaLine = document.createElement('div');

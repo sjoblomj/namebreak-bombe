@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::alphabet::index_to_candidate;
 use crate::error::AppError;
+use crate::models::i64_to_u32;
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -28,6 +29,9 @@ pub struct DashboardTarget {
     /// filename (e.g. a double extension) rather than a real one.
     pub lower_bound: String,
     pub upper_bound: String,
+    /// Shown just below the target's name - see `models::Target::hash_a`/`hash_b`.
+    pub hash_a_hex: String,
+    pub hash_b_hex: String,
     pub found_filename: Option<String>,
     pub found_by: Option<String>,
     /// Higher claims first - see ranges::claim_range. Defaults to 0.
@@ -125,9 +129,9 @@ fn display_name(username: Option<String>, hostname: Option<String>) -> Option<St
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
     #[allow(clippy::type_complexity)]
-    let target_rows: Vec<(i64, String, String, String, String, Option<String>, Option<String>, Option<String>, String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+    let target_rows: Vec<(i64, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT targets.id, targets.name, targets.status, \
-                targets.lower_bound, targets.upper_bound, targets.found_filename, \
+                targets.lower_bound, targets.upper_bound, targets.hash_a, targets.hash_b, targets.found_filename, \
                 found_user.username, found_user.hostname, targets.alphabet_name, targets.alphabet, targets.priority, \
                 targets.description, targets.skip_regex \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
@@ -137,7 +141,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     .await?;
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, lower_bound, upper_bound, found_filename, found_username, found_hostname, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
+    for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_username, found_hostname, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
         #[allow(clippy::type_complexity)]
         let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String, Option<i64>)> = sqlx::query_as(
             "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
@@ -225,6 +229,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             status,
             lower_bound,
             upper_bound,
+            hash_a_hex: format!("0x{:08X}", i64_to_u32(hash_a)),
+            hash_b_hex: format!("0x{:08X}", i64_to_u32(hash_b)),
             found_filename,
             found_by: display_name(found_username, found_hostname),
             priority,
