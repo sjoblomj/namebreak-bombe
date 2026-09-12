@@ -823,25 +823,33 @@ pub enum PriorityRangeRemoval {
     Retired,
 }
 
-/// Removes an admin's priority-range hint. If it's never been touched by
-/// carving (`next_index == start_index`), it's genuinely safe to delete
-/// outright - nothing anywhere refers to it yet. Otherwise it's *retired* in
-/// place instead: `next_index` is forced to `end_index` (so it never offers
-/// fresh work again) but the row itself is kept, because `claim_range`'s
-/// main-sweep exclusion (`find_priority_boundary`) is keyed off this row's
-/// mere existence, not whether it still has remaining work - deleting it
-/// outright would let the main sweep re-carve (and so duplicate) whatever
-/// this priority range already produced. Returns `None` if no such row exists.
+/// Removes an admin's priority-range hint. If it's never actually produced
+/// any `ranges` row, it's genuinely safe to delete outright - nothing
+/// anywhere refers to it yet. Otherwise it's *retired* in place instead:
+/// `next_index` is forced to `end_index` (so it never offers fresh work
+/// again) but the row itself is kept, because `claim_range`'s main-sweep
+/// exclusion (`find_priority_boundary`) is keyed off this row's mere
+/// existence, not whether it still has remaining work - deleting it outright
+/// would let the main sweep re-carve (and so duplicate) whatever this
+/// priority range already produced. Returns `None` if no such row exists.
+///
+/// Deliberately checks for an actual referencing `ranges` row rather than
+/// comparing `next_index` to `start_index`: a same-length priority range can
+/// have its `next_index` clamped ahead of `start_index` at creation time
+/// (see `handlers::admin_create_priority_range`) without anything having
+/// been carved from it yet, which the simpler index comparison would
+/// mistake for "already touched".
 pub async fn retire_or_delete_priority_range(pool: &SqlitePool, priority_range_id: i64) -> Result<Option<PriorityRangeRemoval>, AppError> {
-    let pr = sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE id = ?")
-        .bind(priority_range_id)
-        .fetch_optional(pool)
-        .await?;
-    let Some(pr) = pr else {
+    let exists: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_optional(pool).await?;
+    if exists.is_none() {
         return Ok(None);
-    };
+    }
 
-    if pr.next_index == pr.start_index {
+    let ever_carved: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM ranges WHERE priority_range_id = ? LIMIT 1").bind(priority_range_id).fetch_optional(pool).await?;
+
+    if ever_carved.is_none() {
         sqlx::query("DELETE FROM priority_ranges WHERE id = ?").bind(priority_range_id).execute(pool).await?;
         Ok(Some(PriorityRangeRemoval::Deleted))
     } else {
@@ -1593,6 +1601,44 @@ mod tests {
         assert_eq!(next_index, end_index, "retiring forces next_index to end_index so it never offers fresh work again");
 
         assert!(retire_or_delete_priority_range(&pool, 999_999).await.unwrap().is_none());
+    }
+
+    /// Regression test: a same-length priority range can have `next_index`
+    /// clamped ahead of `start_index` at creation time (see
+    /// `handlers::admin_create_priority_range`, when the main sweep's cursor
+    /// is already partway through that exact length) without the priority
+    /// mechanism ever actually carving anything from it. That must still be
+    /// treated as "untouched" and deleted outright, not retired - it was
+    /// deliberately checking for a referencing `ranges` row, not comparing
+    /// `next_index` to `start_index`, precisely so this case works.
+    #[tokio::test]
+    async fn retire_or_delete_priority_range_deletes_a_clamped_but_never_carved_range() {
+        let pool = test_pool().await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+
+        // Mimics admin_create_priority_range's same-length clamp: start_index
+        // is behind next_index, but nothing has been carved from this row.
+        let (start_index, end_index_inclusive) = crate::alphabet::bound_indices_at_len(letters, "A", "A", 1);
+        let clamped_next_index = start_index + 5;
+        let priority_range_id: i64 = sqlx::query_scalar(
+            "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
+             VALUES (?, 10, 'A', 1, ?, ?, ?, 'letters', ?, ?) RETURNING id",
+        )
+        .bind(target_id)
+        .bind(start_index)
+        .bind(end_index_inclusive + 1)
+        .bind(clamped_next_index)
+        .bind(letters)
+        .bind(now_unix())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(retire_or_delete_priority_range(&pool, priority_range_id).await.unwrap(), Some(PriorityRangeRemoval::Deleted)));
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(remaining, 0);
     }
 
     /// A target's max_backslash_count must reach the client via ClaimResponse

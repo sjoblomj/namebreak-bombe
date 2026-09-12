@@ -324,15 +324,23 @@ pub async fn admin_create_priority_range(
     Path(target_id): Path<i64>,
     Json(req): Json<AdminCreatePriorityRangeRequest>,
 ) -> Result<Json<AdminCreatePriorityRangeResponse>, AppError> {
-    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
-        .bind(target_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(AppError::NotFound)?;
-
     if req.length <= 0 {
         return Err(AppError::BadRequest("length must be positive".into()));
     }
+
+    // Everything from here on reads and writes inside one transaction - the
+    // clamp below depends on the target's cursor not moving out from under
+    // it, which a concurrent claim_range (its own separate transaction)
+    // would otherwise be free to do between a read and this function's own
+    // INSERT.
+    let mut tx = state.pool.begin().await?;
+
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
+        .bind(target_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
     let cap = max_supported_len(&target.alphabet);
     if req.length > cap {
         return Err(AppError::BadRequest(format!("length {} exceeds this target's alphabet's max supported length ({cap})", req.length)));
@@ -355,7 +363,7 @@ pub async fn admin_create_priority_range(
     // to fast-track.
     let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
         .bind(target_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await?;
     if req.length < progress.candidate_len {
         return Err(AppError::BadRequest(format!(
@@ -363,15 +371,24 @@ pub async fn admin_create_priority_range(
             req.length
         )));
     }
+    // The cursor's own next_index is only safe to compare against a
+    // freshly-computed start_index (both below) when it's denominated in
+    // the same alphabet the new priority range is being created under -
+    // otherwise (a patch happened but no claim has resolved the lazy
+    // transition yet - see alphabet::transition_alphabet_cursor) next_index
+    // is still an old-alphabet index, not comparable to a new-alphabet one.
+    // Skipping the clamp in that rare window just means the new range
+    // starts at its literal declared beginning, exactly as it already does
+    // whenever req.length is ahead of the cursor's length.
+    let clamp_to_cursor = req.length == progress.candidate_len && progress.alphabet_name == target.alphabet_name;
 
-    let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let mut priority_range_ids = Vec::with_capacity(prefixes.len());
 
     for prefix in &prefixes {
         let (start_index, end_index_inclusive) = bound_indices_at_len(&target.alphabet, prefix, prefix, req.length);
         let end_index = end_index_inclusive + 1;
-        let next_index = if req.length == progress.candidate_len { start_index.max(progress.next_index) } else { start_index };
+        let next_index = if clamp_to_cursor { start_index.max(progress.next_index) } else { start_index };
         if next_index >= end_index {
             return Err(AppError::BadRequest(format!(
                 "prefix '{prefix}' at length {} has already been fully searched by the main sweep - nothing left to prioritize",
@@ -381,12 +398,16 @@ pub async fn admin_create_priority_range(
 
         // Each priority range permanently owns its declared span (see
         // ranges::find_priority_boundary) - two overlapping ones at the same
-        // length would double-book the same addresses.
+        // length *and alphabet* would double-book the same addresses. One
+        // frozen under a different alphabet isn't index-comparable at all
+        // (same reasoning as find_priority_boundary), so it's excluded here
+        // rather than risking a wrong comparison.
         let overlap: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND start_index < ? AND end_index > ?",
+            "SELECT id FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ? AND start_index < ? AND end_index > ?",
         )
         .bind(target_id)
         .bind(req.length)
+        .bind(&target.alphabet_name)
         .bind(end_index)
         .bind(start_index)
         .fetch_optional(&mut *tx)
