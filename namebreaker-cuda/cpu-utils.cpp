@@ -14,7 +14,11 @@
 std::pair<uint32_t, uint32_t > mpqHashWithPrefixCache_CPU(const char* str, const uint32_t* cryptTable) {
     uint32_t seed1 = 0x7FED7FED;
     uint32_t seed2 = 0xEEEEEEEE;
-    char ch;
+    // unsigned so a byte >= 0x80 zero-extends into the crypt-table index/seed
+    // arithmetic below instead of sign-extending to a negative value - must
+    // match namebreak.cu's device-side hash functions exactly, or a match
+    // found on one side would never reproduce on the other.
+    unsigned char ch;
 
     while ((ch = *str++) != '\0') {
         seed1 = cryptTable[0x100 + ch] ^ (seed1 + seed2);
@@ -38,17 +42,18 @@ void prepareCryptTable(uint32_t* table) {
 }
 
 
-uint64_t stringToIndex(const std::string& str, std::string alphabet) {
+bool stringToIndex(const std::string& str, const std::string& alphabet, uint64_t& out, std::string& error) {
     uint64_t index = 0;
     for (char c : str) {
         size_t pos = alphabet.find(c);
         if (pos == std::string::npos) {
-            fprintf(stderr, "Invalid character in string: '%c'\n", c);
-            exit(1);
+            error = std::string("invalid character in string: '") + c + "'";
+            return false;
         }
         index = index * alphabet.size() + pos;
     }
-    return index;
+    out = index;
+    return true;
 }
 
 
@@ -67,7 +72,7 @@ std::string indexToString(uint64_t index, int len, const std::string& alphabet) 
 // character rather than via stringToIndex: converting a long string to a single index
 // overflows uint64_t well before MAX_CANDIDATE_LEN characters (e.g. 50^16), so this
 // avoids that entirely regardless of string length.
-bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::string& alphabet) {
+bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::string& alphabet, bool& outIsBefore, std::string& error) {
     size_t n = std::max(a.size(), b.size());
     for (size_t i = 0; i < n; ++i) {
         char ca = i < a.size() ? a[i] : alphabet[0];
@@ -76,24 +81,25 @@ bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::s
         size_t pa = alphabet.find(ca);
         size_t pb = alphabet.find(cb);
         if (pa == std::string::npos || pb == std::string::npos) {
-            fprintf(stderr, "Invalid character in string during comparison\n");
-            exit(1);
+            error = "invalid character in string during comparison";
+            return false;
         }
-        return pa < pb;
+        outIsBefore = pa < pb;
+        return true;
     }
-    return false; // equal
+    outIsBefore = false; // equal
+    return true;
 }
 
-std::string getStartCandidate(std::string path, std::string prefix, std::string suffix) {
-    std::string full = path;
-
+bool getStartCandidate(const std::string& path, const std::string& prefix, const std::string& suffix, std::string& out, std::string& error) {
     // Remove prefix and suffix
-    if (full.rfind(prefix, 0) != 0 || full.size() <= prefix.size() + suffix.size()) {
-        fprintf(stderr, "Invalid start filename format.\n");
-        exit(1);
+    if (path.rfind(prefix, 0) != 0 || path.size() <= prefix.size() + suffix.size()) {
+        error = "invalid start filename format";
+        return false;
     }
 
-    return full.substr(prefix.size(), full.size() - prefix.size() - suffix.size());
+    out = path.substr(prefix.size(), path.size() - prefix.size() - suffix.size());
+    return true;
 }
 
 std::string make_bound_string(std::string input, int candidateLen) {
@@ -124,16 +130,19 @@ std::string remove_prefix_and_suffix(std::string base, std::string prefix, std::
 // If every character in `input` is already the alphabet minimum, `input` itself is already
 // the absolute minimum candidate and has no predecessor - saturate to that minimum instead
 // of erroring, since callers use this as a starting point for the search.
-std::string getLowerBound(const std::string& input, std::string alphabet) {
-    if (input.empty()) return std::string(MAX_CANDIDATE_LEN, alphabet.front());
+bool getLowerBound(const std::string& input, const std::string& alphabet, std::string& out, std::string& error) {
+    if (input.empty()) {
+        out = std::string(MAX_CANDIDATE_LEN, alphabet.front());
+        return true;
+    }
 
     std::string result = input;
     int i = (int) result.size() - 1;
     for (; i >= 0; --i) {
         auto pos = alphabet.find(result[i]);
         if (pos == std::string::npos) {
-            fprintf(stderr, "Invalid character in string: '%c'\n", result[i]);
-            exit(1);
+            error = std::string("invalid character in string: '") + result[i] + "'";
+            return false;
         }
         if (pos == 0) {
             result[i] = alphabet.back(); // borrow: this digit wraps to max, keep borrowing left
@@ -143,28 +152,33 @@ std::string getLowerBound(const std::string& input, std::string alphabet) {
         break;
     }
     if (i < 0) {
-        return std::string(MAX_CANDIDATE_LEN, alphabet.front());
+        out = std::string(MAX_CANDIDATE_LEN, alphabet.front());
+        return true;
     }
 
     // Positions beyond input's length are implicitly the min character, which the borrow
     // above already maxes out - so pad the rest with the max character too.
     result.resize(MAX_CANDIDATE_LEN, alphabet.back());
-    return result;
+    out = result;
+    return true;
 }
 
 // Symmetric to getLowerBound: computes the successor of `input` (max-extended to
 // MAX_CANDIDATE_LEN), cascading a carry through the string, saturating to the absolute
 // maximum candidate if `input` is already all max characters.
-std::string getUpperBound(const std::string& input, std::string alphabet) {
-    if (input.empty()) return std::string(MAX_CANDIDATE_LEN, alphabet.front());
+bool getUpperBound(const std::string& input, const std::string& alphabet, std::string& out, std::string& error) {
+    if (input.empty()) {
+        out = std::string(MAX_CANDIDATE_LEN, alphabet.front());
+        return true;
+    }
 
     std::string result = input;
     int i = (int) result.size() - 1;
     for (; i >= 0; --i) {
         auto pos = alphabet.find(result[i]);
         if (pos == std::string::npos) {
-            fprintf(stderr, "Invalid character in string: '%c'\n", result[i]);
-            exit(1);
+            error = std::string("invalid character in string: '") + result[i] + "'";
+            return false;
         }
         if (pos + 1 >= alphabet.size()) {
             result[i] = alphabet.front(); // carry: this digit wraps to min, keep carrying left
@@ -174,13 +188,15 @@ std::string getUpperBound(const std::string& input, std::string alphabet) {
         break;
     }
     if (i < 0) {
-        return std::string(MAX_CANDIDATE_LEN, alphabet.back());
+        out = std::string(MAX_CANDIDATE_LEN, alphabet.back());
+        return true;
     }
 
     // Positions beyond input's length are implicitly the max character, which the carry
     // above already wraps to min - so pad the rest with the min character too.
     result.resize(MAX_CANDIDATE_LEN, alphabet.front());
-    return result;
+    out = result;
+    return true;
 }
 
 bool hexToU32(const std::string& s, uint32_t& out) {

@@ -70,13 +70,17 @@ __device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candida
     uint32_t seed1 = d_seed1_start;
     uint32_t seed2 = d_seed2_start;
 
+    // unsigned so a byte >= 0x80 zero-extends into the crypt-table index/seed
+    // arithmetic instead of sign-extending to a negative value - must match
+    // cpu-utils.cpp's host-side hash exactly, or a match found on one side
+    // would never reproduce on the other.
     for (int i = 0; i < candidateLen; ++i) {
-        char ch = candidate[i];
+        unsigned char ch = candidate[i];
         seed1 = d_cryptTable[0x100 + ch] ^ (seed1 + seed2);
         seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
     }
     for (int i = 0; i < d_suffix_size; ++i) {
-        char ch = d_suffix[i];
+        unsigned char ch = d_suffix[i];
         seed1 = d_cryptTable[0x100 + ch] ^ (seed1 + seed2);
         seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
     }
@@ -87,7 +91,8 @@ __device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candida
 __device__ uint32_t mpqHashSeed2(const char* str) {
     uint32_t seed1 = 0x7FED7FED;
     uint32_t seed2 = 0xEEEEEEEE;
-    char ch;
+    // unsigned - see mpqHashCandidateAndSuffix above.
+    unsigned char ch;
 
     while ((ch = *str++) != '\0') {
         seed1 = d_cryptTable[0x200 + ch] ^ (seed1 + seed2);
@@ -303,7 +308,12 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     // Compare lower/upper using the same alphabet ordering the rest of the search
     // relies on, rather than raw string comparison (which would break if the
     // alphabet's character order ever stopped matching ASCII order).
-    if (!isBeforeInAlphabet(req.lowerBound, req.upperBound, req.alphabet)) {
+    bool lowerIsBeforeUpper = false;
+    if (!isBeforeInAlphabet(req.lowerBound, req.upperBound, req.alphabet, lowerIsBeforeUpper, result.error)) {
+        result.ok = false;
+        return result;
+    }
+    if (!lowerIsBeforeUpper) {
         result.ok = false;
         result.error = "lower bound ('" + req.lowerBound + "') must be smaller than upper bound ('" + req.upperBound + "')";
         return result;
@@ -356,8 +366,12 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     int zero = 0;
     CUDA_CHECK(cudaMemcpyToSymbol(d_foundMatchFlag, &zero, sizeof(zero)));
 
-    std::string lowerBoundLimit = getLowerBound(req.lowerBound, req.alphabet);
-    std::string upperBoundLimit = getUpperBound(req.upperBound, req.alphabet);
+    std::string lowerBoundLimit, upperBoundLimit;
+    if (!getLowerBound(req.lowerBound, req.alphabet, lowerBoundLimit, result.error) ||
+        !getUpperBound(req.upperBound, req.alphabet, upperBoundLimit, result.error)) {
+        result.ok = false;
+        return result;
+    }
 
     printf("alphabet: '%s' (size %d)\n", req.alphabet.c_str(), alphabetSize);
     printf("candidate: '%s'\n", req.startCandidate.c_str());
@@ -428,9 +442,14 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         std::string start_leading = start_full.substr(0, leadingLen);
         std::string end_leading   = end_full.substr(0, leadingLen);
 
-        uint64_t startLeadingIdx = stringToIndex(start_leading, req.alphabet);
-        uint64_t endLeadingIdx   = stringToIndex(end_leading, req.alphabet);
-        uint64_t trailSpaceSize  = stringToIndex(std::string(trailingLen, req.alphabet.back()), req.alphabet) + 1;
+        uint64_t startLeadingIdx = 0, endLeadingIdx = 0, trailSpaceSize = 0;
+        if (!stringToIndex(start_leading, req.alphabet, startLeadingIdx, result.error) ||
+            !stringToIndex(end_leading, req.alphabet, endLeadingIdx, result.error) ||
+            !stringToIndex(std::string(trailingLen, req.alphabet.back()), req.alphabet, trailSpaceSize, result.error)) {
+            result.ok = false;
+            goto breakfree;
+        }
+        trailSpaceSize += 1;
 
         // Cap progress logging to roughly 1000 lines per candidateLen, regardless of how
         // large the leading space is - printing once per leading combination is fine
@@ -453,8 +472,21 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             CUDA_CHECK(cudaMemcpyToSymbol(d_seed1_start, &seed1_start, sizeof(seed1_start)));
             CUDA_CHECK(cudaMemcpyToSymbol(d_seed2_start, &seed2_start, sizeof(seed2_start)));
 
-            uint64_t trailStart = (leadingIdx == startLeadingIdx) ? stringToIndex(start_full.substr(leadingLen), req.alphabet) : 0;
-            uint64_t trailEnd   = (leadingIdx ==   endLeadingIdx) ? stringToIndex(  end_full.substr(leadingLen), req.alphabet) : trailSpaceSize;
+            uint64_t trailStart = 0, trailEnd = 0;
+            if (leadingIdx == startLeadingIdx) {
+                if (!stringToIndex(start_full.substr(leadingLen), req.alphabet, trailStart, result.error)) {
+                    result.ok = false;
+                    goto breakfree;
+                }
+            }
+            if (leadingIdx == endLeadingIdx) {
+                if (!stringToIndex(end_full.substr(leadingLen), req.alphabet, trailEnd, result.error)) {
+                    result.ok = false;
+                    goto breakfree;
+                }
+            } else {
+                trailEnd = trailSpaceSize;
+            }
 
             if ((leadingIdx - startLeadingIdx) % leadingLogInterval == 0) {
                 printf("Leading '%s'. Char length = %d → Trailing combinations: %llu\n",

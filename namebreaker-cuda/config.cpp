@@ -153,7 +153,9 @@ bool buildSearchRequest(const std::map<std::string, std::string>& section, bool 
 
     out.prefix = prefix;
     out.suffix = suffix;
-    out.startCandidate = getStartCandidate(startFilename, prefix, suffix);
+    if (!getStartCandidate(startFilename, prefix, suffix, out.startCandidate, error)) {
+        return false;
+    }
     out.lowerBound = remove_prefix_and_suffix(lowerFilename, prefix, suffix);
     out.upperBound = remove_prefix_and_suffix(upperFilename, prefix, suffix);
     out.continuous = continuous;
