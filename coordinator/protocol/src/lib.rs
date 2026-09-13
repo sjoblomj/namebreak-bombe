@@ -1,5 +1,5 @@
-//! Wire types shared between the coordinator server and the client, so the two
-//! can't silently drift out of sync on the JSON shape.
+//! Wire types used by the coordinator server - an identical shape needs to be
+//! implemented by the client.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,15 +28,11 @@ pub struct ClaimResponse {
     pub hash_a_hex: String,
     pub hash_b_hex: String,
     pub prune_symbol_runs: bool,
-    /// Max '\' occurrences namebreak will allow in a candidate before discarding
-    /// it unhashed; 0 means unlimited. Passed straight through as `namebreak`'s
-    /// `<maxBackslashCount>` CLI argument.
+    /// Max '\' occurrences namebreak will allow in a candidate; 0 means unlimited.
     pub max_backslash_count: i64,
     pub lower_bound_filename: String,
     pub upper_bound_filename: String,
-    /// The literal alphabet characters for this range's target - passed straight
-    /// through as `namebreak`'s `<alphabet>` CLI argument. The client never needs
-    /// to know this by name; only the server resolves profile names.
+    /// The literal alphabet characters for this range's target.
     pub alphabet: String,
     /// Number of candidates covered by this range - lets the client report
     /// throughput on completion without doing any index math itself.
@@ -62,9 +58,9 @@ pub struct HeartbeatResponse {
     /// True if this range's target has already been solved - by someone
     /// else via a different range, or because a *different target* sharing
     /// the same hash_a/hash_b was solved instead (see `ranges::complete_range`).
-    /// The client should kill its running `namebreak` subprocess rather than
-    /// let it keep searching a target that's already found - it won't be
-    /// reporting completion for this range either way.
+    /// The client should move on to a new range rather than let it keep
+    /// searching a target that's already found - it won't be reporting
+    /// completion for this range either way.
     pub target_solved: bool,
 }
 
@@ -107,8 +103,7 @@ pub struct AdminCreateTargetRequest {
     pub upper_bound: String,
     #[serde(default)]
     pub prune_symbol_runs: bool,
-    /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`
-    /// (the original default alphabet) when omitted, for backward compatibility.
+    /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`.
     #[serde(default)]
     pub alphabet_name: Option<String>,
     /// Max '\' occurrences allowed in a candidate; 0 (the default when omitted)
