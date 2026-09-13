@@ -62,15 +62,15 @@ struct CompleteRequest {
     int64_t candidatesProcessed = 0;
 };
 
-std::string toJson(const RegisterRequest& req);
+std::string toJson(const RegisterRequest&  req);
 std::string toJson(const HeartbeatRequest& req);
-std::string toJson(const CompleteRequest& req);
+std::string toJson(const CompleteRequest&  req);
 
 // Each returns false (contents of `out` unspecified) if `body` isn't valid
 // JSON or is missing a required field - callers should treat that as a
 // malformed/unexpected server response.
-bool parseRegisterResponse(const std::string& body, RegisterResponse& out);
-bool parseClaimResponse(const std::string& body, ClaimResponse& out);
+bool parseRegisterResponse (const std::string& body, RegisterResponse&  out);
+bool parseClaimResponse    (const std::string& body, ClaimResponse&     out);
 bool parseHeartbeatResponse(const std::string& body, HeartbeatResponse& out);
 
 // Best-effort extraction of {"error": "..."} from a server error body (see

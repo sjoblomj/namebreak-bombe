@@ -8,10 +8,10 @@
 #include "http_client.h"
 #include "protocol.h"
 
-// Talks to the coordinator server's HTTP API - mirrors
-// coordinator/client/src/api.rs. Not thread-safe: each thread that needs to
-// make requests (the coordinator loop and its heartbeat thread both do)
-// should use its own instance, sharing the token via `setToken`/`token`.
+// Talks to the coordinator server's HTTP API
+// Not thread-safe: each thread that needs to make requests (the
+// coordinator loop and its heartbeat thread both do) should use its
+// own instance, sharing the token via `setToken`/`token`.
 class CoordinatorClient {
 public:
     explicit CoordinatorClient(std::string baseUrl) : baseUrl_(std::move(baseUrl)) {}

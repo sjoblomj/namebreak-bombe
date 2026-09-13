@@ -77,7 +77,9 @@ public:
     // likely typo), or "" if every key was recognized.
     std::string firstUnknownKey() const {
         for (const auto& kv : section_) {
-            if (!used_.count(kv.first)) return kv.first;
+            if (!used_.count(kv.first)) {
+                return kv.first;
+            }
         }
         return "";
     }

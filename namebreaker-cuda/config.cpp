@@ -10,20 +10,23 @@ namespace {
 
 std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "";
+    if (start == std::string::npos)
+        return "";
     size_t end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
 }
 
 std::string unquote(const std::string& s) {
-    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') return s.substr(1, s.size() - 2);
+    if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
+        return s.substr(1, s.size() - 2);
     return s;
 }
 
 bool parseBool(const std::string& s, bool& out) {
     std::string lower = s;
-    for (char& c : lower) c = (char) std::tolower((unsigned char) c);
-    if (lower == "true" || lower == "1") { out = true; return true; }
+    for (char& c : lower)
+        c = (char) std::tolower((unsigned char) c);
+    if (lower == "true"  || lower == "1") { out = true;  return true; }
     if (lower == "false" || lower == "0") { out = false; return true; }
     return false;
 }
@@ -48,7 +51,9 @@ std::string sanitizeForConfigLine(const std::string& s) {
     std::string result;
     result.reserve(s.size());
     for (char c : s) {
-        if (c != '\n' && c != '\r') result += c;
+        if (c != '\n' && c != '\r') {
+            result += c;
+        }
     }
     return result;
 }
@@ -68,7 +73,8 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
     while (std::getline(in, line)) {
         lineNo++;
         std::string trimmed = trim(line);
-        if (trimmed.empty() || trimmed[0] == '#') continue;
+        if (trimmed.empty() || trimmed[0] == '#')
+            continue;
 
         if (trimmed.front() == '[') {
             if (trimmed.back() != ']') {
@@ -76,9 +82,11 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 return false;
             }
             std::string name = trimmed.substr(1, trimmed.size() - 2);
-            if (name == "search") currentSection = &out.search;
-            else if (name == "coordinator") currentSection = &out.coordinator;
-            else {
+            if (name == "search") {
+                currentSection = &out.search;
+            } else if (name == "coordinator") {
+                currentSection = &out.coordinator;
+            } else {
                 error = path + ":" + std::to_string(lineNo) + ": unknown section [" + name + "] (expected [search] or [coordinator])";
                 return false;
             }
@@ -164,10 +172,12 @@ bool buildSearchRequest(const std::map<std::string, std::string>& section, bool 
 
 bool appendKeyToConfigSection(const std::string& path, const std::string& sectionName, const std::string& key, const std::string& value) {
     std::ifstream in(path);
-    if (!in) return false;
+    if (!in)
+        return false;
     std::vector<std::string> lines;
     std::string line;
-    while (std::getline(in, line)) lines.push_back(line);
+    while (std::getline(in, line))
+        lines.push_back(line);
     in.close();
 
     int sectionLine = -1;
@@ -177,12 +187,15 @@ bool appendKeyToConfigSection(const std::string& path, const std::string& sectio
             break;
         }
     }
-    if (sectionLine < 0) return false;
+    if (sectionLine < 0)
+        return false;
 
     lines.insert(lines.begin() + sectionLine + 1, key + " = " + quoteIfNeeded(sanitizeForConfigLine(value)));
 
     std::ofstream out(path, std::ios::trunc);
-    if (!out) return false;
-    for (const auto& l : lines) out << l << "\n";
+    if (!out)
+        return false;
+    for (const auto& l : lines)
+        out << l << "\n";
     return true;
 }

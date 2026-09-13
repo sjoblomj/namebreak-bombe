@@ -1,7 +1,3 @@
-//
-// Created by sjoblomj on 2025-06-17.
-//
-
 #ifndef NAMEBREAK_CUDA_CPU_UTILS_H
 #define NAMEBREAK_CUDA_CPU_UTILS_H
 

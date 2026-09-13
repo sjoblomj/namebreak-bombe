@@ -20,7 +20,8 @@ std::string resolveHostname() {
     char buf[256];
 #ifdef _WIN32
     DWORD size = sizeof(buf);
-    if (GetComputerNameA(buf, &size) && buf[0] != '\0') return std::string(buf);
+    if (GetComputerNameA(buf, &size) && buf[0] != '\0')
+        return std::string(buf);
 #else
     if (gethostname(buf, sizeof(buf)) == 0) {
         buf[sizeof(buf) - 1] = '\0';
@@ -38,14 +39,16 @@ std::string resolveUsername() {
 #ifdef _WIN32
     char buf[256];
     DWORD size = sizeof(buf);
-    if (GetUserNameA(buf, &size) && buf[0] != '\0') return std::string(buf);
+    if (GetUserNameA(buf, &size) && buf[0] != '\0')
+        return std::string(buf);
 #else
     if (struct passwd* pw = getpwuid(geteuid())) {
-        if (pw->pw_name && pw->pw_name[0] != '\0') return pw->pw_name;
+        if (pw->pw_name && pw->pw_name[0] != '\0')
+            return pw->pw_name;
     }
 #endif
-    if (const char* env = std::getenv("USER"); env && env[0] != '\0') return env;
-    if (const char* env = std::getenv("LOGNAME"); env && env[0] != '\0') return env;
+    if (const char* env = std::getenv("USER");     env && env[0] != '\0') return env;
+    if (const char* env = std::getenv("LOGNAME");  env && env[0] != '\0') return env;
     if (const char* env = std::getenv("USERNAME"); env && env[0] != '\0') return env; // Windows' equivalent of $USER
     return "unknown-user";
 }

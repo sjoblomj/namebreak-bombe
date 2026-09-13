@@ -26,7 +26,7 @@ namespace {
 // Fixed rather than derived from a range's lease, so progress checkpoints
 // (and the liveness signal the server's reclaim sweep relies on) land at a
 // steady, predictable cadence regardless of how big a range is or how fast a
-// client is - matches the old Rust client's HEARTBEAT_INTERVAL.
+// client is.
 constexpr int kHeartbeatIntervalSeconds = 60;
 
 // Ceiling for the exponential backoff below, so a prolonged outage doesn't
@@ -39,13 +39,14 @@ constexpr std::chrono::seconds kMaxClaimBackoff{600};
 // runCoordinator, including early failure, rather than leaving the init
 // unmatched.
 struct CurlGlobalGuard {
-    CurlGlobalGuard() { curl_global_init(CURL_GLOBAL_DEFAULT); }
+    CurlGlobalGuard()  { curl_global_init(CURL_GLOBAL_DEFAULT); }
     ~CurlGlobalGuard() { curl_global_cleanup(); }
 };
 
 std::string trimLine(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "";
+    if (start == std::string::npos)
+        return "";
     size_t end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
 }
@@ -80,7 +81,8 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
     }
 
     printf("No %s configured in %s. Detected:\n", missing.size() == 2 ? "username/hostname" : missing[0].key.c_str(), kConfigPath);
-    for (const Field& f : missing) printf("  %s = %s\n", f.key.c_str(), f.value->c_str());
+    for (const Field& f : missing)
+        printf("  %s = %s\n", f.key.c_str(), f.value->c_str());
     printf("Use %s? [Y/n]: ", missing.size() == 2 ? "these" : "this");
     fflush(stdout);
 
@@ -96,7 +98,8 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
             std::string entered;
             std::getline(std::cin, entered);
             entered = trimLine(entered);
-            if (!entered.empty()) *f.value = entered;
+            if (!entered.empty())
+                *f.value = entered;
         }
         if (appendKeyToConfigSection(kConfigPath, "coordinator", f.key, *f.value)) {
             printf("[coordinator] saved %s = %s to %s\n", f.key.c_str(), f.value->c_str(), kConfigPath);
@@ -126,8 +129,7 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
 }
 
 // Runs exactly one claimed range: spawns the heartbeat thread, runs the
-// search in-process on the calling thread, then reports completion. Mirrors
-// coordinator/client/src/main.rs's run_one.
+// search in-process on the calling thread, then reports completion.
 void runOneRange(const std::string& serverUrl, const std::string& token, const ClaimResponse& claim) {
     printf("[coordinator] starting range %lld (target %s) [%s .. %s]\n",
            (long long) claim.rangeId, claim.targetName.c_str(), claim.lowerBoundFilename.c_str(), claim.upperBoundFilename.c_str());
@@ -157,7 +159,8 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
             std::optional<std::string> latest;
             {
                 std::lock_guard<std::mutex> mlock(lastMatchMutex);
-                if (haveLastHashAMatch) latest = lastHashAMatch;
+                if (haveLastHashAMatch)
+                    latest = lastHashAMatch;
             }
             lock.unlock();
             HeartbeatResponse resp;
@@ -212,7 +215,8 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     completeClient.setToken(token);
     CompleteRequest completeReq;
     completeReq.found = result.found;
-    if (result.found) completeReq.filename = result.filename;
+    if (result.found)
+        completeReq.filename = result.filename;
     completeReq.elapsedSeconds = elapsedSeconds;
     completeReq.candidatesProcessed = claim.candidateCount;
 
@@ -228,8 +232,7 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
             if (result.found) {
                 fprintf(stderr,
                         "[coordinator] range %lld: found a match but lost ownership of this range before reporting it - "
-                        "the match is still recorded locally in matches.txt, but the server was never told about it; "
-                        "check matches.txt manually\n",
+                        "It has been reported now\n",
                         (long long) claim.rangeId);
             } else {
                 printf("[coordinator] range %lld: lost ownership of this range before reporting completion - "
@@ -247,7 +250,8 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
 
 bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, CoordinatorArgs& out, std::string& error) {
     ConfigSectionReader r(section);
-    if (!r.getRequired("server_url", out.serverUrl, error)) return false;
+    if (!r.getRequired("server_url", out.serverUrl, error))
+        return false;
     // Left "" if absent - resolveMissingIdentity (called from runCoordinator)
     // auto-detects and interactively confirms/persists a value for either.
     out.username = r.getOptional("username", "");

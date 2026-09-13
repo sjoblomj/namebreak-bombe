@@ -19,11 +19,11 @@ std::string escapeJsonString(const std::string& s) {
     out += '"';
     for (unsigned char c : s) {
         switch (c) {
-            case '"': out += "\\\""; break;
+            case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
             default:
                 if (c < 0x20) {
                     char buf[8];
@@ -114,14 +114,14 @@ private:
                 if (i_ >= s_.size()) return false;
                 char esc = s_[i_++];
                 switch (esc) {
-                    case '"': out += '"'; break;
+                    case '"':  out += '"';  break;
                     case '\\': out += '\\'; break;
-                    case '/': out += '/'; break;
-                    case 'n': out += '\n'; break;
-                    case 'r': out += '\r'; break;
-                    case 't': out += '\t'; break;
-                    case 'b': out += '\b'; break;
-                    case 'f': out += '\f'; break;
+                    case '/':  out += '/';  break;
+                    case 'n':  out += '\n'; break;
+                    case 'r':  out += '\r'; break;
+                    case 't':  out += '\t'; break;
+                    case 'b':  out += '\b'; break;
+                    case 'f':  out += '\f'; break;
                     case 'u': {
                         // Only handles the BMP (\uXXXX -> UTF-8), which is all
                         // any of this protocol's actual field values need
@@ -158,9 +158,9 @@ private:
             out.kind = JsonValue::Kind::String;
             return parseString(out.text);
         }
-        if (consumeLiteral("true")) { out.kind = JsonValue::Kind::True; return true; }
+        if (consumeLiteral("true"))  { out.kind = JsonValue::Kind::True;  return true; }
         if (consumeLiteral("false")) { out.kind = JsonValue::Kind::False; return true; }
-        if (consumeLiteral("null")) { out.kind = JsonValue::Kind::Null; return true; }
+        if (consumeLiteral("null"))  { out.kind = JsonValue::Kind::Null;  return true; }
         if (c == '-' || std::isdigit((unsigned char) c)) {
             size_t start = i_;
             if (c == '-') i_++;
@@ -229,20 +229,20 @@ bool parseRegisterResponse(const std::string& body, RegisterResponse& out) {
 bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
     std::map<std::string, JsonValue> obj;
     if (!JsonParser(body).parseFlatObject(obj)) return false;
-    return getInt64(obj, "range_id", out.rangeId) &&
-           getInt64(obj, "target_id", out.targetId) &&
+    return getInt64( obj, "range_id", out.rangeId) &&
+           getInt64( obj, "target_id", out.targetId) &&
            getString(obj, "target_name", out.targetName) &&
            getString(obj, "prefix", out.prefix) &&
            getString(obj, "suffix", out.suffix) &&
            getString(obj, "hash_a_hex", out.hashAHex) &&
            getString(obj, "hash_b_hex", out.hashBHex) &&
-           getBool(obj, "prune_symbol_runs", out.pruneSymbolRuns) &&
-           getInt64(obj, "max_backslash_count", out.maxBackslashCount) &&
+           getBool(  obj, "prune_symbol_runs", out.pruneSymbolRuns) &&
+           getInt64( obj, "max_backslash_count", out.maxBackslashCount) &&
            getString(obj, "lower_bound_filename", out.lowerBoundFilename) &&
            getString(obj, "upper_bound_filename", out.upperBoundFilename) &&
            getString(obj, "alphabet", out.alphabet) &&
-           getInt64(obj, "candidate_count", out.candidateCount) &&
-           getInt64(obj, "lease_seconds", out.leaseSeconds);
+           getInt64( obj, "candidate_count", out.candidateCount) &&
+           getInt64( obj, "lease_seconds", out.leaseSeconds);
 }
 
 bool parseHeartbeatResponse(const std::string& body, HeartbeatResponse& out) {

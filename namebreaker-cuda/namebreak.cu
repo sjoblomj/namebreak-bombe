@@ -36,7 +36,7 @@ bool isSupportedAlphabetSize(int size) {
 
 // Sized to the largest alphabet this build supports (see MAX_ALPHABET_SIZE);
 // populated at runtime via cudaMemcpyToSymbol from the CLI's <alphabet> argument,
-// the same pattern already used for d_prefix/d_suffix below.
+// the same pattern used for d_prefix/d_suffix below.
 __device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
 
 __device__ volatile int d_foundMatchFlag = 0;
@@ -50,8 +50,8 @@ __device__ __constant__ short d_prefix_size;
 __device__ __constant__ short d_suffix_size;
 __device__ __constant__ uint32_t d_seed1_start;
 __device__ __constant__ uint32_t d_seed2_start;
-// Max '\' occurrences allowed in a candidate before it's discarded unhashed; 0
-// means unlimited (no candidate is ever discarded on this basis - use an
+// Max '\' occurrences allowed in a candidate before it's discarded unhashed;
+// 0 means unlimited (no candidate is ever discarded on this basis - use an
 // alphabet without '\' in it if none should ever appear at all). A plain
 // runtime constant rather than a template parameter like AlphabetSize: this is
 // just an integer compare, not a division, so there's no compile-time-constant
@@ -176,7 +176,8 @@ __global__ void bruteForceKernel(
     int* d_matchCount
 ) {
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
+    if (idx >= total)
+        return;
 
     idx += startIdx;
 
@@ -184,10 +185,12 @@ __global__ void bruteForceKernel(
     indexToCandidate<AlphabetSize>(idx, candidateLen, candidate);
 
     if constexpr (PruneSymbolRuns) {
-        if (hasForbiddenSymbolRun(candidate, candidateLen)) return;
+        if (hasForbiddenSymbolRun(candidate, candidateLen))
+            return;
     }
 
-    if (d_maxBackslashCount != 0 && countBackslashes(candidate, candidateLen) > d_maxBackslashCount) return;
+    if (d_maxBackslashCount != 0 && countBackslashes(candidate, candidateLen) > d_maxBackslashCount)
+        return;
 
     uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen);
     if (hashA == targetA) {
@@ -216,7 +219,8 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
                   char* d_matches, int* d_matchCount, bool pruneSymbolRuns, int alphabetSize,
                   const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
                   char* outFoundFilename) {
-    if (abortRequested && abortRequested->load(std::memory_order_relaxed)) return -1;
+    if (abortRequested && abortRequested->load(std::memory_order_relaxed))
+        return -1;
 
     int h_flag = 0;
     CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
@@ -267,7 +271,8 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     for (int i = 0; i < h_matchCount; ++i) {
         fprintf(fout, "%s\n", h_matches[i]);
         fflush(fout);
-        if (onPartialMatch) onPartialMatch(h_matches[i]);
+        if (onPartialMatch)
+            onPartialMatch(h_matches[i]);
     }
 
     // Re-read rather than reusing the pre-launch value above: this batch's
@@ -440,11 +445,11 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         std::string end_full   = make_bound_string(upperBoundLimit, candidateLen);
 
         std::string start_leading = start_full.substr(0, leadingLen);
-        std::string end_leading   = end_full.substr(0, leadingLen);
+        std::string end_leading   =   end_full.substr(0, leadingLen);
 
         uint64_t startLeadingIdx = 0, endLeadingIdx = 0, trailSpaceSize = 0;
         if (!stringToIndex(start_leading, req.alphabet, startLeadingIdx, result.error) ||
-            !stringToIndex(end_leading, req.alphabet, endLeadingIdx, result.error) ||
+            !stringToIndex(  end_leading, req.alphabet,   endLeadingIdx, result.error) ||
             !stringToIndex(std::string(trailingLen, req.alphabet.back()), req.alphabet, trailSpaceSize, result.error)) {
             result.ok = false;
             goto breakfree;
@@ -531,8 +536,7 @@ breakfree:
 
 int main(int argc, char* argv[]) {
     // The only argument namebreak takes: an optional mode, overriding
-    // config.conf's own `mode = ...` (see config.h). Everything else - which
-    // used to be nine positional/flag arguments differing per mode - now
+    // config.conf's own `mode = ...` (see config.h). Everything else
     // lives in config.conf.
     std::string modeOverride = (argc >= 2) ? argv[1] : "";
     if (argc > 2 || (argc == 2 && modeOverride != "continuous" && modeOverride != "bounded" && modeOverride != "coordinator")) {

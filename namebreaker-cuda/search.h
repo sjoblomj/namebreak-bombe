@@ -42,14 +42,11 @@ struct SearchResult {
 
 // Runs an exhaustive (bounded) or open-ended (continuous) search over
 // `req`'s candidate space, appending every Hash-A-only match to matches.txt
-// in the current working directory (same file/behavior as before this was
-// extracted out of main()). `abortRequested`, if given, is polled between
-// batches so a caller can interrupt a long-running search (e.g. once a
-// coordinator learns the target was solved elsewhere); `onPartialMatch`, if
-// given, is invoked with the full filename of every Hash-A-only match as
-// soon as it's known - the same checkpoint signal the old subprocess-based
-// client used to get by scanning stdout for "Hash A matches: ", now
-// delivered directly since the search runs in-process.
+// in the current working directory. `abortRequested`, if given, is polled
+// between batches so a caller can interrupt a long-running search (e.g. once
+// a coordinator learns the target was solved elsewhere); `onPartialMatch`,
+// if given, is invoked with the full filename of every Hash-A-only match as
+// soon as it's known.
 //
 // Safe to call more than once in the same process (e.g. once per claimed
 // coordinator range): all device state this depends on is reset at the

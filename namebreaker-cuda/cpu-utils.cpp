@@ -77,7 +77,8 @@ bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::s
     for (size_t i = 0; i < n; ++i) {
         char ca = i < a.size() ? a[i] : alphabet[0];
         char cb = i < b.size() ? b[i] : alphabet[0];
-        if (ca == cb) continue;
+        if (ca == cb)
+            continue;
         size_t pa = alphabet.find(ca);
         size_t pb = alphabet.find(cb);
         if (pa == std::string::npos || pb == std::string::npos) {
@@ -203,7 +204,8 @@ bool hexToU32(const std::string& s, uint32_t& out) {
     try {
         size_t consumed = 0;
         unsigned long value = std::stoul(s, &consumed, 16);
-        if (consumed != s.size()) return false; // trailing garbage
+        if (consumed != s.size())
+            return false; // trailing garbage
         out = (uint32_t) value;
         return true;
     } catch (const std::exception&) {
