@@ -1,5 +1,6 @@
 #include "coordinator_runner.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -7,6 +8,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,6 +28,20 @@ namespace {
 // steady, predictable cadence regardless of how big a range is or how fast a
 // client is - matches the old Rust client's HEARTBEAT_INTERVAL.
 constexpr int kHeartbeatIntervalSeconds = 60;
+
+// Ceiling for the exponential backoff below, so a prolonged outage doesn't
+// leave a client waiting arbitrarily long once the server comes back.
+constexpr std::chrono::seconds kMaxClaimBackoff{600};
+
+// Only libcurl needs pairing at process scope - calling curl_global_init()
+// once up front (before the heartbeat thread starts making concurrent
+// requests) and curl_global_cleanup() on every path back out of
+// runCoordinator, including early failure, rather than leaving the init
+// unmatched.
+struct CurlGlobalGuard {
+    CurlGlobalGuard() { curl_global_init(CURL_GLOBAL_DEFAULT); }
+    ~CurlGlobalGuard() { curl_global_cleanup(); }
+};
 
 std::string trimLine(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
@@ -258,8 +274,9 @@ int runCoordinator(CoordinatorArgs args) {
 
     // Not thread-safe to call lazily once the heartbeat thread may already
     // be making requests concurrently with the main thread - do it once,
-    // up front, before any thread touches libcurl.
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    // up front, before any thread touches libcurl. Paired with
+    // curl_global_cleanup() via this guard's destructor on every return path.
+    CurlGlobalGuard curlGuard;
 
     CoordinatorClient client(args.serverUrl);
     int64_t userId = 0;
@@ -271,13 +288,28 @@ int runCoordinator(CoordinatorArgs args) {
     printf("[coordinator] registered with coordinator as user %lld (%s@%s)\n", (long long) userId, args.username.c_str(), args.hostname.c_str());
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
+    auto claimBackoff = pollInterval;
+    std::mt19937 rng(std::random_device{}());
+
     while (true) {
         std::optional<ClaimResponse> claim;
         if (!client.claim(claim, error)) {
-            fprintf(stderr, "[coordinator] claim failed, retrying after backoff: %s\n", error.c_str());
-            std::this_thread::sleep_for(pollInterval);
+            // Exponential backoff, capped at kMaxClaimBackoff, so a real
+            // outage doesn't get hammered at the normal poll rate. Jittered
+            // (sleep a random fraction of the current backoff rather than
+            // its full length) so a fleet of clients that all started
+            // failing at once - e.g. the coordinator itself going down -
+            // doesn't retry in lockstep once it recovers.
+            std::uniform_int_distribution<long long> jitter(0, claimBackoff.count());
+            auto sleepFor = std::chrono::seconds(jitter(rng));
+            fprintf(stderr, "[coordinator] claim failed, retrying in %llds (backoff cap %llds): %s\n",
+                    (long long) sleepFor.count(), (long long) claimBackoff.count(), error.c_str());
+            std::this_thread::sleep_for(sleepFor);
+            claimBackoff = std::min(claimBackoff * 2, kMaxClaimBackoff);
             continue;
         }
+        claimBackoff = pollInterval; // reset once the server is reachable again
+
         if (!claim) {
             printf("[coordinator] no work available, sleeping\n");
             std::this_thread::sleep_for(pollInterval);

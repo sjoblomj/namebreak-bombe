@@ -37,6 +37,22 @@ std::string quoteIfNeeded(const std::string& s) {
     return s;
 }
 
+// config.conf is strictly one key=value per line, with no escaping for a
+// literal newline - an embedded '\n' or '\r' in a value (e.g. an unusual
+// auto-detected username/hostname pulled from an env var) would otherwise
+// split into what looks like a second, unparseable line the next time the
+// file is loaded. Quoting alone doesn't guard against this (it only
+// preserves whitespace at the ends), so strip these out before a value is
+// ever written back to the file.
+std::string sanitizeForConfigLine(const std::string& s) {
+    std::string result;
+    result.reserve(s.size());
+    for (char c : s) {
+        if (c != '\n' && c != '\r') result += c;
+    }
+    return result;
+}
+
 } // namespace
 
 bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error) {
@@ -161,7 +177,7 @@ bool appendKeyToConfigSection(const std::string& path, const std::string& sectio
     }
     if (sectionLine < 0) return false;
 
-    lines.insert(lines.begin() + sectionLine + 1, key + " = " + quoteIfNeeded(value));
+    lines.insert(lines.begin() + sectionLine + 1, key + " = " + quoteIfNeeded(sanitizeForConfigLine(value)));
 
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;

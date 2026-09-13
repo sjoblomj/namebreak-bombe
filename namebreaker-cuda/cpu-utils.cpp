@@ -156,7 +156,7 @@ std::string getLowerBound(const std::string& input, std::string alphabet) {
 // MAX_CANDIDATE_LEN), cascading a carry through the string, saturating to the absolute
 // maximum candidate if `input` is already all max characters.
 std::string getUpperBound(const std::string& input, std::string alphabet) {
-    if (input.empty()) return std::string(MAX_CANDIDATE_LEN, ' ');
+    if (input.empty()) return std::string(MAX_CANDIDATE_LEN, alphabet.front());
 
     std::string result = input;
     int i = (int) result.size() - 1;
@@ -179,7 +179,7 @@ std::string getUpperBound(const std::string& input, std::string alphabet) {
 
     // Positions beyond input's length are implicitly the max character, which the carry
     // above already wraps to min - so pad the rest with the min character too.
-    result.resize(MAX_CANDIDATE_LEN, ' ');
+    result.resize(MAX_CANDIDATE_LEN, alphabet.front());
     return result;
 }
 
