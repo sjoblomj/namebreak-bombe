@@ -10,6 +10,7 @@
 #include "constants.h"
 #include "search.h"
 #include "config.h"
+#include "hash_kernels.cuh"
 #ifdef NAMEBREAK_WITH_NETWORK
 #include "coordinator_runner.h"
 #endif
@@ -34,130 +35,11 @@ bool isSupportedAlphabetSize(int size) {
 // * Candidate = The part of the name that we are brute-forcing
 // * Filename  = The Prefix + Candidate + Suffix
 
-// Sized to the largest alphabet this build supports (see MAX_ALPHABET_SIZE);
-// populated at runtime via cudaMemcpyToSymbol from the CLI's <alphabet> argument,
-// the same pattern used for d_prefix/d_suffix below.
-__device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
-
 __device__ volatile int d_foundMatchFlag = 0;
 // Written by the kernel alongside d_foundMatchFlag, so the host can recover
 // *which* candidate matched both hashes without scanning stdout for it - see
-// buildCompleteFilename below for how it's populated.
+// buildCompleteFilename (hash_kernels.cuh) for how it's populated.
 __device__ char d_foundFilename[MAX_FILENAME_LEN];
-__device__ __constant__ char d_prefix[64];
-__device__ __constant__ char d_suffix[64];
-__device__ __constant__ short d_prefix_size;
-__device__ __constant__ short d_suffix_size;
-__device__ __constant__ uint32_t d_seed1_start;
-__device__ __constant__ uint32_t d_seed2_start;
-// Max '\' occurrences allowed in a candidate before it's discarded unhashed;
-// 0 means unlimited (no candidate is ever discarded on this basis - use an
-// alphabet without '\' in it if none should ever appear at all). A plain
-// runtime constant rather than a template parameter like AlphabetSize: this is
-// just an integer compare, not a division, so there's no compile-time-constant
-// codegen benefit to chase here.
-__device__ __constant__ int d_maxBackslashCount;
-
-__device__ __constant__ uint32_t d_cryptTable[0x500];
-
-// Hashes `candidate` followed by d_suffix directly, without ever concatenating them
-// into a scratch buffer first. Starts from d_seed1_start/d_seed2_start, which already
-// account for the (extended) prefix's contribution - see mpqHashWithPrefixCache_CPU.
-// This is the hot path (every thread runs it), so avoiding the extra buffer write+read
-// that buildFilenameWithoutPrefix + a buffer-based hash would need is worth it; the
-// full filename is only built (via buildCompleteFilename) on the rare hashA match below.
-__device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen) {
-    uint32_t seed1 = d_seed1_start;
-    uint32_t seed2 = d_seed2_start;
-
-    // unsigned so a byte >= 0x80 zero-extends into the crypt-table index/seed
-    // arithmetic instead of sign-extending to a negative value - must match
-    // cpu-utils.cpp's host-side hash exactly, or a match found on one side
-    // would never reproduce on the other.
-    for (int i = 0; i < candidateLen; ++i) {
-        unsigned char ch = candidate[i];
-        seed1 = d_cryptTable[0x100 + ch] ^ (seed1 + seed2);
-        seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
-    }
-    for (int i = 0; i < d_suffix_size; ++i) {
-        unsigned char ch = d_suffix[i];
-        seed1 = d_cryptTable[0x100 + ch] ^ (seed1 + seed2);
-        seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
-    }
-
-    return seed1;
-}
-
-__device__ uint32_t mpqHashSeed2(const char* str) {
-    uint32_t seed1 = 0x7FED7FED;
-    uint32_t seed2 = 0xEEEEEEEE;
-    // unsigned - see mpqHashCandidateAndSuffix above.
-    unsigned char ch;
-
-    while ((ch = *str++) != '\0') {
-        seed1 = d_cryptTable[0x200 + ch] ^ (seed1 + seed2);
-        seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
-    }
-
-    return seed1;
-}
-
-// AlphabetSize is a compile-time template parameter (mirroring PruneSymbolRuns
-// below) so this modulus/division - run once per candidate character, for every
-// thread - stays a cheap compiler-optimized constant instead of a real (much
-// slower) GPU integer division. See runCudaBatch for the fixed set of sizes this
-// gets instantiated for and the runtime dispatch between them.
-template<int AlphabetSize>
-__device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCandidate) {
-    for (int i = candidateLen - 1; i >= 0; --i) {
-        outCandidate[i] = d_alphabet[index % AlphabetSize];
-        index /= AlphabetSize;
-    }
-}
-
-__device__ __forceinline__ bool isAlnumMpq(char c) {
-    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
-}
-
-// Real MPQ filename components essentially never contain three consecutive
-// non-alphanumeric, non-space characters (e.g. "']&_") - used to prune obviously-
-// implausible candidates before spending a hash chain on them. Spaces are exempted
-// since " - " and " & " are common real word separators (e.g. "Arathi - Lake",
-// "Gold Separates East & West") that would otherwise be wrongly pruned. Only
-// inspects the candidate itself, not where it joins the (fixed, user-supplied)
-// prefix/suffix.
-__device__ __forceinline__ bool hasForbiddenSymbolRun(const char* candidate, int candidateLen) {
-    int run = 0;
-    for (int i = 0; i < candidateLen; ++i) {
-        if (isAlnumMpq(candidate[i]) || candidate[i] == ' ') {
-            run = 0;
-        } else if (++run >= 3) {
-            return true;
-        }
-    }
-    return false;
-}
-
-__device__ __forceinline__ int countBackslashes(const char* candidate, int candidateLen) {
-    int count = 0;
-    for (int i = 0; i < candidateLen; ++i) {
-        if (candidate[i] == '\\') count++;
-    }
-    return count;
-}
-
-__device__ void buildCompleteFilename(const char* candidate, int candidateLen, char* out) {
-    memcpy(out, d_prefix, d_prefix_size);
-    short i = d_prefix_size;
-
-    memcpy(out + i, candidate, candidateLen);
-    i += candidateLen;
-
-    memcpy(out + i, d_suffix, d_suffix_size);
-    i += d_suffix_size;
-
-    out[i] = '\0';
-}
 
 // PruneSymbolRuns is a compile-time template parameter rather than a runtime bool:
 // the two instantiations are separate compiled kernels, so the disabled variant
@@ -231,6 +113,11 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     }
     CUDA_CHECK(cudaMemset(d_matchCount, 0, sizeof(int)));
 
+    // This launches `blocks * threadsPerBlock` GPU threads for the chunk (up to
+    // ~5.76M for a full batch - see batchSize in runSearch), one candidate per
+    // thread. Every 32 consecutive threads form a "warp" that the hardware runs
+    // in lockstep (SIMT) - that grouping is automatic (256 threads/block = 8
+    // warps/block here), not something chosen at this call site.
     int threadsPerBlock = 256;
     int blocks = (count + threadsPerBlock - 1) / threadsPerBlock;
 
@@ -421,6 +308,24 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     // batches. 49^4, matching this project's original default alphabet size.
     const uint64_t batchSize = 5'764'801;
 
+    // The search space is walked by four nested levels, outermost to innermost:
+    //  1. This `while` loop: over candidateLen itself - "try every 1-character
+    //     candidate, then every 2-character one, ..." Only continuous mode
+    //     (req.continuous) actually loops here more than once; bounded mode
+    //     runs the body for req.startCandidate's own length and exits via the
+    //     `if (!req.continuous)` check at the bottom.
+    //  2. The `for (leadingIdx ...)` loop below: over the *leading* part of the
+    //     candidate (see windowSize/leadingLen above) - every leading value is
+    //     hashed once on the CPU and uploaded as the GPU's starting seed, so
+    //     candidates longer than windowSize still get covered exhaustively.
+    //     Runs exactly once whenever leadingLen is 0 (candidateLen <=
+    //     windowSize, the common case).
+    //  3. The `for (i = trailStart ...)` loop: chops the (up to
+    //     alphabetSize^trailingLen) remaining space for one leading value into
+    //     batchSize-sized chunks, since that's too large for one kernel launch -
+    //     each iteration is one runCudaBatch call, i.e. one kernel launch.
+    //  4. Inside runCudaBatch: one GPU thread per candidate in the chunk (up to
+    //     ~5.76M threads for a full batchSize chunk) - see its own comment.
     while (true) {
         if (candidateLen > MAX_CANDIDATE_LEN) {
             fprintf(stderr, "candidateLen (%d) exceeds MAX_CANDIDATE_LEN (%d) - exiting\n", candidateLen, MAX_CANDIDATE_LEN);
@@ -463,6 +368,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         uint64_t leadingCount = endLeadingIdx - startLeadingIdx + 1;
         uint64_t leadingLogInterval = std::max<uint64_t>(1, leadingCount / 1000);
 
+        // Level 2 (see the walkthrough above the outer `while`).
         for (uint64_t leadingIdx = startLeadingIdx; leadingIdx <= endLeadingIdx; ++leadingIdx) {
             std::string leading = indexToString(leadingIdx, leadingLen, req.alphabet);
             std::string extendedPrefix = req.prefix + leading;
@@ -498,6 +404,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
                        leading.c_str(), candidateLen, (unsigned long long)(trailEnd - trailStart));
             }
 
+            // Level 3 (see the walkthrough above the outer `while`).
             for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
                 uint64_t count = std::min(batchSize, trailEnd - i);
                 int r = runCudaBatch(trailingLen, i, count, req.targetHashA, req.targetHashB, fout, d_matches, d_matchCount,

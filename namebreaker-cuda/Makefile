@@ -9,7 +9,7 @@ ARCH    := sm_86
 
 TARGET  := namebreak
 SOURCES := namebreak.cu cpu-utils.cpp config.cpp
-HEADERS := cpu-utils.h constants.h search.h config.h
+HEADERS := cpu-utils.h constants.h search.h config.h hash_kernels.cuh
 
 # Set to 0 to build without the coordinator client (no libcurl dependency,
 # `coordinator` mode unavailable at runtime): make NETWORK=0
