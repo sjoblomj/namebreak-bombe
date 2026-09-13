@@ -8,6 +8,29 @@
 
 std::pair<uint32_t, uint32_t > mpqHashWithPrefixCache_CPU(const char* str, const uint32_t* cryptTable);
 
+// CPU-side pruning, applied only to the *leading* characters of a candidate
+// (runSearch's leadingIdx loop, namebreak.cu) - the GPU-brute-forced trailing
+// characters are never checked at all. See that loop's doc comment for why:
+// in short, these are cheap heuristics for skipping implausible candidates,
+// not correctness rules, and checking them on the GPU stopped paying for
+// itself once gpuWindowChars made the trailing window small (measured: no
+// throughput benefit, sometimes a small net loss, from SIMT lockstep - a
+// `return` only saves time if it takes a whole 32-lane warp with it, and a
+// short window rarely gets that lucky). Checking the leading characters on
+// the CPU instead is different: skipping an entire leading value here skips
+// its whole trailing batch (up to batchSize candidates) before ever asking
+// the GPU to do anything, with no SIMT caveat, since this is one thread
+// deciding whether to launch a kernel at all - not GPU lanes deciding
+// whether to keep computing mid-kernel.
+//
+// Mirrors hash_kernels.cuh's isAlnumMpq/hasForbiddenSymbolRun/countBackslashes
+// exactly (same algorithm, plain CPU code - no header a .cpp and a .cu can
+// both pull __device__ code from without dragging CUDA into every CPU-only
+// translation unit, so this is a deliberate, small duplication rather than a
+// shared header).
+bool hasForbiddenSymbolRun_CPU(const std::string& s);
+int countBackslashes_CPU(const std::string& s);
+
 // Incrementally hashes a fixed base state (typically the hash of a fixed
 // filename prefix) extended by a variable-length "leading" string of
 // `leadingLen` alphabet characters, walked in the same odometer order as

@@ -93,6 +93,30 @@ void IncrementalPrefixHasher::advance() {
     }
 }
 
+static bool isAlnumMpq_CPU(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
+}
+
+bool hasForbiddenSymbolRun_CPU(const std::string& s) {
+    int run = 0;
+    for (char c : s) {
+        if (isAlnumMpq_CPU(c) || c == ' ') {
+            run = 0;
+        } else if (++run >= 3) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int countBackslashes_CPU(const std::string& s) {
+    int count = 0;
+    for (char c : s) {
+        if (c == '\\') count++;
+    }
+    return count;
+}
+
 void prepareCryptTable(uint32_t* table) {
     uint32_t seed = 0x00100001;
     for (int index1 = 0; index1 < 0x100; ++index1) {

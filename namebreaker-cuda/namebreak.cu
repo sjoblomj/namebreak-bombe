@@ -41,13 +41,16 @@ __device__ volatile int d_foundMatchFlag = 0;
 // buildCompleteFilename (hash_kernels.cuh) for how it's populated.
 __device__ char d_foundFilename[MAX_FILENAME_LEN];
 
-// PruneSymbolRuns is a compile-time template parameter rather than a runtime bool:
-// the two instantiations are separate compiled kernels, so the disabled variant
-// contains no trace of the check (not even a dead branch) and costs zero cycles
-// on this hot path. Which one runs is decided once per batch on the host, in
-// runCudaBatch, so the flag is still a normal runtime toggle from the caller's
-// point of view. AlphabetSize is the same trick applied to indexToCandidate below.
-template<int AlphabetSize, bool PruneSymbolRuns>
+// No pruneSymbolRuns/maxBackslashCount check here - those are applied only to
+// the leading characters, on the CPU, before this kernel is ever launched
+// (see the leadingIdx loop in runSearch) - not to the trailing characters
+// this kernel brute-forces. See cpu-utils.h's doc comment on
+// hasForbiddenSymbolRun_CPU for why: measured directly, checking them here
+// too bought no speedup (SIMT lockstep means a `return` only saves time if a
+// whole 32-lane warp takes it together, which a small trailing window rarely
+// arranges), so there was nothing to trade the extra branch and device-side
+// code for.
+template<int AlphabetSize>
 __global__ void bruteForceKernel(
     int candidateLen,
     uint64_t startIdx,
@@ -65,14 +68,6 @@ __global__ void bruteForceKernel(
 
     char candidate[MAX_CANDIDATE_LEN];
     indexToCandidate<AlphabetSize>(idx, candidateLen, candidate);
-
-    if constexpr (PruneSymbolRuns) {
-        if (hasForbiddenSymbolRun(candidate, candidateLen))
-            return;
-    }
-
-    if (d_maxBackslashCount != 0 && countBackslashes(candidate, candidateLen) > d_maxBackslashCount)
-        return;
 
     uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen);
     if (hashA == targetA) {
@@ -98,7 +93,7 @@ __global__ void bruteForceKernel(
 // Returns 0 (no match yet), 1 (found - both hashes matched, outFoundFilename
 // is filled), or -1 (abortRequested was set, this batch was skipped).
 int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout,
-                  char* d_matches, int* d_matchCount, bool pruneSymbolRuns, int alphabetSize,
+                  char* d_matches, int* d_matchCount, int alphabetSize,
                   const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
                   char* outFoundFilename) {
     if (abortRequested && abortRequested->load(std::memory_order_relaxed))
@@ -126,13 +121,8 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     // the whole set this build supports. Add a case (and recompile/redistribute
     // namebreak to volunteers) to support a new size.
     #define LAUNCH_WITH_ALPHABET_SIZE(SIZE) \
-        if (pruneSymbolRuns) { \
-            bruteForceKernel<SIZE, true><<<blocks, threadsPerBlock>>>( \
-                    candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount); \
-        } else { \
-            bruteForceKernel<SIZE, false><<<blocks, threadsPerBlock>>>( \
-                    candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount); \
-        }
+        bruteForceKernel<SIZE><<<blocks, threadsPerBlock>>>( \
+                candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount)
     switch (alphabetSize) {
         case 42: LAUNCH_WITH_ALPHABET_SIZE(42); break;
         case 43: LAUNCH_WITH_ALPHABET_SIZE(43); break;
@@ -190,7 +180,8 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         result.error = "Unsupported alphabet size: " + std::to_string(alphabetSize) + " (this build only supports: 42, 43, 47, 48, 49, 50)";
         return result;
     }
-    // 0 means unlimited (see d_maxBackslashCount's declaration comment).
+    // 0 means unlimited (see hasForbiddenSymbolRun_CPU/countBackslashes_CPU's
+    // declaration comment in cpu-utils.h for how and where this is applied).
     if (req.maxBackslashCount < 0) {
         result.ok = false;
         result.error = "maxBackslashCount must be >= 0 (0 means unlimited), got " + std::to_string(req.maxBackslashCount);
@@ -278,8 +269,6 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffix_size, sizeof(suffix_size)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, req.suffix.c_str(), suffix_size + 1));
     CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, req.alphabet.c_str(), req.alphabet.size() + 1));
-    int maxBackslashCount = req.maxBackslashCount;
-    CUDA_CHECK(cudaMemcpyToSymbol(d_maxBackslashCount, &maxBackslashCount, sizeof(maxBackslashCount)));
 
     // A long-lived process (coordinator mode) can call runSearch() many times
     // over its lifetime, one per claimed range - reset explicitly rather than
@@ -305,8 +294,10 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     printf("upperBoundLimit: '%s'\n", upperBoundLimit.c_str());
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
-    printf("pruneSymbolRuns: %s\n", req.pruneSymbolRuns ? "true" : "false");
-    printf("maxBackslashCount: %d%s\n", req.maxBackslashCount, req.maxBackslashCount == 0 ? " (unlimited)" : "");
+    printf("pruneSymbolRuns: %s (leading characters only - see the leadingIdx loop below)\n",
+           req.pruneSymbolRuns ? "true" : "false");
+    printf("maxBackslashCount: %d%s (leading characters only)\n", req.maxBackslashCount,
+           req.maxBackslashCount == 0 ? " (unlimited)" : "");
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
@@ -426,6 +417,21 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
                 leadingHasher.advance();
             }
             const std::string& leading = leadingHasher.leading();
+
+            // req.pruneSymbolRuns/req.maxBackslashCount only ever examine
+            // `leading` - the CPU-computed first leadingLen characters of the
+            // candidate - never the GPU-brute-forced trailing gpuWindowChars
+            // characters (see hasForbiddenSymbolRun_CPU's doc comment in
+            // cpu-utils.h for why, and bruteForceKernel's for the GPU side of
+            // that same story). A prune here skips this leading value's
+            // entire trailing batch (up to batchSize candidates) without
+            // spending anything on the GPU, uploads included - cheaper than
+            // even one of those candidates would have cost individually.
+            if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
+                continue;
+            if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
+                continue;
+
             std::string extendedPrefix = req.prefix + leading;
 
             short extPrefixSize = extendedPrefix.size();
@@ -463,7 +469,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
                 uint64_t count = std::min(batchSize, trailEnd - i);
                 int r = runCudaBatch(trailingLen, i, count, req.targetHashA, req.targetHashB, fout, d_matches, d_matchCount,
-                                      req.pruneSymbolRuns, alphabetSize, abortRequested, onPartialMatch, foundFilename);
+                                      alphabetSize, abortRequested, onPartialMatch, foundFilename);
                 if (r == -1) {
                     aborted = true;
                     goto breakfree;

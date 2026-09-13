@@ -6,9 +6,10 @@
 #include "constants.h"
 
 // Device-side hashing/candidate-decoding building blocks shared between
-// namebreak.cu's real search kernel and tests/warp_hash_test.cu's correctness
-// harness - kept in one header so the code under test is always exactly the
-// code that ships, never a copy that could drift out of sync.
+// namebreak.cu's real search kernel and this project's GPU-backed tests
+// (tests/search_bench.cu, tests/search_integration_test.cu, ...) - kept in
+// one header so the code under test is always exactly the code that ships,
+// never a copy that could drift out of sync.
 
 __device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
 __device__ __constant__ char d_prefix[64];
@@ -17,13 +18,6 @@ __device__ __constant__ short d_prefix_size;
 __device__ __constant__ short d_suffix_size;
 __device__ __constant__ uint32_t d_seed1_start;
 __device__ __constant__ uint32_t d_seed2_start;
-// Max '\' occurrences allowed in a candidate before it's discarded unhashed;
-// 0 means unlimited (no candidate is ever discarded on this basis - use an
-// alphabet without '\' in it if none should ever appear at all). A plain
-// runtime constant rather than a template parameter like AlphabetSize: this is
-// just an integer compare, not a division, so there's no compile-time-constant
-// codegen benefit to chase here.
-__device__ __constant__ int d_maxBackslashCount;
 
 __device__ __constant__ uint32_t d_cryptTable[0x500];
 
@@ -84,11 +78,11 @@ __device__ uint32_t mpqHashSeed2(const char* str) {
     return seed1;
 }
 
-// AlphabetSize is a compile-time template parameter (mirroring PruneSymbolRuns
-// in namebreak.cu) so this modulus/division - run once per candidate character, for every
-// thread - stays a cheap compiler-optimized constant instead of a real (much
-// slower) GPU integer division. See runCudaBatch in namebreak.cu for the fixed set of
-// sizes this gets instantiated for and the runtime dispatch between them.
+// AlphabetSize is a compile-time template parameter so this modulus/division -
+// run once per candidate character, for every thread - stays a cheap
+// compiler-optimized constant instead of a real (much slower) GPU integer
+// division. See runCudaBatch in namebreak.cu for the fixed set of sizes this
+// gets instantiated for and the runtime dispatch between them.
 template<int AlphabetSize>
 __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCandidate) {
     for (int i = candidateLen - 1; i >= 0; --i) {
@@ -97,36 +91,11 @@ __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCand
     }
 }
 
-__device__ __forceinline__ bool isAlnumMpq(char c) {
-    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
-}
-
-// Real MPQ filename components essentially never contain three consecutive
-// non-alphanumeric, non-space characters (e.g. "']&_") - used to prune obviously-
-// implausible candidates before spending a hash chain on them. Spaces are exempted
-// since " - " and " & " are common real word separators (e.g. "Arathi - Lake",
-// "Gold Separates East & West") that would otherwise be wrongly pruned. Only
-// inspects the candidate itself, not where it joins the (fixed, user-supplied)
-// prefix/suffix.
-__device__ __forceinline__ bool hasForbiddenSymbolRun(const char* candidate, int candidateLen) {
-    int run = 0;
-    for (int i = 0; i < candidateLen; ++i) {
-        if (isAlnumMpq(candidate[i]) || candidate[i] == ' ') {
-            run = 0;
-        } else if (++run >= 3) {
-            return true;
-        }
-    }
-    return false;
-}
-
-__device__ __forceinline__ int countBackslashes(const char* candidate, int candidateLen) {
-    int count = 0;
-    for (int i = 0; i < candidateLen; ++i) {
-        if (candidate[i] == '\\') count++;
-    }
-    return count;
-}
+// No hasForbiddenSymbolRun/countBackslashes here (deliberately - see
+// bruteForceKernel's doc comment in namebreak.cu and
+// hasForbiddenSymbolRun_CPU's in cpu-utils.h): those checks only ever run on
+// the CPU now, against the leading characters, before this candidate's batch
+// is even launched.
 
 __device__ void buildCompleteFilename(const char* candidate, int candidateLen, char* out) {
     memcpy(out, d_prefix, d_prefix_size);
