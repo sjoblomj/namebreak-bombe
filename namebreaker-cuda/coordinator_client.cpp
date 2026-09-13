@@ -6,7 +6,7 @@ std::string authHeader(const std::string& token) {
 }
 } // namespace
 
-bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, int64_t& outUserId, std::string& error) {
+bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, int64_t& outUserId, std::string& outServerProtocolVersion, std::string& error) {
     RegisterRequest req{username, hostname};
     HttpResponse resp = http_.post(baseUrl_ + "/api/v1/register", {}, toJson(req));
     if (resp.status == 0) {
@@ -14,6 +14,9 @@ bool CoordinatorClient::registerClient(const std::string& username, const std::s
         return false;
     }
     if (!resp.ok()) {
+        // A protocol version mismatch (see protocol.h's kProtocolVersion)
+        // surfaces here as an ordinary 400 - the server's own message
+        // (already in parseErrorMessage's output) explains why.
         error = "register failed (HTTP " + std::to_string(resp.status) + "): " + parseErrorMessage(resp.body);
         return false;
     }
@@ -24,6 +27,7 @@ bool CoordinatorClient::registerClient(const std::string& username, const std::s
     }
     token_ = out.token;
     outUserId = out.userId;
+    outServerProtocolVersion = out.serverProtocolVersion;
     return true;
 }
 

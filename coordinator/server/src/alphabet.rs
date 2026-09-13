@@ -12,22 +12,54 @@
 //! (much slower) runtime one. The set of *distinct sizes* below must stay in sync
 //! with that dispatch; adding a same-size profile needs no C++ change at all.
 
-/// name -> characters. Sizes present here (42, 43, 47, 48, 49, 50) must match the
-/// sizes `namebreak.cu`'s `runCudaBatch` has compiled-in kernel instantiations
+/// name, characters, and the protocol MINOR version this alphabet was
+/// introduced in (see `namebreak_protocol::PROTOCOL_VERSION`'s doc comment).
+/// Sizes present here (42, 43, 47, 48, 49, 50) must match the sizes
+/// `namebreak.cu`'s `runCudaBatch` has compiled-in kernel instantiations
 /// for. `size49` is relied on elsewhere (`handlers::admin_create_target`'s
 /// fallback when `alphabet_name` is omitted) - keep that name stable even if its
 /// characters or position here ever change.
-pub const PREDEFINED_ALPHABETS: &[(&str, &str)] = &[
-    ("size50", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]_"),
-    ("size49", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"),
-    ("size48", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_"),
-    ("size47", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"),
-    ("size43", " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_"),
-    ("size42", " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"),
+///
+/// Every alphabet below predates protocol versioning itself, so they're all
+/// tagged `(1, 0)` - the version this feature shipped in. A newly added
+/// alphabet should be tagged with whatever the *next* MINOR version will be,
+/// so `alphabet_available_to` keeps it hidden from clients that declared an
+/// older one (see `ranges::claim_range`) - the entire reason this table
+/// carries a version per row instead of just name+characters.
+pub const PREDEFINED_ALPHABETS: &[(&str, &str, (u64, u64))] = &[
+    ("size50", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]_", (1, 0)),
+    ("size49", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_", (1, 0)),
+    ("size48", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_", (1, 0)),
+    ("size47", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_", (1, 0)),
+    ("size43", " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_", (1, 0)),
+    ("size42", " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_", (1, 0)),
 ];
 
 pub fn lookup_predefined_alphabet(name: &str) -> Option<&'static str> {
-    PREDEFINED_ALPHABETS.iter().find(|(n, _)| *n == name).map(|(_, chars)| *chars)
+    PREDEFINED_ALPHABETS.iter().find(|(n, _, _)| *n == name).map(|(_, chars, _)| *chars)
+}
+
+/// The `(major, minor)` protocol version a predefined alphabet was
+/// introduced in, or `None` if `name` isn't a known alphabet at all.
+pub fn alphabet_introduced_in(name: &str) -> Option<(u64, u64)> {
+    PREDEFINED_ALPHABETS.iter().find(|(n, _, _)| *n == name).map(|&(_, _, since)| since)
+}
+
+/// Whether a client that declared `client_version` can be trusted to make
+/// sense of a target using alphabet `name` - see
+/// `namebreak_protocol::PROTOCOL_VERSION`'s doc comment on how MINOR
+/// versions gate this. An unknown alphabet name is always available (there's
+/// nothing to gate it *by* - no version has ever introduced it) - this
+/// shouldn't come up in practice, since a real target's `alphabet_name` is
+/// always one of `PREDEFINED_ALPHABETS` by construction (see
+/// `handlers::admin_create_target`); it's mainly what lets this codebase's
+/// own tests freely use synthetic alphabets outside that table without
+/// tripping this gate.
+pub fn alphabet_available_to(name: &str, client_version: namebreak_protocol::Version) -> bool {
+    match alphabet_introduced_in(name) {
+        Some((since_major, since_minor)) => (since_major, since_minor) <= (client_version.major, client_version.minor),
+        None => true,
+    }
 }
 
 pub fn alphabet_size(alphabet: &str) -> i64 {
@@ -561,12 +593,40 @@ mod tests {
     #[test]
     fn predefined_alphabet_sizes_match_their_declared_names() {
         // Sanity check on the table itself - not exhaustive, but catches an obvious typo.
-        for &(name, chars) in PREDEFINED_ALPHABETS {
+        for &(name, chars, _since) in PREDEFINED_ALPHABETS {
             let size = alphabet_size(chars);
             assert!(size > 0, "{name} has an empty alphabet");
             let unique: std::collections::HashSet<char> = chars.chars().collect();
             assert_eq!(unique.len() as i64, size, "{name} has duplicate characters, which would break the index<->candidate mapping");
         }
+    }
+
+    #[test]
+    fn alphabet_introduced_in_looks_up_a_known_alphabets_version_but_not_an_unknown_ones() {
+        assert_eq!(alphabet_introduced_in("size49"), Some((1, 0)));
+        assert_eq!(alphabet_introduced_in("no-such-alphabet"), None);
+    }
+
+    #[test]
+    fn alphabet_available_to_gates_on_minor_version_but_not_patch() {
+        use namebreak_protocol::Version;
+        // Every real predefined alphabet is tagged (1, 0) - available to
+        // anything from 1.0.0 onward, patch version doesn't matter.
+        assert!(alphabet_available_to("size49", Version::new(1, 0, 0)));
+        assert!(alphabet_available_to("size49", Version::new(1, 0, 99)));
+        assert!(alphabet_available_to("size49", Version::new(1, 5, 0)));
+        assert!(alphabet_available_to("size49", Version::new(2, 0, 0)), "a newer major version can still use an old alphabet");
+        assert!(!alphabet_available_to("size49", Version::new(0, 9, 0)), "a client older than this alphabet's own introduced-in version is refused");
+    }
+
+    #[test]
+    fn alphabet_available_to_fails_open_for_an_unrecognized_name() {
+        use namebreak_protocol::Version;
+        // Not a real code path (a target's alphabet_name is always validated
+        // against PREDEFINED_ALPHABETS elsewhere) - but this codebase's own
+        // tests rely on it to freely use synthetic alphabets without tripping
+        // this gate, so it's worth pinning down explicitly.
+        assert!(alphabet_available_to("totally-made-up", Version::new(0, 0, 1)));
     }
 
     #[test]

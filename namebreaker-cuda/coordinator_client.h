@@ -16,9 +16,13 @@ class CoordinatorClient {
 public:
     explicit CoordinatorClient(std::string baseUrl) : baseUrl_(std::move(baseUrl)) {}
 
-    // Registers with the server. On success, stores the returned token for
-    // subsequent calls (also retrievable via token()) and returns true.
-    bool registerClient(const std::string& username, const std::string& hostname, int64_t& outUserId, std::string& error);
+    // Registers with the server, sending this client's own protocolVersion
+    // (see protocol.h's kProtocolVersion) so the server can gate what it
+    // offers to only what this client understands. On success, stores the
+    // returned token for subsequent calls (also retrievable via token())
+    // and returns true, with outServerProtocolVersion set to the server's
+    // own protocol version - purely informational, worth logging.
+    bool registerClient(const std::string& username, const std::string& hostname, int64_t& outUserId, std::string& outServerProtocolVersion, std::string& error);
 
     void setToken(std::string token) { token_ = std::move(token); }
     const std::string& token() const { return token_; }

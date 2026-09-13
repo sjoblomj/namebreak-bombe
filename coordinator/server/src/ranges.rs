@@ -2,12 +2,12 @@
 //! timed-out work, and recording completions. Lives separately from `handlers.rs`
 //! so the HTTP glue stays thin.
 
-use namebreak_protocol::ClaimResponse;
+use namebreak_protocol::{ClaimResponse, Version};
 use sqlx::SqlitePool;
 
 use crate::alphabet::{
-    alphabet_size, bound_indices_at_len, candidate_to_index, compile_skip_regex, find_skip_run, max_supported_len, range_bound_filenames,
-    skip_char_mask, strip_prefix_suffix, transition_alphabet_cursor,
+    alphabet_available_to, alphabet_size, bound_indices_at_len, candidate_to_index, compile_skip_regex, find_skip_run, max_supported_len,
+    range_bound_filenames, skip_char_mask, strip_prefix_suffix, transition_alphabet_cursor,
 };
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Range, Target, TargetProgress, User};
@@ -283,12 +283,33 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
     let mut tx = pool.begin().await?;
     let now = now_unix();
     let rate = effective_rate(config, user);
+    // Falls back to the oldest possible version on a stored value that
+    // somehow doesn't parse (should never happen - handlers::register
+    // already validates it before it's ever written) rather than failing
+    // the whole claim - the effect is just the most conservative possible
+    // gating, never handing this client anything newer than the original
+    // protocol version until it re-registers with a well-formed one.
+    let client_version: Version = user.protocol_version.parse().unwrap_or(Version::new(1, 0, 0));
 
     let targets = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' ORDER BY priority DESC, created_at ASC")
         .fetch_all(&mut *tx)
         .await?;
 
     for target in targets {
+        // A target using an alphabet introduced after this client's own
+        // declared protocol version is entirely invisible to it - not just
+        // for fresh carving, but for reusing any of its pending ranges too,
+        // even ones that happen to be carved in an older, compatible
+        // alphabet from before a later admin_patch_target moved it forward.
+        // That's a deliberate simplification (see
+        // alphabet::alphabet_available_to's doc comment for the general
+        // idea): an old client simply doesn't get *new* work from this
+        // target until it's upgraded, rather than the server trying to
+        // thread the needle on every individual leftover range.
+        if !alphabet_available_to(&target.alphabet_name, client_version) {
+            continue;
+        }
+
         // 1) Reuse this target's own oldest pending range, if it has one -
         // either a fresh chunk nobody's claimed yet, or the unsearched
         // remainder of a range whose previous claimant's lease expired.
@@ -1014,7 +1035,46 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        User { id, username: name.into(), hostname: format!("{name}-host"), token, ema_rate_per_sec: None, created_at: now, last_seen_at: now }
+        User {
+            id,
+            username: name.into(),
+            hostname: format!("{name}-host"),
+            token,
+            ema_rate_per_sec: None,
+            created_at: now,
+            last_seen_at: now,
+            protocol_version: "1.0.0".to_string(),
+        }
+    }
+
+    /// Like `insert_user`, but with an explicit `protocol_version` instead
+    /// of the default `"1.0.0"` - for tests about `claim_range`'s
+    /// alphabet-version gating.
+    async fn insert_user_with_protocol_version(pool: &SqlitePool, name: &str, protocol_version: &str) -> User {
+        let now = now_unix();
+        let token = format!("{name}-tok");
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(name)
+        .bind(format!("{name}-host"))
+        .bind(&token)
+        .bind(now)
+        .bind(now)
+        .bind(protocol_version)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        User {
+            id,
+            username: name.into(),
+            hostname: format!("{name}-host"),
+            token,
+            ema_rate_per_sec: None,
+            created_at: now,
+            last_seen_at: now,
+            protocol_version: protocol_version.to_string(),
+        }
     }
 
     /// Bounds spanning the *entire* space at a single fixed length - the
@@ -1496,6 +1556,64 @@ mod tests {
         let (exp_lower, exp_upper) = range_bound_filenames(SIZE42, "PRE", ".SUF", 3, 0, space_size(SIZE42, 3));
         assert_eq!(claim.lower_bound_filename, exp_lower);
         assert_eq!(claim.upper_bound_filename, exp_upper);
+    }
+
+    /// The core scenario protocol versioning exists for: a target using an
+    /// alphabet the calling client's declared version predates is entirely
+    /// invisible to it - claim_range falls through to a different,
+    /// compatible target instead, rather than handing out work the client
+    /// has no idea how to search. `size42` is tagged `(1, 0)` in
+    /// `PREDEFINED_ALPHABETS`, so a hypothetical pre-1.0 client (not
+    /// something `handlers::register` would ever actually let through, but
+    /// perfectly well-formed semver, and this test only needs a stored
+    /// value lower than `(1, 0)` to exercise the comparison) can't see it.
+    #[tokio::test]
+    async fn claim_range_hides_a_target_whose_alphabet_predates_the_clients_declared_version() {
+        let pool = test_pool().await;
+        let old_client = insert_user_with_protocol_version(&pool, "old-client", "0.9.0").await;
+        let (lower, upper) = full_bounds(SIZE42, 2);
+        insert_target_with_alphabet(&pool, "size42", SIZE42, &lower, &upper).await;
+
+        let config = test_config(space_size(SIZE42, 2));
+        assert!(claim_range(&pool, &config, &old_client).await.unwrap().is_none(), "the only target uses an alphabet this client predates");
+    }
+
+    /// The other side of the same gate: once a target's alphabet is one the
+    /// client's declared version does understand, it's claimable as normal.
+    #[tokio::test]
+    async fn claim_range_serves_a_target_whose_alphabet_the_client_understands() {
+        let pool = test_pool().await;
+        let new_client = insert_user_with_protocol_version(&pool, "new-client", "1.0.0").await;
+        let (lower, upper) = full_bounds(SIZE42, 2);
+        insert_target_with_alphabet(&pool, "size42", SIZE42, &lower, &upper).await;
+
+        let config = test_config(space_size(SIZE42, 2));
+        let claim = claim_range(&pool, &config, &new_client).await.unwrap().expect("this client's version understands size42");
+        assert_eq!(claim.alphabet, SIZE42);
+    }
+
+    /// With two targets, one alphabet-incompatible and one not, an old
+    /// client is transparently steered to the one it can handle - the whole
+    /// point of gating per-target rather than just refusing the client
+    /// outright. Every *real* predefined alphabet happens to be tagged
+    /// `(1, 0)` as of this writing, so there's no actual alphabet a 0.9.0
+    /// client could understand - the "compatible" target here uses a
+    /// synthetic alphabet name instead, relying on `alphabet_available_to`'s
+    /// fail-open behavior for unrecognized names (see its own doc comment).
+    /// That's still a faithful test of the *mechanism* (skip one target,
+    /// fall through to the next), just not of a same-day real-world alphabet.
+    #[tokio::test]
+    async fn claim_range_falls_through_to_a_compatible_target_when_another_is_hidden() {
+        let pool = test_pool().await;
+        let old_client = insert_user_with_protocol_version(&pool, "old-client", "0.9.0").await;
+        let (lower42, upper42) = full_bounds(SIZE42, 2);
+        insert_target_with_alphabet(&pool, "size42", SIZE42, &lower42, &upper42).await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let compatible_target = insert_target_with_alphabet(&pool, "synthetic-compatible", DEFAULT, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2).max(space_size(SIZE42, 2)));
+        let claim = claim_range(&pool, &config, &old_client).await.unwrap().expect("the synthetic-alphabet target is still visible");
+        assert_eq!(claim.target_id, compatible_target);
     }
 
     /// The scenario admin_patch_target's alphabet change exists for: a target

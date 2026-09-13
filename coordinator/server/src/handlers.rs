@@ -5,6 +5,7 @@ use axum::Json;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateTargetRequest, AdminCreateTargetResponse, AdminPatchTargetRequest,
     AlphabetInfo, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
+    Version, PROTOCOL_VERSION,
 };
 
 use crate::alphabet::{
@@ -17,6 +18,21 @@ use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User};
 use crate::ranges::{self, PriorityRangeRemoval};
 use crate::state::{generate_token, now_unix, AppState};
 
+/// Parses `req.protocol_version` and rejects a MAJOR-version mismatch
+/// against this server's own `PROTOCOL_VERSION` outright - nothing about
+/// compatibility can be assumed across that boundary, so there's no point
+/// letting an incompatible client proceed only to fail confusingly later.
+fn resolve_client_protocol_version(req: &RegisterRequest) -> Result<Version, AppError> {
+    let client_version = req.protocol_version.parse::<Version>().map_err(AppError::BadRequest)?;
+    if client_version.major != PROTOCOL_VERSION.major {
+        return Err(AppError::BadRequest(format!(
+            "client protocol version {client_version} is incompatible with this server's protocol version {PROTOCOL_VERSION} \
+             (major version mismatch) - please upgrade the client"
+        )));
+    }
+    Ok(client_version)
+}
+
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
@@ -26,6 +42,7 @@ pub async fn register(
     if username.is_empty() || hostname.is_empty() {
         return Err(AppError::BadRequest("username and hostname are required".into()));
     }
+    let client_version = resolve_client_protocol_version(&req)?.to_string();
 
     let now = now_unix();
 
@@ -35,27 +52,32 @@ pub async fn register(
         .fetch_optional(&state.pool)
         .await?
     {
-        sqlx::query("UPDATE users SET last_seen_at = ? WHERE id = ?")
+        // Refreshed on every registration, not just created once: a
+        // returning client may have been upgraded (or downgraded) since it
+        // last registered, and claim_range always wants the current picture.
+        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ? WHERE id = ?")
             .bind(now)
+            .bind(&client_version)
             .bind(existing.id)
             .execute(&state.pool)
             .await?;
-        return Ok(Json(RegisterResponse { user_id: existing.id, token: existing.token }));
+        return Ok(Json(RegisterResponse { user_id: existing.id, token: existing.token, server_protocol_version: PROTOCOL_VERSION.to_string() }));
     }
 
     let token = generate_token();
     let user_id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (username, hostname, token, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(username)
     .bind(hostname)
     .bind(&token)
     .bind(now)
     .bind(now)
+    .bind(&client_version)
     .fetch_one(&state.pool)
     .await?;
 
-    Ok(Json(RegisterResponse { user_id, token }))
+    Ok(Json(RegisterResponse { user_id, token, server_protocol_version: PROTOCOL_VERSION.to_string() }))
 }
 
 pub async fn claim(
@@ -116,7 +138,12 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
 pub async fn alphabets() -> Json<AlphabetsResponse> {
     let alphabets = PREDEFINED_ALPHABETS
         .iter()
-        .map(|&(name, characters)| AlphabetInfo { name: name.to_string(), characters: characters.to_string(), size: alphabet_size(characters) })
+        .map(|&(name, characters, (since_major, since_minor))| AlphabetInfo {
+            name: name.to_string(),
+            characters: characters.to_string(),
+            size: alphabet_size(characters),
+            since: format!("{since_major}.{since_minor}"),
+        })
         .collect();
     Json(AlphabetsResponse { alphabets })
 }
@@ -146,7 +173,7 @@ pub async fn admin_create_target(
     }
     let alphabet_name = req.alphabet_name.as_deref().unwrap_or("size49");
     let Some(alphabet) = lookup_predefined_alphabet(alphabet_name) else {
-        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _)| name).collect();
+        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _, _)| name).collect();
         return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
     };
 
@@ -237,7 +264,7 @@ pub async fn admin_create_target(
 /// `alphabet::transition_alphabet_cursor`).
 async fn resolve_alphabet_patch(pool: &sqlx::SqlitePool, target_id: i64, alphabet_name: &str) -> Result<(String, String), AppError> {
     let Some(alphabet) = lookup_predefined_alphabet(alphabet_name) else {
-        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _)| name).collect();
+        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _, _)| name).collect();
         return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
     };
     let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_optional(pool).await?.ok_or(AppError::NotFound)?;
@@ -473,5 +500,31 @@ pub async fn admin_delete_priority_range(
     match ranges::retire_or_delete_priority_range(&state.pool, priority_range_id).await? {
         Some(PriorityRangeRemoval::Deleted) | Some(PriorityRangeRemoval::Retired) => Ok(StatusCode::NO_CONTENT),
         None => Err(AppError::NotFound),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn register_request(protocol_version: &str) -> RegisterRequest {
+        RegisterRequest { username: "u".into(), hostname: "h".into(), protocol_version: protocol_version.to_string() }
+    }
+
+    #[test]
+    fn resolve_client_protocol_version_accepts_a_matching_major_version() {
+        assert_eq!(resolve_client_protocol_version(&register_request("1.4.2")).unwrap(), Version::new(1, 4, 2));
+    }
+
+    #[test]
+    fn resolve_client_protocol_version_rejects_a_different_major_version() {
+        let err = resolve_client_protocol_version(&register_request("2.0.0")).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn resolve_client_protocol_version_rejects_a_malformed_version_string() {
+        let err = resolve_client_protocol_version(&register_request("not-a-version")).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }

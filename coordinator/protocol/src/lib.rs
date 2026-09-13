@@ -3,16 +3,96 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A `MAJOR.MINOR.PATCH` version, semver-style, comparable field-by-field in
+/// that order (the derived `Ord` already does the right thing, since Rust
+/// compares struct fields in declaration order). Deliberately doesn't
+/// support pre-release/build-metadata suffixes or version *ranges* - this
+/// client/server pair only ever needs to compare two exact versions, never
+/// parse an arbitrary semver range expression.
+///
+/// The wire format is always a plain `"X.Y.Z"` string (see
+/// `RegisterRequest::protocol_version`/`RegisterResponse::server_protocol_version`),
+/// not a nested JSON object - the C++ client's hand-rolled JSON parser only
+/// handles flat objects, and a version number doesn't need anything richer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl Version {
+    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Version { major, minor, patch }
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl std::str::FromStr for Version {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.trim().split('.');
+        let mut next = |what: &str| -> Result<u64, String> {
+            let raw = parts.next().ok_or_else(|| format!("version '{s}' is missing its {what} component"))?;
+            raw.parse::<u64>().map_err(|_| format!("version '{s}' has an invalid {what} component"))
+        };
+        let major = next("major")?;
+        let minor = next("minor")?;
+        let patch = next("patch")?;
+        if parts.next().is_some() {
+            return Err(format!("version '{s}' has more than three components"));
+        }
+        Ok(Version { major, minor, patch })
+    }
+}
+
+/// This server's own wire-protocol version - see `Version`. Bump it (and
+/// update this comment's changelog) whenever the request/response shapes
+/// below, or what `alphabet::PREDEFINED_ALPHABETS` offers, change in a way a
+/// client might care about:
+/// - MAJOR: a shape changed in a way an older client's parser can't tolerate
+///   (a field removed, renamed, or given a different type/meaning). The
+///   server refuses to register a client whose declared MAJOR doesn't match
+///   its own (see `handlers::register`) - nothing about compatibility can be
+///   assumed across that boundary, so there's no point letting it proceed.
+/// - MINOR: something purely additive was introduced - a new optional
+///   field, or a new entry in `alphabet::PREDEFINED_ALPHABETS`. An older
+///   client keeps working exactly as before; `ranges::claim_range` just
+///   never hands it a target whose alphabet was introduced in a MINOR
+///   version newer than what that client declared (see
+///   `alphabet::alphabet_available_to`) - so the server can keep an old,
+///   un-upgraded client fed with work it can actually make sense of, rather
+///   than crashing it with a target it has no idea how to search.
+/// - PATCH: anything else (bug fixes, doc changes) - never gates anything.
+///
+/// Changelog: 1.0.0 - initial versioned release; every alphabet in
+/// `PREDEFINED_ALPHABETS` as of this version is tagged `since: (1, 0)`.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 0, 0);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub username: String,
     pub hostname: String,
+    /// This client's own protocol version (`"X.Y.Z"`, see `PROTOCOL_VERSION`).
+    pub protocol_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResponse {
     pub user_id: i64,
     pub token: String,
+    /// This server's own protocol version - see `PROTOCOL_VERSION`. Purely
+    /// informational: the server has already decided whether to accept this
+    /// registration at all (see `handlers::register`), so the client has no
+    /// decision left to make from this - it's just useful to log if it
+    /// differs from what the client expected.
+    pub server_protocol_version: String,
 }
 
 /// A contiguous, ready-to-run slice of one target's search space, handed to a client.
@@ -201,6 +281,11 @@ pub struct AlphabetInfo {
     pub name: String,
     pub characters: String,
     pub size: i64,
+    /// The protocol version this alphabet was introduced in (`"X.Y"`, minor
+    /// version only - see `PROTOCOL_VERSION`). A client whose own declared
+    /// version is older than this will never be offered a target using this
+    /// alphabet - see `alphabet::alphabet_available_to`.
+    pub since: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,4 +296,41 @@ pub struct AlphabetsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn version_parses_a_well_formed_string() {
+        assert_eq!(Version::from_str("1.2.3").unwrap(), Version::new(1, 2, 3));
+        assert_eq!(Version::from_str("0.0.0").unwrap(), Version::new(0, 0, 0));
+        assert_eq!(Version::from_str(" 10.20.30 ").unwrap(), Version::new(10, 20, 30), "surrounding whitespace is trimmed");
+    }
+
+    #[test]
+    fn version_rejects_malformed_strings() {
+        assert!(Version::from_str("1.2").is_err(), "missing patch component");
+        assert!(Version::from_str("1").is_err(), "missing minor and patch components");
+        assert!(Version::from_str("1.2.3.4").is_err(), "too many components");
+        assert!(Version::from_str("1.2.x").is_err(), "non-numeric component");
+        assert!(Version::from_str("").is_err());
+        assert!(Version::from_str("1.-2.3").is_err(), "negative component");
+    }
+
+    #[test]
+    fn version_display_round_trips_through_from_str() {
+        let v = Version::new(3, 14, 15);
+        assert_eq!(Version::from_str(&v.to_string()).unwrap(), v);
+    }
+
+    #[test]
+    fn version_orders_major_then_minor_then_patch() {
+        assert!(Version::new(1, 0, 0) < Version::new(1, 0, 1));
+        assert!(Version::new(1, 0, 1) < Version::new(1, 1, 0));
+        assert!(Version::new(1, 9, 9) < Version::new(2, 0, 0));
+        assert_eq!(Version::new(1, 2, 3), Version::new(1, 2, 3));
+    }
 }

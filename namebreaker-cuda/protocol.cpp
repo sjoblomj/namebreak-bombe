@@ -198,7 +198,8 @@ bool getBool(const std::map<std::string, JsonValue>& obj, const std::string& key
 } // namespace
 
 std::string toJson(const RegisterRequest& req) {
-    return "{\"username\":" + escapeJsonString(req.username) + ",\"hostname\":" + escapeJsonString(req.hostname) + "}";
+    return "{\"username\":" + escapeJsonString(req.username) + ",\"hostname\":" + escapeJsonString(req.hostname) +
+           ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) + "}";
 }
 
 std::string toJson(const HeartbeatRequest& req) {
@@ -223,7 +224,8 @@ std::string toJson(const CompleteRequest& req) {
 bool parseRegisterResponse(const std::string& body, RegisterResponse& out) {
     std::map<std::string, JsonValue> obj;
     if (!JsonParser(body).parseFlatObject(obj)) return false;
-    return getInt64(obj, "user_id", out.userId) && getString(obj, "token", out.token);
+    return getInt64(obj, "user_id", out.userId) && getString(obj, "token", out.token) &&
+           getString(obj, "server_protocol_version", out.serverProtocolVersion);
 }
 
 bool parseClaimResponse(const std::string& body, ClaimResponse& out) {

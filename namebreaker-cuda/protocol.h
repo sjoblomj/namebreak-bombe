@@ -10,14 +10,33 @@
 // unmodified Rust server. Only the request/response shapes the client
 // actually uses are included (not the admin/status/alphabets endpoints).
 
+// This client's own protocol version - see coordinator/protocol/src/lib.rs's
+// PROTOCOL_VERSION for what MAJOR/MINOR/PATCH each mean for this pair. Sent
+// with every RegisterRequest so the server can gate what it offers this
+// client to only what a version this old can actually make sense of (e.g. a
+// predefined alphabet introduced in a MINOR version newer than this one
+// simply never gets handed to it - see ranges::claim_range on the server).
+// Bump this whenever this client starts depending on something the protocol
+// only guarantees from a newer version onward.
+constexpr const char* kProtocolVersion = "1.0.0";
+
 struct RegisterRequest {
     std::string username;
     std::string hostname;
+    std::string protocolVersion = kProtocolVersion;
 };
 
 struct RegisterResponse {
     int64_t userId = 0;
     std::string token;
+    // The server's own protocol version - purely informational. A MAJOR
+    // version mismatch is already rejected by the server before a response
+    // like this one is ever returned (see parseErrorMessage's use in
+    // CoordinatorClient::registerClient), so a successful registration
+    // implies MAJOR already matches; this is just worth logging so it's
+    // visible which MINOR feature set (e.g. which predefined alphabets) the
+    // server might use that this client predates.
+    std::string serverProtocolVersion;
 };
 
 // A contiguous, ready-to-run slice of one target's search space.

@@ -1,0 +1,14 @@
+-- Remembers each client's declared protocol version (see
+-- namebreak_protocol::PROTOCOL_VERSION and handlers::register), so
+-- ranges::claim_range can consult it on every /claim call without the
+-- client having to resend it - the version is only ever declared once, at
+-- registration, and looked up by token from then on, the same way a user's
+-- ema_rate_per_sec already works.
+--
+-- A fixed literal default (unlike the alphabet columns in
+-- 0010_range_target_progress_alphabet.sql, which needed a per-row backfill)
+-- is correct here: every user row that predates this column registered
+-- before protocol versioning existed at all, so "1.0.0" - the version this
+-- feature shipped in - is exactly what such a client actually understands,
+-- not a guess.
+ALTER TABLE users ADD COLUMN protocol_version TEXT NOT NULL DEFAULT '1.0.0';

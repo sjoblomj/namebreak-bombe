@@ -284,12 +284,14 @@ int runCoordinator(CoordinatorArgs args) {
 
     CoordinatorClient client(args.serverUrl);
     int64_t userId = 0;
+    std::string serverProtocolVersion;
     std::string error;
-    if (!client.registerClient(args.username, args.hostname, userId, error)) {
+    if (!client.registerClient(args.username, args.hostname, userId, serverProtocolVersion, error)) {
         fprintf(stderr, "failed to register with coordinator: %s\n", error.c_str());
         return 1;
     }
-    printf("[coordinator] registered with coordinator as user %lld (%s@%s)\n", (long long) userId, args.username.c_str(), args.hostname.c_str());
+    printf("[coordinator] registered with coordinator as user %lld (%s@%s) - client protocol v%s, server protocol v%s\n",
+           (long long) userId, args.username.c_str(), args.hostname.c_str(), kProtocolVersion, serverProtocolVersion.c_str());
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
     auto claimBackoff = pollInterval;

@@ -11,6 +11,12 @@ pub struct User {
     pub ema_rate_per_sec: Option<f64>,
     pub created_at: i64,
     pub last_seen_at: i64,
+    /// This client's declared protocol version (`"X.Y.Z"`), captured at
+    /// `/register` time - see `namebreak_protocol::PROTOCOL_VERSION` and
+    /// `handlers::register`. Consulted by `ranges::claim_range` so it never
+    /// hands this client a target using an alphabet introduced after the
+    /// version it declared - see `alphabet::alphabet_available_to`.
+    pub protocol_version: String,
 }
 
 #[allow(dead_code)]
