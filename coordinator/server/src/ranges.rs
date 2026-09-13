@@ -646,28 +646,43 @@ pub async fn complete_range(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    if range.status != "in_progress" || range.assigned_user_id != Some(user.id) {
+    // A `found: false` report from someone who no longer owns this range is
+    // stale - whoever (or whatever) took it over already has the accurate
+    // picture, so there's nothing worth keeping from it. A `found: true`
+    // report is different: it's a fact about the *target*, not about this
+    // range's bookkeeping, and it doesn't stop being true just because a
+    // lease expired (a network blip outlasting the heartbeat interval, say)
+    // before the client could report in - so it's never rejected just for
+    // that. This doesn't meaningfully change what a malicious client could
+    // already do: claiming a range and immediately reporting `found: true`
+    // with a fabricated filename was always possible, since the server
+    // never re-verifies a reported filename's hash - the ownership check
+    // was only ever a staleness filter, not real authentication of the claim.
+    let owns_range = range.status == "in_progress" && range.assigned_user_id == Some(user.id);
+    if !owns_range && !found {
         return Err(AppError::Conflict("range is not currently assigned to you".into()));
     }
 
     let now = now_unix();
-    sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ? WHERE id = ?")
-        .bind(now)
-        .bind(range_id)
-        .execute(&mut *tx)
-        .await?;
-
-    if elapsed_seconds > 0.001 && candidates_processed > 0 {
-        let observed_rate = candidates_processed as f64 / elapsed_seconds;
-        let new_ema = match user.ema_rate_per_sec {
-            Some(old) => config.ema_alpha * observed_rate + (1.0 - config.ema_alpha) * old,
-            None => observed_rate,
-        };
-        sqlx::query("UPDATE users SET ema_rate_per_sec = ? WHERE id = ?")
-            .bind(new_ema)
-            .bind(user.id)
+    if owns_range {
+        sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(range_id)
             .execute(&mut *tx)
             .await?;
+
+        if elapsed_seconds > 0.001 && candidates_processed > 0 {
+            let observed_rate = candidates_processed as f64 / elapsed_seconds;
+            let new_ema = match user.ema_rate_per_sec {
+                Some(old) => config.ema_alpha * observed_rate + (1.0 - config.ema_alpha) * old,
+                None => observed_rate,
+            };
+            sqlx::query("UPDATE users SET ema_rate_per_sec = ? WHERE id = ?")
+                .bind(new_ema)
+                .bind(user.id)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
 
     // Different targets can share the same hash_a/hash_b (e.g. the same
@@ -1964,6 +1979,62 @@ mod tests {
                 assert!(found_filename.is_none());
             }
         }
+    }
+
+    /// The gap this closes: a genuine "both hashes matched" find must never
+    /// be lost just because the reporting worker's lease already expired
+    /// (e.g. a network blip outlasting the heartbeat interval) and the range
+    /// was reassigned to someone else before the original finder could
+    /// report in. `found: true` always solves the target, crediting whoever
+    /// actually reported it - regardless of who currently owns the range.
+    #[tokio::test]
+    async fn complete_range_accepts_a_late_found_report_even_after_losing_the_range() {
+        let pool = test_pool().await;
+        let finder = insert_user(&pool, "finder").await;
+        let other = insert_user(&pool, "other").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let target_id = insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2));
+        let claim = claim_range(&pool, &config, &finder).await.unwrap().expect("work available");
+
+        // The lease expires and the range is reassigned to someone else
+        // before `finder` can report its genuine find.
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+        let reclaimed = claim_range(&pool, &config, &other).await.unwrap().expect("reassigned to someone else");
+        assert_eq!(reclaimed.range_id, claim.range_id, "reassigned onto the same row, since nothing was ever checkpointed");
+
+        let outcome = complete_range(&pool, &config, &finder, claim.range_id, true, Some("PREXY.SUF".into()), 1.0, 1).await.unwrap();
+        assert!(outcome.target_solved, "a genuine find must never be rejected just because the range moved on");
+
+        let (status, found_filename, found_by_user_id): (String, Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT status, found_filename, found_by_user_id FROM targets WHERE id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "solved");
+        assert_eq!(found_filename, Some("PREXY.SUF".to_string()));
+        assert_eq!(found_by_user_id, Some(finder.id), "credited to whoever actually reported the find, not whoever currently holds the range");
+    }
+
+    /// A `found: false` report, unlike a genuine find, carries nothing worth
+    /// preserving once the range has moved on to someone else - it stays
+    /// rejected as stale, exactly as before this change.
+    #[tokio::test]
+    async fn complete_range_still_rejects_a_not_found_report_from_a_non_owner() {
+        let pool = test_pool().await;
+        let finder = insert_user(&pool, "finder").await;
+        let other = insert_user(&pool, "other").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2));
+        let claim = claim_range(&pool, &config, &finder).await.unwrap().expect("work available");
+
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+        claim_range(&pool, &config, &other).await.unwrap().expect("reassigned to someone else");
+
+        let result = complete_range(&pool, &config, &finder, claim.range_id, false, None, 1.0, 1).await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
     }
 
     #[tokio::test]
