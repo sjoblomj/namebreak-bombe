@@ -214,23 +214,53 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     short prefix_size = req.prefix.size();
     short suffix_size = req.suffix.size();
 
-    // A candidate's trailing `windowSize` characters are brute-forced directly by the
-    // GPU using native 64-bit indices. Any characters beyond that are treated as an
-    // extension of the prefix: their contribution to the hash is folded in once per
-    // outer iteration on the CPU (see mpqHashWithPrefixCache_CPU below), so a candidate
-    // can grow up to MAX_CANDIDATE_LEN without the per-thread index ever overflowing
-    // uint64_t. Computed from alphabetSize/MAX_CANDIDATE_LEN rather than hardcoded, so
-    // it stays correct if either changes (a smaller alphabet allows a larger window).
-    int windowSize = 0;
+    // Largest candidate length stringToIndex/indexToString can safely convert
+    // to/from a uint64_t index without overflow (alphabetSize^N <= UINT64_MAX).
+    // Computed from alphabetSize/MAX_CANDIDATE_LEN rather than hardcoded, so it
+    // stays correct if either changes (a smaller alphabet allows a longer safe
+    // length). This only bounds leadingLen below (see gpuWindowChars and
+    // trailingLen's computation in the loop below) - trailingLen itself never
+    // gets anywhere near this limit.
+    int maxSafeIndexLen = 0;
     {
         uint64_t product = 1;
-        while (windowSize < MAX_CANDIDATE_LEN && product <= UINT64_MAX / alphabetSize) {
+        while (maxSafeIndexLen < MAX_CANDIDATE_LEN && product <= UINT64_MAX / alphabetSize) {
             product *= alphabetSize;
-            windowSize++;
+            maxSafeIndexLen++;
         }
     }
-    int maxLeadingLen = MAX_CANDIDATE_LEN - windowSize;
-    printf("windowSize: %d (max leading/prefix-extension length: %d)\n", windowSize, maxLeadingLen);
+
+    // How many trailing candidate characters go straight to the GPU as a
+    // native index each batch; the rest is folded into an extended prefix and
+    // hashed on the CPU instead, incrementally (IncrementalPrefixHasher,
+    // cpu-utils.h) rather than from scratch per leading value. Deliberately
+    // small and fixed - NOT "as large as maxSafeIndexLen allows", which is
+    // what this project used to do (and still needs to fall back toward for
+    // very long candidates - see trailingLen's computation below). A larger
+    // window means every GPU thread in a batch redundantly re-hashes whatever
+    // leading characters are actually constant across that whole batch -
+    // batchSize threads all sharing the same leading characters, each
+    // independently re-deriving the same hash-chain state from them, is real
+    // wasted work (unlike the within-a-warp sharing this project tried and
+    // reverted earlier - that redundancy was illusory; this one, across an
+    // entire batch, isn't). Measured directly (tests/window_sweep_bench.cu,
+    // this alphabet): shrinking the window to 4 roughly doubled throughput
+    // versus hashing the whole candidate per thread (6.9 -> 13.4 G
+    // candidates/sec); smaller windows (1-3 characters) measured *worse* than
+    // even the old uncapped behavior, since too little GPU work per batch
+    // stops amortizing the CPU-side incremental hash update and the
+    // cudaMemcpyToSymbol uploads a new leading value needs every batch.
+    // Overridable at compile time (-DNAMEBREAK_GPU_WINDOW_CHARS=N) purely for
+    // re-sweeping this number against real hardware/alphabet combinations
+    // later (tests/search_bench.cu) without hand-editing the source each time.
+#ifndef NAMEBREAK_GPU_WINDOW_CHARS
+#define NAMEBREAK_GPU_WINDOW_CHARS 4
+#endif
+    constexpr int gpuWindowChars = NAMEBREAK_GPU_WINDOW_CHARS;
+
+    int maxLeadingLen = maxSafeIndexLen;
+    printf("gpuWindowChars: %d, maxSafeIndexLen: %d (max leading/prefix-extension length: %d)\n",
+           gpuWindowChars, maxSafeIndexLen, maxLeadingLen);
 
     if (prefix_size + maxLeadingLen >= (int) sizeof(d_prefix) || suffix_size >= (int) sizeof(d_suffix)) {
         result.ok = false;
@@ -282,6 +312,11 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     prepareCryptTable(h_cryptTable);
     CUDA_CHECK(cudaMemcpyToSymbol(d_cryptTable, h_cryptTable, sizeof(h_cryptTable)));
 
+    // Hash of req.prefix alone (never changes across candidateLen or
+    // leadingIdx) - the base every leadingIdx loop's IncrementalPrefixHasher
+    // extends by that iteration's leading characters.
+    std::pair<uint32_t, uint32_t> prefixBaseState = mpqHashWithPrefixCache_CPU(req.prefix.c_str(), h_cryptTable);
+
     FILE* fout = fopen("matches.txt", "a");
     if (!fout) {
         result.ok = false;
@@ -315,11 +350,14 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     //     runs the body for req.startCandidate's own length and exits via the
     //     `if (!req.continuous)` check at the bottom.
     //  2. The `for (leadingIdx ...)` loop below: over the *leading* part of the
-    //     candidate (see windowSize/leadingLen above) - every leading value is
-    //     hashed once on the CPU and uploaded as the GPU's starting seed, so
-    //     candidates longer than windowSize still get covered exhaustively.
-    //     Runs exactly once whenever leadingLen is 0 (candidateLen <=
-    //     windowSize, the common case).
+    //     candidate (see gpuWindowChars/leadingLen above) - every leading value
+    //     is hashed on the CPU (incrementally - IncrementalPrefixHasher) and
+    //     uploaded as the GPU's starting seed, so candidates longer than
+    //     gpuWindowChars still get covered exhaustively. Since gpuWindowChars
+    //     is small (throughput-tuned, not "as large as safely possible"),
+    //     leadingLen > 0 - and this loop actually doing work - is the common
+    //     case, not the exception; it only degenerates to a single iteration
+    //     when candidateLen <= gpuWindowChars.
     //  3. The `for (i = trailStart ...)` loop: chops the (up to
     //     alphabetSize^trailingLen) remaining space for one leading value into
     //     batchSize-sized chunks, since that's too large for one kernel launch -
@@ -332,17 +370,23 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             break;
         }
 
-        // Split the candidate into a leading part (folded into the prefix, hashed once
-        // per value on the CPU) and a trailing part of at most `windowSize` characters
-        // (brute-forced by the GPU with native 64-bit indices). Every combination of the
-        // leading part is enumerated too, so the full candidateLen-character space is
-        // still covered exhaustively - it's just indexed in two safely-sized pieces
-        // instead of one that could overflow uint64_t.
-        int trailingLen = std::min(candidateLen, windowSize);
+        // Split the candidate into a leading part (folded into the prefix, hashed
+        // incrementally on the CPU) and a trailing part of gpuWindowChars characters
+        // (brute-forced by the GPU with native 64-bit indices) - or, once candidateLen
+        // grows large enough that leadingLen would exceed maxSafeIndexLen (overflow the
+        // index conversions below), a slightly larger trailing part, just big enough to
+        // keep leadingLen within that safe limit. Every combination of the leading part
+        // is enumerated too, so the full candidateLen-character space is still covered
+        // exhaustively either way.
+        int trailingLen = std::min(candidateLen, std::max(gpuWindowChars, candidateLen - maxSafeIndexLen));
         int leadingLen = candidateLen - trailingLen;
-        if (leadingLen > windowSize) {
-            fprintf(stderr, "candidateLen (%d) needs a %d-character leading part, which exceeds windowSize (%d) - exiting\n",
-                    candidateLen, leadingLen, windowSize);
+        if (leadingLen > maxSafeIndexLen) {
+            // Not expected to ever trigger given trailingLen's formula above (it's
+            // constructed specifically to keep leadingLen <= maxSafeIndexLen) - kept as
+            // a belt-and-suspenders check against future edits to that formula, since a
+            // silent overflow here would mean silently skipped candidates, not a crash.
+            fprintf(stderr, "candidateLen (%d) needs a %d-character leading part, which exceeds maxSafeIndexLen (%d) - exiting\n",
+                    candidateLen, leadingLen, maxSafeIndexLen);
             break;
         }
 
@@ -368,16 +412,27 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         uint64_t leadingCount = endLeadingIdx - startLeadingIdx + 1;
         uint64_t leadingLogInterval = std::max<uint64_t>(1, leadingCount / 1000);
 
-        // Level 2 (see the walkthrough above the outer `while`).
+        // Level 2 (see the walkthrough above the outer `while`). leadingHasher
+        // walks every leading value from startLeadingIdx to endLeadingIdx in
+        // the same order this loop does (always +1), so every step after the
+        // first is an O(1)-amortized incremental update (IncrementalPrefixHasher,
+        // cpu-utils.h) instead of a full from-scratch re-hash of the whole
+        // leading string - the thing that makes leadingLen > 0 being the
+        // common case (see gpuWindowChars above) affordable.
+        IncrementalPrefixHasher leadingHasher(prefixBaseState, leadingLen, req.alphabet, h_cryptTable);
+        leadingHasher.reset(startLeadingIdx);
         for (uint64_t leadingIdx = startLeadingIdx; leadingIdx <= endLeadingIdx; ++leadingIdx) {
-            std::string leading = indexToString(leadingIdx, leadingLen, req.alphabet);
+            if (leadingIdx != startLeadingIdx) {
+                leadingHasher.advance();
+            }
+            const std::string& leading = leadingHasher.leading();
             std::string extendedPrefix = req.prefix + leading;
 
             short extPrefixSize = extendedPrefix.size();
             CUDA_CHECK(cudaMemcpyToSymbol(d_prefix_size, &extPrefixSize, sizeof(extPrefixSize)));
             CUDA_CHECK(cudaMemcpyToSymbol(d_prefix, extendedPrefix.c_str(), extPrefixSize + 1));
 
-            std::pair<uint32_t, uint32_t> pair = mpqHashWithPrefixCache_CPU(extendedPrefix.c_str(), h_cryptTable);
+            std::pair<uint32_t, uint32_t> pair = leadingHasher.state();
             uint32_t seed1_start = pair.first;
             uint32_t seed2_start = pair.second;
             CUDA_CHECK(cudaMemcpyToSymbol(d_seed1_start, &seed1_start, sizeof(seed1_start)));
@@ -441,6 +496,10 @@ breakfree:
     return result;
 }
 
+// Guarded so tests/search_integration_test.cu can link against this file's
+// runSearch() (the actual, unmodified function - not a reimplementation of
+// it) without a duplicate main() symbol: built with -DNAMEBREAK_NO_MAIN.
+#ifndef NAMEBREAK_NO_MAIN
 int main(int argc, char* argv[]) {
     // The only argument namebreak takes: an optional mode, overriding
     // config.conf's own `mode = ...` (see config.h). Everything else
@@ -499,3 +558,4 @@ int main(int argc, char* argv[]) {
     }
     return result.found ? 0 : 2;
 }
+#endif // NAMEBREAK_NO_MAIN

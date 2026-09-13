@@ -64,7 +64,7 @@ NVCC_FLAGS += -DNAMEBREAK_WITH_NETWORK $(if $(CURL_INC),-I$(CURL_INC))
 LDFLAGS += $(NETWORK_LDFLAGS)
 endif
 
-.PHONY: all verbose clean
+.PHONY: all verbose clean test bench
 
 all: $(TARGET)$(EXE_EXT)
 
@@ -77,4 +77,56 @@ verbose: $(SOURCES) $(HEADERS)
 	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) $(NVCC_FLAGS) --ptxas-options=-v -o $(TARGET)$(EXE_EXT) $(SOURCES) $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)$(EXE_EXT)
+	rm -f $(TARGET)$(EXE_EXT) tests/prefix_hasher_test tests/prefix_hasher_bench tests/window_sweep_bench tests/search_integration_test tests/search_bench
+	rm -rf tests/.testrun
+
+# Pure-CPU correctness check for IncrementalPrefixHasher (cpu-utils.h/.cpp) -
+# no GPU involved, plain g++ build.
+tests/prefix_hasher_test: tests/prefix_hasher_test.cpp cpu-utils.cpp cpu-utils.h constants.h
+	g++ -std=$(CXXSTD) -O2 -o tests/prefix_hasher_test tests/prefix_hasher_test.cpp cpu-utils.cpp
+
+# Pure-CPU benchmark isolating IncrementalPrefixHasher's own speedup (O(1)
+# amortized vs. from-scratch rehashing per leadingIdx step) from the separate
+# GPU-window-size question - no GPU involved.
+tests/prefix_hasher_bench: tests/prefix_hasher_bench.cpp cpu-utils.cpp cpu-utils.h constants.h
+	g++ -std=$(CXXSTD) -O2 -o tests/prefix_hasher_bench tests/prefix_hasher_bench.cpp cpu-utils.cpp
+
+prefix_hasher_bench: tests/prefix_hasher_bench
+	./tests/prefix_hasher_bench
+
+# End-to-end correctness check for runSearch() itself (namebreak.cu, linked
+# in directly, main() excluded via -DNAMEBREAK_NO_MAIN) against a CPU
+# brute-force reference - see the file for why this is a separate concern
+# from prefix_hasher_test above. Built without NETWORK (doesn't need it).
+tests/search_integration_test: tests/search_integration_test.cu namebreak.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h search.h
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -o tests/search_integration_test tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+
+test: tests/prefix_hasher_test tests/search_integration_test
+	./tests/prefix_hasher_test
+	mkdir -p tests/.testrun
+	cd tests/.testrun && ../search_integration_test
+
+# GPU window-size sweep benchmark - compares today's behavior against several
+# candidate "how many characters per GPU thread" choices, to see whether
+# shrinking it (paying for it with more frequent CPU-side prefix hashing and
+# host<->device uploads) is worth it here, and if so by how much.
+tests/window_sweep_bench: tests/window_sweep_bench.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -o tests/window_sweep_bench tests/window_sweep_bench.cu cpu-utils.cpp
+
+bench: tests/window_sweep_bench
+	./tests/window_sweep_bench
+
+# Final real-code throughput check - times the actual runSearch(), not a
+# standalone proxy kernel, over a ~28.8B-candidate range. WINDOW controls
+# namebreak.cu's gpuWindowChars for this build only (make WINDOW=6
+# search_bench), to re-sweep that tuning value against real hardware without
+# hand-editing the source - see the comment at gpuWindowChars's declaration.
+# No dependency tracking on WINDOW itself (matches this Makefile's existing
+# NETWORK/etc. convention) - combine with `make clean` first if switching it.
+WINDOW ?= 4
+tests/search_bench: tests/search_bench.cu namebreak.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h search.h
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_GPU_WINDOW_CHARS=$(WINDOW) -o tests/search_bench tests/search_bench.cu namebreak.cu cpu-utils.cpp
+
+search_bench: tests/search_bench
+	mkdir -p tests/.testrun
+	cd tests/.testrun && ../search_bench
