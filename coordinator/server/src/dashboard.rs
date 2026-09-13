@@ -2,6 +2,8 @@
 //! `GET /api/v1/dashboard` for target/range/worker data. No build step, no JS
 //! framework - the page is a single self-contained file embedded at compile time.
 
+use std::collections::HashMap;
+
 use axum::extract::State;
 use axum::response::Html;
 use axum::Json;
@@ -140,26 +142,55 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     .fetch_all(&state.pool)
     .await?;
 
+    // The dashboard renders every target unconditionally, so there's no
+    // filtering benefit to a per-target `WHERE target_id = ?` on the child
+    // tables below - fetch each one whole (1 query apiece, independent of
+    // how many targets exist) and group by target_id in memory instead.
+    // Each table's own ORDER BY is preserved per-group because HashMap's
+    // `entry().or_default().push()` keeps insertion order within a bucket.
+    #[allow(clippy::type_complexity)]
+    let all_ranges: Vec<(i64, i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT ranges.target_id, ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
+                ranges.progress_index, worker.username, worker.hostname, \
+                ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
+                ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id \
+         FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
+         ORDER BY ranges.created_at DESC",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let mut ranges_by_target: HashMap<i64, Vec<_>> = HashMap::new();
+    for row in all_ranges {
+        let target_id = row.0;
+        ranges_by_target.entry(target_id).or_default().push(row);
+    }
+
+    let all_progress: Vec<(i64, i64, i64, String)> =
+        sqlx::query_as("SELECT target_id, candidate_len, next_index, alphabet FROM target_progress").fetch_all(&state.pool).await?;
+    let progress_by_target: HashMap<i64, (i64, i64, String)> =
+        all_progress.into_iter().map(|(target_id, candidate_len, next_index, alphabet)| (target_id, (candidate_len, next_index, alphabet))).collect();
+
+    #[allow(clippy::type_complexity)]
+    let all_priority_ranges: Vec<(i64, i64, i64, String, i64, i64, i64, i64, String, String)> = sqlx::query_as(
+        "SELECT target_id, id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet \
+         FROM priority_ranges ORDER BY priority DESC, created_at ASC",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let mut priority_ranges_by_target: HashMap<i64, Vec<_>> = HashMap::new();
+    for row in all_priority_ranges {
+        let target_id = row.0;
+        priority_ranges_by_target.entry(target_id).or_default().push(row);
+    }
+
     let mut targets = Vec::with_capacity(target_rows.len());
     for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_username, found_hostname, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
-        #[allow(clippy::type_complexity)]
-        let range_rows: Vec<(i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String, Option<i64>)> = sqlx::query_as(
-            "SELECT ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
-                    ranges.progress_index, worker.username, worker.hostname, \
-                    ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
-                    ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id \
-             FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
-             WHERE ranges.target_id = ? \
-             ORDER BY ranges.created_at DESC",
-        )
-        .bind(id)
-        .fetch_all(&state.pool)
-        .await?;
+        let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
 
         let ranges = range_rows
             .into_iter()
             .map(
-                |(range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet, priority_range_id)| {
+                |(_target_id, range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet, priority_range_id)| {
                     // Each range is decoded with its OWN alphabet, not the
                     // target's current one - a range carved before the
                     // target's alphabet was last patched (see
@@ -190,24 +221,16 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             )
             .collect();
 
-        let (cursor_candidate_len, cursor_next_index, cursor_alphabet): (i64, i64, String) =
-            sqlx::query_as("SELECT candidate_len, next_index, alphabet FROM target_progress WHERE target_id = ?")
-                .bind(id)
-                .fetch_one(&state.pool)
-                .await?;
+        let (cursor_candidate_len, cursor_next_index, cursor_alphabet) = progress_by_target
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::Internal(format!("missing target_progress row for target {id}")))?;
         let cursor_candidate = index_to_candidate(&cursor_alphabet, cursor_next_index, cursor_candidate_len);
 
-        #[allow(clippy::type_complexity)]
-        let priority_range_rows: Vec<(i64, i64, String, i64, i64, i64, i64, String, String)> = sqlx::query_as(
-            "SELECT id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet \
-             FROM priority_ranges WHERE target_id = ? ORDER BY priority DESC, created_at ASC",
-        )
-        .bind(id)
-        .fetch_all(&state.pool)
-        .await?;
+        let priority_range_rows = priority_ranges_by_target.remove(&id).unwrap_or_default();
         let priority_ranges = priority_range_rows
             .into_iter()
-            .map(|(pr_id, pr_priority, pattern, candidate_len, start_index, end_index, next_index, pr_alphabet_name, pr_alphabet)| DashboardPriorityRange {
+            .map(|(_target_id, pr_id, pr_priority, pattern, candidate_len, start_index, end_index, next_index, pr_alphabet_name, pr_alphabet)| DashboardPriorityRange {
                 id: pr_id,
                 priority: pr_priority,
                 pattern,
