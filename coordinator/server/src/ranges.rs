@@ -840,22 +840,33 @@ pub enum PriorityRangeRemoval {
 /// been carved from it yet, which the simpler index comparison would
 /// mistake for "already touched".
 pub async fn retire_or_delete_priority_range(pool: &SqlitePool, priority_range_id: i64) -> Result<Option<PriorityRangeRemoval>, AppError> {
+    // Everything below runs in one transaction so a concurrent `/claim` can't
+    // carve a chunk (and thus create the very `ranges` row this function is
+    // checking for) between the "ever carved" check and the delete - which
+    // would otherwise let a priority range that just started producing work
+    // be deleted outright instead of retired, letting the main sweep re-carve
+    // (and duplicate) whatever that chunk was already covering.
+    let mut tx = pool.begin().await?;
+
     let exists: Option<(i64,)> =
-        sqlx::query_as("SELECT 1 FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_optional(pool).await?;
+        sqlx::query_as("SELECT 1 FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_optional(&mut *tx).await?;
     if exists.is_none() {
         return Ok(None);
     }
 
     let ever_carved: Option<(i64,)> =
-        sqlx::query_as("SELECT 1 FROM ranges WHERE priority_range_id = ? LIMIT 1").bind(priority_range_id).fetch_optional(pool).await?;
+        sqlx::query_as("SELECT 1 FROM ranges WHERE priority_range_id = ? LIMIT 1").bind(priority_range_id).fetch_optional(&mut *tx).await?;
 
-    if ever_carved.is_none() {
-        sqlx::query("DELETE FROM priority_ranges WHERE id = ?").bind(priority_range_id).execute(pool).await?;
-        Ok(Some(PriorityRangeRemoval::Deleted))
+    let outcome = if ever_carved.is_none() {
+        sqlx::query("DELETE FROM priority_ranges WHERE id = ?").bind(priority_range_id).execute(&mut *tx).await?;
+        PriorityRangeRemoval::Deleted
     } else {
-        sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id = ?").bind(priority_range_id).execute(pool).await?;
-        Ok(Some(PriorityRangeRemoval::Retired))
-    }
+        sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id = ?").bind(priority_range_id).execute(&mut *tx).await?;
+        PriorityRangeRemoval::Retired
+    };
+
+    tx.commit().await?;
+    Ok(Some(outcome))
 }
 
 /// Translates every one of `target_id`'s priority ranges still frozen under

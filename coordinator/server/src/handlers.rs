@@ -281,6 +281,21 @@ pub async fn admin_patch_target(
 
     let mut tx = state.pool.begin().await?;
 
+    // Checked up front, in the same transaction as the UPDATE below, so we
+    // can tell "no such target" (404) apart from "target exists but is
+    // solved, and thus immutable by design" (409) - the UPDATE's own
+    // `status != 'solved'` guard can't distinguish the two on its own, since
+    // both leave `rows_affected() == 0`.
+    let current_status: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM targets WHERE id = ?").bind(target_id).fetch_optional(&mut *tx).await?;
+    match current_status {
+        None => return Err(AppError::NotFound),
+        Some((status,)) if status == "solved" => {
+            return Err(AppError::Conflict("target is already solved and can no longer be modified".into()));
+        }
+        Some(_) => {}
+    }
+
     let result = sqlx::query(
         "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority), \
          description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex), \
@@ -296,9 +311,7 @@ pub async fn admin_patch_target(
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound);
-    }
+    debug_assert!(result.rows_affected() > 0, "target existed and wasn't solved per the check above");
 
     // Priority ranges are translated eagerly, in the same transaction as
     // the alphabet change itself - see

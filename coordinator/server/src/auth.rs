@@ -62,10 +62,21 @@ impl FromRequestParts<AppState> for AdminAuth {
             .await
             .map_err(|_| AppError::Internal("failed to extract app state".into()))?;
 
-        if header == state.admin_token {
+        if constant_time_eq(&header, &state.admin_token) {
             Ok(AdminAuth)
         } else {
             Err(AppError::Forbidden)
         }
     }
+}
+
+/// Compares two strings without short-circuiting on the first differing
+/// byte, so a mismatched `X-Admin-Token` can't be guessed one byte at a time
+/// via response-timing measurements the way a plain `==` would allow.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }

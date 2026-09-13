@@ -227,7 +227,7 @@ won't report success or silently drop bad work.
 | `BIND_ADDR` | `0.0.0.0:8080` | listen address |
 | `TARGET_CHUNK_SECONDS` | `900` | desired wall-clock time per range |
 | `DEFAULT_RATE_PER_SEC` | `500000000` | assumed candidates/sec until a user's first completed range refines it |
-| `MIN_CHUNK_CANDIDATES` / `MAX_CHUNK_CANDIDATES` | `1000000` / `200000000000` | clamp on carved chunk size |
+| `MIN_CHUNK_CANDIDATES` / `MAX_CHUNK_CANDIDATES` | `1000000` / `1000000000000000` | clamp on carved chunk size |
 | `LEASE_GRACE_MULTIPLIER` | `3.0` | lease length = this × expected chunk duration |
 | `RECLAIM_INTERVAL_SECS` | `30` | how often expired leases are swept back to pending |
 | `EMA_ALPHA` | `0.3` | smoothing factor for each user's observed-rate average |
