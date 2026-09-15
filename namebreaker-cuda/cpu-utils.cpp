@@ -97,7 +97,7 @@ static bool isAlnumMpq_CPU(char c) {
     return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
 }
 
-bool hasForbiddenSymbolRun_CPU(const std::string& s) {
+bool hasForbiddenSymbolRun_CPU(std::string_view s) {
     int run = 0;
     for (char c : s) {
         if (isAlnumMpq_CPU(c) || c == ' ') {
@@ -109,7 +109,7 @@ bool hasForbiddenSymbolRun_CPU(const std::string& s) {
     return false;
 }
 
-int countBackslashes_CPU(const std::string& s) {
+int countBackslashes_CPU(std::string_view s) {
     int count = 0;
     for (char c : s) {
         if (c == '\\') count++;

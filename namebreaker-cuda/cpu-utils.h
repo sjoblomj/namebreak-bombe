@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -25,8 +26,11 @@ std::pair<uint32_t, uint32_t > mpqHashWithPrefixCache_CPU(const char* str, const
 // to launch a kernel at all - not GPU lanes deciding whether to keep
 // computing mid-kernel.
 //
-bool hasForbiddenSymbolRun_CPU(const std::string& s);
-int countBackslashes_CPU(const std::string& s);
+// Take string_view rather than a string - a caller with just a substring to
+// check (e.g. a candidate's leading portion) shouldn't have to allocate one
+// to ask.
+bool hasForbiddenSymbolRun_CPU(std::string_view s);
+int countBackslashes_CPU(std::string_view s);
 
 // Incrementally hashes a fixed base state (typically the hash of a fixed
 // filename prefix) extended by a variable-length "leading" string of
