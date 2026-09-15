@@ -41,15 +41,22 @@ __device__ volatile int d_foundMatchFlag = 0;
 // buildCompleteFilename (hash_kernels.cuh) for how it's populated.
 __device__ char d_foundFilename[MAX_FILENAME_LEN];
 
-// No pruneSymbolRuns/maxBackslashCount check here - those are applied only to
-// the leading characters, on the CPU, before this kernel is ever launched
-// (see the leadingIdx loop in runSearch) - not to the trailing characters
-// this kernel brute-forces. See cpu-utils.h's doc comment on
-// hasForbiddenSymbolRun_CPU for why: measured directly, checking them here
-// too bought no speedup (SIMT lockstep means a `return` only saves time if a
-// whole 32-lane warp takes it together, which a small trailing window rarely
-// arranges), so there was nothing to trade the extra branch and device-side
-// code for.
+// No maxBackslashCount check, and no pruneSymbolRuns check, here - both are
+// applied only to the leading characters, on the CPU, before this kernel is
+// ever launched (see the leadingIdx loop in runSearch), not to the trailing
+// characters this kernel brute-forces. See cpu-utils.h's doc comment on
+// hasForbiddenSymbolRun_CPU for why: measured directly, checking either one
+// here bought no speedup - not even a narrower version that only checked
+// whether the trailing window's first character or two continued a run
+// carried over from the leading part, which looked promising on paper (that
+// position is warp-uniform ~99.97% of the time for these alphabet sizes, so
+// a taken `return` was expected to often save a whole warp's worth of work)
+// but consistently measured 2-9% *slower* once actually benchmarked
+// carefully - the fixed cost of the check itself (a constant-memory read, a
+// comparison) is paid by every thread on every candidate, and against this
+// project's real alphabet a candidate actually completing a leading value's
+// forbidden run at the boundary is rare enough that the fixed cost is paid
+// far more often than it's ever repaid.
 template<int AlphabetSize>
 __global__ void bruteForceKernel(
     int candidateLen,
@@ -418,15 +425,14 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             }
             const std::string& leading = leadingHasher.leading();
 
-            // req.pruneSymbolRuns/req.maxBackslashCount only ever examine
-            // `leading` - the CPU-computed first leadingLen characters of the
-            // candidate - never the GPU-brute-forced trailing gpuWindowChars
-            // characters (see hasForbiddenSymbolRun_CPU's doc comment in
-            // cpu-utils.h for why, and bruteForceKernel's for the GPU side of
-            // that same story). A prune here skips this leading value's
-            // entire trailing batch (up to batchSize candidates) without
-            // spending anything on the GPU, uploads included - cheaper than
-            // even one of those candidates would have cost individually.
+            // req.pruneSymbolRuns/req.maxBackslashCount examine `leading` -
+            // the CPU-computed first leadingLen characters of the candidate
+            // (see hasForbiddenSymbolRun_CPU's doc comment in cpu-utils.h for
+            // why checking it here, instead of on the GPU, is worth doing). A
+            // prune here skips this leading value's entire trailing batch (up
+            // to batchSize candidates) without spending anything on the GPU,
+            // uploads included - cheaper than even one of those candidates
+            // would have cost individually.
             if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
                 continue;
             if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
