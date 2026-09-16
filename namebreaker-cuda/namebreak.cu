@@ -278,8 +278,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     printf("upperBoundLimit: '%s'\n", upperBoundLimit.c_str());
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
-    printf("pruneSymbolRuns: %s (leading characters only - see the leadingIdx loop below)\n",
-           req.pruneSymbolRuns ? "true" : "false");
+    printf("pruneSymbolRuns: %s (leading characters only)\n", req.pruneSymbolRuns ? "true" : "false");
     printf("maxBackslashCount: %d%s (leading characters only)\n", req.maxBackslashCount,
            req.maxBackslashCount == 0 ? " (unlimited)" : "");
 
@@ -441,11 +440,6 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
                 }
             } else {
                 trailEnd = trailSpaceSize;
-            }
-
-            if ((leadingIdx - startLeadingIdx) % leadingLogInterval == 0) {
-                printf("Leading '%s'. Char length = %d → Trailing combinations: %llu\n",
-                       leading.c_str(), candidateLen, (unsigned long long)(trailEnd - trailStart));
             }
 
             // Level 3 (see the walkthrough above the outer `while`).
