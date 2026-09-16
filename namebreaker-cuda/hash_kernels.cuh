@@ -78,6 +78,26 @@ __device__ uint32_t mpqHashSeed2(const char* str) {
     return seed1;
 }
 
+// Same recurrence as mpqHashSeed2 (offset 0x200), but offset 0x100 - i.e. a
+// from-scratch hashA over the complete filename, independent of the
+// prefix-cache incremental path mpqHashCandidateAndSuffix uses. Only called
+// once, on the rare candidate that already matched via that incremental
+// path, as a correctness cross-check (see its call site in
+// bruteForceKernel) - not on the hot per-candidate path, so recomputing from
+// scratch here costs nothing that matters.
+__device__ uint32_t mpqHashSeed1(const char* str) {
+    uint32_t seed1 = 0x7FED7FED;
+    uint32_t seed2 = 0xEEEEEEEE;
+    unsigned char ch;
+
+    while ((ch = *str++) != '\0') {
+        seed1 = d_cryptTable[0x100 + ch] ^ (seed1 + seed2);
+        seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
+    }
+
+    return seed1;
+}
+
 // AlphabetSize is a compile-time template parameter so this modulus/division -
 // run once per candidate character, for every thread - stays a cheap
 // compiler-optimized constant instead of a real (much slower) GPU integer

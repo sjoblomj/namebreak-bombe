@@ -69,6 +69,17 @@ __global__ void bruteForceKernel(
     if (hashA == targetA) {
         char filename[MAX_FILENAME_LEN];
         buildCompleteFilename(candidate, candidateLen, filename);
+
+        // Sanity check: hashA above was computed via the prefix-cache/incremental
+        // path (mpqHashCandidateAndSuffix), which must agree with hashing the
+        // complete filename from scratch. A mismatch would mean the cache is out
+        // of sync with the actual filename - a real bug, not a candidate to skip.
+        uint32_t verifyHashA = mpqHashSeed1(filename);
+        if (verifyHashA != hashA) {
+            printf("WARNING: hashA mismatch for '%s' - incremental hash 0x%08X, full-filename hash 0x%08X\n",
+                   filename, hashA, verifyHashA);
+        }
+
         printf("Hash A matches: %s\n", filename);
 
         uint32_t hashB = mpqHashSeed2(filename);
