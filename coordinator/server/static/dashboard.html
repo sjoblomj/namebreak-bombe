@@ -648,9 +648,11 @@
   }
 
   // The placeholder standing in for a collapsed run's hidden middle: reveals
-  // batches of REVEAL_BATCH from whichever end the viewer asks for, inserted
-  // right where those rows belong (just above the placeholder for "first",
-  // just below it for "last"), and removes itself once nothing is hidden.
+  // batches of REVEAL_BATCH from whichever end the viewer asks for (or
+  // everything at once, via "Show all"), inserted right where those rows
+  // belong (just above the placeholder for "first", just below it for
+  // "last"; "Show all" inserts the whole remaining run, already in order,
+  // in one place), and removes itself once nothing is hidden.
   function collapsedRow(group) {
     const hidden = group.hidden;
     const tr = document.createElement('tr');
@@ -678,6 +680,11 @@
     btnLast.className = 'collapsed-btn';
     wrap.appendChild(btnLast);
 
+    const btnAll = document.createElement('button');
+    btnAll.type = 'button';
+    btnAll.className = 'collapsed-btn';
+    wrap.appendChild(btnAll);
+
     function refresh() {
       if (hidden.length === 0) {
         tr.remove();
@@ -687,6 +694,7 @@
       const n = Math.min(REVEAL_BATCH, hidden.length);
       btnFirst.textContent = `Show first ${n}`;
       btnLast.textContent = `Show last ${n}`;
+      btnAll.textContent = `Show all ${hidden.length}`;
     }
     refresh();
 
@@ -696,6 +704,10 @@
     });
     btnLast.addEventListener('click', () => {
       insertRangeRows(tr.parentNode, tr.nextSibling, hidden.splice(Math.max(0, hidden.length - REVEAL_BATCH), REVEAL_BATCH));
+      refresh();
+    });
+    btnAll.addEventListener('click', () => {
+      insertRangeRows(tr.parentNode, tr, hidden.splice(0, hidden.length));
       refresh();
     });
 
