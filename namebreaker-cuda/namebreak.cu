@@ -44,19 +44,8 @@ __device__ char d_foundFilename[MAX_FILENAME_LEN];
 // No maxBackslashCount check, and no pruneSymbolRuns check, here - both are
 // applied only to the leading characters, on the CPU, before this kernel is
 // ever launched (see the leadingIdx loop in runSearch), not to the trailing
-// characters this kernel brute-forces. See cpu-utils.h's doc comment on
-// hasForbiddenSymbolRun_CPU for why: measured directly, checking either one
-// here bought no speedup - not even a narrower version that only checked
-// whether the trailing window's first character or two continued a run
-// carried over from the leading part, which looked promising on paper (that
-// position is warp-uniform ~99.97% of the time for these alphabet sizes, so
-// a taken `return` was expected to often save a whole warp's worth of work)
-// but consistently measured 2-9% *slower* once actually benchmarked
-// carefully - the fixed cost of the check itself (a constant-memory read, a
-// comparison) is paid by every thread on every candidate, and against this
-// project's real alphabet a candidate actually completing a leading value's
-// forbidden run at the boundary is rare enough that the fixed cost is paid
-// far more often than it's ever repaid.
+// characters this kernel brute-forces. See README.md's "Design decisions"
+// section for why.
 template<int AlphabetSize>
 __global__ void bruteForceKernel(
     int candidateLen,
@@ -234,23 +223,11 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     // cpu-utils.h) rather than from scratch per leading value. Deliberately
     // small and fixed - NOT "as large as maxSafeIndexLen allows", which is
     // what this project used to do (and still needs to fall back toward for
-    // very long candidates - see trailingLen's computation below). A larger
-    // window means every GPU thread in a batch redundantly re-hashes whatever
-    // leading characters are actually constant across that whole batch -
-    // batchSize threads all sharing the same leading characters, each
-    // independently re-deriving the same hash-chain state from them, is real
-    // wasted work (unlike the within-a-warp sharing this project tried and
-    // reverted earlier - that redundancy was illusory; this one, across an
-    // entire batch, isn't). Measured directly (tests/window_sweep_bench.cu,
-    // this alphabet): shrinking the window to 4 roughly doubled throughput
-    // versus hashing the whole candidate per thread (6.9 -> 13.4 G
-    // candidates/sec); smaller windows (1-3 characters) measured *worse* than
-    // even the old uncapped behavior, since too little GPU work per batch
-    // stops amortizing the CPU-side incremental hash update and the
-    // cudaMemcpyToSymbol uploads a new leading value needs every batch.
-    // Overridable at compile time (-DNAMEBREAK_GPU_WINDOW_CHARS=N) purely for
-    // re-sweeping this number against real hardware/alphabet combinations
-    // later (tests/search_bench.cu) without hand-editing the source each time.
+    // very long candidates - see trailingLen's computation below). See
+    // README.md's "Design decisions" section for why. Overridable at compile
+    // time (-DNAMEBREAK_GPU_WINDOW_CHARS=N) purely for re-sweeping this
+    // number against real hardware/alphabet combinations later
+    // (tests/search_bench.cu) without hand-editing the source each time.
 #ifndef NAMEBREAK_GPU_WINDOW_CHARS
 #define NAMEBREAK_GPU_WINDOW_CHARS 4
 #endif
@@ -427,10 +404,10 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
 
             // req.pruneSymbolRuns/req.maxBackslashCount examine `leading` -
             // the CPU-computed first leadingLen characters of the candidate
-            // (see hasForbiddenSymbolRun_CPU's doc comment in cpu-utils.h for
-            // why checking it here, instead of on the GPU, is worth doing). A
-            // prune here skips this leading value's entire trailing batch (up
-            // to batchSize candidates) without spending anything on the GPU,
+            // (see README.md's "Design decisions" section for why checking it
+            // here, instead of on the GPU, is worth doing). A prune here
+            // skips this leading value's entire trailing batch (up to
+            // batchSize candidates) without spending anything on the GPU,
             // uploads included - cheaper than even one of those candidates
             // would have cost individually.
             if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
