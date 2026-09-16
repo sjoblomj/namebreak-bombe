@@ -47,7 +47,7 @@ impl RangeConfig {
             target_chunk_seconds: env_f64("TARGET_CHUNK_SECONDS", 900.0),
             default_rate_per_sec: env_f64("DEFAULT_RATE_PER_SEC", 500_000_000.0),
             min_chunk_candidates: env_i64("MIN_CHUNK_CANDIDATES", 1_000_000),
-            max_chunk_candidates: env_i64("MAX_CHUNK_CANDIDATES", 200_000_000_000),
+            max_chunk_candidates: env_i64("MAX_CHUNK_CANDIDATES", 1_000_000_000_000_000),
             lease_grace_multiplier: env_f64("LEASE_GRACE_MULTIPLIER", 3.0),
             reclaim_interval_secs: env_u64("RECLAIM_INTERVAL_SECS", 30),
             ema_alpha: env_f64("EMA_ALPHA", 0.3),
