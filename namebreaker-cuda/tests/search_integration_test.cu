@@ -16,6 +16,11 @@
 //     forbidden run, and still finds real matches under leading values that
 //     don't.
 //  3. maxBackslashCount, same shape as #2.
+//  4. maxBackslashCount excludes the prefix: a prefix with *more* backslashes
+//     than max_backslash_count allows, alongside a candidate whose own
+//     leading characters have zero backslashes - if the prefix's backslashes
+//     ever leaked into the count, this candidate would be wrongly pruned and
+//     never found.
 //
 // A bug in any of these would look exactly like the failure mode this whole
 // exercise has been worried about from the start: candidates silently
@@ -309,6 +314,39 @@ int main() {
 
         allPassed &= runScenario("3: maxBackslashCount (CPU-side, leading characters only)", alphabet, prefix, suffix,
                                   candidateLen, lower, upper, /*pruneSymbolRuns=*/false, /*maxBackslashCount=*/2,
+                                  targetHash.first, 0xDEADBEEF, &targetCandidate);
+    }
+
+    // --- Scenario 4: maxBackslashCount excludes the prefix. `prefix` has 3
+    // backslashes - more than maxBackslashCount(1) allows - while the target
+    // candidate's own leading characters ("AA") have none. If the prefix's
+    // backslashes ever leaked into the count, this candidate would be
+    // wrongly pruned and runSearch() would never find it.
+    // alphabet[0]='A', alphabet[1]='\\'. leadingLen=2 (candidateLen=6):
+    // leadingIdx=43 ("\\\\", 2 backslashes) is the only pruned value in
+    // [0,44); everything else, including leadingIdx=0 ("AA", the target),
+    // has at most 1 backslash of its own and must survive regardless of the
+    // prefix's 3.
+    {
+        const std::string alphabet = "A\\ &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV"; // 42 chars
+        const std::string prefix = "TEST\\\\\\"; // 3 backslashes - more than maxBackslashCount below allows
+        const std::string suffix = ".DAT";
+        const int candidateLen = 6; // leadingLen = 6-4 = 2
+
+        const std::string lower = std::string(candidateLen, alphabet[0]);
+        std::string leadingPart = indexToString(44, candidateLen - kGpuWindowChars, alphabet); // spans leadingIdx 0..43
+        std::string trailingPart(kGpuWindowChars, alphabet[alphabet.size() - 2]);
+        std::string upper = leadingPart + trailingPart;
+
+        uint32_t cryptTable[0x500];
+        prepareCryptTable(cryptTable);
+        uint64_t targetGlobalIdx = 12345; // leadingIdx=0 ("AA", zero backslashes of its own)
+        std::string targetCandidate = indexToString(targetGlobalIdx, candidateLen, alphabet);
+        std::string targetFull = prefix + targetCandidate + suffix;
+        auto targetHash = mpqHashWithPrefixCache_CPU(targetFull.c_str(), cryptTable);
+
+        allPassed &= runScenario("4: maxBackslashCount excludes the prefix", alphabet, prefix, suffix,
+                                  candidateLen, lower, upper, /*pruneSymbolRuns=*/false, /*maxBackslashCount=*/1,
                                   targetHash.first, 0xDEADBEEF, &targetCandidate);
     }
 
