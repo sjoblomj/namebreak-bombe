@@ -9,8 +9,8 @@ use namebreak_protocol::{
 };
 
 use crate::alphabet::{
-    alphabet_size, bound_indices_at_len, bounds_are_valid, candidate_to_index, compile_skip_regex, expand_priority_pattern, lookup_predefined_alphabet,
-    max_supported_len, PREDEFINED_ALPHABETS,
+    alphabet_size, bound_indices_at_len, bounds_are_valid, bounds_diverge_immediately, candidate_to_index, compile_skip_regex, expand_priority_pattern,
+    lookup_predefined_alphabet, max_supported_len, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
@@ -205,6 +205,11 @@ pub async fn admin_create_target(
     }
     if !bounds_are_valid(alphabet, lower_bound, upper_bound) {
         return Err(AppError::BadRequest("lower_bound must be alphabetically before upper_bound".into()));
+    }
+    if !bounds_diverge_immediately(alphabet, lower_bound, upper_bound) {
+        return Err(AppError::BadRequest(
+            "lower_bound and upper_bound must not share a leading character - move whatever they have in common into prefix/suffix instead".into(),
+        ));
     }
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;

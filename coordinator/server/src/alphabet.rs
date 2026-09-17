@@ -199,6 +199,25 @@ pub fn bounds_are_valid(alphabet: &str, lower_bound: &str, upper_bound: &str) ->
     lower_idx <= upper_idx
 }
 
+/// Whether `lower_bound` and `upper_bound` diverge at their very first
+/// character. Required at target creation (see `admin_create_target`)
+/// because carving (`ranges::claim_range`) always starts at
+/// `candidate_len = 1`: if the two bounds shared even one leading character,
+/// every carve at that length - and, transitively, at every length up to
+/// however long the shared part is - would truncate both bounds down to the
+/// same string, handing out a range with no searchable candidates in it.
+/// Checking only length 1 is enough, not a heuristic: by the same
+/// once-diverged-stays-diverged reasoning `bounds_are_valid` above already
+/// relies on, a character that differs at any position is that number's
+/// most significant digit from then on, so bounds that diverge at length 1
+/// stay diverged at every longer length too. A bound pair that fails this
+/// should have its shared leading text moved into the target's own
+/// prefix/suffix instead - that's what prefix/suffix are for.
+pub fn bounds_diverge_immediately(alphabet: &str, lower_bound: &str, upper_bound: &str) -> bool {
+    let (lower_idx, upper_idx) = bound_indices_at_len(alphabet, lower_bound, upper_bound, 1);
+    lower_idx != upper_idx
+}
+
 /// Strips a target's prefix/suffix off a full filename to recover the candidate
 /// portion, e.g. for turning a `namebreak`-reported match back into an index via
 /// `candidate_to_index`. Alphabet-independent - pure string surgery.
@@ -732,6 +751,59 @@ mod tests {
         let long_lower = "A".repeat((max_supported_len(DEFAULT) + 5) as usize);
         assert!(bounds_are_valid(DEFAULT, &long_lower, "ZZZZZ"));
         assert!(!bounds_are_valid(DEFAULT, &long_lower, " "));
+    }
+
+    #[test]
+    fn bounds_diverge_immediately_accepts_bounds_that_differ_at_the_first_character() {
+        // The real-world shape (see admin_create_target's own example):
+        // bounds that already differ at their first character, regardless
+        // of whatever they share (or don't) after that.
+        assert!(bounds_diverge_immediately(DEFAULT, "FINZ09BX", "GAMEMENU"));
+        // Also holds for two entirely unrelated filenames used purely for
+        // their alphabetical position (see admin_create_target's doc
+        // comment on that use case) - nothing about this check requires the
+        // bounds to relate to each other beyond differing at position 0.
+        assert!(bounds_diverge_immediately(DEFAULT, "GLUE PALCS DLG.GRP", "MUSIC MENGSKVICTORY.WAV"));
+    }
+
+    #[test]
+    fn bounds_diverge_immediately_rejects_a_shared_leading_character() {
+        // This is exactly the shape that used to make claim_range carve an
+        // unsearchable single-candidate range at short lengths (both bounds
+        // truncate to the same "T", "TE", "TES", ... until length finally
+        // exceeds the shared "TEST" run) - see ranges::claim_range's carving
+        // and namebreak.cu's former strict lowerBound < upperBound check.
+        assert!(!bounds_diverge_immediately(DEFAULT, "TESTAAA", "TESTZZZ"));
+        // Even sharing just the first character is enough to reject -
+        // nothing about *how much* they share matters, only whether they
+        // share anything at position 0.
+        assert!(!bounds_diverge_immediately(DEFAULT, "AAA", "AZZ"));
+    }
+
+    #[test]
+    fn bounds_diverge_immediately_rejects_fully_equal_bounds() {
+        // The degenerate case of sharing a leading character: sharing all of
+        // it. Still correctly rejected by the same length-1 check.
+        assert!(!bounds_diverge_immediately(DEFAULT, "SAME", "SAME"));
+    }
+
+    #[test]
+    fn bounds_diverge_immediately_pads_a_bound_shorter_than_one_character() {
+        // An empty bound pads to the alphabet's min (lower_bound) or max
+        // (upper_bound) character at length 1 - same padding
+        // bound_indices_at_len already applies elsewhere, not a special case
+        // here. Both empty is the widest possible bound pair ("no
+        // constraint on either side"), min character vs max character -
+        // about as diverged as two bounds can get, not equal.
+        assert!(bounds_diverge_immediately(DEFAULT, "", "A"));
+        assert!(bounds_diverge_immediately(DEFAULT, "", ""));
+        // Only degenerate if the min and max character happen to coincide -
+        // i.e. an alphabet with just one character, which nothing in this
+        // codebase actually allows (MAX_ALPHABET_SIZE's whole *point* is a
+        // useful brute-force space), but bounds_diverge_immediately itself
+        // has no lower limit on alphabet size to enforce that - worth
+        // documenting the edge rather than leaving it implicit.
+        assert!(!bounds_diverge_immediately("A", "", ""));
     }
 
     #[test]
