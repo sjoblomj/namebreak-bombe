@@ -29,6 +29,13 @@ pub struct RangeConfig {
     pub lease_grace_multiplier: f64,
     pub reclaim_interval_secs: u64,
     pub ema_alpha: f64,
+    /// How long a range may sit claimed with no real progress (its
+    /// progress_index never advancing between heartbeats) before
+    /// heartbeat_range releases it back to pending for someone else -
+    /// heartbeating alone keeps lease_expires_at renewed indefinitely, so
+    /// without this a stalled (e.g. paused) client would hold a range
+    /// hostage forever. See `ranges::heartbeat_range`.
+    pub stall_release_seconds: i64,
 }
 
 impl RangeConfig {
@@ -51,6 +58,7 @@ impl RangeConfig {
             lease_grace_multiplier: env_f64("LEASE_GRACE_MULTIPLIER", 3.0),
             reclaim_interval_secs: env_u64("RECLAIM_INTERVAL_SECS", 30),
             ema_alpha: env_f64("EMA_ALPHA", 0.3),
+            stall_release_seconds: env_i64("STALL_RELEASE_SECONDS", 24 * 60 * 60),
         }
     }
 }

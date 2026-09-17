@@ -1,0 +1,14 @@
+-- When a range's progress_index was last confirmed to have actually
+-- advanced (not just re-reported) - set to the claim moment as a baseline
+-- whenever a range becomes 'in_progress' (alongside assigned_at), and bumped
+-- forward on any heartbeat whose reported progress genuinely moves past what
+-- was already recorded. NULL while a range isn't currently claimed (not
+-- meaningful then), same as assigned_at/lease_expires_at.
+--
+-- Lets heartbeat_range release a range back to pending once it's gone
+-- STALL_RELEASE_SECONDS without any real progress - covers a deliberately
+-- paused client (which keeps heartbeating the same last-reported match
+-- indefinitely) without the server needing to know "paused" is a concept at
+-- all, and for free also covers any other reason a heartbeating client might
+-- stop making progress (stuck, crashed into a loop, etc).
+ALTER TABLE ranges ADD COLUMN last_progress_at INTEGER;

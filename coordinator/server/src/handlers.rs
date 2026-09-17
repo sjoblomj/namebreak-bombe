@@ -96,8 +96,8 @@ pub async fn heartbeat(
     Path(range_id): Path<i64>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
-    let outcome = ranges::heartbeat_range(&state.pool, &user, range_id, req.last_hash_a_match_filename).await?;
-    Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, target_solved: outcome.target_solved }))
+    let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename).await?;
+    Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, range_released: outcome.range_released }))
 }
 
 pub async fn complete(

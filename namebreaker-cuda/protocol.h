@@ -64,14 +64,25 @@ struct ClaimResponse {
 struct HeartbeatRequest {
     // The most recent Hash-A-only match's full filename for the range this
     // heartbeat is for, if any - see runSearch's onPartialMatch callback.
+    // Also doubles as this client's only liveness-of-*progress* signal (as
+    // opposed to liveness of the heartbeat itself, which every call already
+    // proves) - reporting the same filename heartbeat after heartbeat, as a
+    // paused client necessarily would, is what lets the server notice and
+    // eventually release a stalled range (see HeartbeatResponse::rangeReleased).
     std::optional<std::string> lastHashAMatchFilename;
 };
 
 struct HeartbeatResponse {
     int64_t leaseSeconds = 0;
-    // True once this range's target has been solved via a different range -
-    // the caller should abort its current search rather than keep going.
-    bool targetSolved = false;
+    // True once this range should be abandoned - either its target was
+    // solved (by this range or a different one), or the range went too long
+    // without any reported progress and the server released it back to
+    // pending for someone else. Either way the caller should abort its
+    // current search and won't be reporting completion for this range; the
+    // two reasons need no distinguishing here - a caller that's locally
+    // paused already knows to stay paused and idle rather than claim a new
+    // range regardless of which one this was (see runCoordinator's claim loop).
+    bool rangeReleased = false;
 };
 
 struct CompleteRequest {

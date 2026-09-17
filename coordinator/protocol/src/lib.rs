@@ -128,6 +128,12 @@ pub struct HeartbeatRequest {
     /// this candidate is known to have been searched (namebreak only logs a match
     /// after the CUDA batch containing it has finished), so if this range is later
     /// reassigned, the new client resumes just past it instead of from the start.
+    /// Also doubles as this client's only liveness-of-*progress* signal (as
+    /// opposed to liveness of the heartbeat itself, which every call already
+    /// proves): reporting the same filename heartbeat after heartbeat - as a
+    /// paused client necessarily would, having nothing new to report - is
+    /// what lets the server notice and eventually reclaim a stalled range.
+    /// See `HeartbeatResponse::range_released`.
     #[serde(default)]
     pub last_hash_a_match_filename: Option<String>,
 }
@@ -135,13 +141,16 @@ pub struct HeartbeatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub lease_seconds: i64,
-    /// True if this range's target has already been solved - by someone
-    /// else via a different range, or because a *different target* sharing
-    /// the same hash_a/hash_b was solved instead (see `ranges::complete_range`).
-    /// The client should move on to a new range rather than let it keep
-    /// searching a target that's already found - it won't be reporting
-    /// completion for this range either way.
-    pub target_solved: bool,
+    /// True once this range should be abandoned - either its target was
+    /// solved (by this range or a different one, see
+    /// `ranges::complete_range`), or the range went STALL_RELEASE_SECONDS
+    /// without any reported progress and was released back to pending for
+    /// someone else (see `ranges::heartbeat_range`). Either way the client
+    /// should abort its current search and won't be reporting completion for
+    /// this range; the two reasons need no further distinguishing on the
+    /// wire; a client that's locally paused already knows to stay paused and
+    /// idle rather than claim a new range regardless of which one this was.
+    pub range_released: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

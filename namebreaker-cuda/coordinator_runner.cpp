@@ -146,6 +146,14 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     std::string lastHashAMatch;
     bool haveLastHashAMatch = false;
     std::atomic<bool> abortRequested{false};
+    // Only ever written by the heartbeat thread below, right before it
+    // breaks out of its loop, and only ever read after heartbeatThread.join()
+    // - that join() is itself a synchronizes-with edge, so a plain bool
+    // (unlike abortRequested, which the search thread polls concurrently
+    // while the heartbeat thread is still running) needs no atomic here.
+    // Captured at the moment the release is detected, not re-read later, to
+    // avoid any raciness against the user unpausing in between.
+    bool wasPausedWhenReleased = false;
 
     std::mutex stopMutex;
     std::condition_variable stopCv;
@@ -166,8 +174,21 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
             HeartbeatResponse resp;
             std::string err;
             if (hbClient.heartbeat(claim.rangeId, latest, resp, err)) {
-                if (resp.targetSolved) {
-                    printf("[coordinator] range %lld: target already solved elsewhere - signaling abort\n", (long long) claim.rangeId);
+                if (resp.rangeReleased) {
+                    // The server doesn't say why (target solved elsewhere, or
+                    // this range stalled too long - see HeartbeatResponse's
+                    // doc comment in protocol.h) - our own pause state is
+                    // enough to pick the right message and, more importantly,
+                    // is what runCoordinator's claim loop already keys off to
+                    // decide whether to go claim a new range or stay idle.
+                    wasPausedWhenReleased = pauseRequested && pauseRequested->load(std::memory_order_relaxed);
+                    if (wasPausedWhenReleased) {
+                        printf("[coordinator] range %lld: claim released - no progress was reported while paused. "
+                               "Still paused; no new work will be claimed until resumed.\n",
+                               (long long) claim.rangeId);
+                    } else {
+                        printf("[coordinator] range %lld: target already solved elsewhere - signaling abort\n", (long long) claim.rangeId);
+                    }
                     abortRequested.store(true, std::memory_order_relaxed);
                     lock.lock();
                     break;
@@ -201,7 +222,11 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     }
 
     if (result.aborted) {
-        printf("[coordinator] range %lld: aborted - target was already solved by someone else\n", (long long) claim.rangeId);
+        if (wasPausedWhenReleased) {
+            printf("[coordinator] range %lld: aborted - claim released while paused\n", (long long) claim.rangeId);
+        } else {
+            printf("[coordinator] range %lld: aborted - target was already solved by someone else\n", (long long) claim.rangeId);
+        }
         return;
     }
 
@@ -298,6 +323,16 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
     std::mt19937 rng(std::random_device{}());
 
     while (true) {
+        // Never claim new work while paused - "pause the client" means
+        // exactly that, not just "pause whichever range is currently in
+        // hand". This is also what makes staying paused actually stick after
+        // a claim-expired-while-paused release (see runOneRange above): that
+        // release doesn't touch pauseRequested itself, it just stops the
+        // now-invalid range's search and heartbeat - it's this gate, right
+        // here, that keeps the loop from immediately claiming a replacement.
+        while (pauseRequested && pauseRequested->load(std::memory_order_relaxed))
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
         std::optional<ClaimResponse> claim;
         if (!client.claim(claim, error)) {
             // Exponential backoff, capped at kMaxClaimBackoff, so a real

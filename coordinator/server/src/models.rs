@@ -93,6 +93,10 @@ pub struct Range {
     /// dashboard labeling; claim/heartbeat/complete/reclaim logic treats
     /// every range the same regardless of origin.
     pub priority_range_id: Option<i64>,
+    /// When this range's progress_index was last confirmed to actually
+    /// advance - `None` while it isn't currently claimed. See
+    /// `ranges::heartbeat_range` and `STALL_RELEASE_SECONDS`.
+    pub last_progress_at: Option<i64>,
 }
 
 #[allow(dead_code)]

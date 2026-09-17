@@ -250,7 +250,7 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
 bool parseHeartbeatResponse(const std::string& body, HeartbeatResponse& out) {
     std::map<std::string, JsonValue> obj;
     if (!JsonParser(body).parseFlatObject(obj)) return false;
-    return getInt64(obj, "lease_seconds", out.leaseSeconds) && getBool(obj, "target_solved", out.targetSolved);
+    return getInt64(obj, "lease_seconds", out.leaseSeconds) && getBool(obj, "range_released", out.rangeReleased);
 }
 
 std::string parseErrorMessage(const std::string& body) {
