@@ -11,8 +11,29 @@
 // one header so the code under test is always exactly the code that ships,
 // never a copy that could drift out of sync.
 
+// Capacity of both d_prefix and BatchParams::prefix below (including the
+// terminating NUL) - what runSearch checks the extended prefix against.
+constexpr int kMaxPrefixSize = 64;
+
+// Everything that changes from one leading value to the next (i.e. once per
+// kernel launch in the common case), passed to bruteForceKernel by value as a
+// kernel argument instead of being uploaded to the __constant__ symbols below
+// with cudaMemcpyToSymbol. Those uploads were synchronous driver calls that
+// each cost ~6us of GPU idle time between two consecutive kernels - a kernel
+// argument rides along with the launch itself for free.
+struct BatchParams {
+    char prefix[kMaxPrefixSize]; // req.prefix + the leading characters, NUL-terminated
+    short prefixSize;
+    uint32_t seed1Start;         // hash state after the (extended) prefix - see
+    uint32_t seed2Start;         // mpqHashWithPrefixCache_CPU / IncrementalPrefixHasher
+};
+
 __device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
-__device__ __constant__ char d_prefix[64];
+// d_prefix/d_prefix_size/d_seed*_start (below) are no longer what the search
+// kernel reads - it takes a BatchParams instead. They remain for the
+// symbol-based overloads of mpqHashCandidateAndSuffix/buildCompleteFilename,
+// which tests/window_sweep_bench.cu still uses.
+__device__ __constant__ char d_prefix[kMaxPrefixSize];
 __device__ __constant__ char d_suffix[64];
 __device__ __constant__ short d_prefix_size;
 __device__ __constant__ short d_suffix_size;
@@ -22,7 +43,7 @@ __device__ __constant__ uint32_t d_seed2_start;
 __device__ __constant__ uint32_t d_cryptTable[0x500];
 
 // Hashes `candidate` followed by d_suffix directly, without ever concatenating them
-// into a scratch buffer first. Starts from d_seed1_start/d_seed2_start, which already
+// into a scratch buffer first. Starts from seed1/seed2, which already
 // account for the (extended) prefix's contribution - see mpqHashWithPrefixCache_CPU.
 // This is the hot path (every thread runs it), so avoiding the extra buffer write+read
 // that buildFilenameWithoutPrefix + a buffer-based hash would need is worth it; the
@@ -42,10 +63,7 @@ __device__ __constant__ uint32_t d_cryptTable[0x500];
 // the warp the same number of cycles it always did (masking off the other 31
 // lanes doesn't make a loop finish faster), and the broadcast/uniformity-
 // check machinery is pure overhead on top of that.
-__device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen) {
-    uint32_t seed1 = d_seed1_start;
-    uint32_t seed2 = d_seed2_start;
-
+__device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen, uint32_t seed1, uint32_t seed2) {
     // unsigned so a byte >= 0x80 zero-extends into the crypt-table index/seed
     // arithmetic instead of sign-extending to a negative value - must match
     // cpu-utils.cpp's host-side hash exactly, or a match found on one side
@@ -62,6 +80,11 @@ __device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candida
     }
 
     return seed1;
+}
+
+// Same, starting from the d_seed1_start/d_seed2_start symbols.
+__device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen) {
+    return mpqHashCandidateAndSuffix(candidate, candidateLen, d_seed1_start, d_seed2_start);
 }
 
 __device__ uint32_t mpqHashSeed2(const char* str) {
@@ -117,9 +140,9 @@ __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCand
 // the CPU now, against the leading characters, before this candidate's batch
 // is even launched.
 
-__device__ void buildCompleteFilename(const char* candidate, int candidateLen, char* out) {
-    memcpy(out, d_prefix, d_prefix_size);
-    short i = d_prefix_size;
+__device__ void buildCompleteFilename(const char* prefix, short prefixSize, const char* candidate, int candidateLen, char* out) {
+    memcpy(out, prefix, prefixSize);
+    short i = prefixSize;
 
     memcpy(out + i, candidate, candidateLen);
     i += candidateLen;
@@ -128,6 +151,11 @@ __device__ void buildCompleteFilename(const char* candidate, int candidateLen, c
     i += d_suffix_size;
 
     out[i] = '\0';
+}
+
+// Same, using the d_prefix/d_prefix_size symbols.
+__device__ void buildCompleteFilename(const char* candidate, int candidateLen, char* out) {
+    buildCompleteFilename(d_prefix, d_prefix_size, candidate, candidateLen, out);
 }
 
 #endif //NAMEBREAK_CUDA_HASH_KERNELS_CUH

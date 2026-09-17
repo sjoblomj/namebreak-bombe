@@ -39,11 +39,18 @@ bool isSupportedAlphabetSize(int size) {
 // * Candidate = The part of the name that we are brute-forcing
 // * Filename  = The Prefix + Candidate + Suffix
 
-__device__ volatile int d_foundMatchFlag = 0;
-// Written by the kernel alongside d_foundMatchFlag, so the host can recover
-// *which* candidate matched both hashes without scanning stdout for it - see
-// buildCompleteFilename (hash_kernels.cuh) for how it's populated.
+// Written by the kernel alongside BatchResults::foundFlag, so the host can
+// recover *which* candidate matched both hashes without scanning stdout for it
+// - see buildCompleteFilename (hash_kernels.cuh) for how it's populated.
 __device__ char d_foundFilename[MAX_FILENAME_LEN];
+
+// The kernel's small per-batch outputs, kept together in one device buffer so
+// the host reads both back with a single cudaMemcpy (each separate driver
+// call is ~10us of GPU idle time between two consecutive kernels).
+struct BatchResults {
+    int matchCount; // hashA matches this batch (may exceed MAX_MATCHES; see below)
+    int foundFlag;  // 1 once any candidate has matched both hashes - never reset mid-search
+};
 
 // No maxBackslashCount check, and no pruneSymbolRuns check, here - both are
 // applied only to the leading characters, on the CPU, before this kernel is
@@ -57,8 +64,15 @@ __global__ void bruteForceKernel(
     uint64_t total,
     uint32_t targetA,
     uint32_t targetB,
+    // __grid_constant__: buildCompleteFilename (rare match path) takes the address
+    // of params.prefix, which without this makes the compiler copy the whole
+    // struct into per-thread local memory at kernel entry - for every one of the
+    // ~5.7M threads, match or not - measured as a ~3x slowdown. It lets that
+    // address point straight at the kernel-parameter constant bank instead.
+    // Needs compute capability >= 7.0.
+    const __grid_constant__ BatchParams params,
     char* d_matches,
-    int* d_matchCount
+    BatchResults* d_results
 ) {
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total)
@@ -69,10 +83,10 @@ __global__ void bruteForceKernel(
     char candidate[MAX_CANDIDATE_LEN];
     indexToCandidate<AlphabetSize>(idx, candidateLen, candidate);
 
-    uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen);
+    uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen, params.seed1Start, params.seed2Start);
     if (hashA == targetA) {
         char filename[MAX_FILENAME_LEN];
-        buildCompleteFilename(candidate, candidateLen, filename);
+        buildCompleteFilename(params.prefix, params.prefixSize, candidate, candidateLen, filename);
 
         // Sanity check: hashA above was computed via the prefix-cache/incremental
         // path (mpqHashCandidateAndSuffix), which must agree with hashing the
@@ -90,10 +104,10 @@ __global__ void bruteForceKernel(
         if (hashB == targetB) {
             printf("BOTH HASHES MATCH: %s\n", filename);
             memcpy(d_foundFilename, filename, MAX_FILENAME_LEN);
-            d_foundMatchFlag = 1;
+            d_results->foundFlag = 1;
         }
 
-        int slot = atomicAdd(d_matchCount, 1);
+        int slot = atomicAdd(&d_results->matchCount, 1);
         if (slot < MAX_MATCHES) {
             memcpy(&d_matches[slot * MAX_FILENAME_LEN], filename, MAX_FILENAME_LEN);
         }
@@ -103,8 +117,8 @@ __global__ void bruteForceKernel(
 
 // Returns 0 (no match yet), 1 (found - both hashes matched, outFoundFilename
 // is filled), or -1 (abortRequested was set, this batch was skipped).
-int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout,
-                  char* d_matches, int* d_matchCount, int alphabetSize,
+int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, const BatchParams& params, FILE* fout,
+                  char* d_matches, BatchResults* d_results, int alphabetSize,
                   const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
                   char* outFoundFilename, const std::atomic<bool>* pauseRequested) {
     if (abortRequested && abortRequested->load(std::memory_order_relaxed))
@@ -121,15 +135,13 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    int h_flag = 0;
-    CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
-
-    if (h_flag) {
-        CUDA_CHECK(cudaMemcpyFromSymbol(outFoundFilename, d_foundFilename, MAX_FILENAME_LEN));
-        return h_flag;
-    }
-    CUDA_CHECK(cudaMemset(d_matchCount, 0, sizeof(int)));
-
+    // No pre-launch check of d_results->foundFlag: runSearch zeroes it before
+    // the first batch, and a batch that finds a match returns 1 (below) - so
+    // runSearch stops calling this - rather than leaving it set for a later
+    // call to notice. d_results->matchCount is likewise already 0 here (see
+    // the reset after the readback below), so there's no per-batch memset
+    // either. Each of those was a synchronous driver call in the gap between
+    // two kernels.
     // This launches `blocks * threadsPerBlock` GPU threads for the chunk (up to
     // ~5.76M for a full batch - see batchSize in runSearch), one candidate per
     // thread. Every 32 consecutive threads form a "warp" that the hardware runs
@@ -144,7 +156,7 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     // namebreak to volunteers) to support a new size.
     #define LAUNCH_WITH_ALPHABET_SIZE(SIZE) \
         bruteForceKernel<SIZE><<<blocks, threadsPerBlock>>>( \
-                candidateLen, startIdx, count, targetA, targetB, d_matches, d_matchCount)
+                candidateLen, startIdx, count, targetA, targetB, params, d_matches, d_results)
     switch (alphabetSize) {
         case 42: LAUNCH_WITH_ALPHABET_SIZE(42); break;
         case 43: LAUNCH_WITH_ALPHABET_SIZE(43); break;
@@ -160,32 +172,37 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    int h_matchCount = 0;
-    CUDA_CHECK(cudaMemcpy(&h_matchCount, d_matchCount, sizeof(int), cudaMemcpyDeviceToHost));
-    h_matchCount = std::min(h_matchCount, MAX_MATCHES);
+    BatchResults h_results;
+    CUDA_CHECK(cudaMemcpy(&h_results, d_results, sizeof(h_results), cudaMemcpyDeviceToHost));
 
-    char h_matches[MAX_MATCHES][MAX_FILENAME_LEN];
-    CUDA_CHECK(cudaMemcpy(h_matches, d_matches, h_matchCount * MAX_FILENAME_LEN, cudaMemcpyDeviceToHost));
+    // Matches are rare (a few per thousand batches), so everything below is the
+    // exception path - the common batch costs exactly the one cudaMemcpy above.
+    int h_matchCount = std::min(h_results.matchCount, MAX_MATCHES);
+    if (h_matchCount > 0) {
+        char h_matches[MAX_MATCHES][MAX_FILENAME_LEN];
+        CUDA_CHECK(cudaMemcpy(h_matches, d_matches, h_matchCount * MAX_FILENAME_LEN, cudaMemcpyDeviceToHost));
 
-    for (int i = 0; i < h_matchCount; ++i) {
-        fprintf(fout, "%s\n", h_matches[i]);
-        fflush(fout);
-        if (onPartialMatch)
-            onPartialMatch(h_matches[i]);
+        for (int i = 0; i < h_matchCount; ++i) {
+            fprintf(fout, "%s\n", h_matches[i]);
+            fflush(fout);
+            if (onPartialMatch)
+                onPartialMatch(h_matches[i]);
+        }
+
+        // Restores the "matchCount is 0 at launch" invariant the next batch relies on.
+        CUDA_CHECK(cudaMemset(&d_results->matchCount, 0, sizeof(int)));
     }
 
-    // Re-read rather than reusing the pre-launch value above: this batch's
-    // own kernel (just synchronized) may be the one that just found the
-    // match, and the early-return above only ever fires for a match found by
-    // some *earlier* call - without this, a match found in a batch would go
-    // undetected until whatever call happens to come after it, which may
-    // never come (e.g. a "bounded" search whose very last batch is the one
-    // that finds it would otherwise report "not found").
-    CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
-    if (h_flag) {
+    // Read from the same copy as matchCount, taken after this batch's own kernel
+    // has finished (cudaDeviceSynchronize above), so a match found by *this*
+    // batch is reported now instead of going undetected until whatever call
+    // happens to come after it, which may never come (e.g. a "bounded" search
+    // whose very last batch is the one that finds it would otherwise report
+    // "not found").
+    if (h_results.foundFlag) {
         CUDA_CHECK(cudaMemcpyFromSymbol(outFoundFilename, d_foundFilename, MAX_FILENAME_LEN));
     }
-    return h_flag;
+    return h_results.foundFlag;
 }
 
 SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequested, std::function<void(const std::string&)> onPartialMatch,
@@ -275,10 +292,10 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     printf("gpuWindowChars: %d, maxSafeIndexLen: %d (max leading/prefix-extension length: %d)\n",
            gpuWindowChars, maxSafeIndexLen, maxLeadingLen);
 
-    if (prefix_size + maxLeadingLen >= (int) sizeof(d_prefix) || suffix_size >= (int) sizeof(d_suffix)) {
+    if (prefix_size + maxLeadingLen >= (int) kMaxPrefixSize || suffix_size >= (int) sizeof(d_suffix)) {
         result.ok = false;
         result.error = "prefix (up to " + std::to_string(prefix_size + maxLeadingLen) + " once extended by leading candidate characters) or suffix (" +
-                        std::to_string(suffix_size) + ") too long for device buffers (max: " + std::to_string(sizeof(d_prefix)) + " each)";
+                        std::to_string(suffix_size) + ") too long for device buffers (max: " + std::to_string(kMaxPrefixSize) + " each)";
         return result;
     }
     if (prefix_size + suffix_size + MAX_CANDIDATE_LEN >= MAX_FILENAME_LEN) {
@@ -291,13 +308,6 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffix_size, sizeof(suffix_size)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, req.suffix.c_str(), suffix_size + 1));
     CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, req.alphabet.c_str(), req.alphabet.size() + 1));
-
-    // A long-lived process (coordinator mode) can call runSearch() many times
-    // over its lifetime, one per claimed range - reset explicitly rather than
-    // relying on its process-startup zero value, so a previous range's match
-    // can't make every subsequent range falsely report "found" immediately.
-    int zero = 0;
-    CUDA_CHECK(cudaMemcpyToSymbol(d_foundMatchFlag, &zero, sizeof(zero)));
 
     std::string lowerBoundLimit, upperBoundLimit;
     if (!getLowerBound(req.lowerBound, req.alphabet, lowerBoundLimit, result.error) ||
@@ -340,9 +350,16 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     // these buffers are always the same size, so there's no reason to pay driver
     // allocation overhead on every single kernel launch.
     char* d_matches;
-    int* d_matchCount;
+    BatchResults* d_results;
     CUDA_CHECK(cudaMalloc(&d_matches, MAX_MATCHES * MAX_FILENAME_LEN));
-    CUDA_CHECK(cudaMalloc(&d_matchCount, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_results, sizeof(BatchResults)));
+    // A long-lived process (coordinator mode) can call runSearch() many times
+    // over its lifetime, one per claimed range - zeroing this fresh allocation
+    // every call (rather than relying on any process-lifetime state) is what
+    // keeps a previous range's match from making every subsequent range
+    // falsely report "found" immediately. It also establishes the
+    // "matchCount is 0 at launch" invariant runCudaBatch maintains from here.
+    CUDA_CHECK(cudaMemset(d_results, 0, sizeof(BatchResults)));
 
     bool found_match = false;
     bool aborted = false;
@@ -452,17 +469,15 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
                 continue;
 
+            // Handed to every runCudaBatch call below as a kernel argument -
+            // not uploaded to device symbols first; see BatchParams.
             std::string extendedPrefix = req.prefix + leading;
-
-            short extPrefixSize = extendedPrefix.size();
-            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix_size, &extPrefixSize, sizeof(extPrefixSize)));
-            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix, extendedPrefix.c_str(), extPrefixSize + 1));
-
+            BatchParams params;
+            memcpy(params.prefix, extendedPrefix.c_str(), extendedPrefix.size() + 1);
+            params.prefixSize = (short) extendedPrefix.size();
             std::pair<uint32_t, uint32_t> pair = leadingHasher.state();
-            uint32_t seed1_start = pair.first;
-            uint32_t seed2_start = pair.second;
-            CUDA_CHECK(cudaMemcpyToSymbol(d_seed1_start, &seed1_start, sizeof(seed1_start)));
-            CUDA_CHECK(cudaMemcpyToSymbol(d_seed2_start, &seed2_start, sizeof(seed2_start)));
+            params.seed1Start = pair.first;
+            params.seed2Start = pair.second;
 
             uint64_t trailStart = 0, trailEnd = 0;
             if (leadingIdx == startLeadingIdx) {
@@ -483,7 +498,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             // Level 3 (see the walkthrough above the outer `while`).
             for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
                 uint64_t count = std::min(batchSize, trailEnd - i);
-                int r = runCudaBatch(trailingLen, i, count, req.targetHashA, req.targetHashB, fout, d_matches, d_matchCount,
+                int r = runCudaBatch(trailingLen, i, count, req.targetHashA, req.targetHashB, params, fout, d_matches, d_results,
                                       alphabetSize, abortRequested, onPartialMatch, foundFilename, pauseRequested);
                 if (r == -1) {
                     aborted = true;
@@ -506,7 +521,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
 breakfree:
 
     CUDA_CHECK(cudaFree(d_matches));
-    CUDA_CHECK(cudaFree(d_matchCount));
+    CUDA_CHECK(cudaFree(d_results));
     fclose(fout);
 
     result.aborted = aborted;
