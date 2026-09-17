@@ -1,16 +1,20 @@
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <string>
+#include <thread>
 #include "cpu-utils.h"
 #include "constants.h"
 #include "search.h"
 #include "config.h"
 #include "hash_kernels.cuh"
+#include "platform.h"
 #ifdef NAMEBREAK_WITH_NETWORK
 #include "coordinator_runner.h"
 #endif
@@ -102,9 +106,20 @@ __global__ void bruteForceKernel(
 int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, FILE* fout,
                   char* d_matches, int* d_matchCount, int alphabetSize,
                   const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
-                  char* outFoundFilename) {
+                  char* outFoundFilename, const std::atomic<bool>* pauseRequested) {
     if (abortRequested && abortRequested->load(std::memory_order_relaxed))
         return -1;
+
+    // Called between batches only (every previous call already synchronized
+    // via cudaDeviceSynchronize below before returning), so a batch already
+    // in flight is never interrupted - pausing here just means the *next*
+    // kernel launch waits. Keeps polling abortRequested too, so a pause that
+    // outlasts the target being solved elsewhere doesn't block forever.
+    while (pauseRequested && pauseRequested->load(std::memory_order_relaxed)) {
+        if (abortRequested && abortRequested->load(std::memory_order_relaxed))
+            return -1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 
     int h_flag = 0;
     CUDA_CHECK(cudaMemcpyFromSymbol(&h_flag, d_foundMatchFlag, sizeof(int)));
@@ -173,7 +188,8 @@ int runCudaBatch(int candidateLen, uint64_t startIdx, uint64_t count, uint32_t t
     return h_flag;
 }
 
-SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequested, std::function<void(const std::string&)> onPartialMatch) {
+SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequested, std::function<void(const std::string&)> onPartialMatch,
+                        const std::atomic<bool>* pauseRequested) {
     SearchResult result;
 
     if (req.alphabet.empty() || req.alphabet.size() > MAX_ALPHABET_SIZE) {
@@ -457,7 +473,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             for (uint64_t i = trailStart; i < trailEnd; i += batchSize) {
                 uint64_t count = std::min(batchSize, trailEnd - i);
                 int r = runCudaBatch(trailingLen, i, count, req.targetHashA, req.targetHashB, fout, d_matches, d_matchCount,
-                                      alphabetSize, abortRequested, onPartialMatch, foundFilename);
+                                      alphabetSize, abortRequested, onPartialMatch, foundFilename, pauseRequested);
                 if (r == -1) {
                     aborted = true;
                     goto breakfree;
@@ -492,8 +508,65 @@ breakfree:
 
 // Guarded so tests/search_integration_test.cu can link against this file's
 // runSearch() (the actual, unmodified function - not a reimplementation of
-// it) without a duplicate main() symbol: built with -DNAMEBREAK_NO_MAIN.
+// it) without a duplicate main() symbol: built with -DNAMEBREAK_NO_MAIN. That
+// build doesn't link platform.cpp either, so g_paused/pauseKeyListener below
+// (which need it) have to stay inside this guard too.
 #ifndef NAMEBREAK_NO_MAIN
+
+// Toggled by pauseKeyListener below, polled by runCudaBatch (via runSearch's
+// pauseRequested parameter) so a pause takes effect between batches rather
+// than needing to interrupt one mid-flight.
+std::atomic<bool> g_paused{false};
+
+// Runs for the life of the process once main() starts it (only when stdin is
+// an interactive terminal - see its call site), toggling g_paused on 'p'/
+// 'P', the same key cgminer/xmrig and other long-running GPU compute tools
+// already use for this. One key toggles both directions (like a media
+// player's pause button) rather than separate pause/resume keys, since
+// there's only ever one thing to remember.
+void pauseKeyListener() {
+    for (;;) {
+        int key = readKeypressBlocking();
+        if (key < 0)
+            return; // stdin closed - nothing left to listen for
+        if (key != 'p' && key != 'P')
+            continue;
+        bool nowPaused = !g_paused.load(std::memory_order_relaxed);
+        g_paused.store(nowPaused, std::memory_order_relaxed);
+        printf(nowPaused ? "\n[paused] finishing the current batch; no new batches will start until resumed (press 'p' to resume)\n"
+                          : "\n[resumed]\n");
+        fflush(stdout);
+    }
+}
+
+// Installed as SIGINT's handler (overriding the plain restore-and-terminate
+// one enableRawKeypressMode() already installed - see platform.h) so a
+// reflexive first Ctrl+C pauses instead of losing the run outright: a pause
+// is trivially undone (press 'p', or Ctrl+C once more), a quit isn't. A
+// second Ctrl+C while already paused - however it got paused, this handler
+// or the 'p' key - actually quits, restoring the terminal first exactly
+// like the handler it replaced would have.
+//
+// Signal-handler context: only touches an atomic and async-signal-safe
+// calls (write() via writeStdoutSignalSafe, tcsetattr via
+// restoreKeypressMode, signal(), raise()) - no printf/fflush, which aren't
+// guaranteed reentrant-safe if this signal interrupts another stdio call
+// already in progress on the main or listener thread.
+void handleSigintPauseOrQuit(int sig) {
+    if (!g_paused.exchange(true, std::memory_order_relaxed)) {
+        static constexpr char kMsg[] =
+            "\n[paused] (Ctrl+C) finishing the current batch; no new batches will start until resumed "
+            "(press 'p' to resume, or Ctrl+C again to quit)\n";
+        writeStdoutSignalSafe(kMsg, sizeof(kMsg) - 1);
+        return;
+    }
+    static constexpr char kMsg[] = "\n[quitting] (Ctrl+C again)\n";
+    writeStdoutSignalSafe(kMsg, sizeof(kMsg) - 1);
+    restoreKeypressMode();
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
 int main(int argc, char* argv[]) {
     // The only argument namebreak takes: an optional mode, overriding
     // config.conf's own `mode = ...` (see config.h). Everything else
@@ -522,6 +595,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Only when stdin is actually a terminal - a piped/redirected/absent
+    // stdin (cron, systemd, ...) has no keypresses to listen for, and
+    // enableRawKeypressMode() would just fail anyway.
+    if (isInteractiveTerminal() && enableRawKeypressMode()) {
+        printf("Press 'p' to pause/resume the search. Ctrl+C pauses too - press it again to quit.\n");
+        std::thread(pauseKeyListener).detach();
+        std::signal(SIGINT, handleSigintPauseOrQuit);
+    }
+
 #ifdef NAMEBREAK_WITH_NETWORK
     if (mode == "coordinator") {
         CoordinatorArgs cargs;
@@ -529,7 +611,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "%s [coordinator]: %s\n", kConfigPath, error.c_str());
             return 1;
         }
-        return runCoordinator(cargs);
+        return runCoordinator(cargs, &g_paused);
     }
 #else
     if (mode == "coordinator") {
@@ -544,7 +626,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    SearchResult result = runSearch(req);
+    SearchResult result = runSearch(req, nullptr, nullptr, &g_paused);
 
     if (!result.ok) {
         fprintf(stderr, "%s\n", result.error.c_str());

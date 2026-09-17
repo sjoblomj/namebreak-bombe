@@ -1,6 +1,7 @@
 #ifndef NAMEBREAK_CUDA_COORDINATOR_RUNNER_H
 #define NAMEBREAK_CUDA_COORDINATOR_RUNNER_H
 
+#include <atomic>
 #include <map>
 #include <string>
 
@@ -25,6 +26,10 @@ bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, Coo
 // only on a startup error (e.g. registration failure); otherwise this never
 // returns under normal operation. Takes `args` by value since it fills in
 // (and may prompt to confirm/persist) any of username/hostname left empty.
-int runCoordinator(CoordinatorArgs args);
+// `pauseRequested`, if given, is forwarded to every claimed range's
+// runSearch() call - the heartbeat thread keeps running (and keeps
+// heartbeating) regardless of it, since it's independent of the search
+// itself; see runSearch's own doc comment (search.h) for what pausing does.
+int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested = nullptr);
 
 #endif // NAMEBREAK_CUDA_COORDINATOR_RUNNER_H

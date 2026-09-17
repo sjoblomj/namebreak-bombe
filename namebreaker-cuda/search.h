@@ -46,13 +46,19 @@ struct SearchResult {
 // between batches so a caller can interrupt a long-running search (e.g. once
 // a coordinator learns the target was solved elsewhere); `onPartialMatch`,
 // if given, is invoked with the full filename of every Hash-A-only match as
-// soon as it's known.
+// soon as it's known. `pauseRequested`, if given, is polled the same way
+// abortRequested is - but instead of ending the search, blocks (still
+// letting a caller's own heartbeat/etc. threads run) until it's cleared
+// again, so the batch already in flight always finishes normally and only
+// the *next* one is held back. See namebreak.cu's main() for the key
+// listener that drives this.
 //
 // Safe to call more than once in the same process (e.g. once per claimed
 // coordinator range): all device state this depends on is reset at the
 // start of each call.
 SearchResult runSearch(const SearchRequest& req,
                         std::atomic<bool>* abortRequested = nullptr,
-                        std::function<void(const std::string&)> onPartialMatch = nullptr);
+                        std::function<void(const std::string&)> onPartialMatch = nullptr,
+                        const std::atomic<bool>* pauseRequested = nullptr);
 
 #endif // NAMEBREAK_CUDA_SEARCH_H

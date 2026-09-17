@@ -1,6 +1,8 @@
 #include "platform.h"
 
 #include <cstdlib>
+#include <cstdio>
+#include <cerrno>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -10,10 +12,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h> // GetComputerNameA, GetUserNameA - link against Advapi32 for the latter
-#include <io.h>      // _isatty, _fileno
+#include <io.h>      // _isatty, _fileno, _write
+#include <conio.h>   // _getch
 #else
+#include <csignal>
 #include <pwd.h>     // getpwuid
-#include <unistd.h>  // gethostname, isatty, fileno, geteuid
+#include <termios.h> // tcgetattr, tcsetattr
+#include <unistd.h>  // gethostname, isatty, fileno, geteuid, read, write
 #endif
 
 std::string resolveHostname() {
@@ -60,3 +65,86 @@ bool isInteractiveTerminal() {
     return isatty(fileno(stdin)) != 0;
 #endif
 }
+
+void writeStdoutSignalSafe(const char* msg, std::size_t len) {
+#ifdef _WIN32
+    (void) _write(_fileno(stdout), msg, (unsigned) len);
+#else
+    ssize_t written = write(STDOUT_FILENO, msg, len);
+    (void) written; // nothing useful to do with a failure from inside a signal handler
+#endif
+}
+
+#ifdef _WIN32
+
+bool enableRawKeypressMode() { return true; } // _getch() needs no mode change - see platform.h
+void restoreKeypressMode() {}
+
+int readKeypressBlocking() {
+    int c = _getch();
+    return c == EOF ? -1 : c;
+}
+
+#else
+
+namespace {
+struct termios g_savedTermios;
+bool g_rawModeActive = false;
+
+void restoreKeypressModeAndReraise(int sig) {
+    restoreKeypressMode();
+    // Put this signal's disposition back to the default (terminate) and
+    // re-deliver it, rather than calling exit()/_exit() ourselves - so the
+    // process still ends exactly the way it would have without this handler
+    // (same exit status, same "killed by signal" semantics for a parent
+    // shell/process-supervisor), just with the terminal already restored.
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+} // namespace
+
+bool enableRawKeypressMode() {
+    if (!isatty(fileno(stdin)))
+        return false;
+    if (tcgetattr(fileno(stdin), &g_savedTermios) != 0)
+        return false;
+
+    struct termios raw = g_savedTermios;
+    raw.c_lflag &= ~(ICANON | ECHO); // read single keypresses, don't echo them - but ISIG stays on (see platform.h)
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(fileno(stdin), TCSANOW, &raw) != 0)
+        return false;
+
+    g_rawModeActive = true;
+    std::signal(SIGINT, restoreKeypressModeAndReraise);
+    std::signal(SIGTERM, restoreKeypressModeAndReraise);
+    return true;
+}
+
+void restoreKeypressMode() {
+    if (g_rawModeActive) {
+        tcsetattr(fileno(stdin), TCSANOW, &g_savedTermios);
+        g_rawModeActive = false;
+    }
+}
+
+int readKeypressBlocking() {
+    unsigned char c;
+    for (;;) {
+        ssize_t n = read(fileno(stdin), &c, 1);
+        if (n == 1)
+            return (int) c;
+        // A signal (namebreak.cu's own SIGINT handler, e.g.) interrupting
+        // this blocking read looks identical to any other error unless
+        // EINTR is checked for and retried - without this, the first Ctrl+C
+        // would silently kill this listener thread (read() returning -1
+        // reads as "stdin closed" below) instead of leaving it to keep
+        // listening for a possible second Ctrl+C or a 'p' resume.
+        if (n < 0 && errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
+#endif

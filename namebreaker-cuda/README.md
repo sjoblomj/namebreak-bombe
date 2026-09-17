@@ -33,6 +33,27 @@ suffix** - the prefix and suffix are fixed, known strings (e.g. `REZ\` and
 Exit code is `0` if both hashes matched, `2` if the search space was
 exhausted without a match, `1` on any setup/config error.
 
+## Pausing
+
+Press `p` (or `P`) at any point while `namebreak` is running interactively
+to pause the search - the same key cgminer/xmrig and other long-running GPU
+compute tools use for this. The GPU batch already in flight always finishes
+normally; no new one starts until `p` is pressed again to resume. Ctrl+C
+pauses too, on the first press - a reflexive Ctrl+C doesn't lose the run
+outright, since a pause is trivially undone. A second Ctrl+C, while already
+paused by either method, actually quits. In `coordinator` mode,
+heartbeating keeps going while paused (it runs on its own thread,
+independent of the search itself), so a paused client doesn't lose its
+claimed range to a lease timeout - it just makes no progress on it until
+resumed. (Pausing doesn't stop the coordinator loop from claiming a *new*
+range if there isn't one in progress yet, though - if you pause between
+ranges, the next one still gets claimed, and then sits idle, heartbeated
+but unworked, until you resume; it just isn't reassigned to someone else in
+the meantime.) Only available when stdin is an actual interactive terminal
+(not when redirected/piped, or with no controlling terminal at all, e.g. a
+cron job or systemd service) - `namebreak` prints `Press 'p' to
+pause/resume the search.` on startup when it is.
+
 ## Configuring
 
 `namebreak` reads `config.conf` from the current working directory (not a

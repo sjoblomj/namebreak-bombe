@@ -130,7 +130,7 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
 
 // Runs exactly one claimed range: spawns the heartbeat thread, runs the
 // search in-process on the calling thread, then reports completion.
-void runOneRange(const std::string& serverUrl, const std::string& token, const ClaimResponse& claim) {
+void runOneRange(const std::string& serverUrl, const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested) {
     printf("[coordinator] starting range %lld (target %s) [%s .. %s]\n",
            (long long) claim.rangeId, claim.targetName.c_str(), claim.lowerBoundFilename.c_str(), claim.upperBoundFilename.c_str());
 
@@ -184,7 +184,7 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
         std::lock_guard<std::mutex> mlock(lastMatchMutex);
         lastHashAMatch = filename;
         haveLastHashAMatch = true;
-    });
+    }, pauseRequested);
     double elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
     {
@@ -273,7 +273,7 @@ bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, Coo
     return true;
 }
 
-int runCoordinator(CoordinatorArgs args) {
+int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested) {
     resolveMissingIdentity(args);
 
     // Not thread-safe to call lazily once the heartbeat thread may already
@@ -322,6 +322,6 @@ int runCoordinator(CoordinatorArgs args) {
             continue;
         }
 
-        runOneRange(args.serverUrl, client.token(), *claim);
+        runOneRange(args.serverUrl, client.token(), *claim, pauseRequested);
     }
 }
