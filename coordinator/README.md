@@ -32,15 +32,36 @@ matching `GET /api/v1/status`.
 
 See the top-level plan/design notes for the full rationale; the short version:
 
-- **Auth**: `/register {username, hostname}` (no password) hands back an opaque
-  bearer token. Every other endpoint requires it - this is the only thing
-  standing between a real client and a generic bot scraping the API, so it's
-  intentionally simple rather than absent.
+- **Auth**: `/register {username, hostname, protocol_version}` (no password)
+  hands back an opaque bearer token. Every other endpoint requires it - this
+  is the only thing standing between a real client and a generic bot scraping
+  the API, so it's intentionally simple rather than absent.
+- **Protocol versioning**: every client declares its own `protocol_version`
+  (`X.Y.Z`) at `/register`; the server rejects registration outright on a
+  MAJOR version mismatch against its own `PROTOCOL_VERSION`
+  (`coordinator/protocol/src/lib.rs`), asking for an upgrade. A client's
+  MINOR version also gates which `PREDEFINED_ALPHABETS` it's offered -
+  `GET /api/v1/alphabets` and range-claiming both hide an alphabet from a
+  client whose declared version predates that alphabet's own
+  `introduced_in` version (`server/src/alphabet.rs`), so an old client never
+  gets handed a range in a newer alphabet it doesn't understand.
 - **Ranges**: a target's candidate space is carved into contiguous chunks sized
   from each user's observed candidates/sec, so a chunk takes roughly
   `TARGET_CHUNK_SECONDS` regardless of GPU speed. A range that isn't completed
   or heartbeated before its lease expires is automatically reassigned to
   someone else.
+- **Priority ranges**: an operator can flag specific candidate prefixes within
+  a target (at one exact length each) as claimable ahead of everything else -
+  useful for testing a hunch about the answer without waiting for ordinary
+  carving to reach it. `POST /api/v1/admin/targets/{id}/priority-ranges`
+  takes a small regex-*style* `pattern` (literal characters, `.`, backslash
+  escapes, and `[...]` bracket classes - no quantifiers, alternation, groups
+  or anchors), a `length`, and a `priority`; a pattern matching more than one
+  character at some position expands into one priority range per concrete
+  prefix (capped at `MAX_PRIORITY_PATTERN_EXPANSIONS`, 200, in
+  `server/src/alphabet.rs`), each claimed the same way an ordinary range is.
+  `DELETE /api/v1/admin/priority-ranges/{id}` removes one (or, if work on it
+  already started, retires it instead of deleting it outright).
 - **Alphabets**: each target picks one of a small set of predefined alphabets
   (`server/src/alphabet.rs`'s `PREDEFINED_ALPHABETS`, also listable via
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
