@@ -2,7 +2,7 @@
 // not a reimplementation of it - linked in directly (built with
 // -DNAMEBREAK_NO_MAIN so this file's main() doesn't collide with its own).
 //
-// Three scenarios, each comparing runSearch()'s hashA-only matches against a
+// Five scenarios, each comparing runSearch()'s hashA-only matches against a
 // CPU reference that brute-forces the same range independently:
 //
 //  1. Leading/trailing split correctness (pruning disabled): IncrementalPrefixHasher
@@ -21,6 +21,9 @@
 //     leading characters have zero backslashes - if the prefix's backslashes
 //     ever leaked into the count, this candidate would be wrongly pruned and
 //     never found.
+//  5. lower_bound == upper_bound: a legal one-candidate search (previously
+//     rejected outright) - confirms it's actually searched, not silently
+//     skipped.
 //
 // A bug in any of these would look exactly like the failure mode this whole
 // exercise has been worried about from the start: candidates silently
@@ -347,6 +350,35 @@ int main() {
 
         allPassed &= runScenario("4: maxBackslashCount excludes the prefix", alphabet, prefix, suffix,
                                   candidateLen, lower, upper, /*pruneSymbolRuns=*/false, /*maxBackslashCount=*/1,
+                                  targetHash.first, 0xDEADBEEF, &targetCandidate);
+    }
+
+    // --- Scenario 5: lower_bound == upper_bound - the search space collapses
+    // to exactly one candidate. runSearch() used to reject this outright
+    // (isBeforeInAlphabet reports equal strings as "not before", which used
+    // to be treated as an error) - it's now a legal, if narrow, search. This
+    // confirms it actually finds that one candidate rather than silently
+    // searching nothing or refusing to run at all. candidateLen=6 keeps the
+    // real leading/trailing split in play (leadingLen=2, kGpuWindowChars=4)
+    // rather than only exercising the degenerate case through the GPU's
+    // trailing window alone.
+    {
+        const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"; // 49 chars
+        const std::string prefix = "TEST_";
+        const std::string suffix = ".DAT";
+        const int candidateLen = 6;
+
+        const std::string targetCandidate = indexToString(123456789, candidateLen, alphabet);
+        const std::string& lower = targetCandidate;
+        const std::string& upper = targetCandidate; // identical - the whole point of this scenario
+
+        uint32_t cryptTable[0x500];
+        prepareCryptTable(cryptTable);
+        std::string targetFull = prefix + targetCandidate + suffix;
+        auto targetHash = mpqHashWithPrefixCache_CPU(targetFull.c_str(), cryptTable);
+
+        allPassed &= runScenario("5: lower_bound == upper_bound (single-candidate search)", alphabet, prefix, suffix,
+                                  candidateLen, lower, upper, /*pruneSymbolRuns=*/false, /*maxBackslashCount=*/0,
                                   targetHash.first, 0xDEADBEEF, &targetCandidate);
     }
 

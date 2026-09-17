@@ -219,9 +219,20 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         result.ok = false;
         return result;
     }
-    if (!lowerIsBeforeUpper) {
+    // Equal bounds are allowed - not a special case, just the search space
+    // collapsing to exactly one candidate at whatever length they're given
+    // at (the rest of runSearch already handles a one-candidate batch/leading
+    // value fine, since that's an ordinary shape for the *last* batch of any
+    // search - this just makes it a legal shape for the *whole* search too).
+    // In `continuous` mode this also has a second, useful reading: since
+    // lowerBoundLimit/upperBoundLimit (getLowerBound/getUpperBound below)
+    // extend outward from whatever's given as candidateLen grows, equal
+    // bounds naturally become "every candidate with this exact string as a
+    // prefix" once the search moves past this length - not a coincidence
+    // worth special-casing, just what the existing widening already does.
+    if (!lowerIsBeforeUpper && req.lowerBound != req.upperBound) {
         result.ok = false;
-        result.error = "lower bound ('" + req.lowerBound + "') must be smaller than upper bound ('" + req.upperBound + "')";
+        result.error = "lower bound ('" + req.lowerBound + "') must not be greater than upper bound ('" + req.upperBound + "')";
         return result;
     }
 
