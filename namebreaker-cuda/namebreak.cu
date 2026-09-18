@@ -532,6 +532,13 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         result.ok = false;
         return result;
     }
+    // upperBoundLimit is an *exclusive* end (the successor of req.upperBound), but an
+    // upper bound of all-maximum characters has no successor: getUpperBound saturates
+    // to that maximum itself, which used as an exclusive end would silently leave the
+    // very last candidate of the candidate length unsearched. Detect that case so the
+    // end is treated as "everything up to and including the last candidate" instead.
+    const bool upperBoundIsAbsoluteMax =
+        !req.upperBound.empty() && req.upperBound.find_first_not_of(req.alphabet.back()) == std::string::npos;
 
     printf("alphabet: '%s' (size %d)\n", req.alphabet.c_str(), alphabetSize);
     printf("candidate: '%s'\n", req.startCandidate.c_str());
@@ -738,7 +745,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
                     goto breakfree;
                 }
             }
-            if (leadingIdx == endLeadingIdx) {
+            if (leadingIdx == endLeadingIdx && !upperBoundIsAbsoluteMax) {
                 if (!stringToIndex(end_full.substr(leadingLen), req.alphabet, trailEnd, result.error)) {
                     result.ok = false;
                     goto breakfree;

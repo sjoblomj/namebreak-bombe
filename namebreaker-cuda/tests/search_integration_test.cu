@@ -28,7 +28,7 @@
 //     handles a *row* (every value of the last character) per thread, so
 //     ranges that start/end mid-row, sit inside one row, are row-aligned,
 //     straddle a leading-value boundary or a launch boundary, or touch the
-//     very first candidate, each take a different path through it.
+//     very first/last candidate, each take a different path through it.
 //  K. Every last-character position k for every alphabet size (the kernel's
 //     inner loop is fully unrolled with k as a compile-time constant, so a
 //     wrong constant at one position would only ever affect candidates with
@@ -567,8 +567,10 @@ static bool geometryForAlphabet(int as) {
     }
     // Straddling a leading-value boundary (the trailing space wraps).
     run("leading boundary", base + T - 300, base + T + 300, {base + T - 300, base + T - 1, base + T, base + T + 1, base + T + 300});
-    // The very first candidates of the whole candidate space.
+    // The very first and very last candidates of the whole candidate space.
     run("first candidates", 0, 300, {0, 1, 300});
+    const uint64_t last = ipow(AS, len) - 1;
+    run("last candidates", last - 300, last, {last - 300, last - 1, last});
     // Straddling launch boundaries (only exist when a leading value spans more than one launch).
     const uint64_t batch = AS * kRowsPerLaunch;
     for (uint64_t k : {1ULL, 2ULL, 3ULL}) {
