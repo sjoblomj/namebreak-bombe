@@ -11,15 +11,15 @@
 // one header so the code under test is always exactly the code that ships,
 // never a copy that could drift out of sync.
 
-// Capacity of both d_prefix and BatchParams::prefix below (including the
-// terminating NUL) - what runSearch checks the extended prefix against.
+// Capacity of BatchParams::prefix below (including the terminating NUL) -
+// what runSearch checks the extended prefix against.
 constexpr int kMaxPrefixSize = 64;
 
 // Everything that changes from one leading value to the next (i.e. once per
-// kernel launch in the common case), passed to bruteForceKernel by value as a
-// kernel argument instead of being uploaded to the __constant__ symbols below
-// with cudaMemcpyToSymbol. Those uploads were synchronous driver calls that
-// each cost ~6us of GPU idle time between two consecutive kernels - a kernel
+// kernel launch in the common case), passed to the kernel by value as a kernel
+// argument rather than uploaded to __constant__ symbols with
+// cudaMemcpyToSymbol. Those uploads were synchronous driver calls that each
+// cost ~6us of GPU idle time between two consecutive kernels - a kernel
 // argument rides along with the launch itself for free.
 struct BatchParams {
     char prefix[kMaxPrefixSize]; // req.prefix + the leading characters, NUL-terminated
@@ -29,16 +29,8 @@ struct BatchParams {
 };
 
 __device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
-// d_prefix/d_prefix_size/d_seed*_start (below) are no longer what the search
-// kernel reads - it takes a BatchParams instead. They remain for the
-// symbol-based overloads of mpqHashCandidateAndSuffix/buildCompleteFilename,
-// which tests/window_sweep_bench.cu still uses.
-__device__ __constant__ char d_prefix[kMaxPrefixSize];
 __device__ __constant__ char d_suffix[64];
-__device__ __constant__ short d_prefix_size;
 __device__ __constant__ short d_suffix_size;
-__device__ __constant__ uint32_t d_seed1_start;
-__device__ __constant__ uint32_t d_seed2_start;
 
 __device__ __constant__ uint32_t d_cryptTable[0x500];
 
@@ -80,11 +72,6 @@ __device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candida
     }
 
     return seed1;
-}
-
-// Same, starting from the d_seed1_start/d_seed2_start symbols.
-__device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen) {
-    return mpqHashCandidateAndSuffix(candidate, candidateLen, d_seed1_start, d_seed2_start);
 }
 
 __device__ uint32_t mpqHashSeed2(const char* str) {
@@ -151,11 +138,6 @@ __device__ void buildCompleteFilename(const char* prefix, short prefixSize, cons
     i += d_suffix_size;
 
     out[i] = '\0';
-}
-
-// Same, using the d_prefix/d_prefix_size symbols.
-__device__ void buildCompleteFilename(const char* candidate, int candidateLen, char* out) {
-    buildCompleteFilename(d_prefix, d_prefix_size, candidate, candidateLen, out);
 }
 
 #endif //NAMEBREAK_CUDA_HASH_KERNELS_CUH

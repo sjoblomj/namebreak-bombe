@@ -5,11 +5,14 @@
 //
 // The tradeoff being measured: a smaller GPU window means each GPU thread
 // hashes fewer characters (cheaper kernel), but it also means a new leading
-// value - and therefore a new d_prefix/d_seed1_start/d_seed2_start upload -
-// has to happen far more often (once per *batch* instead of once per
-// *search*). Whether that's a net win depends on real host<->device
-// round-trip costs in this environment, which is exactly what this measures
-// instead of assuming.
+// value - and therefore a new BatchParams (extended prefix + seeds, passed to
+// the kernel by value, exactly like the real bruteForceKernel) - has to
+// happen far more often (once per *batch* instead of once per *search*).
+// Whether that's a net win depends on real per-launch costs in this
+// environment, which is exactly what this measures instead of assuming.
+// (This originally measured the cost of uploading those values with four
+// cudaMemcpyToSymbol calls per batch, before namebreak.cu switched to kernel
+// arguments - see hash_kernels.cuh's BatchParams.)
 //
 // Every variant (baseline and every window size) launches bruteForceKernel's
 // real decode -> prune -> hash pipeline (via hash_kernels.cuh, not a copy of
@@ -21,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include "../constants.h"
@@ -36,7 +40,7 @@
 } while (0)
 
 template<int AlphabetSize>
-__global__ void benchKernel(int candidateLen, uint64_t startIdx, uint64_t total, uint32_t targetA, unsigned long long* sink) {
+__global__ void benchKernel(int candidateLen, uint64_t startIdx, uint64_t total, uint32_t targetA, BatchParams params, unsigned long long* sink) {
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total)
         return;
@@ -47,16 +51,27 @@ __global__ void benchKernel(int candidateLen, uint64_t startIdx, uint64_t total,
 
     // No pruning here - matches bruteForceKernel's real behavior
     // (namebreak.cu): pruneSymbolRuns/maxBackslashCount are CPU-side only now.
-    uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen);
+    uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen, params.seed1Start, params.seed2Start);
     if (hashA == targetA) {
         atomicAdd(sink, 1ULL);
     }
 }
 
-static void launchAndSync(int candidateLen, uint64_t startIdx, uint64_t count, unsigned long long* d_sink) {
+// What runSearch's leadingIdx loop builds per leading value: the extended
+// prefix (fixed prefix + current leading characters) and its hash state.
+static BatchParams makeParams(const std::string& extendedPrefix, std::pair<uint32_t, uint32_t> state) {
+    BatchParams params;
+    memcpy(params.prefix, extendedPrefix.c_str(), extendedPrefix.size() + 1);
+    params.prefixSize = (short) extendedPrefix.size();
+    params.seed1Start = state.first;
+    params.seed2Start = state.second;
+    return params;
+}
+
+static void launchAndSync(int candidateLen, uint64_t startIdx, uint64_t count, const BatchParams& params, unsigned long long* d_sink) {
     int threadsPerBlock = 256;
     int blocks = (int) ((count + threadsPerBlock - 1) / threadsPerBlock);
-    benchKernel<49><<<blocks, threadsPerBlock>>>(candidateLen, startIdx, count, 0xFFFFFFFFu, d_sink);
+    benchKernel<49><<<blocks, threadsPerBlock>>>(candidateLen, startIdx, count, 0xFFFFFFFFu, params, d_sink);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -97,24 +112,20 @@ int main() {
     std::vector<Result> results;
 
     // --- Baseline: today's behavior - whole 10-character candidate hashed
-    // per GPU thread, prefix/seed uploaded exactly once, total. ---
+    // per GPU thread, prefix/seed built exactly once, total. ---
     {
         auto baseState = mpqHashWithPrefixCache_CPU(prefix.c_str(), h_cryptTable);
-        short prefixSize = (short) prefix.size();
-        CUDA_CHECK(cudaMemcpyToSymbol(d_prefix_size, &prefixSize, sizeof(prefixSize)));
-        CUDA_CHECK(cudaMemcpyToSymbol(d_prefix, prefix.c_str(), prefixSize + 1));
-        CUDA_CHECK(cudaMemcpyToSymbol(d_seed1_start, &baseState.first, sizeof(baseState.first)));
-        CUDA_CHECK(cudaMemcpyToSymbol(d_seed2_start, &baseState.second, sizeof(baseState.second)));
+        BatchParams params = makeParams(prefix, baseState);
 
         const uint64_t batchSize = 5'764'801; // 49^4, this project's existing fixed batch size
-        launchAndSync(candidateLen, 0, batchSize, d_sink); // warm-up, untimed
+        launchAndSync(candidateLen, 0, batchSize, params, d_sink); // warm-up, untimed
 
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
         CUDA_CHECK(cudaEventRecord(start));
         for (uint64_t b = 0; b < iterations; ++b) {
-            launchAndSync(candidateLen, b * batchSize, batchSize, d_sink);
+            launchAndSync(candidateLen, b * batchSize, batchSize, params, d_sink);
         }
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -140,16 +151,7 @@ int main() {
         hasher.reset(0);
 
         // Warm-up, untimed.
-        {
-            std::string extended = prefix + hasher.leading();
-            short prefixSize = (short) extended.size();
-            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix_size, &prefixSize, sizeof(prefixSize)));
-            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix, extended.c_str(), prefixSize + 1));
-            auto s = hasher.state();
-            CUDA_CHECK(cudaMemcpyToSymbol(d_seed1_start, &s.first, sizeof(s.first)));
-            CUDA_CHECK(cudaMemcpyToSymbol(d_seed2_start, &s.second, sizeof(s.second)));
-            launchAndSync(W, 0, windowSpace, d_sink);
-        }
+        launchAndSync(W, 0, windowSpace, makeParams(prefix + hasher.leading(), hasher.state()), d_sink);
 
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
@@ -157,15 +159,7 @@ int main() {
         CUDA_CHECK(cudaEventRecord(start));
         for (uint64_t b = 0; b < iterations; ++b) {
             hasher.advance();
-            std::string extended = prefix + hasher.leading();
-            short prefixSize = (short) extended.size();
-            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix_size, &prefixSize, sizeof(prefixSize)));
-            CUDA_CHECK(cudaMemcpyToSymbol(d_prefix, extended.c_str(), prefixSize + 1));
-            auto s = hasher.state();
-            CUDA_CHECK(cudaMemcpyToSymbol(d_seed1_start, &s.first, sizeof(s.first)));
-            CUDA_CHECK(cudaMemcpyToSymbol(d_seed2_start, &s.second, sizeof(s.second)));
-
-            launchAndSync(W, 0, windowSpace, d_sink);
+            launchAndSync(W, 0, windowSpace, makeParams(prefix + hasher.leading(), hasher.state()), d_sink);
         }
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -188,7 +182,7 @@ int main() {
     printf("Compare 'GPU window=4' against 'baseline' directly - both launch batches of the same\n");
     printf("size (5,764,801 threads), so that pair isolates exactly the tradeoff being tested:\n");
     printf("cheaper per-thread hashing (4 characters vs 10) against the added per-batch cost of\n");
-    printf("advance() + the 4 cudaMemcpyToSymbol uploads that batch-scoped d_prefix/d_seed*_start now need.\n");
+    printf("advance() + building a fresh BatchParams per batch (which the kernel launch then carries along).\n");
 
     CUDA_CHECK(cudaFree(d_sink));
     return 0;

@@ -381,7 +381,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     //  2. The `for (leadingIdx ...)` loop below: over the *leading* part of the
     //     candidate (see gpuWindowChars/leadingLen above) - every leading value
     //     is hashed on the CPU (incrementally - IncrementalPrefixHasher) and
-    //     uploaded as the GPU's starting seed, so candidates longer than
+    //     handed to the GPU as its starting seed, so candidates longer than
     //     gpuWindowChars still get covered exhaustively. Since gpuWindowChars
     //     is small (throughput-tuned, not "as large as safely possible"),
     //     leadingLen > 0 - and this loop actually doing work - is the common
@@ -462,15 +462,14 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             // here, instead of on the GPU, is worth doing). A prune here
             // skips this leading value's entire trailing batch (up to
             // batchSize candidates) without spending anything on the GPU,
-            // uploads included - cheaper than even one of those candidates
-            // would have cost individually.
+            // kernel launch included - cheaper than even one of those
+            // candidates would have cost individually.
             if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
                 continue;
             if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
                 continue;
 
-            // Handed to every runCudaBatch call below as a kernel argument -
-            // not uploaded to device symbols first; see BatchParams.
+            // Handed to every runCudaBatch call below as a kernel argument; see BatchParams.
             std::string extendedPrefix = req.prefix + leading;
             BatchParams params;
             memcpy(params.prefix, extendedPrefix.c_str(), extendedPrefix.size() + 1);

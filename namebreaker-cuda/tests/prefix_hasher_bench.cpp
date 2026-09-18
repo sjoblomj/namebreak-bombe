@@ -7,7 +7,7 @@
 //
 // Both variants build the same `prefix + leading` string every iteration
 // (matching what runSearch's leadingIdx loop actually does either way, for
-// the d_prefix upload) - only the hashing itself differs, so the measured
+// BatchParams::prefix) - only the hashing itself differs, so the measured
 // ratio isolates exactly the thing IncrementalPrefixHasher changed, with the
 // (identical, so if anything conservative) string-building cost counted in
 // both.
