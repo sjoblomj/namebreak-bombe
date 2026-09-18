@@ -64,13 +64,9 @@ __global__ void bruteForceKernel(
     uint64_t total,
     uint32_t targetA,
     uint32_t targetB,
-    // __grid_constant__: buildCompleteFilename (rare match path) takes the address
-    // of params.prefix, which without this makes the compiler copy the whole
-    // struct into per-thread local memory at kernel entry - for every one of the
-    // ~5.7M threads, match or not - measured as a ~3x slowdown. It lets that
-    // address point straight at the kernel-parameter constant bank instead.
-    // Needs compute capability >= 7.0.
-    const __grid_constant__ BatchParams params,
+    // Only ever read at constant offsets - see buildCompleteFilename (hash_kernels.cuh)
+    // for why taking params' address here would cost ~3x throughput.
+    BatchParams params,
     char* d_matches,
     BatchResults* d_results
 ) {
@@ -86,7 +82,7 @@ __global__ void bruteForceKernel(
     uint32_t hashA = mpqHashCandidateAndSuffix(candidate, candidateLen, params.seed1Start, params.seed2Start);
     if (hashA == targetA) {
         char filename[MAX_FILENAME_LEN];
-        buildCompleteFilename(params.prefix, params.prefixSize, candidate, candidateLen, filename);
+        buildCompleteFilename(params, candidate, candidateLen, filename);
 
         // Sanity check: hashA above was computed via the prefix-cache/incremental
         // path (mpqHashCandidateAndSuffix), which must agree with hashing the

@@ -127,9 +127,22 @@ __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCand
 // the CPU now, against the leading characters, before this candidate's batch
 // is even launched.
 
-__device__ void buildCompleteFilename(const char* prefix, short prefixSize, const char* candidate, int candidateLen, char* out) {
-    memcpy(out, prefix, prefixSize);
-    short i = prefixSize;
+// `params` is the kernel's by-value BatchParams argument, and must only ever be
+// read at compile-time-constant offsets here - hence the fully unrolled byte
+// loop instead of memcpy(out, params.prefix, params.prefixSize). Anything that
+// needs params' *address* (a runtime-sized memcpy, or indexing with a runtime
+// value) makes the compiler copy the whole struct into per-thread local memory
+// at kernel entry - for every one of the ~5.7M threads, match or not - which
+// measured as a ~3x slowdown. This form doesn't, on any architecture, whereas
+// the alternative of marking the kernel parameter __grid_constant__ is only
+// documented for compute capability >= 7.0.
+__device__ void buildCompleteFilename(const BatchParams& params, const char* candidate, int candidateLen, char* out) {
+    #pragma unroll
+    for (int k = 0; k < kMaxPrefixSize; ++k) {
+        if (k < params.prefixSize)
+            out[k] = params.prefix[k];
+    }
+    short i = params.prefixSize;
 
     memcpy(out + i, candidate, candidateLen);
     i += candidateLen;
