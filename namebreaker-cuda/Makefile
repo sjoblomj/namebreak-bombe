@@ -9,6 +9,7 @@ ARCH    := sm_86
 
 TARGET  := namebreak
 SOURCES := namebreak.cu cpu-utils.cpp config.cpp
+HEADERS_CORE := cpu-utils.h constants.h search.h hash_kernels.cuh
 HEADERS := cpu-utils.h constants.h search.h config.h hash_kernels.cuh
 
 # Set to 0 to build without the coordinator client (no libcurl dependency,
@@ -77,7 +78,7 @@ verbose: $(SOURCES) $(HEADERS)
 	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) $(NVCC_FLAGS) --ptxas-options=-v -o $(TARGET)$(EXE_EXT) $(SOURCES) $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)$(EXE_EXT) tests/prefix_hasher_test tests/prefix_hasher_bench tests/window_sweep_bench tests/search_integration_test tests/search_bench
+	rm -f $(TARGET)$(EXE_EXT) tests/prefix_hasher_test tests/prefix_hasher_bench tests/window_sweep_bench tests/search_bench $(INTEGRATION_TESTS) tests/search_overflow_test
 	rm -rf tests/.testrun
 
 # Pure-CPU correctness check for IncrementalPrefixHasher (cpu-utils.h/.cpp) -
@@ -98,18 +99,55 @@ prefix_hasher_bench: tests/prefix_hasher_bench
 # in directly, main() excluded via -DNAMEBREAK_NO_MAIN) against a CPU
 # brute-force reference - see the file for why this is a separate concern
 # from prefix_hasher_test above. Built without NETWORK (doesn't need it).
-tests/search_integration_test: tests/search_integration_test.cu namebreak.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h search.h
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -o tests/search_integration_test tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+#
+# The same test source is built several times with different compile-time
+# tuning values (constants.h), because they change which code paths a
+# search exercises - every case derives its geometry from those values:
+#   (default)        the shipped configuration
+#   _small_launch    3 rows per launch: forces many launches per leading value,
+#                    so the chunk boundaries are actually exercised
+#   _window2         a 2-character GPU window (5 rows per launch): a much
+#                    longer CPU-side leading part, and a shallower row decode
+#   _window6         the widest supported window: 5 prefix digits per row and
+#                    trailing indices beyond 32 bits
+INTEGRATION_DEPS := tests/search_integration_test.cu namebreak.cu cpu-utils.cpp $(HEADERS_CORE)
+INTEGRATION_TESTS := tests/search_integration_test tests/search_integration_test_small_launch \
+                     tests/search_integration_test_window2 tests/search_integration_test_window6
 
-test: tests/prefix_hasher_test tests/search_integration_test
+tests/search_integration_test: $(INTEGRATION_DEPS)
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+
+tests/search_integration_test_small_launch: $(INTEGRATION_DEPS)
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_ROWS_PER_LAUNCH=3 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+
+tests/search_integration_test_window2: $(INTEGRATION_DEPS)
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_GPU_WINDOW_CHARS=2 -DNAMEBREAK_ROWS_PER_LAUNCH=5 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+
+tests/search_integration_test_window6: $(INTEGRATION_DEPS)
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_GPU_WINDOW_CHARS=6 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+
+# What runSearch() does when a launch has more hashA hits than MAX_MATCHES can
+# record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
+tests/search_overflow_test: tests/search_overflow_test.cu namebreak.cu cpu-utils.cpp $(HEADERS_CORE)
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DMAX_MATCHES=1 -o $@ tests/search_overflow_test.cu namebreak.cu cpu-utils.cpp
+
+# Each configuration takes about a minute to compile (the search kernel is
+# instantiated per alphabet size and suffix length) - `make -j test` builds
+# them in parallel.
+test: tests/prefix_hasher_test $(INTEGRATION_TESTS) tests/search_overflow_test
 	./tests/prefix_hasher_test
 	mkdir -p tests/.testrun
 	cd tests/.testrun && ../search_integration_test
+	cd tests/.testrun && ../search_integration_test_small_launch
+	cd tests/.testrun && ../search_integration_test_window2
+	cd tests/.testrun && ../search_integration_test_window6
+	cd tests/.testrun && ../search_overflow_test
 
-# GPU window-size sweep benchmark - compares today's behavior against several
-# candidate "how many characters per GPU thread" choices, to see whether
-# shrinking it (paying for it with more frequent CPU-side prefix hashing and
-# host<->device uploads) is worth it here, and if so by how much.
+# GPU window-size sweep benchmark - a *proxy* kernel modelling the previous
+# design (one GPU thread per candidate), which compares several "how many
+# characters per GPU thread" choices. It no longer models the shipped kernel
+# (one thread per row - see namebreak.cu); use search_bench below, which times
+# the real runSearch(), to tune the window.
 tests/window_sweep_bench: tests/window_sweep_bench.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h
 	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -o tests/window_sweep_bench tests/window_sweep_bench.cu cpu-utils.cpp
 
@@ -120,12 +158,12 @@ bench: tests/window_sweep_bench
 # standalone proxy kernel, over a ~28.8B-candidate range. WINDOW controls
 # namebreak.cu's gpuWindowChars for this build only (make WINDOW=6
 # search_bench), to re-sweep that tuning value against real hardware without
-# hand-editing the source - see the comment at gpuWindowChars's declaration.
+# hand-editing the source - see constants.h. Unset, the shipped default is used.
 # No dependency tracking on WINDOW itself (matches this Makefile's existing
 # NETWORK/etc. convention) - combine with `make clean` first if switching it.
-WINDOW ?= 4
+WINDOW ?=
 tests/search_bench: tests/search_bench.cu namebreak.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h search.h
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_GPU_WINDOW_CHARS=$(WINDOW) -o tests/search_bench tests/search_bench.cu namebreak.cu cpu-utils.cpp
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN $(if $(WINDOW),-DNAMEBREAK_GPU_WINDOW_CHARS=$(WINDOW)) -o tests/search_bench tests/search_bench.cu namebreak.cu cpu-utils.cpp
 
 search_bench: tests/search_bench
 	mkdir -p tests/.testrun

@@ -32,6 +32,17 @@ __device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
 __device__ __constant__ char d_suffix[64];
 __device__ __constant__ short d_suffix_size;
 
+// Per-search tables precomputed on the host so the search kernel can read them
+// at compile-time-constant indices (folded straight into ALU instructions as
+// constant-bank operands) instead of doing a data-dependent d_cryptTable lookup
+// per character, which every lane of a warp would then serialize on:
+//   d_alphabetKey[k] = d_cryptTable[0x100 + alphabet[k]]   (hashA's per-char key)
+//   d_alphabetOrd[k] = (unsigned char) alphabet[k]
+//   d_suffixKey[i]   = d_cryptTable[0x100 + suffix[i]]
+__device__ __constant__ uint32_t d_alphabetKey[MAX_ALPHABET_SIZE];
+__device__ __constant__ uint32_t d_alphabetOrd[MAX_ALPHABET_SIZE];
+__device__ __constant__ uint32_t d_suffixKey[64];
+
 __device__ __constant__ uint32_t d_cryptTable[0x500];
 
 // Hashes `candidate` followed by d_suffix directly, without ever concatenating them

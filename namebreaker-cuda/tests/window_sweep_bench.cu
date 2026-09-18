@@ -1,3 +1,10 @@
+// NOTE: this is a *proxy* for the kernel design namebreak.cu used before it
+// switched to one-thread-per-row (it models one thread per candidate, hashing
+// the whole trailing window each time), kept as a record of how the window
+// size was originally chosen. It does not measure the shipped kernel - use
+// tests/search_bench.cu (`make search_bench`, `make WINDOW=N search_bench`),
+// which times the real runSearch(), to tune the window today.
+//
 // Measures whether shrinking the GPU's per-thread candidate window (and
 // folding the rest into a CPU-cached, incrementally-hashed "leading" prefix -
 // see IncrementalPrefixHasher in cpu-utils.h) is actually worth it here, and

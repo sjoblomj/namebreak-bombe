@@ -8,6 +8,41 @@
 #define MAX_ALPHABET_SIZE 50
 #define MAX_CANDIDATE_LEN 16
 #define MAX_FILENAME_LEN 128
+// Overridable at compile time (-DMAX_MATCHES=N) so tests/search_overflow_test.cu
+// can exercise the "more hashA hits in one batch than fit" path with just a
+// couple of colliding candidates instead of needing >1024 of them.
+#ifndef MAX_MATCHES
 #define MAX_MATCHES 1024
+#endif
+
+// How many trailing characters of a candidate the GPU enumerates directly
+// (the rest - the "leading" part - is folded into the prefix on the CPU, one
+// value per group of GPU launches). Overridable at compile time
+// (-DNAMEBREAK_GPU_WINDOW_CHARS=N) so tests can force a different leading/
+// trailing split and benchmarks can re-sweep it. Lives here, not in
+// namebreak.cu, so the tests derive their expectations from the same value
+// instead of duplicating it. See namebreak.cu (runSearch) and README.md's
+// "Design decisions" for what it trades off.
+#ifndef NAMEBREAK_GPU_WINDOW_CHARS
+#define NAMEBREAK_GPU_WINDOW_CHARS 5
+#endif
+
+// How many *rows* one kernel launch covers at most (a row = every value of a
+// candidate's last character, for one combination of its other trailing
+// characters - see bruteForceKernel in namebreak.cu), so one launch covers
+// at most kRowsPerLaunch * alphabetSize candidates. Bounds how long a single
+// launch can run (pause/abort are only polled between launches). Overridable
+// at compile time (-DNAMEBREAK_ROWS_PER_LAUNCH=N) so tests can force many
+// small launches and exercise the chunk boundaries with tiny ranges.
+#ifndef NAMEBREAK_ROWS_PER_LAUNCH
+#define NAMEBREAK_ROWS_PER_LAUNCH (1u << 23)
+#endif
+
+// Largest trailing (GPU-enumerated) length the kernel supports. A row index
+// (alphabetSize^(trailingLen-1)) must fit in 32 bits: 50^5 < 2^32 <= 50^6.
+#define MAX_TRAILING_LEN 6
+static_assert(NAMEBREAK_GPU_WINDOW_CHARS >= 1 && NAMEBREAK_GPU_WINDOW_CHARS <= MAX_TRAILING_LEN,
+              "NAMEBREAK_GPU_WINDOW_CHARS must be between 1 and MAX_TRAILING_LEN");
+static_assert(NAMEBREAK_ROWS_PER_LAUNCH >= 1, "NAMEBREAK_ROWS_PER_LAUNCH must be >= 1");
 
 #endif //NAMEBREAK_CUDA_CONSTANTS_H

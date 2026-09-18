@@ -116,26 +116,70 @@ and fails fast with a clear message if `config.conf`'s alphabet doesn't
 match one of them. Supporting a new size means editing the dispatch table in
 `namebreak.cu` and recompiling.
 
-`make test` runs the correctness test suite (a pure-CPU unit test plus an
-end-to-end GPU test comparing real search results against an independent
-brute-force reference); `make bench` / `make search_bench` run throughput
-benchmarks used to tune the GPU/CPU split described below.
+`make test` runs the correctness test suite: a pure-CPU unit test, plus
+end-to-end GPU tests that compare real search results against an independent
+brute-force CPU reference (thousands of cases: every supported alphabet
+size, every last-character position, ranges starting/ending mid-row and
+crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
+0x80, the both-hashes-match path, and a seeded fuzzer). The same test source
+is built in several configurations (different GPU window / launch sizes),
+and each takes about a minute to compile, so `make -j test` is much faster.
+`make search_bench` times the real search over a fixed range; `make
+WINDOW=6 search_bench` re-runs it with a different GPU window
+(`make bench` runs an older proxy benchmark and no longer models the real
+kernel).
 
 ## Design decisions
 
 ### The GPU doesn't brute-force the whole candidate
 
 Only a small, fixed-size trailing window of each candidate (`gpuWindowChars`
-characters, currently 4) is generated and hashed directly on the GPU with a
-native 64-bit index. Anything beyond that is treated as an extension of the
-prefix: every combination of those leading characters is enumerated on the
-CPU and its hash contribution folded in once (incrementally - O(1)
-amortized per step, not a full rehash) before a batch of GPU threads ever
-launches. This isn't primarily about correctness (a much larger window would
-still fit in a `uint64_t`) - it's throughput: a wide window means every GPU
-thread in a batch redundantly re-hashes whatever leading characters are
-actually constant across that whole batch, and shrinking it to 4 roughly
-doubled measured throughput for this project's alphabet.
+characters, currently 5, set in `constants.h`) is enumerated directly on the
+GPU. Anything beyond that is treated as an extension of the prefix: every
+combination of those leading characters is enumerated on the CPU and its
+hash contribution folded in once (incrementally - O(1) amortized per step,
+not a full rehash) before the GPU launches for that leading value. The
+window is bounded above (`MAX_TRAILING_LEN`, 6) because the kernel indexes
+rows with 32-bit integers.
+
+With the current kernel the window is a launch-size knob more than a
+per-thread-cost knob (see below), and 5 measured best on the reference
+hardware (about 155 G candidates/s at a window of 4, 222 at 5, 216 at 6):
+a window of 4 makes each leading value's launch so short (~25 us) that
+per-launch overhead becomes a large fraction of the runtime. Note the window
+also decides how much `prune_symbol_runs`/`max_backslash_count` can see (they
+only examine the leading characters, see below): a larger window means fewer
+characters are pruned on, so those two settings skip slightly fewer
+candidates than they did at a window of 4 (never more).
+
+### How the GPU kernel is structured
+
+Hashing a candidate is a sequential chain of one step per character, and most
+of a candidate's characters are the same as its neighbours', so the kernel
+works on *rows*: one GPU thread owns one combination of the trailing part's
+first `trailingLen - 1` characters, hashes that shared part once, and then
+loops the last character over the whole alphabet - each candidate costs just
+one more character step plus the suffix. That loop is fully unrolled with the
+alphabet position a compile-time constant, so the per-character hash table
+values are read as constant-bank operands of the ALU instructions themselves
+rather than through a data-dependent lookup (which serializes across a warp
+whenever its threads need different entries). The suffix length is a
+compile-time template parameter too (0-8; longer suffixes take a slower
+runtime-length path). Together these made the kernel about 16x faster than
+the previous one-thread-per-candidate design, while producing bit-identical
+hashes.
+
+The kernel only *records* the position of each hashA hit. A second, tiny
+kernel (`verifyMatchesKernel`), launched only for a batch that had hits,
+rebuilds each hit's complete filename, checks hashB, and prints - using the
+original, independent hashing code path, so every hit the fast kernel reports
+is cross-checked against a second implementation at runtime (a disagreement
+prints a `WARNING`, and the test suite fails on any). If more than
+`MAX_MATCHES` (1024) hashA hits land in one launch the excess is dropped with
+a warning - including any that would have matched hashB too. With a real
+32-bit hash that is not a practical concern (it would take over a thousand
+collisions in a single launch), but it is handled explicitly and tested
+(`tests/search_overflow_test.cu`).
 
 ### `prune_symbol_runs` and `max_backslash_count` only run on the CPU
 
