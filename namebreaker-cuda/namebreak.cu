@@ -59,14 +59,15 @@ __device__ char d_foundFilename[MAX_FILENAME_LEN];
 // so the host reads them back with a single cudaMemcpy (each separate driver
 // call is ~10us of GPU idle time between two consecutive kernels).
 struct BatchResults {
-    int matchCount; // hashA hits this batch (may exceed MAX_MATCHES; only the first MAX_MATCHES are recorded)
+    int matchCount; // hashA hits this batch (may exceed MAX_MATCHES; runCudaBatch then re-searches the range in halves)
     int foundFlag;  // 1 once any candidate has matched both hashes - never reset mid-search
 };
 
 struct DeviceBuffers {
     BatchResults* results;
-    // matchIdx[i]: trailing index of the i-th hashA hit. Written by
-    // bruteForceKernel, consumed by verifyMatchesKernel.
+    // matchIdx[i]: trailing index of the i-th hashA hit (only the first MAX_MATCHES
+    // hits of a launch are recorded). Written by bruteForceKernel, consumed by
+    // verifyMatchesKernel.
     uint64_t* matchIdx;
     // matches + i * MAX_FILENAME_LEN: the i-th hit's complete filename.
     // Written by verifyMatchesKernel, consumed by the host.
@@ -317,6 +318,12 @@ void dispatchSuffixLen(int suffixLen, F&& f) {
 // Searches the trailing indices [startIdx, startIdx + count) (count > 0).
 // Returns 0 (no match yet), 1 (found - both hashes matched, outFoundFilename
 // is filled), or -1 (abortRequested was set, this batch was skipped).
+//
+// Every hashA hit is verified against hashB: if a launch has more hits than
+// MAX_MATCHES record (which needs a target hashA with over a thousand matches
+// among the range's candidates - not something a real 32-bit hash produces,
+// but the one outcome that must never happen is a both-hashes match going
+// unchecked), the range is searched again as two halves, recursively.
 int runCudaBatch(int trailingLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, const BatchParams& params, FILE* fout,
                   const DeviceBuffers& bufs, int alphabetSize, int suffixLen,
                   const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
@@ -383,12 +390,26 @@ int runCudaBatch(int trailingLen, uint64_t startIdx, uint64_t count, uint32_t ta
 
     // Hits are rare (a few per thousand batches), so everything below is the
     // exception path - the common batch costs exactly the one cudaMemcpy above.
+    if (h_results.matchCount > MAX_MATCHES) {
+        // More hits than bufs.matchIdx can record: the excess would never reach
+        // verifyMatchesKernel, so they'd never be checked against hashB. Nothing
+        // from this launch has been verified or reported yet, so discard it and
+        // search each half of the range on its own instead (splitting again as
+        // needed). A one-candidate range has at most one hit and MAX_MATCHES >= 1,
+        // so count >= 2 here and this always terminates.
+        fprintf(stderr, "note: %d hashA hits in one batch, more than the %d that can be recorded - searching its two halves separately\n",
+                h_results.matchCount, MAX_MATCHES);
+        CUDA_CHECK(cudaMemset(&bufs.results->matchCount, 0, sizeof(int)));
+        const uint64_t half = count / 2;
+        int r = runCudaBatch(trailingLen, startIdx, half, targetA, targetB, params, fout, bufs, alphabetSize, suffixLen,
+                              abortRequested, onPartialMatch, outFoundFilename, pauseRequested);
+        if (r != 0)
+            return r;
+        return runCudaBatch(trailingLen, startIdx + half, count - half, targetA, targetB, params, fout, bufs, alphabetSize, suffixLen,
+                             abortRequested, onPartialMatch, outFoundFilename, pauseRequested);
+    }
     if (h_results.matchCount > 0) {
-        if (h_results.matchCount > MAX_MATCHES) {
-            fprintf(stderr, "WARNING: %d hashA hits in one batch, more than the %d that can be recorded - the rest were "
-                            "dropped, including any that would have matched hashB too\n", h_results.matchCount, MAX_MATCHES);
-        }
-        const int recorded = std::min(h_results.matchCount, MAX_MATCHES);
+        const int recorded = h_results.matchCount;
 
         dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
             constexpr int AlphabetSize = decltype(alphabetC)::value;

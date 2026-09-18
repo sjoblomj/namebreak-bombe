@@ -174,12 +174,12 @@ kernel (`verifyMatchesKernel`), launched only for a batch that had hits,
 rebuilds each hit's complete filename, checks hashB, and prints - using the
 original, independent hashing code path, so every hit the fast kernel reports
 is cross-checked against a second implementation at runtime (a disagreement
-prints a `WARNING`, and the test suite fails on any). If more than
-`MAX_MATCHES` (1024) hashA hits land in one launch the excess is dropped with
-a warning - including any that would have matched hashB too. With a real
-32-bit hash that is not a practical concern (it would take over a thousand
-collisions in a single launch), but it is handled explicitly and tested
-(`tests/search_overflow_test.cu`).
+prints a `WARNING`, and the test suite fails on any). Only the first
+`MAX_MATCHES` (1024) hits of a launch can be recorded; if a launch has more,
+its range is searched again as two halves (recursively) so that every hit is
+still checked against hashB. With a real 32-bit hash that never happens in
+practice (it would take over a thousand collisions in a single launch), but
+it is handled explicitly and tested (`tests/search_overflow_test.cu`).
 
 ### `prune_symbol_runs` and `max_backslash_count` only run on the CPU
 

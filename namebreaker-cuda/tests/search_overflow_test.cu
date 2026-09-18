@@ -6,19 +6,23 @@
 // (two different candidates with the same hashA, found by a birthday search
 // on the CPU) to overflow it with just two hits.
 //
-// What must hold:
-//  * exactly MAX_MATCHES of the hits are reported (no out-of-bounds write
-//    past the recorded-matches buffers, no crash, no duplicates),
-//  * a loud WARNING is printed rather than the overflow being silent,
-//  * the overflow doesn't poison the next runSearch() call (matchCount is
-//    reset, nothing stale is reported),
-//  * and the documented limitation: a dropped hit is never checked against
-//    hashB, so `found` is true only if the recorded hit is the hashB match.
+// What must hold - the point being that a both-hashes match must never go
+// unchecked just because of how many other hashA hits share its launch:
+//  * runSearch() falls back to searching the launch's range in halves, so
+//    *every* hit is checked against hashB: the hashB-matching candidate is
+//    found whether it is the earlier or the later of the pair,
+//  * hits are still reported in enumeration order, exactly once each, and
+//    finding a match still ends the search (so a hit after the found one is
+//    never reported),
+//  * the fallback is announced (a "note:"), nothing is silently dropped, and
+//    the kernels never disagree with the reference hashing path,
+//  * and it doesn't poison the next runSearch() call (matchCount is reset).
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
 // to the current directory - `make test` runs this from tests/.testrun/.
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
@@ -104,23 +108,74 @@ int main() {
         return req;
     };
 
-    // Both candidates are in one launch, hashB selects c2.
+    // Both candidates are in one launch (2 hits, room for 1).
+    const std::string note = "note: 2 hashA hits in one batch";
+    auto noKernelDisagreement = [](const std::string& log) {
+        return log.find("WARNING") == std::string::npos;
+    };
+
     {
-        printf("--- overflow: 2 hashA hits, room for 1, hashB selects the second ---\n");
+        printf("--- 2 hits, room for 1: hashB selects the LATER candidate ---\n");
         SearchResult r; std::vector<std::string> reported;
         std::string log = runCaptured(makeRequest(collHash, hashB(prefix + c2 + suffix), idxA, idxB), r, reported);
         CHECK(r.ok, "runSearch() succeeded");
-        CHECK(reported.size() == (size_t) MAX_MATCHES, "exactly MAX_MATCHES hit(s) reported");
-        CHECK(reported.size() == 1 && (reported[0] == c1 || reported[0] == c2), "the reported hit is one of the two colliding candidates");
-        CHECK(log.find("WARNING: 2 hashA hits in one batch") != std::string::npos, "a WARNING about the overflow was printed");
-        bool recordedIsWinner = reported.size() == 1 && reported[0] == c2;
-        CHECK(r.found == recordedIsWinner, "found is true exactly when the recorded hit is the hashB match (a dropped hit is never checked against hashB)");
-        if (r.found) CHECK(r.filename == prefix + c2 + suffix, "the found filename is the hashB match");
-        CHECK(log.find("WARNING: bruteForceKernel reported") == std::string::npos && log.find("WARNING: hashA mismatch") == std::string::npos,
-              "no kernel/reference disagreement warnings");
+        CHECK(r.found && r.filename == prefix + c2 + suffix, "the hashB-matching (later) candidate is found");
+        CHECK(reported.size() == 2 && reported[0] == c1 && reported[1] == c2, "both hits reported, once each, in enumeration order");
+        CHECK(log.find(note) != std::string::npos, "the fallback to searching in halves was announced");
+        CHECK(noKernelDisagreement(log), "no kernel/reference disagreement warnings");
+    }
+    {
+        printf("--- 2 hits, room for 1: hashB selects the EARLIER candidate ---\n");
+        SearchResult r; std::vector<std::string> reported;
+        std::string log = runCaptured(makeRequest(collHash, hashB(prefix + c1 + suffix), idxA, idxB), r, reported);
+        CHECK(r.ok, "runSearch() succeeded");
+        CHECK(r.found && r.filename == prefix + c1 + suffix, "the hashB-matching (earlier) candidate is found");
+        CHECK(reported.size() == 1 && reported[0] == c1, "finding it ends the search: the later hit is not reported");
+        CHECK(log.find(note) != std::string::npos, "the fallback was announced");
+        CHECK(noKernelDisagreement(log), "no kernel/reference disagreement warnings");
+    }
+    {
+        printf("--- 2 hits, room for 1: hashB matches neither ---\n");
+        SearchResult r; std::vector<std::string> reported;
+        std::string log = runCaptured(makeRequest(collHash, hashB(prefix + c1 + suffix) ^ hashB(prefix + c2 + suffix) ^ 0x1, idxA, idxB), r, reported);
+        CHECK(r.ok && !r.found, "nothing is found");
+        CHECK(reported.size() == 2 && reported[0] == c1 && reported[1] == c2, "both hits are still reported, once each, in enumeration order");
+        CHECK(noKernelDisagreement(log), "no kernel/reference disagreement warnings");
+    }
+    {
+        printf("--- the range is narrowed to just one of the pair: no overflow, no note ---\n");
+        SearchResult r; std::vector<std::string> reported;
+        std::string log = runCaptured(makeRequest(collHash, hashB(prefix + c1 + suffix), idxA, idxB - 1), r, reported);
+        CHECK(r.found && r.filename == prefix + c1 + suffix && reported.size() == 1, "the single hit is found and reported");
+        CHECK(log.find("note:") == std::string::npos, "with no fallback note");
     }
 
-    // The very next search is unaffected by the overflow above.
+    // The split point itself: a range chosen so the very first midpoint lands exactly on a hit
+    // (the second half then *starts* with it), or so the first half *ends* with a hit. An
+    // off-by-one in how the halves are cut would drop exactly such a hit.
+    {
+        const uint64_t d = idxB - idxA;
+        struct Layout { const char* what; uint64_t lo, hi; };
+        const Layout layouts[] = {
+            {"the first midpoint is exactly the later hit (the second half starts with it)", idxA, idxA + 2 * d},
+            {"the first half ends exactly with the earlier hit", idxA - d, idxB + 1},
+        };
+        for (const Layout& L : layouts) {
+            for (int which = 0; which < 2; ++which) {
+                const std::string& winner = which == 0 ? c1 : c2;
+                printf("--- %s; hashB selects the %s hit ---\n", L.what, which == 0 ? "earlier" : "later");
+                SearchResult r; std::vector<std::string> reported;
+                std::string log = runCaptured(makeRequest(collHash, hashB(prefix + winner + suffix), L.lo, L.hi), r, reported);
+                CHECK(r.ok && r.found && r.filename == prefix + winner + suffix, "the hashB-matching hit is found");
+                CHECK(std::find(reported.begin(), reported.end(), winner) != reported.end(), "and reported");
+                if (which == 1) // the later one: the earlier hit precedes it, so it must have been reported too
+                    CHECK(reported.size() == 2 && reported[0] == c1 && reported[1] == c2, "with the earlier hit reported before it");
+                CHECK(noKernelDisagreement(log), "no kernel/reference disagreement warnings");
+            }
+        }
+    }
+
+    // The very next search is unaffected by the overflows above.
     {
         printf("--- the next search is unaffected (no stale match count) ---\n");
         uint64_t single = idxA + 5;
@@ -129,17 +184,16 @@ int main() {
         std::string log = runCaptured(makeRequest(hashA(prefix + cand + suffix), hashB(prefix + cand + suffix), single - 3, single + 3), r, reported);
         CHECK(r.ok && r.found && r.filename == prefix + cand + suffix, "the next search finds its own target");
         CHECK(reported.size() == 1 && reported[0] == cand, "and reports exactly that one hit");
-        CHECK(log.find("WARNING") == std::string::npos, "with no warnings");
+        CHECK(log.find("WARNING") == std::string::npos && log.find("note:") == std::string::npos, "with no warnings or notes");
     }
 
-    // (The "next search" above also covers exactly MAX_MATCHES hits, which is not an overflow.)
     // And a range with no hits at all reports nothing.
     {
         printf("--- no hits ---\n");
         SearchResult r; std::vector<std::string> reported;
         std::string log = runCaptured(makeRequest(hashA(prefix + c1 + suffix) ^ 0x1, 0xDEADBEEF, idxA, idxB), r, reported); // matches nothing in the range
         CHECK(r.ok && reported.empty() && !r.found, "a target with no hits reports nothing");
-        CHECK(log.find("WARNING") == std::string::npos, "and prints no warning");
+        CHECK(log.find("WARNING") == std::string::npos && log.find("note:") == std::string::npos, "and prints no warning or note");
     }
 
     if (g_failures) {

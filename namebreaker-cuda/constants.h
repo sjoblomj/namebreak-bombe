@@ -8,9 +8,12 @@
 #define MAX_ALPHABET_SIZE 50
 #define MAX_CANDIDATE_LEN 16
 #define MAX_FILENAME_LEN 128
+// How many hashA hits one kernel launch can record. More than this in a single
+// launch is handled by re-searching that launch's range in halves (see
+// runCudaBatch in namebreak.cu), so it only bounds a buffer, not correctness.
 // Overridable at compile time (-DMAX_MATCHES=N) so tests/search_overflow_test.cu
-// can exercise the "more hashA hits in one batch than fit" path with just a
-// couple of colliding candidates instead of needing >1024 of them.
+// can exercise that path with just a couple of colliding candidates instead of
+// needing >1024 of them. Must be >= 1.
 #ifndef MAX_MATCHES
 #define MAX_MATCHES 1024
 #endif
@@ -43,6 +46,7 @@
 #define MAX_TRAILING_LEN 6
 static_assert(NAMEBREAK_GPU_WINDOW_CHARS >= 1 && NAMEBREAK_GPU_WINDOW_CHARS <= MAX_TRAILING_LEN,
               "NAMEBREAK_GPU_WINDOW_CHARS must be between 1 and MAX_TRAILING_LEN");
+static_assert(MAX_MATCHES >= 1, "MAX_MATCHES must be at least 1 (a one-candidate range can have one hit)");
 static_assert(NAMEBREAK_ROWS_PER_LAUNCH >= 1, "NAMEBREAK_ROWS_PER_LAUNCH must be >= 1");
 
 #endif //NAMEBREAK_CUDA_CONSTANTS_H
