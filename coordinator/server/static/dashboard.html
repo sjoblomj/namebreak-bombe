@@ -692,8 +692,14 @@
       }
       label.textContent = `${hidden.length} more ${statusWord(group.status)} · length ${group.candidateLen}`;
       const n = Math.min(REVEAL_BATCH, hidden.length);
+      // When hidden.length <= REVEAL_BATCH, "first n" and "last n" reveal
+      // the exact same set as "all" - no point offering three identical
+      // buttons, so only "Show all" is shown.
+      const distinct = hidden.length > REVEAL_BATCH;
       btnFirst.textContent = `Show first ${n}`;
+      btnFirst.style.display = distinct ? '' : 'none';
       btnLast.textContent = `Show last ${n}`;
+      btnLast.style.display = distinct ? '' : 'none';
       btnAll.textContent = `Show all ${hidden.length}`;
     }
     refresh();
