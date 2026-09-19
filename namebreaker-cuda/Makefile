@@ -8,12 +8,16 @@ OPT     := -O3
 ARCH    := sm_86
 
 TARGET  := namebreak
-SOURCES := namebreak.cu cpu-utils.cpp config.cpp
+# platform.cpp is always built: it isn't networking code - it holds the OS-
+# specific terminal/keypress helpers behind the pause key (used in every mode),
+# alongside the hostname/username lookups the coordinator client wants.
+SOURCES := namebreak.cu cpu-utils.cpp config.cpp platform.cpp
 HEADERS_CORE := cpu-utils.h constants.h search.h hash_kernels.cuh
-HEADERS := cpu-utils.h constants.h search.h config.h hash_kernels.cuh
+HEADERS := cpu-utils.h constants.h search.h config.h hash_kernels.cuh platform.h
 
-# Set to 0 to build without the coordinator client (no libcurl dependency,
-# `coordinator` mode unavailable at runtime): make NETWORK=0
+# Set to 0 to build without any networking: no coordinator client, HTTP or
+# protocol code, no libcurl dependency, and `coordinator` mode is unavailable
+# at runtime (the bounded and continuous modes are unaffected): make NETWORK=0
 NETWORK ?= 1
 
 # Windows here means a native build: MSVC (cl.exe) as nvcc's host compiler +
@@ -55,12 +59,15 @@ else
     EXE_EXT :=
     CURL_INC     ?=
     CURL_LIB_DIR ?=
-    NETWORK_LDFLAGS = -lcurl -lpthread
+    NETWORK_LDFLAGS = -lcurl
+    # std::thread (the pause key listener, in every mode) needs libpthread on
+    # older glibc - not just the networked build.
+    LDFLAGS += -lpthread
 endif
 
 ifeq ($(NETWORK),1)
-SOURCES += coordinator_runner.cpp coordinator_client.cpp http_client.cpp protocol.cpp platform.cpp
-HEADERS += coordinator_runner.h coordinator_client.h http_client.h protocol.h platform.h
+SOURCES += coordinator_runner.cpp coordinator_client.cpp http_client.cpp protocol.cpp
+HEADERS += coordinator_runner.h coordinator_client.h http_client.h protocol.h
 NVCC_FLAGS += -DNAMEBREAK_WITH_NETWORK $(if $(CURL_INC),-I$(CURL_INC))
 LDFLAGS += $(NETWORK_LDFLAGS)
 endif
