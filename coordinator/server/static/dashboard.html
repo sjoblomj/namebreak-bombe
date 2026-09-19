@@ -210,10 +210,30 @@
     text-transform: uppercase;
     letter-spacing: 0.03em;
   }
-  tr.gap-row td {
-    color: var(--muted);
+  .priority-gap-note {
+    display: block;
+    margin-top: 2px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    white-space: normal;
+    font-size: 11px;
     font-style: italic;
+    color: var(--muted);
+  }
+  tr.priority-done-sep td {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 10px 8px 4px;
+    border-top: 2px solid var(--border);
+  }
+  tr.priority-carved-row td {
     background: var(--detail-bg);
+    font-size: 12px;
+  }
+  tr.priority-carved-row td:first-child {
+    padding-left: 22px;
   }
   .table-scroll {
     overflow-x: auto;
@@ -746,42 +766,86 @@
     return tr;
   }
 
-  // The gap between wherever the target's main sweep currently is
-  // (t.cursor_candidate_len/cursor_next_index) and a not-yet-reached
-  // priority range is never persisted server-side (see
+  // Whether the ordinary (non-priority) candidates leading up to a priority
+  // range have been carved yet is never persisted server-side (see
   // ranges::find_priority_boundary) - it's computed here, purely for
   // display, from the two cursors the dashboard API already sends. Only
-  // rendered when it's actually bounded (same length as the main sweep);
-  // a priority range at a longer, not-yet-reached length just gets a plain
-  // "not yet reached" note instead, since the true gap there could span
-  // several whole lengths and isn't a single meaningful address range.
-  function priorityGapRow(t, pr) {
-    let text = null;
+  // detailed (with the main sweep's current candidate) when it's actually
+  // bounded (same length as the main sweep); a priority range at a longer,
+  // not-yet-reached length just gets a plain "not yet reached" note instead,
+  // since the true gap there could span several whole lengths and isn't a
+  // single meaningful address range.
+  //
+  // This describes the MAIN SWEEP's cursor only, never the priority range's
+  // own progress - priority ranges are claimed and worked independently,
+  // via a separate fast-track path that can carry a range's own next_index
+  // deep into [start_index, end_index) while the main sweep still sits well
+  // behind its start_index (see ranges::claim_priority_range_chunk). So a
+  // range can show real, substantial progress in its own row while this note
+  // still - correctly - reports the ordinary candidates ahead of it as not
+  // yet carved. Returned as plain text (not a row of its own) so the caller
+  // can attach it directly to the one priority range it describes, rather
+  // than leaving readers to guess whether a standalone row talks about the
+  // range above or below it.
+  function priorityGapNote(t, pr) {
     if (t.cursor_candidate_len === pr.candidate_len && t.cursor_next_index < pr.start_index) {
-      text = `Unclaimed: ${t.cursor_candidate} → ${pr.first_candidate} (not yet carved)`;
+      return `Main sweep hasn't reached here yet - still at ${t.cursor_candidate}`;
     } else if (t.cursor_candidate_len < pr.candidate_len) {
-      text = `Not yet reached – main sweep is at length ${t.cursor_candidate_len} (${t.cursor_candidate})`;
+      return `Main sweep hasn't reached this length yet - still at length ${t.cursor_candidate_len} (${t.cursor_candidate})`;
     }
-    if (!text) return null;
-
-    const tr = document.createElement('tr');
-    tr.className = 'gap-row';
-    const td = document.createElement('td');
-    td.colSpan = 4;
-    td.className = 'mono';
-    td.textContent = text;
-    tr.appendChild(td);
-    return tr;
+    return null;
   }
 
   // A small table of the target's priority ranges (see
   // models::PriorityRange), address-ordered (by length then start) rather
   // than by their own priority field, so it reads like a timeline of the
   // target's search space - with the gap ahead of each not-yet-reached one
-  // shown inline via priorityGapRow. Done ranges (next_candidate is null,
-  // meaning next_index has reached end_index) sink below every still-active
+  // shown as a note under its own Pattern cell via priorityGapNote. Done
+  // ranges (next_candidate is null, meaning next_index has reached
+  // end_index) sink below every still-active
   // one, since a finished range is no longer part of what's worth watching.
   // Returns null when the target has none.
+  // The actual carved chunks (models::Range rows, same as the main Progress
+  // tab's table) that were split off a given priority range - each still
+  // has its own independent status/worker/progress, since a priority range
+  // is carved and claimed piecemeal, same as ordinary sweep work (see
+  // ranges::claim_priority_range_chunk). A four-column condensed cousin of
+  // rangeRow() rather than a reuse of it: the priority table only has four
+  // columns, and rangeRow()'s eight would misalign against its header.
+  function priorityCarvedRangeRow(r) {
+    const tr = document.createElement('tr');
+    tr.className = 'priority-carved-row';
+
+    const tdRange = document.createElement('td');
+    tdRange.className = 'mono';
+    tdRange.textContent = `${r.first_candidate} – ${r.last_candidate}`;
+    tr.appendChild(tdRange);
+
+    const tdStatus = document.createElement('td');
+    tdStatus.colSpan = 2;
+    const statusLabel = r.status === 'in_progress'
+      ? inProgressLabel(r.progress_percent)
+      : (r.status === 'completed' ? 'Done' : (r.status === 'skipped' ? 'Skip' : undefined));
+    tdStatus.appendChild(statusBadge(r.status, statusLabel));
+    tdStatus.append(' ');
+    tdStatus.appendChild(workerFragment(r.worker));
+    tr.appendChild(tdStatus);
+
+    const tdDetail = document.createElement('td');
+    if (r.status === 'in_progress' && r.progress_candidate) {
+      tdDetail.className = 'mono';
+      tdDetail.textContent = 'Progress: ' + r.progress_candidate;
+    } else if (r.status === 'completed') {
+      setTimeCell(tdDetail, r.completed_at);
+    } else {
+      tdDetail.className = 'muted';
+      tdDetail.textContent = '—';
+    }
+    tr.appendChild(tdDetail);
+
+    return tr;
+  }
+
   function priorityRangeSection(t) {
     if (!t.priority_ranges || t.priority_ranges.length === 0) return null;
 
@@ -799,15 +863,37 @@
     thead.innerHTML = '<tr><th>Pattern</th><th>Len</th><th>Priority</th><th>Progress</th></tr>';
     table.appendChild(thead);
 
+    // Every actual carved chunk any priority range has produced so far,
+    // keyed by which priority range it came from (DashboardRange.priority_range_id
+    // - see dashboard.rs) so each summary row below can list its own.
+    const carvedByPriorityId = new Map();
+    for (const r of t.ranges) {
+      if (r.priority_range_id == null) continue;
+      if (!carvedByPriorityId.has(r.priority_range_id)) carvedByPriorityId.set(r.priority_range_id, []);
+      carvedByPriorityId.get(r.priority_range_id).push(r);
+    }
+
     const tbody = document.createElement('tbody');
     const sorted = t.priority_ranges.slice().sort((a, b) => {
       const aDone = a.next_candidate ? 0 : 1;
       const bDone = b.next_candidate ? 0 : 1;
       return aDone - bDone || a.candidate_len - b.candidate_len || a.start_index - b.start_index;
     });
-    for (const pr of sorted) {
-      const gapRow = priorityGapRow(t, pr);
-      if (gapRow) tbody.appendChild(gapRow);
+    // A labeled divider row right before the first Done range - but only
+    // when there's at least one still-active range above it to divide from,
+    // since an all-done (or all-active) list needs no separator at all.
+    const firstDoneIdx = sorted.findIndex((pr) => !pr.next_candidate);
+    for (let idx = 0; idx < sorted.length; idx++) {
+      const pr = sorted[idx];
+      if (idx === firstDoneIdx && firstDoneIdx > 0) {
+        const sep = document.createElement('tr');
+        sep.className = 'priority-done-sep';
+        const sepTd = document.createElement('td');
+        sepTd.colSpan = 4;
+        sepTd.textContent = 'Done';
+        sep.appendChild(sepTd);
+        tbody.appendChild(sep);
+      }
 
       const tr = document.createElement('tr');
 
@@ -815,6 +901,13 @@
       tdPattern.className = 'mono';
       tdPattern.textContent = pr.pattern;
       tdPattern.title = `"${pr.alphabet}"`;
+      const gapText = priorityGapNote(t, pr);
+      if (gapText) {
+        const note = document.createElement('span');
+        note.className = 'priority-gap-note';
+        note.textContent = gapText;
+        tdPattern.appendChild(note);
+      }
       tr.appendChild(tdPattern);
 
       const tdLen = document.createElement('td');
@@ -836,6 +929,9 @@
       tr.appendChild(tdProgress);
 
       tbody.appendChild(tr);
+
+      const carved = (carvedByPriorityId.get(pr.id) || []).slice().sort((a, b) => a.start_index - b.start_index);
+      for (const r of carved) tbody.appendChild(priorityCarvedRangeRow(r));
     }
     table.appendChild(tbody);
     section.appendChild(table);
