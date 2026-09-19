@@ -68,11 +68,11 @@ std::string sanitizeForFilename(const std::string& name) {
 
 // Interactively confirms (or lets the user override) auto-discovered values
 // for whichever of `args`'s username/hostname were left unset by
-// config.conf, then persists the final values back into the file - so this
-// only ever prompts once per machine (future runs find both keys already
-// set there). Falls back to silently using the discovered defaults with no
-// prompt/write when stdin isn't a terminal (e.g. a cron job or systemd
-// service), so a missing config never hangs a non-interactive run.
+// args.configPath, then persists the final values back into that same file -
+// so this only ever prompts once per machine (future runs find both keys
+// already set there). Falls back to silently using the discovered defaults
+// with no prompt/write when stdin isn't a terminal (e.g. a cron job or
+// systemd service), so a missing config never hangs a non-interactive run.
 void resolveMissingIdentity(CoordinatorArgs& args) {
     struct Field {
         std::string key;
@@ -90,12 +90,12 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
     if (!isInteractiveTerminal()) {
         for (const Field& f : missing) {
             fprintf(stderr, "[coordinator] no %s configured - using detected value '%s' (run interactively to save this to %s)\n",
-                    f.key.c_str(), f.value->c_str(), kConfigPath);
+                    f.key.c_str(), f.value->c_str(), args.configPath.c_str());
         }
         return;
     }
 
-    printf("No %s configured in %s. Detected:\n", missing.size() == 2 ? "username/hostname" : missing[0].key.c_str(), kConfigPath);
+    printf("No %s configured in %s. Detected:\n", missing.size() == 2 ? "username/hostname" : missing[0].key.c_str(), args.configPath.c_str());
     for (const Field& f : missing)
         printf("  %s = %s\n", f.key.c_str(), f.value->c_str());
     printf("Use %s? [Y/n]: ", missing.size() == 2 ? "these" : "this");
@@ -116,10 +116,10 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
             if (!entered.empty())
                 *f.value = entered;
         }
-        if (appendKeyToConfigSection(kConfigPath, "coordinator", f.key, *f.value)) {
-            printf("[coordinator] saved %s = %s to %s\n", f.key.c_str(), f.value->c_str(), kConfigPath);
+        if (appendKeyToConfigSection(args.configPath, "coordinator", f.key, *f.value)) {
+            printf("[coordinator] saved %s = %s to %s\n", f.key.c_str(), f.value->c_str(), args.configPath.c_str());
         } else {
-            fprintf(stderr, "[coordinator] warning: could not save %s to %s - you'll be asked again next time\n", f.key.c_str(), kConfigPath);
+            fprintf(stderr, "[coordinator] warning: could not save %s to %s - you'll be asked again next time\n", f.key.c_str(), args.configPath.c_str());
         }
     }
 }

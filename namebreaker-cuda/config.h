@@ -7,20 +7,20 @@
 
 #include "search.h"
 
-// The one, fixed location namebreak reads its config from - see ConfigFile
-// below. Shared so every file that needs to reference it (for error
-// messages, or to write a discovered value back into it) agrees on it.
-inline constexpr const char* kConfigPath = "config.conf";
+// Where namebreak reads its config from absent a --config <file> argument -
+// see ConfigFile below. Shared so every file that needs to reference it (for
+// usage/error messages) agrees on it.
+inline constexpr const char* kDefaultConfigPath = "config.conf";
 
-// namebreak's on-disk config.conf - always read from "./config.conf" (the
-// current working directory), never pointed to via a flag. A flat key=value
+// namebreak's on-disk config.conf - read from "./config.conf" (the current
+// working directory) unless overridden via --config <file>. A flat key=value
 // file with exactly two possible [section] headers:
 //   [search]      - bounded/continuous parameters (mode picks which of the
 //                   two actually runs; both take the same parameters)
 //   [coordinator] - coordinator-mode parameters (see coordinator_runner.h)
 // plus one key allowed before any section: `mode = continuous|bounded|
-// coordinator` (overridable by passing a mode as the program's first
-// argument - see main()). '#'-led lines and blank lines are ignored; a
+// coordinator` (overridable by passing --mode <mode> - see main()). '#'-led
+// lines and blank lines are ignored; a
 // value may optionally be wrapped in "..." if it needs meaningful leading/
 // trailing whitespace (no other escaping - a candidate/prefix/suffix
 // containing a literal backslash needs none).

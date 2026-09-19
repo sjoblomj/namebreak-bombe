@@ -876,22 +876,49 @@ void handleSigintPauseOrQuit(int sig) {
     std::raise(sig);
 }
 
+// Usage/error message for a malformed command line - shared by every exit
+// path in the argv-parsing loop below so they all describe the same syntax.
+void printUsage(const char* argv0) {
+    fprintf(stderr, "Usage: %s [--mode continuous|bounded|coordinator] [--config <file>]\n"
+                     "Reads the given --config file (default: %s, in the current directory) for\n"
+                     "everything else; --mode, if given, overrides that file's own 'mode = ...'.\n",
+            argv0, kDefaultConfigPath);
+}
+
 int main(int argc, char* argv[]) {
-    // The only argument namebreak takes: an optional mode, overriding
-    // config.conf's own `mode = ...` (see config.h). Everything else
-    // lives in config.conf.
-    std::string modeOverride = (argc >= 2) ? argv[1] : "";
-    if (argc > 2 || (argc == 2 && modeOverride != "continuous" && modeOverride != "bounded" && modeOverride != "coordinator")) {
-        fprintf(stderr, "Usage: %s [continuous|bounded|coordinator]\n"
-                         "Reads %s from the current directory for everything else; the argument above,\n"
-                         "if given, overrides that file's own 'mode = ...'.\n",
-                argv[0], kConfigPath);
-        return 1;
+    // Two optional, order-independent flags: --mode, overriding config.conf's
+    // own `mode = ...` (see config.h), and --config <file>, overriding which
+    // file that config (and everything else below) is read from. Everything
+    // other than these two lives in the config file itself.
+    std::string modeOverride;
+    std::string configPath = kDefaultConfigPath;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--config") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--config requires a file path argument\n");
+                return 1;
+            }
+            configPath = argv[++i];
+        } else if (arg == "--mode") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--mode requires an argument (continuous, bounded, or coordinator)\n");
+                return 1;
+            }
+            modeOverride = argv[++i];
+            if (modeOverride != "continuous" && modeOverride != "bounded" && modeOverride != "coordinator") {
+                fprintf(stderr, "--mode must be one of continuous, bounded, or coordinator (got '%s')\n", modeOverride.c_str());
+                return 1;
+            }
+        } else {
+            printUsage(argv[0]);
+            return 1;
+        }
     }
 
     ConfigFile config;
     std::string error;
-    if (!loadConfigFile(kConfigPath, config, error)) {
+    if (!loadConfigFile(configPath, config, error)) {
         fprintf(stderr, "%s\n", error.c_str());
         return 1;
     }
@@ -899,8 +926,8 @@ int main(int argc, char* argv[]) {
     std::string mode = !modeOverride.empty() ? modeOverride : config.mode;
     if (mode != "continuous" && mode != "bounded" && mode != "coordinator") {
         fprintf(stderr, "Unknown or missing mode '%s' - expected continuous, bounded, or coordinator "
-                         "(set %s's 'mode = ...', or pass one as this program's argument)\n",
-                mode.c_str(), kConfigPath);
+                         "(set %s's 'mode = ...', or pass --mode <mode>)\n",
+                mode.c_str(), configPath.c_str());
         return 1;
     }
 
@@ -917,9 +944,10 @@ int main(int argc, char* argv[]) {
     if (mode == "coordinator") {
         CoordinatorArgs cargs;
         if (!buildCoordinatorArgs(config.coordinator, cargs, error)) {
-            fprintf(stderr, "%s [coordinator]: %s\n", kConfigPath, error.c_str());
+            fprintf(stderr, "%s [coordinator]: %s\n", configPath.c_str(), error.c_str());
             return 1;
         }
+        cargs.configPath = configPath;
         return runCoordinator(cargs, &g_paused);
     }
 #else
@@ -931,7 +959,7 @@ int main(int argc, char* argv[]) {
 
     SearchRequest req;
     if (!buildSearchRequest(config.search, mode == "continuous", req, error)) {
-        fprintf(stderr, "%s [search]: %s\n", kConfigPath, error.c_str());
+        fprintf(stderr, "%s [search]: %s\n", configPath.c_str(), error.c_str());
         return 1;
     }
 

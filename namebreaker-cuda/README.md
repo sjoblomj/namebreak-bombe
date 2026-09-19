@@ -16,8 +16,9 @@ suffix** - the prefix and suffix are fixed, known strings (e.g. `REZ\` and
 ## Modes
 
 `namebreak` runs in one of three modes, set via `config.conf`'s `mode = ...`
-(or overridden by passing it as the program's first argument, e.g.
-`./namebreak bounded`):
+(or overridden by passing `--mode <mode>`, e.g. `./namebreak --mode bounded`).
+A different config file can be used instead of `config.conf` via
+`--config <file>`.
 
 - **`bounded`** - exhaustively searches candidates of exactly
   `start_candidate`'s length, between `lower_bound` and `upper_bound`, then

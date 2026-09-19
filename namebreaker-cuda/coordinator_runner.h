@@ -5,6 +5,8 @@
 #include <map>
 #include <string>
 
+#include "config.h"
+
 struct CoordinatorArgs {
     std::string serverUrl;
     // Empty means "not set in config.conf" - runCoordinator() auto-detects
@@ -13,6 +15,13 @@ struct CoordinatorArgs {
     std::string username;
     std::string hostname;
     int pollIntervalSecs = 30;
+    // Path the config was actually loaded from (kDefaultConfigPath, or
+    // whatever --config <file> gave main()) - not itself a config.conf key,
+    // main() fills this in after buildCoordinatorArgs(). resolveMissingIdentity
+    // writes any interactively-confirmed username/hostname back here, so a
+    // --config'd run persists to the file it was actually read from rather
+    // than always writing back to kDefaultConfigPath.
+    std::string configPath = kDefaultConfigPath;
 };
 
 // Builds a CoordinatorArgs from a config.conf [coordinator] section (see
