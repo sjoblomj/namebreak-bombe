@@ -31,7 +31,14 @@ public:
     // Content) - not an error.
     bool claim(std::optional<ClaimResponse>& out, std::string& error);
 
-    bool heartbeat(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, HeartbeatResponse& out, std::string& error);
+    // Distinguishes a 409 (this range's ownership already moved on - e.g. a
+    // network or sleep/hibernate outage during heartbeating outlasted the
+    // lease and the server already released or reassigned it) from other
+    // failures, mirroring api.rs's `err.status() == CONFLICT` check. On
+    // Conflict, `out`/`error` are unset - there's nothing more to read, the
+    // caller already knows what happened.
+    enum class HeartbeatOutcome { Ok, Conflict, Error };
+    HeartbeatOutcome heartbeat(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, HeartbeatResponse& out, std::string& error);
 
     // Distinguishes a 409 (this range's ownership already moved on - e.g. a
     // network outage during heartbeating outlasted the lease and the server

@@ -151,9 +151,17 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     // - that join() is itself a synchronizes-with edge, so a plain bool
     // (unlike abortRequested, which the search thread polls concurrently
     // while the heartbeat thread is still running) needs no atomic here.
-    // Captured at the moment the release is detected, not re-read later, to
-    // avoid any raciness against the user unpausing in between.
-    bool wasPausedWhenReleased = false;
+    // Captured at the moment the search is signaled to stop, not re-read
+    // later, to avoid any raciness against the user unpausing in between.
+    // Set by either stopping reason below (an ordinary release, or losing
+    // ownership outright); the messages below just word it differently
+    // depending on which one it was (see lostOwnership).
+    bool wasPausedWhenStopped = false;
+    // Set (alongside wasPausedWhenStopped, not instead of it) specifically
+    // when a heartbeat finds out this range's ownership had already moved on
+    // by the time it was sent - see the HeartbeatOutcome::Conflict handling
+    // below - as opposed to an ordinary rangeReleased response.
+    bool lostOwnership = false;
 
     std::mutex stopMutex;
     std::condition_variable stopCv;
@@ -173,31 +181,61 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
             lock.unlock();
             HeartbeatResponse resp;
             std::string err;
-            if (hbClient.heartbeat(claim.rangeId, latest, resp, err)) {
-                if (resp.rangeReleased) {
-                    // The server doesn't say why (target solved elsewhere, or
-                    // this range stalled too long - see HeartbeatResponse's
-                    // doc comment in protocol.h) - our own pause state is
-                    // enough to pick the right message and, more importantly,
-                    // is what runCoordinator's claim loop already keys off to
-                    // decide whether to go claim a new range or stay idle.
-                    wasPausedWhenReleased = pauseRequested && pauseRequested->load(std::memory_order_relaxed);
-                    if (wasPausedWhenReleased) {
-                        printf("[coordinator] range %lld: claim released - no progress was reported while paused. "
-                               "Still paused; no new work will be claimed until resumed.\n",
+            switch (hbClient.heartbeat(claim.rangeId, latest, resp, err)) {
+                case CoordinatorClient::HeartbeatOutcome::Ok:
+                    if (resp.rangeReleased) {
+                        // The server doesn't say why (target solved elsewhere, or
+                        // this range stalled too long - see HeartbeatResponse's
+                        // doc comment in protocol.h) - our own pause state is
+                        // enough to pick the right message and, more importantly,
+                        // is what runCoordinator's claim loop already keys off to
+                        // decide whether to go claim a new range or stay idle.
+                        wasPausedWhenStopped = pauseRequested && pauseRequested->load(std::memory_order_relaxed);
+                        if (wasPausedWhenStopped) {
+                            printf("[coordinator] range %lld: claim released - no progress was reported while paused. "
+                                   "Still paused; no new work will be claimed until resumed.\n",
+                                   (long long) claim.rangeId);
+                        } else {
+                            printf("[coordinator] range %lld: target already solved elsewhere - signaling abort\n", (long long) claim.rangeId);
+                        }
+                        abortRequested.store(true, std::memory_order_relaxed);
+                        lock.lock();
+                        goto stopHeartbeating;
+                    }
+                    break;
+                case CoordinatorClient::HeartbeatOutcome::Conflict:
+                    // Not a failure, and not something retrying will ever fix: by
+                    // the time this heartbeat reached the server, it had already
+                    // stopped considering this range ours - almost always because
+                    // the lease (kHeartbeatIntervalSeconds-ish) lapsed while this
+                    // client wasn't heartbeating at all (paused, or the machine
+                    // itself was suspended/hibernated), so the server released or
+                    // reassigned the range before we ever got a chance to say
+                    // otherwise. Stop heartbeating (every next attempt would just
+                    // get the same answer) and signal the search to stop too,
+                    // exactly like an ordinary release above.
+                    lostOwnership = true;
+                    wasPausedWhenStopped = pauseRequested && pauseRequested->load(std::memory_order_relaxed);
+                    if (wasPausedWhenStopped) {
+                        printf("[coordinator] range %lld: no longer assigned to us - unsurprising, since this client "
+                               "has been paused (and therefore not heartbeating) for a while. Still paused; no new "
+                               "work will be claimed until resumed.\n",
                                (long long) claim.rangeId);
                     } else {
-                        printf("[coordinator] range %lld: target already solved elsewhere - signaling abort\n", (long long) claim.rangeId);
+                        printf("[coordinator] range %lld: no longer assigned to us (the lease likely lapsed while "
+                               "this client was inactive) - stopping\n",
+                               (long long) claim.rangeId);
                     }
                     abortRequested.store(true, std::memory_order_relaxed);
                     lock.lock();
+                    goto stopHeartbeating;
+                case CoordinatorClient::HeartbeatOutcome::Error:
+                    fprintf(stderr, "[coordinator] range %lld: heartbeat failed: %s\n", (long long) claim.rangeId, err.c_str());
                     break;
-                }
-            } else {
-                fprintf(stderr, "[coordinator] range %lld: heartbeat failed: %s\n", (long long) claim.rangeId, err.c_str());
             }
             lock.lock();
         }
+    stopHeartbeating:;
     });
 
     auto started = std::chrono::steady_clock::now();
@@ -222,7 +260,10 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     }
 
     if (result.aborted) {
-        if (wasPausedWhenReleased) {
+        if (lostOwnership) {
+            printf("[coordinator] range %lld: aborted - no longer assigned to us%s\n", (long long) claim.rangeId,
+                   wasPausedWhenStopped ? " (still paused)" : "");
+        } else if (wasPausedWhenStopped) {
             printf("[coordinator] range %lld: aborted - claim released while paused\n", (long long) claim.rangeId);
         } else {
             printf("[coordinator] range %lld: aborted - target was already solved by someone else\n", (long long) claim.rangeId);

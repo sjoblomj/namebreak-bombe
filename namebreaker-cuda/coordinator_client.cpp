@@ -54,23 +54,26 @@ bool CoordinatorClient::claim(std::optional<ClaimResponse>& out, std::string& er
     return true;
 }
 
-bool CoordinatorClient::heartbeat(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, HeartbeatResponse& out, std::string& error) {
+CoordinatorClient::HeartbeatOutcome CoordinatorClient::heartbeat(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, HeartbeatResponse& out, std::string& error) {
     HeartbeatRequest req{lastHashAMatchFilename};
     std::string url = baseUrl_ + "/api/v1/ranges/" + std::to_string(rangeId) + "/heartbeat";
     HttpResponse resp = http_.post(url, {authHeader(token_)}, toJson(req));
     if (resp.status == 0) {
         error = "request failed: " + resp.error;
-        return false;
+        return HeartbeatOutcome::Error;
+    }
+    if (resp.status == 409) {
+        return HeartbeatOutcome::Conflict;
     }
     if (!resp.ok()) {
         error = "heartbeat failed (HTTP " + std::to_string(resp.status) + "): " + parseErrorMessage(resp.body);
-        return false;
+        return HeartbeatOutcome::Error;
     }
     if (!parseHeartbeatResponse(resp.body, out)) {
         error = "malformed heartbeat response: " + resp.body;
-        return false;
+        return HeartbeatOutcome::Error;
     }
-    return true;
+    return HeartbeatOutcome::Ok;
 }
 
 CoordinatorClient::CompleteOutcome CoordinatorClient::complete(int64_t rangeId, const CompleteRequest& req, std::string& error) {
