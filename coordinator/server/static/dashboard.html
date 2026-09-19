@@ -364,6 +364,30 @@
     font-size: 13px;
     margin-top: 10px;
   }
+  .target-tabs {
+    margin-top: 14px;
+  }
+  .tab-bar {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab-btn {
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 12px;
+    margin-bottom: -1px;
+    cursor: pointer;
+  }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .tab-panel > *:first-child { margin-top: 0; }
   .loading, .error {
     color: var(--muted);
     font-size: 14px;
@@ -754,7 +778,10 @@
   // models::PriorityRange), address-ordered (by length then start) rather
   // than by their own priority field, so it reads like a timeline of the
   // target's search space - with the gap ahead of each not-yet-reached one
-  // shown inline via priorityGapRow. Returns null when the target has none.
+  // shown inline via priorityGapRow. Done ranges (next_candidate is null,
+  // meaning next_index has reached end_index) sink below every still-active
+  // one, since a finished range is no longer part of what's worth watching.
+  // Returns null when the target has none.
   function priorityRangeSection(t) {
     if (!t.priority_ranges || t.priority_ranges.length === 0) return null;
 
@@ -773,7 +800,11 @@
     table.appendChild(thead);
 
     const tbody = document.createElement('tbody');
-    const sorted = t.priority_ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
+    const sorted = t.priority_ranges.slice().sort((a, b) => {
+      const aDone = a.next_candidate ? 0 : 1;
+      const bDone = b.next_candidate ? 0 : 1;
+      return aDone - bDone || a.candidate_len - b.candidate_len || a.start_index - b.start_index;
+    });
     for (const pr of sorted) {
       const gapRow = priorityGapRow(t, pr);
       if (gapRow) tbody.appendChild(gapRow);
@@ -809,6 +840,91 @@
     table.appendChild(tbody);
     section.appendChild(table);
     return section;
+  }
+
+  // Builds the two-tab "Progress" / "Priority ranges" switcher used when a
+  // target has priority ranges to show alongside its main range table.
+  // Starts on the Progress tab; clicking a tab swaps which panel has the
+  // "active" class (CSS handles the actual show/hide).
+  function targetTabs(progressPanel, priorityPanel) {
+    const wrap = document.createElement('div');
+    wrap.className = 'target-tabs';
+
+    const bar = document.createElement('div');
+    bar.className = 'tab-bar';
+
+    const progressBtn = document.createElement('button');
+    progressBtn.type = 'button';
+    progressBtn.className = 'tab-btn active';
+    progressBtn.textContent = 'Progress';
+    bar.appendChild(progressBtn);
+
+    const priorityBtn = document.createElement('button');
+    priorityBtn.type = 'button';
+    priorityBtn.className = 'tab-btn';
+    priorityBtn.textContent = 'Priority ranges';
+    bar.appendChild(priorityBtn);
+
+    wrap.appendChild(bar);
+
+    progressPanel.classList.add('tab-panel', 'active');
+    priorityPanel.classList.add('tab-panel');
+    wrap.appendChild(progressPanel);
+    wrap.appendChild(priorityPanel);
+
+    function activate(btn, panel) {
+      for (const b of [progressBtn, priorityBtn]) b.classList.remove('active');
+      for (const p of [progressPanel, priorityPanel]) p.classList.remove('active');
+      btn.classList.add('active');
+      panel.classList.add('active');
+    }
+
+    progressBtn.addEventListener('click', () => activate(progressBtn, progressPanel));
+    priorityBtn.addEventListener('click', () => activate(priorityBtn, priorityPanel));
+
+    return wrap;
+  }
+
+  // The target's main range table (or the "no ranges carved yet" note),
+  // exactly what used to be inlined at the end of targetCard - pulled out
+  // so it can be placed either directly on the card or inside a tab panel,
+  // depending on whether the target has priority ranges to tab against.
+  function rangesContent(t) {
+    if (t.ranges.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-ranges';
+      empty.textContent = 'No ranges carved yet.';
+      return empty;
+    }
+
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    thead.innerHTML =
+      '<tr><th class="col-range">Range</th><th>Status</th><th>Len</th><th>First / last candidate</th>' +
+      '<th class="col-count">Count</th><th class="col-worker">Worker</th>' +
+      '<th class="col-assigned">Assigned</th><th class="col-completed">Completed</th></tr>';
+    table.appendChild(thead);
+
+    // Shorter candidates (fewer characters) before longer ones, since a
+    // target's search always works through lengths in that order.
+    const sortedRanges = t.ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
+
+    const tbody = document.createElement('tbody');
+    for (const group of groupRanges(sortedRanges)) {
+      if (group.kind === 'range') {
+        const [row, detailRow] = rangeRow(group.range);
+        tbody.appendChild(row);
+        tbody.appendChild(detailRow);
+      } else {
+        tbody.appendChild(collapsedRow(group));
+      }
+    }
+    table.appendChild(tbody);
+
+    const tableScroll = document.createElement('div');
+    tableScroll.className = 'table-scroll';
+    tableScroll.appendChild(table);
+    return tableScroll;
   }
 
   function targetCard(t) {
@@ -894,45 +1010,16 @@
       card.appendChild(banner);
     }
 
+    // A target with priority ranges gets a Progress/Priority ranges tab
+    // switcher; one without goes straight to the range table, exactly as
+    // before - no tabs shown when there's nothing to tab against.
     const prioritySection = priorityRangeSection(t);
-    if (prioritySection) card.appendChild(prioritySection);
-
-    if (t.ranges.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty-ranges';
-      empty.textContent = 'No ranges carved yet.';
-      card.appendChild(empty);
-      return card;
+    const progress = rangesContent(t);
+    if (prioritySection) {
+      card.appendChild(targetTabs(progress, prioritySection));
+    } else {
+      card.appendChild(progress);
     }
-
-    const table = document.createElement('table');
-    const thead = document.createElement('thead');
-    thead.innerHTML =
-      '<tr><th class="col-range">Range</th><th>Status</th><th>Len</th><th>First / last candidate</th>' +
-      '<th class="col-count">Count</th><th class="col-worker">Worker</th>' +
-      '<th class="col-assigned">Assigned</th><th class="col-completed">Completed</th></tr>';
-    table.appendChild(thead);
-
-    // Shorter candidates (fewer characters) before longer ones, since a
-    // target's search always works through lengths in that order.
-    const sortedRanges = t.ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
-
-    const tbody = document.createElement('tbody');
-    for (const group of groupRanges(sortedRanges)) {
-      if (group.kind === 'range') {
-        const [row, detailRow] = rangeRow(group.range);
-        tbody.appendChild(row);
-        tbody.appendChild(detailRow);
-      } else {
-        tbody.appendChild(collapsedRow(group));
-      }
-    }
-    table.appendChild(tbody);
-
-    const tableScroll = document.createElement('div');
-    tableScroll.className = 'table-scroll';
-    tableScroll.appendChild(table);
-    card.appendChild(tableScroll);
     return card;
   }
 
