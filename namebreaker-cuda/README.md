@@ -125,9 +125,7 @@ crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
 is built in several configurations (different GPU window / launch sizes),
 and each takes about a minute to compile, so `make -j test` is much faster.
 `make search_bench` times the real search over a fixed range; `make
-WINDOW=6 search_bench` re-runs it with a different GPU window
-(`make bench` runs an older proxy benchmark and no longer models the real
-kernel).
+WINDOW=6 search_bench` re-runs it with a different GPU window.
 
 ## Design decisions
 

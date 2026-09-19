@@ -1,7 +1,6 @@
-// Final real-code throughput check: times the *actual* runSearch() (not a
-// standalone proxy kernel like tests/window_sweep_bench.cu) over a bounded
-// candidateLen=10 range sized to match window_sweep_bench's comparison
-// (~28.8 billion candidates), using this project's real 49-character
+// Real-code throughput check: times the *actual* runSearch() (not a
+// standalone proxy kernel) over a bounded candidateLen=10 range of about
+// 28.8 billion candidates, using this project's real 49-character
 // alphabet and an unreachable target hash so it runs to completion instead
 // of stopping early on a match. Linked against namebreak.cu directly (built
 // with -DNAMEBREAK_NO_MAIN), so this measures the exact code that ships, not
@@ -31,8 +30,7 @@ int main(int argc, char** argv) {
     // leading/trailing split - namebreak.cu picks that internally via
     // gpuWindowChars) so this bound, and therefore this benchmark, works
     // unchanged regardless of what NAMEBREAK_GPU_WINDOW_CHARS is compiled
-    // with - the same ~28.8B total this project's window-size sweep has
-    // used throughout, for direct comparability across runs.
+    // with - a fixed ~28.8B total, for direct comparability across runs.
     const uint64_t targetTotalCandidates = 28'800'000'000ULL;
     std::string upper = indexToString(targetTotalCandidates, candidateLen, alphabet);
     std::string lower(candidateLen, alphabet[0]);

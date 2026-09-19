@@ -65,7 +65,7 @@ NVCC_FLAGS += -DNAMEBREAK_WITH_NETWORK $(if $(CURL_INC),-I$(CURL_INC))
 LDFLAGS += $(NETWORK_LDFLAGS)
 endif
 
-.PHONY: all verbose clean test bench
+.PHONY: all verbose clean test
 
 all: $(TARGET)$(EXE_EXT)
 
@@ -78,7 +78,7 @@ verbose: $(SOURCES) $(HEADERS)
 	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) $(NVCC_FLAGS) --ptxas-options=-v -o $(TARGET)$(EXE_EXT) $(SOURCES) $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)$(EXE_EXT) tests/prefix_hasher_test tests/prefix_hasher_bench tests/window_sweep_bench tests/search_bench $(INTEGRATION_TESTS) tests/search_overflow_test
+	rm -f $(TARGET)$(EXE_EXT) tests/prefix_hasher_test tests/prefix_hasher_bench tests/search_bench $(INTEGRATION_TESTS) tests/search_overflow_test
 	rm -rf tests/.testrun
 
 # Pure-CPU correctness check for IncrementalPrefixHasher (cpu-utils.h/.cpp) -
@@ -143,19 +143,8 @@ test: tests/prefix_hasher_test $(INTEGRATION_TESTS) tests/search_overflow_test
 	cd tests/.testrun && ../search_integration_test_window6
 	cd tests/.testrun && ../search_overflow_test
 
-# GPU window-size sweep benchmark - a *proxy* kernel modelling the previous
-# design (one GPU thread per candidate), which compares several "how many
-# characters per GPU thread" choices. It no longer models the shipped kernel
-# (one thread per row - see namebreak.cu); use search_bench below, which times
-# the real runSearch(), to tune the window.
-tests/window_sweep_bench: tests/window_sweep_bench.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -o tests/window_sweep_bench tests/window_sweep_bench.cu cpu-utils.cpp
-
-bench: tests/window_sweep_bench
-	./tests/window_sweep_bench
-
-# Final real-code throughput check - times the actual runSearch(), not a
-# standalone proxy kernel, over a ~28.8B-candidate range. WINDOW controls
+# Real-code throughput check - times the actual runSearch() (not a proxy
+# kernel) over a ~28.8B-candidate range. WINDOW controls
 # namebreak.cu's gpuWindowChars for this build only (make WINDOW=6
 # search_bench), to re-sweep that tuning value against real hardware without
 # hand-editing the source - see constants.h. Unset, the shipped default is used.
