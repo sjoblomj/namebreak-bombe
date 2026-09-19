@@ -72,6 +72,31 @@ NVCC_FLAGS += -DNAMEBREAK_WITH_NETWORK $(if $(CURL_INC),-I$(CURL_INC))
 LDFLAGS += $(NETWORK_LDFLAGS)
 endif
 
+# A little native Win32 GUI wrapper around coordinator mode (gui_win32.cpp) -
+# Windows-only (Win32 API), so `make gui`/this target simply doesn't exist on
+# the Linux branch above. Always built with networking (it's coordinator-only,
+# unaffected by NETWORK=0 above) and with namebreak.cu's own console main()
+# excluded via -DNAMEBREAK_NO_MAIN - the same flag/precedent the test
+# executables further down already use to get runSearch()/the CUDA kernels
+# without a duplicate main() symbol. /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup
+# gives the process no console while still letting gui_win32.cpp use an
+# ordinary main() instead of WinMain() - see that file's own header comment.
+# NOTE: like the Windows OS branch above, this is untested - no Windows+CUDA
+# machine is available to build-verify it on.
+ifeq ($(OS),Windows_NT)
+GUI_TARGET  := namebreak-gui
+GUI_SOURCES := gui_win32.cpp namebreak.cu cpu-utils.cpp config.cpp platform.cpp \
+               coordinator_runner.cpp coordinator_client.cpp http_client.cpp protocol.cpp
+GUI_LDFLAGS := $(NETWORK_LDFLAGS) -lcomctl32 -lshell32 -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup
+
+.PHONY: gui
+gui: $(GUI_TARGET)$(EXE_EXT)
+
+$(GUI_TARGET)$(EXE_EXT): $(GUI_SOURCES) $(HEADERS)
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_WITH_NETWORK $(if $(CURL_INC),-I$(CURL_INC)) \
+	    -o $(GUI_TARGET)$(EXE_EXT) $(GUI_SOURCES) $(GUI_LDFLAGS)
+endif
+
 .PHONY: all verbose clean test
 
 all: $(TARGET)$(EXE_EXT)
@@ -85,7 +110,7 @@ verbose: $(SOURCES) $(HEADERS)
 	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) $(NVCC_FLAGS) --ptxas-options=-v -o $(TARGET)$(EXE_EXT) $(SOURCES) $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)$(EXE_EXT) tests/prefix_hasher_test tests/prefix_hasher_bench tests/search_bench $(INTEGRATION_TESTS) tests/search_overflow_test
+	rm -f $(TARGET)$(EXE_EXT) $(GUI_TARGET)$(EXE_EXT) tests/prefix_hasher_test tests/prefix_hasher_bench tests/search_bench $(INTEGRATION_TESTS) tests/search_overflow_test
 	rm -rf tests/.testrun
 
 # Pure-CPU correctness check for IncrementalPrefixHasher (cpu-utils.h/.cpp) -

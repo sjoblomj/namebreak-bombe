@@ -44,6 +44,23 @@ struct CurlGlobalGuard {
     ~CurlGlobalGuard() { curl_global_cleanup(); }
 };
 
+// Sleeps for `duration`, but returns early (in at most ~500ms) once
+// `quitRequested` becomes true - so a caller wanting to quit promptly (e.g.
+// a GUI's Quit button) doesn't have to wait out a long claim-backoff or
+// no-work poll interval once it's requested. A no-op wait (just the plain
+// full-duration sleep) when `quitRequested` is null, matching every existing
+// call site's behavior before this was introduced.
+void interruptibleSleep(std::chrono::milliseconds duration, const std::atomic<bool>* quitRequested) {
+    constexpr auto kTick = std::chrono::milliseconds(500);
+    while (duration.count() > 0) {
+        if (quitRequested && quitRequested->load(std::memory_order_relaxed))
+            return;
+        auto step = std::min(duration, kTick);
+        std::this_thread::sleep_for(step);
+        duration -= step;
+    }
+}
+
 std::string trimLine(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
     if (start == std::string::npos)
@@ -146,7 +163,11 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
 
 // Runs exactly one claimed range: spawns the heartbeat thread, runs the
 // search in-process on the calling thread, then reports completion.
-void runOneRange(const std::string& serverUrl, const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested) {
+// `quitRequested`/`callbacks`, if given, are as documented on runCoordinator
+// (coordinator_runner.h) - both default null for the CLI's own call site
+// below, so this function's added behavior is opt-in.
+void runOneRange(const std::string& serverUrl, const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested,
+                  std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
     printf("[coordinator] starting range %lld (target %s) [%s .. %s]\n",
            (long long) claim.rangeId, claim.targetName.c_str(), claim.lowerBoundFilename.c_str(), claim.upperBoundFilename.c_str());
 
@@ -157,6 +178,9 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
                 (long long) claim.rangeId, reqError.c_str());
         return;
     }
+
+    if (callbacks && callbacks->onRangeClaimed)
+        callbacks->onRangeClaimed(claim, req.outputFilePath);
 
     std::mutex lastMatchMutex;
     std::string lastHashAMatch;
@@ -182,6 +206,29 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     std::mutex stopMutex;
     std::condition_variable stopCv;
     bool stopRequested = false;
+
+    // Watches `quitRequested` (a caller-owned atomic - e.g. a GUI's Quit
+    // button, see coordinator_runner.h) and relays it into the same
+    // `abortRequested` the heartbeat thread above already uses for a
+    // server-signaled release, so runSearch() needs no separate awareness of
+    // it. Simple polling rather than a condition_variable like the heartbeat
+    // thread's wait, since there's no event to wait on here - just
+    // `quitRequested` occasionally flipping true from another thread - and
+    // ~200ms is frequent enough to keep a GUI's Quit button feeling
+    // responsive without busy-waiting.
+    std::atomic<bool> quitWatcherStop{false};
+    std::thread quitWatcherThread;
+    if (quitRequested) {
+        quitWatcherThread = std::thread([&]() {
+            while (!quitWatcherStop.load(std::memory_order_relaxed)) {
+                if (quitRequested->load(std::memory_order_relaxed)) {
+                    abortRequested.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        });
+    }
 
     std::thread heartbeatThread([&]() {
         CoordinatorClient hbClient(serverUrl);
@@ -261,6 +308,10 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
         haveLastHashAMatch = true;
     }, pauseRequested);
     double elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    // Read once, right as the search stops, rather than re-checked later -
+    // same reasoning as wasPausedWhenStopped above (avoids raciness against
+    // quitRequested changing again in between).
+    bool externallyQuit = quitRequested && quitRequested->load(std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> lock(stopMutex);
@@ -268,15 +319,27 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     }
     stopCv.notify_all();
     heartbeatThread.join();
+    quitWatcherStop.store(true, std::memory_order_relaxed);
+    if (quitWatcherThread.joinable())
+        quitWatcherThread.join();
 
     if (!result.ok) {
         fprintf(stderr, "[coordinator] range %lld: search failed (%s) - letting the lease expire so it gets reassigned\n",
                 (long long) claim.rangeId, result.error.c_str());
+        if (callbacks && callbacks->onRangeFinished)
+            callbacks->onRangeFinished(false);
         return;
     }
 
     if (result.aborted) {
-        if (lostOwnership) {
+        // Checked first and independently of lostOwnership/wasPausedWhenStopped
+        // above - those two both describe reasons the *server* ended this
+        // range, which externallyQuit (a caller-owned atomic, e.g. a GUI's
+        // Quit button - see coordinator_runner.h) is not, even though it
+        // reaches the same abortRequested flag runSearch() polls.
+        if (externallyQuit) {
+            printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
+        } else if (lostOwnership) {
             printf("[coordinator] range %lld: aborted - no longer assigned to us%s\n", (long long) claim.rangeId,
                    wasPausedWhenStopped ? " (still paused)" : "");
         } else if (wasPausedWhenStopped) {
@@ -284,6 +347,8 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
         } else {
             printf("[coordinator] range %lld: aborted - target was already solved by someone else\n", (long long) claim.rangeId);
         }
+        if (callbacks && callbacks->onRangeFinished)
+            callbacks->onRangeFinished(false);
         return;
     }
 
@@ -292,6 +357,8 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     } else {
         printf("[coordinator] range %lld: exhausted, no match\n", (long long) claim.rangeId);
     }
+    if (callbacks && callbacks->onRangeFinished)
+        callbacks->onRangeFinished(result.found);
 
     CoordinatorClient completeClient(serverUrl);
     completeClient.setToken(token);
@@ -355,7 +422,8 @@ bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, Coo
     return true;
 }
 
-int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested) {
+int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested,
+                    const CoordinatorCallbacks* callbacks) {
     resolveMissingIdentity(args);
 
     // Not thread-safe to call lazily once the heartbeat thread may already
@@ -369,11 +437,19 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
     std::string serverProtocolVersion;
     std::string error;
     if (!client.registerClient(args.username, args.hostname, userId, serverProtocolVersion, error)) {
-        fprintf(stderr, "failed to register with coordinator: %s\n", error.c_str());
+        std::string msg = "failed to register with coordinator: " + error;
+        fprintf(stderr, "%s\n", msg.c_str());
+        if (callbacks && callbacks->onStatus)
+            callbacks->onStatus(msg);
         return 1;
     }
-    printf("[coordinator] registered with coordinator as user %lld (%s@%s) - client protocol v%s, server protocol v%s\n",
-           (long long) userId, args.username.c_str(), args.hostname.c_str(), kProtocolVersion, serverProtocolVersion.c_str());
+    {
+        std::string msg = "[coordinator] registered with coordinator as user " + std::to_string(userId) + " (" + args.username + "@" +
+                           args.hostname + ") - client protocol v" + kProtocolVersion + ", server protocol v" + serverProtocolVersion;
+        printf("%s\n", msg.c_str());
+        if (callbacks && callbacks->onStatus)
+            callbacks->onStatus(msg);
+    }
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
     auto claimBackoff = pollInterval;
@@ -387,8 +463,13 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
         // release doesn't touch pauseRequested itself, it just stops the
         // now-invalid range's search and heartbeat - it's this gate, right
         // here, that keeps the loop from immediately claiming a replacement.
-        while (pauseRequested && pauseRequested->load(std::memory_order_relaxed))
+        while (pauseRequested && pauseRequested->load(std::memory_order_relaxed)) {
+            if (quitRequested && quitRequested->load(std::memory_order_relaxed))
+                return 0;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (quitRequested && quitRequested->load(std::memory_order_relaxed))
+            return 0;
 
         std::optional<ClaimResponse> claim;
         if (!client.claim(claim, error)) {
@@ -400,9 +481,12 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
             // doesn't retry in lockstep once it recovers.
             std::uniform_int_distribution<long long> jitter(0, claimBackoff.count());
             auto sleepFor = std::chrono::seconds(jitter(rng));
-            fprintf(stderr, "[coordinator] claim failed, retrying in %llds (backoff cap %llds): %s\n",
-                    (long long) sleepFor.count(), (long long) claimBackoff.count(), error.c_str());
-            std::this_thread::sleep_for(sleepFor);
+            std::string msg = "[coordinator] claim failed, retrying in " + std::to_string(sleepFor.count()) + "s (backoff cap " +
+                               std::to_string(claimBackoff.count()) + "s): " + error;
+            fprintf(stderr, "%s\n", msg.c_str());
+            if (callbacks && callbacks->onStatus)
+                callbacks->onStatus(msg);
+            interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(sleepFor), quitRequested);
             claimBackoff = std::min(claimBackoff * 2, kMaxClaimBackoff);
             continue;
         }
@@ -410,10 +494,14 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
 
         if (!claim) {
             printf("[coordinator] no work available, sleeping\n");
-            std::this_thread::sleep_for(pollInterval);
+            if (callbacks && callbacks->onStatus)
+                callbacks->onStatus("[coordinator] no work available, sleeping");
+            interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(pollInterval), quitRequested);
             continue;
         }
 
-        runOneRange(args.serverUrl, client.token(), *claim, pauseRequested);
+        runOneRange(args.serverUrl, client.token(), *claim, pauseRequested, quitRequested, callbacks);
+        if (quitRequested && quitRequested->load(std::memory_order_relaxed))
+            return 0;
     }
 }
