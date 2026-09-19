@@ -49,7 +49,7 @@
     background: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    padding: 24px;
+    padding: 1ex;
   }
   h1 {
     font-size: 20px;
@@ -79,7 +79,7 @@
     background: var(--card-bg);
     border: 1px solid var(--border);
     border-radius: 10px;
-    padding: 16px 20px;
+    padding: 1ex;
   }
   .target-card.solved {
     background: var(--solved-bg);
@@ -120,6 +120,7 @@
   .target-description :last-child { margin-bottom: 0; }
   .badge {
     display: inline-block;
+    white-space: nowrap;
     font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;
@@ -193,6 +194,14 @@
     color: var(--muted);
     margin-bottom: 6px;
   }
+  .priority-intro {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .priority-section .table-scroll {
+    margin-top: 0;
+  }
   .priority-table {
     width: 100%;
     border-collapse: collapse;
@@ -209,6 +218,15 @@
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.03em;
+  }
+  /* Overrides the page-wide `th, td { white-space: nowrap }` (below) for
+     this table's non-candidate cells - the Progress column's long
+     comma-formatted counts are what actually forced this table wider than
+     the viewport, on every screen size, not just narrow ones. Candidate
+     strings (Pattern, and the carved-range span below) keep the page-wide
+     mono/pre behavior, since those are meant to line up character-for-character. */
+  .priority-table td:not(.mono) {
+    white-space: normal;
   }
   .priority-gap-note {
     display: block;
@@ -232,7 +250,7 @@
     background: var(--detail-bg);
     font-size: 12px;
   }
-  tr.priority-carved-row td:first-child {
+  .priority-carved-indent {
     padding-left: 22px;
   }
   .table-scroll {
@@ -796,39 +814,34 @@
     return null;
   }
 
-  // A small table of the target's priority ranges (see
-  // models::PriorityRange), address-ordered (by length then start) rather
-  // than by their own priority field, so it reads like a timeline of the
-  // target's search space - with the gap ahead of each not-yet-reached one
-  // shown as a note under its own Pattern cell via priorityGapNote. Done
-  // ranges (next_candidate is null, meaning next_index has reached
-  // end_index) sink below every still-active
-  // one, since a finished range is no longer part of what's worth watching.
-  // Returns null when the target has none.
   // The actual carved chunks (models::Range rows, same as the main Progress
   // tab's table) that were split off a given priority range - each still
-  // has its own independent status/worker/progress, since a priority range
-  // is carved and claimed piecemeal, same as ordinary sweep work (see
+  // has its own independent status/progress, since a priority range is
+  // carved and claimed piecemeal, same as ordinary sweep work (see
   // ranges::claim_priority_range_chunk). A four-column condensed cousin of
   // rangeRow() rather than a reuse of it: the priority table only has four
-  // columns, and rangeRow()'s eight would misalign against its header.
+  // columns, and rangeRow()'s eight would misalign against its header. No
+  // worker/hostname shown here (or anywhere in this table) - unlike the
+  // main Progress tab, this table is about the priority range's own address
+  // and status, not who's working it.
   function priorityCarvedRangeRow(r) {
     const tr = document.createElement('tr');
     tr.className = 'priority-carved-row';
 
+    // Blank Priority cell - a carved chunk doesn't have its own priority,
+    // only the priority range it came from does (shown on the row above).
+    tr.appendChild(document.createElement('td'));
+
     const tdRange = document.createElement('td');
-    tdRange.className = 'mono';
+    tdRange.className = 'mono priority-carved-indent';
     tdRange.textContent = `${r.first_candidate} – ${r.last_candidate}`;
     tr.appendChild(tdRange);
 
     const tdStatus = document.createElement('td');
-    tdStatus.colSpan = 2;
     const statusLabel = r.status === 'in_progress'
       ? inProgressLabel(r.progress_percent)
       : (r.status === 'completed' ? 'Done' : (r.status === 'skipped' ? 'Skip' : undefined));
     tdStatus.appendChild(statusBadge(r.status, statusLabel));
-    tdStatus.append(' ');
-    tdStatus.appendChild(workerFragment(r.worker));
     tr.appendChild(tdStatus);
 
     const tdDetail = document.createElement('td');
@@ -846,6 +859,14 @@
     return tr;
   }
 
+  // A small table of the target's priority ranges (see
+  // models::PriorityRange), address-ordered (by length then start) rather
+  // than by their own priority field, so it reads like a timeline of the
+  // target's search space - with the gap ahead of each not-yet-reached one
+  // shown as a note under its own Pattern cell via priorityGapNote. Done
+  // ranges (see isPriorityRangeDone below) sink below every still-active
+  // one, since a finished range is no longer part of what's worth watching.
+  // Returns null when the target has none.
   function priorityRangeSection(t) {
     if (!t.priority_ranges || t.priority_ranges.length === 0) return null;
 
@@ -857,10 +878,15 @@
     heading.textContent = 'Priority ranges';
     section.appendChild(heading);
 
+    const intro = document.createElement('div');
+    intro.className = 'priority-intro';
+    intro.textContent = 'Candidate prefixes an operator flagged to search ahead of the normal sweep - useful for testing a hunch about the answer without waiting for ordinary carving to reach it.';
+    section.appendChild(intro);
+
     const table = document.createElement('table');
     table.className = 'priority-table';
     const thead = document.createElement('thead');
-    thead.innerHTML = '<tr><th>Pattern</th><th>Len</th><th>Priority</th><th>Progress</th></tr>';
+    thead.innerHTML = '<tr><th>Prio</th><th>Pattern</th><th>Len</th><th>Progress</th></tr>';
     table.appendChild(thead);
 
     // Every actual carved chunk any priority range has produced so far,
@@ -873,16 +899,28 @@
       carvedByPriorityId.get(r.priority_range_id).push(r);
     }
 
+    // pr.next_candidate turning null only means the priority range's address
+    // space has been fully CARVED (ranges::claim_priority_range_chunk has no
+    // more to hand out) - it says nothing about whether the chunks already
+    // carved from it have actually finished. A range can be fully carved and
+    // still have a chunk sitting in_progress (or even pending), so "done"
+    // has to additionally check every one of its own carved chunks.
+    function isPriorityRangeDone(pr) {
+      if (pr.next_candidate) return false;
+      const carved = carvedByPriorityId.get(pr.id) || [];
+      return carved.every((r) => r.status === 'completed' || r.status === 'skipped');
+    }
+
     const tbody = document.createElement('tbody');
     const sorted = t.priority_ranges.slice().sort((a, b) => {
-      const aDone = a.next_candidate ? 0 : 1;
-      const bDone = b.next_candidate ? 0 : 1;
+      const aDone = isPriorityRangeDone(a) ? 1 : 0;
+      const bDone = isPriorityRangeDone(b) ? 1 : 0;
       return aDone - bDone || a.candidate_len - b.candidate_len || a.start_index - b.start_index;
     });
     // A labeled divider row right before the first Done range - but only
     // when there's at least one still-active range above it to divide from,
     // since an all-done (or all-active) list needs no separator at all.
-    const firstDoneIdx = sorted.findIndex((pr) => !pr.next_candidate);
+    const firstDoneIdx = sorted.findIndex((pr) => isPriorityRangeDone(pr));
     for (let idx = 0; idx < sorted.length; idx++) {
       const pr = sorted[idx];
       if (idx === firstDoneIdx && firstDoneIdx > 0) {
@@ -896,6 +934,11 @@
       }
 
       const tr = document.createElement('tr');
+
+      const tdPriority = document.createElement('td');
+      tdPriority.className = 'mono';
+      tdPriority.textContent = String(pr.priority);
+      tr.appendChild(tdPriority);
 
       const tdPattern = document.createElement('td');
       tdPattern.className = 'mono';
@@ -915,17 +958,12 @@
       tdLen.textContent = String(pr.candidate_len);
       tr.appendChild(tdLen);
 
-      const tdPriority = document.createElement('td');
-      tdPriority.className = 'mono';
-      tdPriority.textContent = String(pr.priority);
-      tr.appendChild(tdPriority);
-
       const tdProgress = document.createElement('td');
       const total = pr.end_index - pr.start_index;
       const done = pr.next_index - pr.start_index;
-      tdProgress.textContent = pr.next_candidate
-        ? `${fmtNum(done)} / ${fmtNum(total)} (next: ${pr.next_candidate})`
-        : `Done (${fmtNum(total)})`;
+      tdProgress.textContent = isPriorityRangeDone(pr)
+        ? `Done (${fmtNum(total)})`
+        : `${fmtNum(done)} / ${fmtNum(total)}` + (pr.next_candidate ? ` (next: ${pr.next_candidate})` : '');
       tr.appendChild(tdProgress);
 
       tbody.appendChild(tr);
@@ -934,7 +972,10 @@
       for (const r of carved) tbody.appendChild(priorityCarvedRangeRow(r));
     }
     table.appendChild(tbody);
-    section.appendChild(table);
+    const tableScroll = document.createElement('div');
+    tableScroll.className = 'table-scroll';
+    tableScroll.appendChild(table);
+    section.appendChild(tableScroll);
     return section;
   }
 
