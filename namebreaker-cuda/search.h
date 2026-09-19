@@ -24,6 +24,12 @@ struct SearchRequest {
     // false ("bounded"): stop once upperBound is exhausted at its own length.
     // true ("continuous"): keep going to longer candidateLens indefinitely.
     bool continuous = false;
+    // Path (relative to the current working directory, unless absolute)
+    // every Hash-A-only match is appended to. Defaults to the plain local
+    // name; coordinator_runner.cpp's toSearchRequest overrides this per
+    // claimed range so concurrent/successive targets don't clobber each
+    // other's matches.
+    std::string outputFilePath = "matches.txt";
 };
 
 struct SearchResult {
@@ -41,8 +47,8 @@ struct SearchResult {
 };
 
 // Runs an exhaustive (bounded) or open-ended (continuous) search over
-// `req`'s candidate space, appending every Hash-A-only match to matches.txt
-// in the current working directory. `abortRequested`, if given, is polled
+// `req`'s candidate space, appending every Hash-A-only match to
+// `req.outputFilePath`. `abortRequested`, if given, is polled
 // between batches so a caller can interrupt a long-running search (e.g. once
 // a coordinator learns the target was solved elsewhere); `onPartialMatch`,
 // if given, is invoked with the full filename of every Hash-A-only match as

@@ -601,10 +601,10 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     // extends by that iteration's leading characters.
     std::pair<uint32_t, uint32_t> prefixBaseState = mpqHashWithPrefixCache_CPU(req.prefix.c_str(), h_cryptTable);
 
-    FILE* fout = fopen("matches.txt", "a");
+    FILE* fout = fopen(req.outputFilePath.c_str(), "a");
     if (!fout) {
         result.ok = false;
-        result.error = std::string("fopen matches.txt: ") + strerror(errno);
+        result.error = std::string("fopen ") + req.outputFilePath + ": " + strerror(errno);
         return result;
     }
 

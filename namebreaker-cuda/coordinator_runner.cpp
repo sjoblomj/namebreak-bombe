@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -49,6 +50,20 @@ std::string trimLine(const std::string& s) {
         return "";
     size_t end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
+}
+
+// Turns a target name (an admin-chosen label, not guaranteed filesystem-safe -
+// e.g. it may contain the same backslashes a target MPQ filename would) into
+// a bare filename component: every character other than
+// alnum/'.'/'-'/'_' becomes '_', so it can't smuggle in a path separator
+// (or ".." for one) and land outside the current working directory.
+std::string sanitizeForFilename(const std::string& name) {
+    std::string out = name;
+    for (char& c : out) {
+        if (!isalnum((unsigned char) c) && c != '.' && c != '-' && c != '_')
+            c = '_';
+    }
+    return out.empty() ? "target" : out;
 }
 
 // Interactively confirms (or lets the user override) auto-discovered values
@@ -122,6 +137,7 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
     req.startCandidate = req.lowerBound;
     req.pruneSymbolRuns = claim.pruneSymbolRuns;
     req.continuous = false; // a coordinator range is always run "bounded"
+    req.outputFilePath = "matches-" + sanitizeForFilename(claim.targetName) + ".txt";
     if (!hexToU32(claim.hashAHex, req.targetHashA) || !hexToU32(claim.hashBHex, req.targetHashB)) {
         error = "malformed target hash in claim response (hashA=" + claim.hashAHex + " hashB=" + claim.hashBHex + ")";
     }
