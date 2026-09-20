@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_CUDA_COORDINATOR_RUNNER_H
-#define NAMEBREAK_CUDA_COORDINATOR_RUNNER_H
+#ifndef NAMEBREAK_NET_COORDINATOR_RUNNER_H
+#define NAMEBREAK_NET_COORDINATOR_RUNNER_H
 
 #include <atomic>
 #include <functional>
@@ -47,7 +47,7 @@ struct CoordinatorCallbacks {
     // outputFilePath - where that range's Hash-A matches will be appended -
     // and alphabet/lowerBound/upperBound, which a caller can use together
     // with the matches file's own last line to derive real progress through
-    // the range: candidates are enumerated in a fixed order (see cpu_utils.h's
+    // the range: candidates are enumerated in a fixed order (see candidate.h's
     // stringToIndex), so the most recent Hash-A-only match's position in that
     // order is a truer measure of how far a search has gotten than any
     // time-based guess - there's no live "candidates processed so far"
@@ -86,4 +86,4 @@ struct CoordinatorCallbacks {
 int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested = nullptr,
                     std::atomic<bool>* quitRequested = nullptr, const CoordinatorCallbacks* callbacks = nullptr);
 
-#endif // NAMEBREAK_CUDA_COORDINATOR_RUNNER_H
+#endif // NAMEBREAK_NET_COORDINATOR_RUNNER_H

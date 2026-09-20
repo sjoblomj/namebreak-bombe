@@ -10,7 +10,8 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-#include "engine/cpu_utils.h"
+#include "engine/candidate.h"
+#include "engine/mpq_hash.h"
 #include "engine/constants.h"
 #include "engine/search.h"
 #include "backends/cuda/hash_kernels.cuh"
@@ -79,7 +80,7 @@ constexpr int kRuntimeSuffix = -1;
 
 // One step of the MPQ hash recurrence (hashA table, offset 0x100) for a
 // character whose crypt-table key `key` and value `ord` are already known.
-// Must match mpqHashCandidateAndSuffix/cpu_utils.cpp exactly, or a match
+// Must match mpqHashCandidateAndSuffix/mpq_hash.cpp exactly, or a match
 // found on one side would never reproduce on the other.
 __device__ __forceinline__ void mpqStep(uint32_t& seed1, uint32_t& seed2, uint32_t key, uint32_t ord) {
     seed1 = key ^ (seed1 + seed2);
@@ -456,7 +457,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         return result;
     }
     // 0 means unlimited (see hasForbiddenSymbolRun_CPU/countBackslashes_CPU's
-    // declaration comment in cpu_utils.h for how and where this is applied).
+    // declaration comment in candidate.h for how and where this is applied).
     if (req.maxBackslashCount < 0) {
         result.ok = false;
         result.error = "maxBackslashCount must be >= 0 (0 means unlimited), got " + std::to_string(req.maxBackslashCount);
@@ -510,7 +511,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     // How many trailing candidate characters go straight to the GPU as a
     // native index each batch; the rest is folded into an extended prefix and
     // hashed on the CPU instead, incrementally (IncrementalPrefixHasher,
-    // cpu_utils.h) rather than from scratch per leading value. Deliberately
+    // mpq_hash.h) rather than from scratch per leading value. Deliberately
     // small and fixed - NOT "as large as maxSafeIndexLen allows", which is
     // what this project used to do (and still needs to fall back toward for
     // very long candidates - see trailingLen's computation below). See
@@ -694,8 +695,8 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
             break;
         }
 
-        std::string start_full = make_bound_string(start_candidate, candidateLen);
-        std::string end_full   = make_bound_string(upperBoundLimit, candidateLen);
+        std::string start_full = makeBoundString(start_candidate, candidateLen);
+        std::string end_full   = makeBoundString(upperBoundLimit, candidateLen);
 
         std::string start_leading = start_full.substr(0, leadingLen);
         std::string end_leading   =   end_full.substr(0, leadingLen);
@@ -720,7 +721,7 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
         // walks every leading value from startLeadingIdx to endLeadingIdx in
         // the same order this loop does (always +1), so every step after the
         // first is an O(1)-amortized incremental update (IncrementalPrefixHasher,
-        // cpu_utils.h) instead of a full from-scratch re-hash of the whole
+        // mpq_hash.h) instead of a full from-scratch re-hash of the whole
         // leading string - the thing that makes leadingLen > 0 being the
         // common case (see gpuWindowChars above) affordable.
         IncrementalPrefixHasher leadingHasher(prefixBaseState, leadingLen, req.alphabet, h_cryptTable);

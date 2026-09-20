@@ -19,7 +19,7 @@
 // Groups:
 //  1-5. The original scenarios: leading/trailing split, pruneSymbolRuns and
 //     maxBackslashCount (CPU-side, leading characters only - see
-//     hasForbiddenSymbolRun_CPU's comment in cpu_utils.h), maxBackslashCount
+//     hasForbiddenSymbolRun_CPU's comment in candidate.h), maxBackslashCount
 //     excluding the prefix, and lower_bound == upper_bound. Pruning ones run
 //     twice: once with the target on the surviving side (must be found) and
 //     once on the pruned side (must NOT be).
@@ -74,7 +74,8 @@
 #include <unistd.h>
 #endif
 #include "engine/search.h"
-#include "engine/cpu_utils.h"
+#include "engine/candidate.h"
+#include "engine/mpq_hash.h"
 #include "engine/constants.h"
 
 static const int kWindow = NAMEBREAK_GPU_WINDOW_CHARS;
@@ -291,7 +292,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
     std::set<std::string> reported;
     std::vector<std::string> reportedInOrder;
     auto onPartialMatch = [&](const std::string& filename) {
-        std::string cand = remove_prefix_and_suffix(filename, c.prefix, c.suffix);
+        std::string cand = removePrefixAndSuffix(filename, c.prefix, c.suffix);
         reported.insert(cand);
         reportedInOrder.push_back(cand);
     };

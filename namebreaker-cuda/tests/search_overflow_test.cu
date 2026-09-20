@@ -36,7 +36,8 @@
 #include <unistd.h>
 #endif
 #include "engine/search.h"
-#include "engine/cpu_utils.h"
+#include "engine/candidate.h"
+#include "engine/mpq_hash.h"
 #include "engine/constants.h"
 
 static_assert(MAX_MATCHES == 1, "this test must be built with -DMAX_MATCHES=1 (see the Makefile)");
@@ -57,7 +58,7 @@ static std::string runCaptured(const SearchRequest& req, SearchResult& result, s
     int savedOut = dup(1), savedErr = dup(2);
     dup2(fd, 1); dup2(fd, 2);
 #endif
-    result = runSearch(req, nullptr, [&](const std::string& f) { reported.push_back(remove_prefix_and_suffix(f, req.prefix, req.suffix)); });
+    result = runSearch(req, nullptr, [&](const std::string& f) { reported.push_back(removePrefixAndSuffix(f, req.prefix, req.suffix)); });
 #ifndef _WIN32
     fflush(stdout); fflush(stderr);
     dup2(savedOut, 1); dup2(savedErr, 2);

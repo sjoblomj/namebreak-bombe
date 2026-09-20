@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_CUDA_HASH_KERNELS_CUH
-#define NAMEBREAK_CUDA_HASH_KERNELS_CUH
+#ifndef NAMEBREAK_BACKENDS_CUDA_HASH_KERNELS_CUH
+#define NAMEBREAK_BACKENDS_CUDA_HASH_KERNELS_CUH
 
 #include <cstdint>
 #include <cstring>
@@ -69,7 +69,7 @@ __device__ __constant__ uint32_t d_cryptTable[0x500];
 __device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen, uint32_t seed1, uint32_t seed2) {
     // unsigned so a byte >= 0x80 zero-extends into the crypt-table index/seed
     // arithmetic instead of sign-extending to a negative value - must match
-    // cpu_utils.cpp's host-side hash exactly, or a match found on one side
+    // mpq_hash.cpp's host-side hash exactly, or a match found on one side
     // would never reproduce on the other.
     for (int i = 0; i < candidateLen; ++i) {
         unsigned char ch = candidate[i];
@@ -134,7 +134,7 @@ __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCand
 
 // No hasForbiddenSymbolRun/countBackslashes here (deliberately - see
 // bruteForceKernel's doc comment in cuda_backend.cu and
-// hasForbiddenSymbolRun_CPU's in cpu_utils.h): those checks only ever run on
+// hasForbiddenSymbolRun_CPU's in candidate.h): those checks only ever run on
 // the CPU now, against the leading characters, before this candidate's batch
 // is even launched.
 
@@ -164,4 +164,4 @@ __device__ void buildCompleteFilename(const BatchParams& params, const char* can
     out[i] = '\0';
 }
 
-#endif //NAMEBREAK_CUDA_HASH_KERNELS_CUH
+#endif // NAMEBREAK_BACKENDS_CUDA_HASH_KERNELS_CUH

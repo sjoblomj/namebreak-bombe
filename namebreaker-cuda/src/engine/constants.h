@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_CUDA_CONSTANTS_H
-#define NAMEBREAK_CUDA_CONSTANTS_H
+#ifndef NAMEBREAK_ENGINE_CONSTANTS_H
+#define NAMEBREAK_ENGINE_CONSTANTS_H
 
 // Upper bound on the alphabet's character count, sizing the device-side
 // d_alphabet buffer. Must be >= the largest size in the fixed set of
@@ -49,4 +49,4 @@ static_assert(NAMEBREAK_GPU_WINDOW_CHARS >= 1 && NAMEBREAK_GPU_WINDOW_CHARS <= M
 static_assert(MAX_MATCHES >= 1, "MAX_MATCHES must be at least 1 (a one-candidate range can have one hit)");
 static_assert(NAMEBREAK_ROWS_PER_LAUNCH >= 1, "NAMEBREAK_ROWS_PER_LAUNCH must be >= 1");
 
-#endif //NAMEBREAK_CUDA_CONSTANTS_H
+#endif // NAMEBREAK_ENGINE_CONSTANTS_H

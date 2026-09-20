@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_CUDA_PLATFORM_H
-#define NAMEBREAK_CUDA_PLATFORM_H
+#ifndef NAMEBREAK_COMMON_PLATFORM_H
+#define NAMEBREAK_COMMON_PLATFORM_H
 
 #include <cstddef>
 #include <string>
@@ -63,4 +63,4 @@ void restoreKeypressMode();
 // error here anyway.
 void writeStdoutSignalSafe(const char* msg, std::size_t len);
 
-#endif // NAMEBREAK_CUDA_PLATFORM_H
+#endif // NAMEBREAK_COMMON_PLATFORM_H

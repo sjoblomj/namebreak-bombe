@@ -1,9 +1,11 @@
-#ifndef NAMEBREAK_CUDA_CONFIG_H
-#define NAMEBREAK_CUDA_CONFIG_H
+#ifndef NAMEBREAK_COMMON_CONFIG_H
+#define NAMEBREAK_COMMON_CONFIG_H
 
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "engine/search.h"
 
@@ -48,6 +50,17 @@ bool buildSearchRequest(const std::map<std::string, std::string>& section, bool 
 // file can't be read/written or the section doesn't exist in it.
 bool appendKeyToConfigSection(const std::string& path, const std::string& sectionName, const std::string& key, const std::string& value);
 
+// Makes sure `path` is set up to run in `mode`: its `mode = ...` line is set
+// (see setModeKey), its [sectionName] section exists, and every non-empty
+// `keys` entry is present in that section - creating the file from scratch
+// if it doesn't exist yet at all. Values already set in the file (that the
+// caller left untouched, e.g. re-running setup after only partially filling
+// it in before) are never overwritten - same "fill in only what's missing"
+// behavior the CLI's own resolveMissingIdentity (coordinator_runner.cpp)
+// already has for username/hostname, just generalized to any section/mode.
+bool ensureConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
+                         const std::vector<std::pair<std::string, std::string>>& keys, std::string& error);
+
 // Small helper for reading a config section by known key names while
 // catching typos: tracks which keys were actually looked up, so a caller
 // can report any left over as "unknown key" once done. Shared with
@@ -89,4 +102,4 @@ private:
     std::set<std::string> used_;
 };
 
-#endif // NAMEBREAK_CUDA_CONFIG_H
+#endif // NAMEBREAK_COMMON_CONFIG_H

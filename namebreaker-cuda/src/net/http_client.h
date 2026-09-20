@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_CUDA_HTTP_CLIENT_H
-#define NAMEBREAK_CUDA_HTTP_CLIENT_H
+#ifndef NAMEBREAK_NET_HTTP_CLIENT_H
+#define NAMEBREAK_NET_HTTP_CLIENT_H
 
 #include <string>
 #include <vector>
@@ -37,4 +37,4 @@ private:
     void* curl_; // CURL*, opaque here so this header doesn't need <curl/curl.h>
 };
 
-#endif // NAMEBREAK_CUDA_HTTP_CLIENT_H
+#endif // NAMEBREAK_NET_HTTP_CLIENT_H

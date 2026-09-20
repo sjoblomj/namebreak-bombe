@@ -35,8 +35,8 @@ render 96 640x640+680+190 0x0.9+0.8+0 2   105
 // ask for as a 24-bit bottom-up BMP with its BITMAPFILEHEADER. Embedded as
 // bytes (no .rc / resource compiler, no image-decoder dependency); the GUI
 // picks the smallest one that is at least as large as the size requested.
-#ifndef NAMEBREAK_CUDA_ICON_BMP_H
-#define NAMEBREAK_CUDA_ICON_BMP_H
+#ifndef NAMEBREAK_GUI_WIN32_RESOURCES_ICON_BMP_H
+#define NAMEBREAK_GUI_WIN32_RESOURCES_ICON_BMP_H
 
 HEADER
   for s in 16 24 32 48 64 96; do
@@ -56,7 +56,7 @@ static const IconImage kIconImages[] = {
     {16, kIconBmp16}, {24, kIconBmp24}, {32, kIconBmp32}, {48, kIconBmp48}, {64, kIconBmp64}, {96, kIconBmp96},
 };
 
-#endif // NAMEBREAK_CUDA_ICON_BMP_H
+#endif // NAMEBREAK_GUI_WIN32_RESOURCES_ICON_BMP_H
 FOOTER
 } > "$OUT"
 echo "wrote $OUT ($(wc -c < "$OUT") bytes)"

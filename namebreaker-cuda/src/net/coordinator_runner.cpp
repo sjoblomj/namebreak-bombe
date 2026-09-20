@@ -18,7 +18,8 @@
 
 #include "common/config.h"
 #include "net/coordinator_client.h"
-#include "engine/cpu_utils.h"
+#include "common/string_util.h"
+#include "engine/candidate.h"
 #include "common/platform.h"
 #include "engine/search.h"
 
@@ -59,14 +60,6 @@ void interruptibleSleep(std::chrono::milliseconds duration, const std::atomic<bo
         std::this_thread::sleep_for(step);
         duration -= step;
     }
-}
-
-std::string trimLine(const std::string& s) {
-    size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos)
-        return "";
-    size_t end = s.find_last_not_of(" \t\r\n");
-    return s.substr(start, end - start + 1);
 }
 
 // Turns a target name (an admin-chosen label, not guaranteed filesystem-safe -
@@ -120,7 +113,7 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
 
     std::string line;
     std::getline(std::cin, line);
-    line = trimLine(line);
+    line = trim(line);
     bool accepted = line.empty() || line == "y" || line == "Y" || line == "yes" || line == "Yes";
 
     for (Field& f : missing) {
@@ -129,7 +122,7 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
             fflush(stdout);
             std::string entered;
             std::getline(std::cin, entered);
-            entered = trimLine(entered);
+            entered = trim(entered);
             if (!entered.empty())
                 *f.value = entered;
         }
@@ -147,8 +140,8 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
     req.maxBackslashCount = (int) claim.maxBackslashCount;
     req.prefix = claim.prefix;
     req.suffix = claim.suffix;
-    req.lowerBound = remove_prefix_and_suffix(claim.lowerBoundFilename, req.prefix, req.suffix);
-    req.upperBound = remove_prefix_and_suffix(claim.upperBoundFilename, req.prefix, req.suffix);
+    req.lowerBound = removePrefixAndSuffix(claim.lowerBoundFilename, req.prefix, req.suffix);
+    req.upperBound = removePrefixAndSuffix(claim.upperBoundFilename, req.prefix, req.suffix);
     // A claimed range always starts exactly at its own lower bound (unlike
     // local "continuous" mode's arbitrary mid-space resume point).
     req.startCandidate = req.lowerBound;

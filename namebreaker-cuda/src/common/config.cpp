@@ -2,19 +2,13 @@
 
 #include <cctype>
 #include <fstream>
+#include <utility>
 #include <vector>
 
-#include "engine/cpu_utils.h"
+#include "common/string_util.h"
+#include "engine/candidate.h"
 
 namespace {
-
-std::string trim(const std::string& s) {
-    size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos)
-        return "";
-    size_t end = s.find_last_not_of(" \t\r\n");
-    return s.substr(start, end - start + 1);
-}
 
 std::string unquote(const std::string& s) {
     if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
@@ -56,6 +50,93 @@ std::string sanitizeForConfigLine(const std::string& s) {
         }
     }
     return result;
+}
+
+// appendKeyToConfigSection requires the file AND the target
+// [sectionName] header to already exist - true for a config.conf a CLI run
+// already created (as long as that run used the same section), but not for
+// one being created from scratch (by the Windows GUI's setup dialog), and
+// not for one that so far only
+// ever had the *other* section (e.g. a hand-written [search]-only file, and
+// the setup dialog's Coordinator tab was used). Appends a bare
+// "[sectionName]" header to the end of the file if one isn't already
+// present; a no-op (returns true) if it already is.
+bool ensureSectionExists(const std::string& path, const std::string& sectionName, std::string& error) {
+    {
+        std::ifstream in(path);
+        if (!in) {
+            error = "cannot open " + path;
+            return false;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (trim(line) == "[" + sectionName + "]")
+                return true;
+        }
+    }
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        error = "cannot append to " + path;
+        return false;
+    }
+    out << "\n[" << sectionName << "]\n";
+    return true;
+}
+
+// Sets (or inserts) config.conf's single top-level `mode = ...` line - the
+// one key that lives before any [section] header (config.h) - to `mode`.
+// Unlike ensureSectionExists/appendKeyToConfigSection, this can
+// *replace* an existing value: switching which tab of the setup dialog was
+// used (e.g. Coordinator -> Local Search on a config.conf that already had a
+// mode from a previous run) needs the old mode value gone, not just another
+// line added alongside it - loadConfigFile would otherwise just take
+// whichever `mode = ...` line comes last, silently ignoring the new choice
+// if it happened to land above the stale one.
+bool setModeKey(const std::string& path, const std::string& mode, std::string& error) {
+    std::ifstream in(path);
+    if (!in) {
+        error = "cannot open " + path;
+        return false;
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+        lines.push_back(line);
+    in.close();
+
+    int firstSectionLine = -1;
+    int modeLine = -1;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string trimmed = trim(lines[i]);
+        if (!trimmed.empty() && trimmed.front() == '[') {
+            firstSectionLine = (int) i;
+            break;
+        }
+        if (trimmed.rfind("mode", 0) == 0) {
+            size_t eq = trimmed.find('=');
+            if (eq != std::string::npos && trim(trimmed.substr(0, eq)) == "mode") {
+                modeLine = (int) i;
+                break;
+            }
+        }
+    }
+
+    if (modeLine >= 0) {
+        lines[modeLine] = "mode = " + mode;
+    } else if (firstSectionLine >= 0) {
+        lines.insert(lines.begin() + firstSectionLine, "mode = " + mode);
+    } else {
+        lines.insert(lines.begin(), "mode = " + mode);
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) {
+        error = "cannot rewrite " + path;
+        return false;
+    }
+    for (const auto& l : lines)
+        out << l << "\n";
+    return true;
 }
 
 } // namespace
@@ -164,8 +245,8 @@ bool buildSearchRequest(const std::map<std::string, std::string>& section, bool 
     if (!getStartCandidate(startFilename, prefix, suffix, out.startCandidate, error)) {
         return false;
     }
-    out.lowerBound = remove_prefix_and_suffix(lowerFilename, prefix, suffix);
-    out.upperBound = remove_prefix_and_suffix(upperFilename, prefix, suffix);
+    out.lowerBound = removePrefixAndSuffix(lowerFilename, prefix, suffix);
+    out.upperBound = removePrefixAndSuffix(upperFilename, prefix, suffix);
     out.continuous = continuous;
     return true;
 }
@@ -197,5 +278,53 @@ bool appendKeyToConfigSection(const std::string& path, const std::string& sectio
         return false;
     for (const auto& l : lines)
         out << l << "\n";
+    return true;
+}
+
+bool ensureConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
+                          const std::vector<std::pair<std::string, std::string>>& keys, std::string& error) {
+    std::ifstream probe(path);
+    bool fileExists = probe.good();
+    probe.close();
+
+    if (!fileExists) {
+        std::ofstream out(path, std::ios::trunc);
+        if (!out) {
+            error = "cannot create " + path;
+            return false;
+        }
+        out << "mode = " << mode << "\n\n[" << sectionName << "]\n";
+        for (const auto& kv : keys) {
+            if (!kv.second.empty())
+                out << kv.first << " = " << kv.second << "\n";
+        }
+        return true;
+    }
+
+    if (!setModeKey(path, mode, error))
+        return false;
+    if (!ensureSectionExists(path, sectionName, error))
+        return false;
+
+    ConfigFile existing;
+    std::string loadErr;
+    if (!loadConfigFile(path, existing, loadErr)) {
+        error = loadErr;
+        return false;
+    }
+    const std::map<std::string, std::string>& existingSection = (sectionName == "coordinator") ? existing.coordinator : existing.search;
+
+    for (const auto& kv : keys) {
+        if (kv.second.empty())
+            continue;
+        auto it = existingSection.find(kv.first);
+        bool hasNonEmpty = it != existingSection.end() && !it->second.empty();
+        if (hasNonEmpty)
+            continue;
+        if (!appendKeyToConfigSection(path, sectionName, kv.first, kv.second)) {
+            error = "failed to write " + kv.first + " to " + path;
+            return false;
+        }
+    }
     return true;
 }

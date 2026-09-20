@@ -17,7 +17,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include "engine/cpu_utils.h"
+#include "engine/candidate.h"
+#include "engine/mpq_hash.h"
 
 static double benchNaive(const std::string& prefix, int leadingLen, const std::string& alphabet,
                           const uint32_t* cryptTable, uint64_t iterations) {

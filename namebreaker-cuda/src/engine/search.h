@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_CUDA_SEARCH_H
-#define NAMEBREAK_CUDA_SEARCH_H
+#ifndef NAMEBREAK_ENGINE_SEARCH_H
+#define NAMEBREAK_ENGINE_SEARCH_H
 
 #include <atomic>
 #include <cstdint>
@@ -8,8 +8,8 @@
 
 // One request to search a candidate space for a target MPQ hash pair. All of
 // startCandidate/lowerBound/upperBound are candidate-only strings (no
-// prefix/suffix) - see remove_prefix_and_suffix/getStartCandidate in
-// cpu_utils.h for stripping a full filename down to just the candidate.
+// prefix/suffix) - see removePrefixAndSuffix/getStartCandidate in
+// candidate.h for stripping a full filename down to just the candidate.
 struct SearchRequest {
     std::string alphabet;
     int maxBackslashCount = 0;
@@ -67,4 +67,4 @@ SearchResult runSearch(const SearchRequest& req,
                         std::function<void(const std::string&)> onPartialMatch = nullptr,
                         const std::atomic<bool>* pauseRequested = nullptr);
 
-#endif // NAMEBREAK_CUDA_SEARCH_H
+#endif // NAMEBREAK_ENGINE_SEARCH_H

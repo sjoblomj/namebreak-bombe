@@ -83,7 +83,7 @@ COMPILE := $(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -Isrc
 # src/net       the coordinator client (NETWORK=1 only)
 # src/cli       the console program's main()
 # src/gui       the Windows GUI's main() and windows (Windows only)
-ENGINE_SRC := src/engine/cpu_utils.cpp
+ENGINE_SRC := src/engine/mpq_hash.cpp src/engine/candidate.cpp
 CUDA_SRC   := src/backends/cuda/cuda_backend.cu
 # platform.cpp is always built: it isn't networking code - it holds the OS-
 # specific terminal/keypress helpers behind the pause key (used in every mode),
@@ -201,7 +201,7 @@ endif
 # them away from any real matches.txt.
 
 # Pure-CPU correctness check for IncrementalPrefixHasher
-# (src/engine/cpu_utils.h) - no GPU involved.
+# (src/engine/mpq_hash.h) - no GPU involved.
 $(BUILD)/tests/prefix_hasher_test: $(call objs,test,tests/prefix_hasher_test.cpp $(ENGINE_SRC))
 	@mkdir -p $(@D)
 	$(COMPILE) -o $@ $^

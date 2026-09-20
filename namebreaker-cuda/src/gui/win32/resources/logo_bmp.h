@@ -5,8 +5,8 @@
 // resource-compiler step or image-decoder dependency. Regenerate with:
 //   convert namebreak-cuda.png -resize 192x128! BMP3:logo.bmp
 //   (then wrap `xxd -i < logo.bmp` in the array below)
-#ifndef NAMEBREAK_CUDA_LOGO_BMP_H
-#define NAMEBREAK_CUDA_LOGO_BMP_H
+#ifndef NAMEBREAK_GUI_WIN32_RESOURCES_LOGO_BMP_H
+#define NAMEBREAK_GUI_WIN32_RESOURCES_LOGO_BMP_H
 
 static const unsigned char kLogoBmp[] = {
   0x42, 0x4d, 0x36, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00,
@@ -6160,4 +6160,4 @@ static const unsigned char kLogoBmp[] = {
   0x05, 0x2a, 0x4b, 0x05, 0x2b, 0x4d
 };
 
-#endif // NAMEBREAK_CUDA_LOGO_BMP_H
+#endif // NAMEBREAK_GUI_WIN32_RESOURCES_LOGO_BMP_H

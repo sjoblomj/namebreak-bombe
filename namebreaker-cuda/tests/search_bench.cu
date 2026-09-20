@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <string>
 #include "engine/search.h"
-#include "engine/cpu_utils.h"
+#include "engine/candidate.h"
 
 int main(int argc, char** argv) {
     bool pruneSymbolRuns = !(argc >= 2 && std::string(argv[1]) == "noprune");
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     // exact (it depends on leading/trailing bound edge effects).
     std::string err, upperBoundLimit;
     getUpperBound(upper, alphabet, upperBoundLimit, err);
-    std::string end_full = make_bound_string(upperBoundLimit, candidateLen);
+    std::string end_full = makeBoundString(upperBoundLimit, candidateLen);
     uint64_t totalCandidates;
     stringToIndex(end_full, alphabet, totalCandidates, err);
 

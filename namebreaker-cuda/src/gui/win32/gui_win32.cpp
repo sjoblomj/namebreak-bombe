@@ -58,7 +58,8 @@
 
 #include "common/config.h"
 #include "net/coordinator_runner.h"
-#include "engine/cpu_utils.h"
+#include "common/string_util.h"
+#include "engine/candidate.h"
 #include "gui/win32/resources/icon_bmp.h"
 #include "gui/win32/resources/logo_bmp.h"
 #include "common/platform.h"
@@ -125,7 +126,7 @@ struct SharedStatus {
     // derives a real progress fraction from these plus the matches file's
     // own last line (see matchProgressFraction/updateUiFromSharedState)
     // instead of guessing from elapsed time: candidates are enumerated in a
-    // fixed order (cpu_utils.h's stringToIndex), so the most recent Hash-A-
+    // fixed order (candidate.h's stringToIndex), so the most recent Hash-A-
     // only match's position in that order is a true measure of how far a
     // search has gotten - the same signal the coordinator server itself
     // already uses for stall detection (see coordinator/README.md). When
@@ -176,15 +177,6 @@ std::string g_activeMode;
 // Small helpers
 // ---------------------------------------------------------------------
 
-std::string trimCopy(const char* s) {
-    std::string str(s);
-    size_t start = str.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos)
-        return "";
-    size_t end = str.find_last_not_of(" \t\r\n");
-    return str.substr(start, end - start + 1);
-}
-
 // Reads up to the last `maxLines` lines of `path` (oldest first). This file
 // only ever grows a few KB to low MB over a session (one line per Hash-A
 // hit), so re-reading it whole on every ~1s tick is cheap enough not to need
@@ -204,7 +196,7 @@ std::vector<std::string> readLastLines(const std::string& path, size_t maxLines)
 
 // Fraction (0.0-1.0) of the way `matchFilename` (a full prefix+candidate+
 // suffix line from the matches file) sits between `lowerBound` and
-// `upperBound` in `alphabet`'s enumeration order (cpu_utils.h's
+// `upperBound` in `alphabet`'s enumeration order (candidate.h's
 // stringToIndex - the same fixed odometer order runSearch() itself
 // enumerates candidates in). Returns -1.0 if it can't be computed (mismatched
 // candidate lengths - shouldn't happen for a single bounded-shaped range/
@@ -213,7 +205,7 @@ std::vector<std::string> readLastLines(const std::string& path, size_t maxLines)
 // treat that as "no usable progress signal yet" rather than a hard error.
 double matchProgressFraction(const std::string& matchFilename, const std::string& prefix, const std::string& suffix,
                               const std::string& alphabet, const std::string& lowerBound, const std::string& upperBound) {
-    std::string candidate = remove_prefix_and_suffix(matchFilename, prefix, suffix);
+    std::string candidate = removePrefixAndSuffix(matchFilename, prefix, suffix);
     if (candidate.length() != lowerBound.length() || lowerBound.length() != upperBound.length())
         return -1.0;
     uint64_t lowerIdx = 0, upperIdx = 0, matchIdx = 0;
@@ -451,159 +443,6 @@ bool isConfigReady(const ConfigFile& config) {
     return false;
 }
 
-// appendKeyToConfigSection (config.h) requires the file AND the target
-// [sectionName] header to already exist - true for a config.conf a CLI run
-// already created (as long as that run used the same section), but not for
-// one this GUI is creating from scratch, and not for one that so far only
-// ever had the *other* section (e.g. a hand-written [search]-only file, and
-// the setup dialog's Coordinator tab was used). Appends a bare
-// "[sectionName]" header to the end of the file if one isn't already
-// present; a no-op (returns true) if it already is.
-bool ensureSectionExists(const std::string& path, const std::string& sectionName, std::string& error) {
-    {
-        std::ifstream in(path);
-        if (!in) {
-            error = "cannot open " + path;
-            return false;
-        }
-        std::string line;
-        while (std::getline(in, line)) {
-            size_t start = line.find_first_not_of(" \t\r\n");
-            size_t end = line.find_last_not_of(" \t\r\n");
-            std::string trimmed = (start == std::string::npos) ? "" : line.substr(start, end - start + 1);
-            if (trimmed == "[" + sectionName + "]")
-                return true;
-        }
-    }
-    std::ofstream out(path, std::ios::app);
-    if (!out) {
-        error = "cannot append to " + path;
-        return false;
-    }
-    out << "\n[" << sectionName << "]\n";
-    return true;
-}
-
-// Sets (or inserts) config.conf's single top-level `mode = ...` line - the
-// one key that lives before any [section] header (config.h) - to `mode`.
-// Unlike ensureSectionExists/appendKeyToConfigSection below, this can
-// *replace* an existing value: switching which tab of the setup dialog was
-// used (e.g. Coordinator -> Local Search on a config.conf that already had a
-// mode from a previous run) needs the old mode value gone, not just another
-// line added alongside it - config.cpp's parser would otherwise just take
-// whichever `mode = ...` line comes last, silently ignoring the new choice
-// if it happened to land above the stale one.
-bool setModeKey(const std::string& path, const std::string& mode, std::string& error) {
-    std::ifstream in(path);
-    if (!in) {
-        error = "cannot open " + path;
-        return false;
-    }
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(in, line))
-        lines.push_back(line);
-    in.close();
-
-    auto trim = [](const std::string& s) {
-        size_t start = s.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos)
-            return std::string();
-        size_t end = s.find_last_not_of(" \t\r\n");
-        return s.substr(start, end - start + 1);
-    };
-
-    int firstSectionLine = -1;
-    int modeLine = -1;
-    for (size_t i = 0; i < lines.size(); ++i) {
-        std::string trimmed = trim(lines[i]);
-        if (!trimmed.empty() && trimmed.front() == '[') {
-            firstSectionLine = (int) i;
-            break;
-        }
-        if (trimmed.rfind("mode", 0) == 0) {
-            size_t eq = trimmed.find('=');
-            if (eq != std::string::npos && trim(trimmed.substr(0, eq)) == "mode") {
-                modeLine = (int) i;
-                break;
-            }
-        }
-    }
-
-    if (modeLine >= 0) {
-        lines[modeLine] = "mode = " + mode;
-    } else if (firstSectionLine >= 0) {
-        lines.insert(lines.begin() + firstSectionLine, "mode = " + mode);
-    } else {
-        lines.insert(lines.begin(), "mode = " + mode);
-    }
-
-    std::ofstream out(path, std::ios::trunc);
-    if (!out) {
-        error = "cannot rewrite " + path;
-        return false;
-    }
-    for (const auto& l : lines)
-        out << l << "\n";
-    return true;
-}
-
-// Makes sure `path` is set up to run in `mode`: its `mode = ...` line is set
-// (see setModeKey), its [sectionName] section exists, and every non-empty
-// `keys` entry is present in that section - creating the file from scratch
-// if it doesn't exist yet at all. Values already set in the file (that the
-// caller left untouched, e.g. re-running setup after only partially filling
-// it in before) are never overwritten - same "fill in only what's missing"
-// behavior the CLI's own resolveMissingIdentity (coordinator_runner.cpp)
-// already has for username/hostname, just generalized to any section/mode.
-bool ensureConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
-                          const std::vector<std::pair<std::string, std::string>>& keys, std::string& error) {
-    std::ifstream probe(path);
-    bool fileExists = probe.good();
-    probe.close();
-
-    if (!fileExists) {
-        std::ofstream out(path, std::ios::trunc);
-        if (!out) {
-            error = "cannot create " + path;
-            return false;
-        }
-        out << "mode = " << mode << "\n\n[" << sectionName << "]\n";
-        for (const auto& kv : keys) {
-            if (!kv.second.empty())
-                out << kv.first << " = " << kv.second << "\n";
-        }
-        return true;
-    }
-
-    if (!setModeKey(path, mode, error))
-        return false;
-    if (!ensureSectionExists(path, sectionName, error))
-        return false;
-
-    ConfigFile existing;
-    std::string loadErr;
-    if (!loadConfigFile(path, existing, loadErr)) {
-        error = loadErr;
-        return false;
-    }
-    const std::map<std::string, std::string>& existingSection = (sectionName == "coordinator") ? existing.coordinator : existing.search;
-
-    for (const auto& kv : keys) {
-        if (kv.second.empty())
-            continue;
-        auto it = existingSection.find(kv.first);
-        bool hasNonEmpty = it != existingSection.end() && !it->second.empty();
-        if (hasNonEmpty)
-            continue;
-        if (!appendKeyToConfigSection(path, sectionName, kv.first, kv.second)) {
-            error = "failed to write " + kv.first + " to " + path;
-            return false;
-        }
-    }
-    return true;
-}
-
 // ---------------------------------------------------------------------
 // First-run setup dialog - a hand-rolled modal window (CreateWindowEx +
 // its own nested message loop) rather than a .rc dialog template, so the
@@ -721,7 +560,7 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     char buf[512];
                     auto getField = [&](HWND h) {
                         GetWindowTextA(h, buf, sizeof(buf));
-                        return trimCopy(buf);
+                        return trim(buf);
                     };
                     int sel = (int) SendMessage(state->hwndTab, TCM_GETCURSEL, 0, 0);
                     if (sel == kTabCoordinator) {

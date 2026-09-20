@@ -1,4 +1,4 @@
-// Correctness test for IncrementalPrefixHasher (cpu_utils.h/.cpp). Pure host
+// Correctness test for IncrementalPrefixHasher (engine/mpq_hash.h). Pure host
 // C++, no CUDA/GPU involved - this class only ever runs on the CPU.
 //
 // The thing that could go wrong here is exactly the kind of bug that would
@@ -21,7 +21,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
-#include "engine/cpu_utils.h"
+#include "engine/candidate.h"
+#include "engine/mpq_hash.h"
 
 static uint64_t g_checked = 0;
 static uint64_t g_failures = 0;

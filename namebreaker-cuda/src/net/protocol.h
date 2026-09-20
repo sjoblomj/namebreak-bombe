@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_CUDA_PROTOCOL_H
-#define NAMEBREAK_CUDA_PROTOCOL_H
+#ifndef NAMEBREAK_NET_PROTOCOL_H
+#define NAMEBREAK_NET_PROTOCOL_H
 
 #include <cstdint>
 #include <optional>
@@ -43,7 +43,7 @@ struct RegisterResponse {
 // lowerBoundFilename/upperBoundFilename are both inclusive, full filenames
 // (prefix+candidate+suffix) - directly usable as SearchRequest's
 // startCandidate/lowerBound/upperBound once stripped of prefix/suffix (see
-// remove_prefix_and_suffix in cpu_utils.h).
+// removePrefixAndSuffix in candidate.h).
 struct ClaimResponse {
     int64_t rangeId = 0;
     int64_t targetId = 0;
@@ -108,4 +108,4 @@ bool parseHeartbeatResponse(const std::string& body, HeartbeatResponse& out);
 // such field.
 std::string parseErrorMessage(const std::string& body);
 
-#endif // NAMEBREAK_CUDA_PROTOCOL_H
+#endif // NAMEBREAK_NET_PROTOCOL_H
