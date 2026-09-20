@@ -187,12 +187,15 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
         }
 
         if (currentSection == nullptr) {
-            if (key != "mode") {
+            if (key == "mode") {
+                out.mode = value;
+            } else if (key == "matches_dir") {
+                out.matchesDir = value;
+            } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search] or [coordinator] section (only 'mode' is allowed before any section)";
+                        "' must be inside a [search] or [coordinator] section (only 'mode' and 'matches_dir' are allowed before any section)";
                 return false;
             }
-            out.mode = value;
         } else {
             (*currentSection)[key] = value;
         }
@@ -200,8 +203,8 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
     return true;
 }
 
-bool buildSearchRequest(const std::map<std::string, std::string>& section, bool continuous, SearchRequest& out, std::string& error) {
-    ConfigSectionReader r(section);
+bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest& out, std::string& error) {
+    ConfigSectionReader r(config.search);
     std::string prefix, suffix, startFilename, lowerFilename, upperFilename, hashAHex, hashBHex, maxBackslashStr;
 
     if (!r.getRequired("alphabet", out.alphabet, error)) return false;
@@ -248,6 +251,7 @@ bool buildSearchRequest(const std::map<std::string, std::string>& section, bool 
     out.lowerBound = removePrefixAndSuffix(lowerFilename, prefix, suffix);
     out.upperBound = removePrefixAndSuffix(upperFilename, prefix, suffix);
     out.continuous = continuous;
+    out.outputFilePath = matchesFilePath(config.matchesDir, "");
     return true;
 }
 

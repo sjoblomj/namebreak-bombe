@@ -2,7 +2,7 @@
 
 # namebreak reads its parameters from config.conf (see src/common/config.h) -
 # this script (re)generates that file's [search] section in the current
-# directory, recomputing the resume point from matches.txt each time, then
+# directory, recomputing the resume point from matches/matches.txt each time, then
 # runs namebreak (build it first with `make`) in "continuous" mode.
 
 NAMEBREAK="$(dirname "$0")/../build/namebreak"
@@ -17,10 +17,10 @@ HASH_A=0xF60F5D90
 HASH_B=0xCE0A9BDB
 PRUNE_SYMBOL_RUNS=true
 
-if [ ! -f matches.txt ]; then
+if [ ! -f matches/matches.txt ]; then
     start_candidate="REZ\\ .WAV"
 else
-    start_candidate=$(awk 'END{print}' matches.txt)
+    start_candidate=$(awk 'END{print}' matches/matches.txt)
 fi
 
 # Looking for the real deal

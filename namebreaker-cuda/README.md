@@ -96,9 +96,16 @@ plus optional `username`, `hostname` (auto-detected and interactively
 confirmed if omitted), and `poll_interval_secs` (default `30`) - see the
 coordinator README linked above for the full picture.
 
+Every Hash-A match (a candidate matching the first hash, whether or not it
+matches the second) is appended to a matches file, one filename per line.
+They all go in one directory - `matches/` in the current directory, or
+whatever a top-level `matches_dir = <directory>` line (next to `mode`) says;
+it's created if missing. `bounded`/`continuous` mode writes `matches.txt`
+there, and `coordinator` mode one `matches-<target name>.txt` per target.
+
 `scripts/run.sh` is a working example: it regenerates `config.conf`'s `[search]`
 section from a few shell variables (recomputing `start_candidate` from the
-last line of `matches.txt` each time) and launches `continuous` mode.
+last line of `matches/matches.txt` each time) and launches `continuous` mode.
 
 ## Compiling
 

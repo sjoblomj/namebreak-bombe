@@ -138,7 +138,7 @@ int main(int argc, char* argv[]) {
 #ifdef NAMEBREAK_WITH_NETWORK
     if (mode == "coordinator") {
         CoordinatorArgs cargs;
-        if (!buildCoordinatorArgs(config.coordinator, cargs, error)) {
+        if (!buildCoordinatorArgs(config, cargs, error)) {
             fprintf(stderr, "%s [coordinator]: %s\n", configPath.c_str(), error.c_str());
             return 1;
         }
@@ -153,7 +153,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     SearchRequest req;
-    if (!buildSearchRequest(config.search, mode == "continuous", req, error)) {
+    if (!buildSearchRequest(config, mode == "continuous", req, error)) {
         fprintf(stderr, "%s [search]: %s\n", configPath.c_str(), error.c_str());
         return 1;
     }

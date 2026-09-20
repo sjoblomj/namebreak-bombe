@@ -25,10 +25,9 @@ struct SearchRequest {
     // true ("continuous"): keep going to longer candidateLens indefinitely.
     bool continuous = false;
     // Path (relative to the current working directory, unless absolute)
-    // every Hash-A-only match is appended to. Defaults to the plain local
-    // name; coordinator_runner.cpp's toSearchRequest overrides this per
-    // claimed range so concurrent/successive targets don't clobber each
-    // other's matches.
+    // every Hash-A-only match is appended to; missing parent directories are
+    // created. The program always sets this from matchesFilePath()
+    // (common/matches_file.h) - this default only matters to the tests.
     std::string outputFilePath = "matches.txt";
 };
 

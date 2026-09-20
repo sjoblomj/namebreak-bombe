@@ -223,8 +223,8 @@ curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecre
 
 Build `namebreak` as usual first (see `../namebreaker-cuda/Makefile` - the
 default build includes coordinator support; `make NETWORK=0` omits it). Then,
-from wherever you want `matches.txt` written, create a `config.conf` (see
-`../namebreaker-cuda/src/common/config.h`) with a `[coordinator]` section:
+in the directory you want its `matches/` directory in, create a `config.conf`
+(see `../namebreaker-cuda/src/common/config.h`) with a `[coordinator]` section:
 
 ```sh
 cd run   # or any working directory of your choice
@@ -242,7 +242,7 @@ EOF
 `poll_interval_secs` (optional) defaults to 30. namebreak re-registers
 (idempotently) on every start, claims a range, searches it in-process against
 exactly that range, reports the result, and loops. If the search fails to
-even start (bad claim data, matches.txt not writable), it skips reporting
+even start (bad claim data, matches file not writable), it skips reporting
 completion and lets the range's lease expire so the server reassigns it - it
 won't report success or silently drop bad work.
 

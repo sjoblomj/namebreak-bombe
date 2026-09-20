@@ -57,6 +57,7 @@
 #include <vector>
 
 #include "common/config.h"
+#include "common/matches_file.h"
 #include "net/coordinator_runner.h"
 #include "common/string_util.h"
 #include "engine/candidate.h"
@@ -172,52 +173,6 @@ bool g_quitting = false;
 // (to decide which of runCoordinator()/runSearch() to call) and the UI
 // thread (window title, Quit's confirmation wording).
 std::string g_activeMode;
-
-// ---------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------
-
-// Reads up to the last `maxLines` lines of `path` (oldest first). This file
-// only ever grows a few KB to low MB over a session (one line per Hash-A
-// hit), so re-reading it whole on every ~1s tick is cheap enough not to need
-// a real seek-from-end tail implementation.
-std::vector<std::string> readLastLines(const std::string& path, size_t maxLines) {
-    std::vector<std::string> lines;
-    std::ifstream in(path);
-    if (!in)
-        return lines;
-    std::string line;
-    while (std::getline(in, line))
-        lines.push_back(line);
-    if (lines.size() > maxLines)
-        lines.erase(lines.begin(), lines.begin() + (lines.size() - maxLines));
-    return lines;
-}
-
-// Fraction (0.0-1.0) of the way `matchFilename` (a full prefix+candidate+
-// suffix line from the matches file) sits between `lowerBound` and
-// `upperBound` in `alphabet`'s enumeration order (candidate.h's
-// stringToIndex - the same fixed odometer order runSearch() itself
-// enumerates candidates in). Returns -1.0 if it can't be computed (mismatched
-// candidate lengths - shouldn't happen for a single bounded-shaped range/
-// search, but a match line surviving from a previous, differently-shaped run
-// on the same file is possible - malformed alphabet, etc.); callers should
-// treat that as "no usable progress signal yet" rather than a hard error.
-double matchProgressFraction(const std::string& matchFilename, const std::string& prefix, const std::string& suffix,
-                              const std::string& alphabet, const std::string& lowerBound, const std::string& upperBound) {
-    std::string candidate = removePrefixAndSuffix(matchFilename, prefix, suffix);
-    if (candidate.length() != lowerBound.length() || lowerBound.length() != upperBound.length())
-        return -1.0;
-    uint64_t lowerIdx = 0, upperIdx = 0, matchIdx = 0;
-    std::string error;
-    if (!stringToIndex(lowerBound, alphabet, lowerIdx, error) || !stringToIndex(upperBound, alphabet, upperIdx, error) ||
-        !stringToIndex(candidate, alphabet, matchIdx, error))
-        return -1.0;
-    if (upperIdx <= lowerIdx)
-        return -1.0;
-    matchIdx = std::min(std::max(matchIdx, lowerIdx), upperIdx);
-    return double(matchIdx - lowerIdx) / double(upperIdx - lowerIdx);
-}
 
 // ---------------------------------------------------------------------
 // Logo + About box - shared by the setup dialog and the main window.
@@ -438,7 +393,7 @@ bool isConfigReady(const ConfigFile& config) {
     if (config.mode == "bounded" || config.mode == "continuous") {
         SearchRequest probe;
         std::string error;
-        return buildSearchRequest(config.search, config.mode == "continuous", probe, error);
+        return buildSearchRequest(config, config.mode == "continuous", probe, error);
     }
     return false;
 }
@@ -944,13 +899,13 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
 
     outConfig.mode = config.mode;
     if (config.mode == "coordinator") {
-        if (!buildCoordinatorArgs(config.coordinator, outConfig.coordinatorArgs, error)) {
+        if (!buildCoordinatorArgs(config, outConfig.coordinatorArgs, error)) {
             MessageBoxA(nullptr, (configPath + " [coordinator]: " + error).c_str(), "namebreak", MB_OK | MB_ICONERROR);
             return false;
         }
         outConfig.coordinatorArgs.configPath = configPath;
     } else if (config.mode == "bounded" || config.mode == "continuous") {
-        if (!buildSearchRequest(config.search, config.mode == "continuous", outConfig.searchRequest, error)) {
+        if (!buildSearchRequest(config, config.mode == "continuous", outConfig.searchRequest, error)) {
             MessageBoxA(nullptr, (configPath + " [search]: " + error).c_str(), "namebreak", MB_OK | MB_ICONERROR);
             return false;
         }

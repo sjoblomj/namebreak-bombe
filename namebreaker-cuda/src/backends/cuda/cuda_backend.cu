@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <thread>
@@ -596,6 +597,16 @@ SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequest
     // extends by that iteration's leading characters.
     std::pair<uint32_t, uint32_t> prefixBaseState = mpqHashWithPrefixCache_CPU(req.prefix.c_str(), h_cryptTable);
 
+    std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
+    if (!outputDir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(outputDir, ec);
+        if (ec) {
+            result.ok = false;
+            result.error = "cannot create " + outputDir.string() + ": " + ec.message();
+            return result;
+        }
+    }
     FILE* fout = fopen(req.outputFilePath.c_str(), "a");
     if (!fout) {
         result.ok = false;

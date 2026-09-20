@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -17,6 +16,7 @@
 #include <curl/curl.h>
 
 #include "common/config.h"
+#include "common/matches_file.h"
 #include "net/coordinator_client.h"
 #include "common/string_util.h"
 #include "engine/candidate.h"
@@ -60,20 +60,6 @@ void interruptibleSleep(std::chrono::milliseconds duration, const std::atomic<bo
         std::this_thread::sleep_for(step);
         duration -= step;
     }
-}
-
-// Turns a target name (an admin-chosen label, not guaranteed filesystem-safe -
-// e.g. it may contain the same backslashes a target MPQ filename would) into
-// a bare filename component: every character other than
-// alnum/'.'/'-'/'_' becomes '_', so it can't smuggle in a path separator
-// (or ".." for one) and land outside the current working directory.
-std::string sanitizeForFilename(const std::string& name) {
-    std::string out = name;
-    for (char& c : out) {
-        if (!isalnum((unsigned char) c) && c != '.' && c != '-' && c != '_')
-            c = '_';
-    }
-    return out.empty() ? "target" : out;
 }
 
 // Interactively confirms (or lets the user override) auto-discovered values
@@ -134,7 +120,7 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
     }
 }
 
-SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
+SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& matchesDir, std::string& error) {
     SearchRequest req;
     req.alphabet = claim.alphabet;
     req.maxBackslashCount = (int) claim.maxBackslashCount;
@@ -147,7 +133,7 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
     req.startCandidate = req.lowerBound;
     req.pruneSymbolRuns = claim.pruneSymbolRuns;
     req.continuous = false; // a coordinator range is always run "bounded"
-    req.outputFilePath = "matches-" + sanitizeForFilename(claim.targetName) + ".txt";
+    req.outputFilePath = matchesFilePath(matchesDir, claim.targetName);
     if (!hexToU32(claim.hashAHex, req.targetHashA) || !hexToU32(claim.hashBHex, req.targetHashB)) {
         error = "malformed target hash in claim response (hashA=" + claim.hashAHex + " hashB=" + claim.hashBHex + ")";
     }
@@ -159,13 +145,13 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, std::string& error) {
 // `quitRequested`/`callbacks`, if given, are as documented on runCoordinator
 // (coordinator_runner.h) - both default null for the CLI's own call site
 // below, so this function's added behavior is opt-in.
-void runOneRange(const std::string& serverUrl, const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested,
+void runOneRange(const CoordinatorArgs& args, const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested,
                   std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
     printf("[coordinator] starting range %lld (target %s) [%s .. %s]\n",
            (long long) claim.rangeId, claim.targetName.c_str(), claim.lowerBoundFilename.c_str(), claim.upperBoundFilename.c_str());
 
     std::string reqError;
-    SearchRequest req = toSearchRequest(claim, reqError);
+    SearchRequest req = toSearchRequest(claim, args.matchesDir, reqError);
     if (!reqError.empty()) {
         fprintf(stderr, "[coordinator] range %lld: %s - skipping, letting the lease expire so it gets reassigned\n",
                 (long long) claim.rangeId, reqError.c_str());
@@ -224,7 +210,7 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     }
 
     std::thread heartbeatThread([&]() {
-        CoordinatorClient hbClient(serverUrl);
+        CoordinatorClient hbClient(args.serverUrl);
         hbClient.setToken(token);
         std::unique_lock<std::mutex> lock(stopMutex);
         while (!stopCv.wait_for(lock, std::chrono::seconds(kHeartbeatIntervalSeconds), [&] { return stopRequested; })) {
@@ -353,7 +339,7 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     if (callbacks && callbacks->onRangeFinished)
         callbacks->onRangeFinished(result.found);
 
-    CoordinatorClient completeClient(serverUrl);
+    CoordinatorClient completeClient(args.serverUrl);
     completeClient.setToken(token);
     CompleteRequest completeReq;
     completeReq.found = result.found;
@@ -390,8 +376,8 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
 
 } // namespace
 
-bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, CoordinatorArgs& out, std::string& error) {
-    ConfigSectionReader r(section);
+bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::string& error) {
+    ConfigSectionReader r(config.coordinator);
     if (!r.getRequired("server_url", out.serverUrl, error))
         return false;
     // Left "" if absent - resolveMissingIdentity (called from runCoordinator)
@@ -412,6 +398,7 @@ bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, Coo
         error = "invalid poll_interval_secs: " + pollStr;
         return false;
     }
+    out.matchesDir = config.matchesDir;
     return true;
 }
 
@@ -493,7 +480,7 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
             continue;
         }
 
-        runOneRange(args.serverUrl, client.token(), *claim, pauseRequested, quitRequested, callbacks);
+        runOneRange(args, client.token(), *claim, pauseRequested, quitRequested, callbacks);
         if (quitRequested && quitRequested->load(std::memory_order_relaxed))
             return 0;
     }

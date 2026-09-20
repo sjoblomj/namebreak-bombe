@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/matches_file.h"
 #include "engine/search.h"
 
 // Where namebreak reads its config from absent a --config <file> argument -
@@ -20,14 +21,15 @@ inline constexpr const char* kDefaultConfigPath = "config.conf";
 //   [search]      - bounded/continuous parameters (mode picks which of the
 //                   two actually runs; both take the same parameters)
 //   [coordinator] - coordinator-mode parameters (see coordinator_runner.h)
-// plus one key allowed before any section: `mode = continuous|bounded|
-// coordinator` (overridable by passing --mode <mode> - see main()). '#'-led
-// lines and blank lines are ignored; a
-// value may optionally be wrapped in "..." if it needs meaningful leading/
-// trailing whitespace (no other escaping - a candidate/prefix/suffix
-// containing a literal backslash needs none).
+// plus two keys allowed before any section: `mode = continuous|bounded|
+// coordinator` (overridable by passing --mode <mode> - see main()), and
+// `matches_dir = <directory>` (optional - see matches_file.h). '#'-led lines
+// and blank lines are ignored; a value may optionally be wrapped in "..." if
+// it needs meaningful leading/trailing whitespace (no other escaping - a
+// candidate/prefix/suffix containing a literal backslash needs none).
 struct ConfigFile {
     std::string mode;
+    std::string matchesDir = kDefaultMatchesDir;
     std::map<std::string, std::string> search;
     std::map<std::string, std::string> coordinator;
 };
@@ -36,11 +38,11 @@ struct ConfigFile {
 // malformed line or unknown section/top-level key.
 bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error);
 
-// Builds a SearchRequest from a config.conf [search] section - shared by
-// both bounded and continuous mode (`continuous` selects which). Returns
-// false with `error` set if a required key is missing or a value doesn't
-// parse.
-bool buildSearchRequest(const std::map<std::string, std::string>& section, bool continuous, SearchRequest& out, std::string& error);
+// Builds a SearchRequest from `config`'s [search] section (and matches_dir) -
+// shared by both bounded and continuous mode (`continuous` selects which).
+// Returns false with `error` set if a required key is missing or a value
+// doesn't parse.
+bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest& out, std::string& error);
 
 // Inserts `key = value` right after `[sectionName]`'s header line in the
 // file at `path`, leaving every other line untouched - used to persist an

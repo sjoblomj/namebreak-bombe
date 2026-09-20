@@ -1,2 +1,4 @@
 # Everything the Makefile produces
 /build/
+# Where namebreak writes its matches when run from here (scripts/run.sh)
+/matches/

@@ -25,13 +25,16 @@ struct CoordinatorArgs {
     // --config'd run persists to the file it was actually read from rather
     // than always writing back to kDefaultConfigPath.
     std::string configPath = kDefaultConfigPath;
+    // Where each target's matches file goes - config.conf's matches_dir (see
+    // matches_file.h).
+    std::string matchesDir = kDefaultMatchesDir;
 };
 
-// Builds a CoordinatorArgs from a config.conf [coordinator] section (see
-// config.h). Returns false with `error` set if a required key is missing or
+// Builds a CoordinatorArgs from `config`'s [coordinator] section (and its
+// matches_dir - see config.h). Returns false with `error` set if a required key is missing or
 // a value doesn't parse. username/hostname are left "" if absent from the
 // section - see CoordinatorArgs above.
-bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, CoordinatorArgs& out, std::string& error);
+bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::string& error);
 
 // Optional hooks a caller (e.g. the Windows GUI, gui_win32.cpp) can pass into
 // runCoordinator() to observe its progress without a console - the CLI's

@@ -88,7 +88,7 @@ CUDA_SRC   := src/backends/cuda/cuda_backend.cu
 # platform.cpp is always built: it isn't networking code - it holds the OS-
 # specific terminal/keypress helpers behind the pause key (used in every mode),
 # alongside the hostname/username lookups the coordinator client wants.
-COMMON_SRC := src/common/config.cpp src/common/platform.cpp
+COMMON_SRC := src/common/config.cpp src/common/matches_file.cpp src/common/platform.cpp
 NET_SRC    := src/net/coordinator_runner.cpp src/net/coordinator_client.cpp src/net/http_client.cpp src/net/protocol.cpp
 CLI_SRC    := src/cli/main.cpp
 GUI_SRC    := src/gui/win32/gui_win32.cpp
