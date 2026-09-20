@@ -1,21 +1,20 @@
+// The CUDA backend: the search kernels, and the SearchBackend that launches
+// them (see engine/backend.h for what the engine asks of a backend).
+
+#include "backends/cuda/cuda_backend.h"
+
 #include <cuda_runtime.h>
-#include <atomic>
-#include <cerrno>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <functional>
 #include <string>
-#include <thread>
 #include <type_traits>
 #include <vector>
-#include "engine/candidate.h"
-#include "engine/mpq_hash.h"
-#include "engine/constants.h"
-#include "engine/search.h"
 #include "backends/cuda/hash_kernels.cuh"
+#include "backends/cuda/tuning.h"
+#include "engine/backend.h"
+#include "engine/limits.h"
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err__ = (call); \
@@ -25,22 +24,10 @@
     } \
 } while (0)
 
-// Keep this set in sync with the switch in runCudaBatch (and MAX_ALPHABET_SIZE in
-// constants.h, which must be >= the largest size here). Checked early in runSearch(),
-// before any CUDA setup, so an unsupported size fails fast with a clear message
-// instead of only surfacing deep inside the first batch.
-bool isSupportedAlphabetSize(int size) {
-    return size == 42 || size == 43 || size == 47 || size == 48 || size == 49 || size == 50;
-}
-
-// Terminology:
-// * Candidate = The part of the name that we are brute-forcing
-// * Filename  = The Prefix + Candidate + Suffix
+// Terminology (see also engine/backend.h):
 // * Trailing part = the last `trailingLen` characters of the candidate; the
 //   part the GPU enumerates (the rest - the "leading" part - is folded into
 //   the prefix on the CPU, see runSearch).
-// * Trailing index = a candidate's position within the trailing space, in
-//   the same last-character-fastest order as indexToString/stringToIndex.
 // * Row = one combination of the trailing part's first `trailingLen - 1`
 //   characters. A row holds `alphabetSize` candidates, one per value of the
 //   last character, so row r's candidate with last character k has trailing
@@ -55,7 +42,7 @@ __device__ char d_foundFilename[MAX_FILENAME_LEN];
 // so the host reads them back with a single cudaMemcpy (each separate driver
 // call is ~10us of GPU idle time between two consecutive kernels).
 struct BatchResults {
-    int matchCount; // hashA hits this batch (may exceed MAX_MATCHES; runCudaBatch then re-searches the range in halves)
+    int matchCount; // hashA hits this batch (may exceed MAX_MATCHES; the engine then re-searches the range in halves)
     int foundFlag;  // 1 once any candidate has matched both hashes - never reset mid-search
 };
 
@@ -70,9 +57,7 @@ struct DeviceBuffers {
     char* matches;
 };
 
-constexpr int kThreadsPerBlock = 256; // must be >= MAX_ALPHABET_SIZE (bruteForceKernel fills its shared tables one entry per thread)
 static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "bruteForceKernel needs one thread per alphabet entry to fill its shared tables");
-static_assert(NAMEBREAK_ROWS_PER_LAUNCH <= (1u << 30), "a launch's row count must stay well within 32 bits");
 
 // Suffix lengths 0-8 (see dispatchSuffixLen) get their own compile-time
 // instantiation of bruteForceKernel, fully unrolled - measured ~2x faster than
@@ -170,7 +155,7 @@ __global__ void bruteForceKernel(
         case 3: hashRowDigits<AlphabetSize, 3>(row, seed1, seed2, sKey, sOrd); break;
         case 4: hashRowDigits<AlphabetSize, 4>(row, seed1, seed2, sKey, sOrd); break;
         case 5: hashRowDigits<AlphabetSize, 5>(row, seed1, seed2, sKey, sOrd); break;
-        // trailingLen is validated against MAX_TRAILING_LEN (== 6) by runSearch
+        // trailingLen is validated against kMaxTrailingLen (== 6) by runSearch
     }
 
     constexpr int kSuffixRegs = (SuffixLen > 0) ? SuffixLen : 1;
@@ -226,7 +211,7 @@ __global__ void bruteForceKernel(
 // Second stage, launched only for a batch that had hashA hits (one thread per
 // recorded hit): rebuilds each hit's complete filename and does everything
 // that used to happen inline in the search kernel - the hashB check, the
-// found flag/filename, the printf output. Deliberately implemented with the
+// found flag/filename. Deliberately implemented with the
 // *original*, independent hashing path (indexToCandidate +
 // mpqHashCandidateAndSuffix + from-scratch mpqHashSeed1/Seed2), not
 // bruteForceKernel's row-based one, so every hit bruteForceKernel reports is
@@ -264,11 +249,8 @@ __global__ void verifyMatchesKernel(
                filename, hashA, verifyHashA);
     }
 
-    printf("Hash A matches: %s\n", filename);
-
     uint32_t hashB = mpqHashSeed2(filename);
     if (hashB == targetB) {
-        printf("BOTH HASHES MATCH: %s\n", filename);
         memcpy(d_foundFilename, filename, MAX_FILENAME_LEN);
         bufs.results->foundFlag = 1;
     }
@@ -278,21 +260,32 @@ __global__ void verifyMatchesKernel(
 
 // alphabetSize/suffix length have to be dispatched to one of a fixed set of
 // compile-time template instantiations (see indexToCandidate's and
-// bruteForceKernel's comments for why) - these two functions are the whole
-// set this build supports, and call `f` with a std::integral_constant of the
-// matching value. Add a case (and recompile/redistribute namebreak to
-// volunteers) to support a new alphabet size. Returns false if unsupported.
+// bruteForceKernel's comments for why) - dispatchAlphabetSize/
+// dispatchSuffixLen call `f` with a std::integral_constant of the matching
+// value.
+//
+// The alphabet sizes this backend supports, ascending: add one here (and
+// recompile/redistribute namebreak to volunteers) to support a new size.
+// Must all be <= MAX_ALPHABET_SIZE.
+template<int... Sizes>
+struct AlphabetSizeList {};
+using SupportedAlphabetSizes = AlphabetSizeList<42, 43, 47, 48, 49, 50>;
+
+template<typename F, int... Sizes>
+bool dispatchAlphabetSizeIn(AlphabetSizeList<Sizes...>, int alphabetSize, F&& f) {
+    static_assert(((Sizes <= MAX_ALPHABET_SIZE) && ...), "an alphabet size exceeds MAX_ALPHABET_SIZE");
+    return ((alphabetSize == Sizes ? (f(std::integral_constant<int, Sizes>{}), true) : false) || ...);
+}
+
+template<int... Sizes>
+std::vector<int> alphabetSizesIn(AlphabetSizeList<Sizes...>) {
+    return {Sizes...};
+}
+
+// Returns false if `alphabetSize` isn't in SupportedAlphabetSizes.
 template<typename F>
 bool dispatchAlphabetSize(int alphabetSize, F&& f) {
-    switch (alphabetSize) {
-        case 42: f(std::integral_constant<int, 42>{}); return true;
-        case 43: f(std::integral_constant<int, 43>{}); return true;
-        case 47: f(std::integral_constant<int, 47>{}); return true;
-        case 48: f(std::integral_constant<int, 48>{}); return true;
-        case 49: f(std::integral_constant<int, 49>{}); return true;
-        case 50: f(std::integral_constant<int, 50>{}); return true;
-        default: return false;
-    }
+    return dispatchAlphabetSizeIn(SupportedAlphabetSizes{}, alphabetSize, f);
 }
 
 template<typename F>
@@ -311,37 +304,93 @@ void dispatchSuffixLen(int suffixLen, F&& f) {
     }
 }
 
-// Searches the trailing indices [startIdx, startIdx + count) (count > 0).
-// Returns 0 (no match yet), 1 (found - both hashes matched, outFoundFilename
-// is filled), or -1 (abortRequested was set, this batch was skipped).
-//
-// Every hashA hit is verified against hashB: if a launch has more hits than
-// MAX_MATCHES record (which needs a target hashA with over a thousand matches
-// among the range's candidates - not something a real 32-bit hash produces,
-// but the one outcome that must never happen is a both-hashes match going
-// unchecked), the range is searched again as two halves, recursively.
-int runCudaBatch(int trailingLen, uint64_t startIdx, uint64_t count, uint32_t targetA, uint32_t targetB, const BatchParams& params, FILE* fout,
-                  const DeviceBuffers& bufs, int alphabetSize, int suffixLen,
-                  const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
-                  char* outFoundFilename, const std::atomic<bool>* pauseRequested) {
-    if (abortRequested && abortRequested->load(std::memory_order_relaxed))
-        return -1;
+namespace {
 
-    // Called between batches only (every previous call already synchronized
-    // via cudaDeviceSynchronize below before returning), so a batch already
-    // in flight is never interrupted - pausing here just means the *next*
-    // kernel launch waits. Keeps polling abortRequested too, so a pause that
-    // outlasts the target being solved elsewhere doesn't block forever.
-    while (pauseRequested && pauseRequested->load(std::memory_order_relaxed)) {
-        if (abortRequested && abortRequested->load(std::memory_order_relaxed))
-            return -1;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+class CudaBackend : public SearchBackend {
+public:
+    const char* name() const override { return "cuda"; }
+    std::vector<int> supportedAlphabetSizes() const override { return alphabetSizesIn(SupportedAlphabetSizes{}); }
+    int windowChars() const override { return NAMEBREAK_GPU_WINDOW_CHARS; }
+    int maxTrailingLen() const override { return kMaxTrailingLen; }
+    // A whole number of rows (see the terminology comment above
+    // bruteForceKernel), NAMEBREAK_ROWS_PER_LAUNCH of them (tuning.h). Launch
+    // boundaries then always land on row boundaries (except at a range's own
+    // start/end), so almost every row a launch handles takes
+    // bruteForceKernel's fast path.
+    uint64_t batchSize(int alphabetSize) const override { return (uint64_t) alphabetSize * NAMEBREAK_ROWS_PER_LAUNCH; }
+
+    void beginSearch(const SearchConstants& constants) override;
+    BatchOutcome runBatch(int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params) override;
+    void endSearch() override;
+
+private:
+    int alphabetSize_ = 0;
+    int suffixLen_ = 0;
+    uint32_t targetA_ = 0;
+    uint32_t targetB_ = 0;
+    DeviceBuffers bufs_ = {};
+};
+
+void CudaBackend::beginSearch(const SearchConstants& constants) {
+    alphabetSize_ = (int) constants.alphabet.size();
+    suffixLen_ = (int) constants.suffix.size();
+    targetA_ = constants.targetHashA;
+    targetB_ = constants.targetHashB;
+
+    short suffixSize = (short) suffixLen_;
+    CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffixSize, sizeof(suffixSize)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, constants.suffix.c_str(), suffixLen_ + 1));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, constants.alphabet.c_str(), alphabetSize_ + 1));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_cryptTable, constants.cryptTable, 0x500 * sizeof(uint32_t)));
+
+    // The per-search tables bruteForceKernel reads at compile-time-constant
+    // indices - see their declaration in hash_kernels.cuh.
+    {
+        uint32_t h_alphabetKey[MAX_ALPHABET_SIZE] = {0};
+        uint32_t h_alphabetOrd[MAX_ALPHABET_SIZE] = {0};
+        uint32_t h_suffixKey[kMaxSuffixSize] = {0};
+        for (int k = 0; k < alphabetSize_; ++k) {
+            h_alphabetOrd[k] = (unsigned char) constants.alphabet[k];
+            h_alphabetKey[k] = constants.cryptTable[0x100 + h_alphabetOrd[k]];
+        }
+        for (int i = 0; i < suffixLen_; ++i)
+            h_suffixKey[i] = constants.cryptTable[0x100 + (unsigned char) constants.suffix[i]];
+        CUDA_CHECK(cudaMemcpyToSymbol(d_alphabetKey, h_alphabetKey, sizeof(h_alphabetKey)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_alphabetOrd, h_alphabetOrd, sizeof(h_alphabetOrd)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_suffixKey, h_suffixKey, sizeof(h_suffixKey)));
     }
 
-    // No pre-launch check of bufs.results->foundFlag: runSearch zeroes it
-    // before the first batch, and a batch that finds a match returns 1 (below)
-    // - so runSearch stops calling this - rather than leaving it set for a
-    // later call to notice. bufs.results->matchCount is likewise already 0
+    // Allocated once per search and reused for every batch, instead of
+    // malloc/free per call - these buffers are always the same size, so
+    // there's no reason to pay driver allocation overhead on every single
+    // kernel launch.
+    CUDA_CHECK(cudaMalloc(&bufs_.matches, MAX_MATCHES * MAX_FILENAME_LEN));
+    CUDA_CHECK(cudaMalloc(&bufs_.matchIdx, MAX_MATCHES * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&bufs_.results, sizeof(BatchResults)));
+    // A long-lived process (coordinator mode) runs many searches over its
+    // lifetime, one per claimed range - zeroing this fresh allocation every
+    // search (rather than relying on any process-lifetime state) is what
+    // keeps a previous range's match from making every subsequent range
+    // falsely report "found" immediately. It also establishes the
+    // "matchCount is 0 at launch" invariant runBatch maintains from here.
+    CUDA_CHECK(cudaMemset(bufs_.results, 0, sizeof(BatchResults)));
+}
+
+void CudaBackend::endSearch() {
+    CUDA_CHECK(cudaFree(bufs_.matches));
+    CUDA_CHECK(cudaFree(bufs_.matchIdx));
+    CUDA_CHECK(cudaFree(bufs_.results));
+    bufs_ = {};
+}
+
+BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params) {
+    const int alphabetSize = alphabetSize_;
+    BatchOutcome outcome;
+
+    // No pre-launch check of bufs_.results->foundFlag: beginSearch zeroes it
+    // before the first batch, and a batch that finds a match reports it
+    // (below) - so runSearch stops calling this - rather than leaving it set
+    // for a later call to notice. bufs_.results->matchCount is likewise already 0
     // here (see the reset after the readback below), so there's no per-batch
     // memset either. Each of those was a synchronous driver call in the gap
     // between two kernels.
@@ -368,67 +417,53 @@ int runCudaBatch(int trailingLen, uint64_t startIdx, uint64_t count, uint32_t ta
 
     bool supported = dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
         constexpr int AlphabetSize = decltype(alphabetC)::value;
-        dispatchSuffixLen(suffixLen, [&](auto suffixC) {
+        dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
             constexpr int SuffixLen = decltype(suffixC)::value;
             bruteForceKernel<AlphabetSize, SuffixLen><<<blocks, kThreadsPerBlock>>>(
-                    trailingLen, (uint32_t) firstRow, (uint32_t) rowCount, firstRowStartK, lastRowEndK, targetA, params, bufs);
+                    trailingLen, (uint32_t) firstRow, (uint32_t) rowCount, firstRowStartK, lastRowEndK, targetA_, params, bufs_);
         });
     });
     if (!supported) {
-        fprintf(stderr, "Unsupported alphabet size: %d (this build only supports: 42, 43, 47, 48, 49, 50)\n", alphabetSize);
+        // runSearch checks supportedAlphabetSizes() before any batch.
+        fprintf(stderr, "Unsupported alphabet size: %d\n", alphabetSize);
         exit(1);
     }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     BatchResults h_results;
-    CUDA_CHECK(cudaMemcpy(&h_results, bufs.results, sizeof(h_results), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_results, bufs_.results, sizeof(h_results), cudaMemcpyDeviceToHost));
+    outcome.hitCount = h_results.matchCount;
 
     // Hits are rare (a few per thousand batches), so everything below is the
     // exception path - the common batch costs exactly the one cudaMemcpy above.
     if (h_results.matchCount > MAX_MATCHES) {
-        // More hits than bufs.matchIdx can record: the excess would never reach
-        // verifyMatchesKernel, so they'd never be checked against hashB. Nothing
-        // from this launch has been verified or reported yet, so discard it and
-        // search each half of the range on its own instead (splitting again as
-        // needed). A one-candidate range has at most one hit and MAX_MATCHES >= 1,
-        // so count >= 2 here and this always terminates.
-        fprintf(stderr, "note: %d hashA hits in one batch, more than the %d that can be recorded - searching its two halves separately\n",
-                h_results.matchCount, MAX_MATCHES);
-        CUDA_CHECK(cudaMemset(&bufs.results->matchCount, 0, sizeof(int)));
-        const uint64_t half = count / 2;
-        int r = runCudaBatch(trailingLen, startIdx, half, targetA, targetB, params, fout, bufs, alphabetSize, suffixLen,
-                              abortRequested, onPartialMatch, outFoundFilename, pauseRequested);
-        if (r != 0)
-            return r;
-        return runCudaBatch(trailingLen, startIdx + half, count - half, targetA, targetB, params, fout, bufs, alphabetSize, suffixLen,
-                             abortRequested, onPartialMatch, outFoundFilename, pauseRequested);
+        // More hits than bufs_.matchIdx can record: the excess would never reach
+        // verifyMatchesKernel. Nothing from this launch has been verified, so
+        // leave it all to the engine to search again in halves.
+        CUDA_CHECK(cudaMemset(&bufs_.results->matchCount, 0, sizeof(int)));
+        return outcome;
     }
     if (h_results.matchCount > 0) {
         const int recorded = h_results.matchCount;
 
         dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
             constexpr int AlphabetSize = decltype(alphabetC)::value;
-            verifyMatchesKernel<AlphabetSize><<<(recorded + 63) / 64, 64>>>(trailingLen, recorded, targetA, targetB, params, bufs);
+            verifyMatchesKernel<AlphabetSize><<<(recorded + 63) / 64, 64>>>(trailingLen, recorded, targetA_, targetB_, params, bufs_);
         });
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
         std::vector<char> h_matches((size_t) recorded * MAX_FILENAME_LEN);
-        CUDA_CHECK(cudaMemcpy(h_matches.data(), bufs.matches, h_matches.size(), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < recorded; ++i) {
-            const char* match = &h_matches[(size_t) i * MAX_FILENAME_LEN];
-            fprintf(fout, "%s\n", match);
-            fflush(fout);
-            if (onPartialMatch)
-                onPartialMatch(match);
-        }
+        CUDA_CHECK(cudaMemcpy(h_matches.data(), bufs_.matches, h_matches.size(), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < recorded; ++i)
+            outcome.hits.emplace_back(&h_matches[(size_t) i * MAX_FILENAME_LEN]);
 
         // verifyMatchesKernel is what sets foundFlag, so re-read it now.
-        CUDA_CHECK(cudaMemcpy(&h_results, bufs.results, sizeof(h_results), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&h_results, bufs_.results, sizeof(h_results), cudaMemcpyDeviceToHost));
 
         // Restores the "matchCount is 0 at launch" invariant the next batch relies on.
-        CUDA_CHECK(cudaMemset(&bufs.results->matchCount, 0, sizeof(int)));
+        CUDA_CHECK(cudaMemset(&bufs_.results->matchCount, 0, sizeof(int)));
     }
 
     // Read after this batch's own kernels have finished, so a match found by
@@ -437,386 +472,16 @@ int runCudaBatch(int trailingLen, uint64_t startIdx, uint64_t count, uint32_t ta
     // "bounded" search whose very last batch is the one that finds it would
     // otherwise report "not found").
     if (h_results.foundFlag) {
-        CUDA_CHECK(cudaMemcpyFromSymbol(outFoundFilename, d_foundFilename, MAX_FILENAME_LEN));
+        char foundFilename[MAX_FILENAME_LEN];
+        CUDA_CHECK(cudaMemcpyFromSymbol(foundFilename, d_foundFilename, MAX_FILENAME_LEN));
+        outcome.found = true;
+        outcome.foundFilename = foundFilename;
     }
-    return h_results.foundFlag;
+    return outcome;
 }
 
-SearchResult runSearch(const SearchRequest& req, std::atomic<bool>* abortRequested, std::function<void(const std::string&)> onPartialMatch,
-                        const std::atomic<bool>* pauseRequested) {
-    SearchResult result;
+} // namespace
 
-    if (req.alphabet.empty() || req.alphabet.size() > MAX_ALPHABET_SIZE) {
-        result.ok = false;
-        result.error = "Alphabet must be non-empty and at most " + std::to_string(MAX_ALPHABET_SIZE) + " characters (got " + std::to_string(req.alphabet.size()) + ")";
-        return result;
-    }
-    int alphabetSize = (int) req.alphabet.size();
-    if (!isSupportedAlphabetSize(alphabetSize)) {
-        result.ok = false;
-        result.error = "Unsupported alphabet size: " + std::to_string(alphabetSize) + " (this build only supports: 42, 43, 47, 48, 49, 50)";
-        return result;
-    }
-    // 0 means unlimited (see hasForbiddenSymbolRun_CPU/countBackslashes_CPU's
-    // declaration comment in candidate.h for how and where this is applied).
-    if (req.maxBackslashCount < 0) {
-        result.ok = false;
-        result.error = "maxBackslashCount must be >= 0 (0 means unlimited), got " + std::to_string(req.maxBackslashCount);
-        return result;
-    }
-
-    // Compare lower/upper using the same alphabet ordering the rest of the search
-    // relies on, rather than raw string comparison (which would break if the
-    // alphabet's character order ever stopped matching ASCII order).
-    bool lowerIsBeforeUpper = false;
-    if (!isBeforeInAlphabet(req.lowerBound, req.upperBound, req.alphabet, lowerIsBeforeUpper, result.error)) {
-        result.ok = false;
-        return result;
-    }
-    // Equal bounds are allowed - not a special case, just the search space
-    // collapsing to exactly one candidate at whatever length they're given
-    // at (the rest of runSearch already handles a one-candidate batch/leading
-    // value fine, since that's an ordinary shape for the *last* batch of any
-    // search - this just makes it a legal shape for the *whole* search too).
-    // In `continuous` mode this also has a second, useful reading: since
-    // lowerBoundLimit/upperBoundLimit (getLowerBound/getUpperBound below)
-    // extend outward from whatever's given as candidateLen grows, equal
-    // bounds naturally become "every candidate with this exact string as a
-    // prefix" once the search moves past this length - not a coincidence
-    // worth special-casing, just what the existing widening already does.
-    if (!lowerIsBeforeUpper && req.lowerBound != req.upperBound) {
-        result.ok = false;
-        result.error = "lower bound ('" + req.lowerBound + "') must not be greater than upper bound ('" + req.upperBound + "')";
-        return result;
-    }
-
-    short prefix_size = req.prefix.size();
-    short suffix_size = req.suffix.size();
-
-    // Largest candidate length stringToIndex/indexToString can safely convert
-    // to/from a uint64_t index without overflow (alphabetSize^N <= UINT64_MAX).
-    // Computed from alphabetSize/MAX_CANDIDATE_LEN rather than hardcoded, so it
-    // stays correct if either changes (a smaller alphabet allows a longer safe
-    // length). This only bounds leadingLen below (see gpuWindowChars and
-    // trailingLen's computation in the loop below) - trailingLen itself never
-    // gets anywhere near this limit.
-    int maxSafeIndexLen = 0;
-    {
-        uint64_t product = 1;
-        while (maxSafeIndexLen < MAX_CANDIDATE_LEN && product <= UINT64_MAX / alphabetSize) {
-            product *= alphabetSize;
-            maxSafeIndexLen++;
-        }
-    }
-
-    // How many trailing candidate characters go straight to the GPU as a
-    // native index each batch; the rest is folded into an extended prefix and
-    // hashed on the CPU instead, incrementally (IncrementalPrefixHasher,
-    // mpq_hash.h) rather than from scratch per leading value. Deliberately
-    // small and fixed - NOT "as large as maxSafeIndexLen allows", which is
-    // what this project used to do (and still needs to fall back toward for
-    // very long candidates - see trailingLen's computation below). See
-    // README.md's "Design decisions" section for why. Defined (and
-    // overridable at compile time, -DNAMEBREAK_GPU_WINDOW_CHARS=N) in
-    // constants.h, so tests/benchmarks share this exact value instead of
-    // duplicating it.
-    constexpr int gpuWindowChars = NAMEBREAK_GPU_WINDOW_CHARS;
-
-    int maxLeadingLen = maxSafeIndexLen;
-    printf("gpuWindowChars: %d, maxSafeIndexLen: %d (max leading/prefix-extension length: %d)\n",
-           gpuWindowChars, maxSafeIndexLen, maxLeadingLen);
-
-    if (prefix_size + maxLeadingLen >= (int) kMaxPrefixSize || suffix_size >= (int) sizeof(d_suffix)) {
-        result.ok = false;
-        result.error = "prefix (up to " + std::to_string(prefix_size + maxLeadingLen) + " once extended by leading candidate characters) or suffix (" +
-                        std::to_string(suffix_size) + ") too long for device buffers (max: " + std::to_string(kMaxPrefixSize) + " each)";
-        return result;
-    }
-    if (prefix_size + suffix_size + MAX_CANDIDATE_LEN >= MAX_FILENAME_LEN) {
-        result.ok = false;
-        result.error = "prefix (" + std::to_string(prefix_size) + ") + suffix (" + std::to_string(suffix_size) + ") + candidate (up to " +
-                        std::to_string(MAX_CANDIDATE_LEN) + ") would exceed MAX_FILENAME_LEN (" + std::to_string(MAX_FILENAME_LEN) + ")";
-        return result;
-    }
-
-    CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffix_size, sizeof(suffix_size)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, req.suffix.c_str(), suffix_size + 1));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, req.alphabet.c_str(), req.alphabet.size() + 1));
-
-    std::string lowerBoundLimit, upperBoundLimit;
-    if (!getLowerBound(req.lowerBound, req.alphabet, lowerBoundLimit, result.error) ||
-        !getUpperBound(req.upperBound, req.alphabet, upperBoundLimit, result.error)) {
-        result.ok = false;
-        return result;
-    }
-    // upperBoundLimit is an *exclusive* end (the successor of req.upperBound), but an
-    // upper bound of all-maximum characters has no successor: getUpperBound saturates
-    // to that maximum itself, which used as an exclusive end would silently leave the
-    // very last candidate of the candidate length unsearched. Detect that case so the
-    // end is treated as "everything up to and including the last candidate" instead.
-    const bool upperBoundIsAbsoluteMax =
-        !req.upperBound.empty() && req.upperBound.find_first_not_of(req.alphabet.back()) == std::string::npos;
-
-    printf("alphabet: '%s' (size %d)\n", req.alphabet.c_str(), alphabetSize);
-    printf("candidate: '%s'\n", req.startCandidate.c_str());
-    printf("prefix: '%s'\n", req.prefix.c_str());
-    printf("suffix: '%s'\n", req.suffix.c_str());
-    printf("lower: '%s'\n", req.lowerBound.c_str());
-    printf("upper: '%s'\n", req.upperBound.c_str());
-    printf("lowerBoundLimit: '%s'\n", lowerBoundLimit.c_str());
-    printf("upperBoundLimit: '%s'\n", upperBoundLimit.c_str());
-    printf("hashA: '%X'\n", req.targetHashA);
-    printf("hashB: '%X'\n", req.targetHashB);
-    printf("pruneSymbolRuns: %s (leading characters only)\n", req.pruneSymbolRuns ? "true" : "false");
-    printf("maxBackslashCount: %d%s (leading characters only)\n", req.maxBackslashCount,
-           req.maxBackslashCount == 0 ? " (unlimited)" : "");
-
-    uint32_t h_cryptTable[0x500];
-    prepareCryptTable(h_cryptTable);
-    CUDA_CHECK(cudaMemcpyToSymbol(d_cryptTable, h_cryptTable, sizeof(h_cryptTable)));
-
-    // The per-search tables bruteForceKernel reads at compile-time-constant
-    // indices - see their declaration in hash_kernels.cuh.
-    {
-        uint32_t h_alphabetKey[MAX_ALPHABET_SIZE] = {0};
-        uint32_t h_alphabetOrd[MAX_ALPHABET_SIZE] = {0};
-        uint32_t h_suffixKey[64] = {0};
-        for (int k = 0; k < alphabetSize; ++k) {
-            h_alphabetOrd[k] = (unsigned char) req.alphabet[k];
-            h_alphabetKey[k] = h_cryptTable[0x100 + h_alphabetOrd[k]];
-        }
-        for (int i = 0; i < suffix_size; ++i)
-            h_suffixKey[i] = h_cryptTable[0x100 + (unsigned char) req.suffix[i]];
-        CUDA_CHECK(cudaMemcpyToSymbol(d_alphabetKey, h_alphabetKey, sizeof(h_alphabetKey)));
-        CUDA_CHECK(cudaMemcpyToSymbol(d_alphabetOrd, h_alphabetOrd, sizeof(h_alphabetOrd)));
-        CUDA_CHECK(cudaMemcpyToSymbol(d_suffixKey, h_suffixKey, sizeof(h_suffixKey)));
-    }
-
-    // Hash of req.prefix alone (never changes across candidateLen or
-    // leadingIdx) - the base every leadingIdx loop's IncrementalPrefixHasher
-    // extends by that iteration's leading characters.
-    std::pair<uint32_t, uint32_t> prefixBaseState = mpqHashWithPrefixCache_CPU(req.prefix.c_str(), h_cryptTable);
-
-    std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
-    if (!outputDir.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(outputDir, ec);
-        if (ec) {
-            result.ok = false;
-            result.error = "cannot create " + outputDir.string() + ": " + ec.message();
-            return result;
-        }
-    }
-    FILE* fout = fopen(req.outputFilePath.c_str(), "a");
-    if (!fout) {
-        result.ok = false;
-        result.error = std::string("fopen ") + req.outputFilePath + ": " + strerror(errno);
-        return result;
-    }
-
-    // Allocated once and reused for every batch, instead of malloc/free per call -
-    // these buffers are always the same size, so there's no reason to pay driver
-    // allocation overhead on every single kernel launch.
-    DeviceBuffers bufs;
-    CUDA_CHECK(cudaMalloc(&bufs.matches, MAX_MATCHES * MAX_FILENAME_LEN));
-    CUDA_CHECK(cudaMalloc(&bufs.matchIdx, MAX_MATCHES * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&bufs.results, sizeof(BatchResults)));
-    // A long-lived process (coordinator mode) can call runSearch() many times
-    // over its lifetime, one per claimed range - zeroing this fresh allocation
-    // every call (rather than relying on any process-lifetime state) is what
-    // keeps a previous range's match from making every subsequent range
-    // falsely report "found" immediately. It also establishes the
-    // "matchCount is 0 at launch" invariant runCudaBatch maintains from here.
-    CUDA_CHECK(cudaMemset(bufs.results, 0, sizeof(BatchResults)));
-
-    bool found_match = false;
-    bool aborted = false;
-    char foundFilename[MAX_FILENAME_LEN] = {0};
-    std::string start_candidate = req.startCandidate;
-    int candidateLen = start_candidate.size();
-    // Candidates per kernel launch: a whole number of rows (see the
-    // terminology comment above bruteForceKernel), NAMEBREAK_ROWS_PER_LAUNCH
-    // of them (constants.h). Launch boundaries always land on row boundaries
-    // (except at a range's own start/end - see runCudaBatch), so almost every
-    // row a launch handles takes bruteForceKernel's fast path.
-    const uint64_t batchSize = (uint64_t) alphabetSize * NAMEBREAK_ROWS_PER_LAUNCH;
-
-    // The search space is walked by four nested levels, outermost to innermost:
-    //  1. This `while` loop: over candidateLen itself - "try every 1-character
-    //     candidate, then every 2-character one, ..." Only continuous mode
-    //     (req.continuous) actually loops here more than once; bounded mode
-    //     runs the body for req.startCandidate's own length and exits via the
-    //     `if (!req.continuous)` check at the bottom.
-    //  2. The `for (leadingIdx ...)` loop below: over the *leading* part of the
-    //     candidate (see gpuWindowChars/leadingLen above) - every leading value
-    //     is hashed on the CPU (incrementally - IncrementalPrefixHasher) and
-    //     handed to the GPU as its starting seed, so candidates longer than
-    //     gpuWindowChars still get covered exhaustively. Since gpuWindowChars
-    //     is small (throughput-tuned, not "as large as safely possible"),
-    //     leadingLen > 0 - and this loop actually doing work - is the common
-    //     case, not the exception; it only degenerates to a single iteration
-    //     when candidateLen <= gpuWindowChars.
-    //  3. The `for (i = trailStart ...)` loop: chops the (up to
-    //     alphabetSize^trailingLen) remaining space for one leading value into
-    //     batchSize-sized chunks (aligned to multiples of batchSize, so only a
-    //     range's own first/last chunk can start/end mid-row) - each iteration
-    //     is one runCudaBatch call, i.e. one kernel launch (plus a second,
-    //     tiny one only if that launch had a hashA hit).
-    //  4. Inside runCudaBatch: one GPU thread per *row* of the chunk, each
-    //     looping over its row's alphabetSize candidates - see
-    //     bruteForceKernel's comment.
-    if (candidateLen < 1) {
-        // bruteForceKernel enumerates at least one trailing character; a zero-length
-        // candidate (a range whose lower bound is empty) isn't something it can search.
-        result.ok = false;
-        result.error = "the start candidate must not be empty";
-        goto breakfree;
-    }
-    while (true) {
-        if (candidateLen > MAX_CANDIDATE_LEN) {
-            fprintf(stderr, "candidateLen (%d) exceeds MAX_CANDIDATE_LEN (%d) - exiting\n", candidateLen, MAX_CANDIDATE_LEN);
-            break;
-        }
-
-        // Split the candidate into a leading part (folded into the prefix, hashed
-        // incrementally on the CPU) and a trailing part of gpuWindowChars characters
-        // (brute-forced by the GPU with native 64-bit indices) - or, once candidateLen
-        // grows large enough that leadingLen would exceed maxSafeIndexLen (overflow the
-        // index conversions below), a slightly larger trailing part, just big enough to
-        // keep leadingLen within that safe limit. Every combination of the leading part
-        // is enumerated too, so the full candidateLen-character space is still covered
-        // exhaustively either way.
-        int trailingLen = std::min(candidateLen, std::max(gpuWindowChars, candidateLen - maxSafeIndexLen));
-        int leadingLen = candidateLen - trailingLen;
-        if (trailingLen > MAX_TRAILING_LEN) {
-            // Only reachable if MAX_CANDIDATE_LEN/the alphabet sizes change so that
-            // candidateLen - maxSafeIndexLen exceeds what bruteForceKernel's 32-bit row
-            // index supports (see MAX_TRAILING_LEN) - refuse rather than overflow it.
-            fprintf(stderr, "candidateLen (%d) needs a %d-character trailing part, which exceeds MAX_TRAILING_LEN (%d) - exiting\n",
-                    candidateLen, trailingLen, MAX_TRAILING_LEN);
-            break;
-        }
-        if (leadingLen > maxSafeIndexLen) {
-            // Not expected to ever trigger given trailingLen's formula above (it's
-            // constructed specifically to keep leadingLen <= maxSafeIndexLen) - kept as
-            // a belt-and-suspenders check against future edits to that formula, since a
-            // silent overflow here would mean silently skipped candidates, not a crash.
-            fprintf(stderr, "candidateLen (%d) needs a %d-character leading part, which exceeds maxSafeIndexLen (%d) - exiting\n",
-                    candidateLen, leadingLen, maxSafeIndexLen);
-            break;
-        }
-
-        std::string start_full = makeBoundString(start_candidate, candidateLen);
-        std::string end_full   = makeBoundString(upperBoundLimit, candidateLen);
-
-        std::string start_leading = start_full.substr(0, leadingLen);
-        std::string end_leading   =   end_full.substr(0, leadingLen);
-
-        uint64_t startLeadingIdx = 0, endLeadingIdx = 0, trailSpaceSize = 0;
-        if (!stringToIndex(start_leading, req.alphabet, startLeadingIdx, result.error) ||
-            !stringToIndex(  end_leading, req.alphabet,   endLeadingIdx, result.error) ||
-            !stringToIndex(std::string(trailingLen, req.alphabet.back()), req.alphabet, trailSpaceSize, result.error)) {
-            result.ok = false;
-            goto breakfree;
-        }
-        trailSpaceSize += 1;
-
-        // Cap progress logging to roughly 1000 lines per candidateLen, regardless of how
-        // large the leading space is - printing once per leading combination is fine
-        // when leadingLen is 0 (a single iteration), but would flood stdout (and cost
-        // real time) once leadingLen grows.
-        uint64_t leadingCount = endLeadingIdx - startLeadingIdx + 1;
-        uint64_t leadingLogInterval = std::max<uint64_t>(1, leadingCount / 1000);
-
-        // Level 2 (see the walkthrough above the outer `while`). leadingHasher
-        // walks every leading value from startLeadingIdx to endLeadingIdx in
-        // the same order this loop does (always +1), so every step after the
-        // first is an O(1)-amortized incremental update (IncrementalPrefixHasher,
-        // mpq_hash.h) instead of a full from-scratch re-hash of the whole
-        // leading string - the thing that makes leadingLen > 0 being the
-        // common case (see gpuWindowChars above) affordable.
-        IncrementalPrefixHasher leadingHasher(prefixBaseState, leadingLen, req.alphabet, h_cryptTable);
-        leadingHasher.reset(startLeadingIdx);
-        for (uint64_t leadingIdx = startLeadingIdx; leadingIdx <= endLeadingIdx; ++leadingIdx) {
-            if (leadingIdx != startLeadingIdx) {
-                leadingHasher.advance();
-            }
-            const std::string& leading = leadingHasher.leading();
-
-            // req.pruneSymbolRuns/req.maxBackslashCount examine `leading` -
-            // the CPU-computed first leadingLen characters of the candidate
-            // (see README.md's "Design decisions" section for why checking it
-            // here, instead of on the GPU, is worth doing). A prune here
-            // skips this leading value's entire trailing batch (up to
-            // batchSize candidates) without spending anything on the GPU,
-            // kernel launch included - cheaper than even one of those
-            // candidates would have cost individually.
-            if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
-                continue;
-            if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
-                continue;
-
-            // Handed to every runCudaBatch call below as a kernel argument; see BatchParams.
-            std::string extendedPrefix = req.prefix + leading;
-            BatchParams params;
-            memcpy(params.prefix, extendedPrefix.c_str(), extendedPrefix.size() + 1);
-            params.prefixSize = (short) extendedPrefix.size();
-            std::pair<uint32_t, uint32_t> pair = leadingHasher.state();
-            params.seed1Start = pair.first;
-            params.seed2Start = pair.second;
-
-            uint64_t trailStart = 0, trailEnd = 0;
-            if (leadingIdx == startLeadingIdx) {
-                if (!stringToIndex(start_full.substr(leadingLen), req.alphabet, trailStart, result.error)) {
-                    result.ok = false;
-                    goto breakfree;
-                }
-            }
-            if (leadingIdx == endLeadingIdx && !upperBoundIsAbsoluteMax) {
-                if (!stringToIndex(end_full.substr(leadingLen), req.alphabet, trailEnd, result.error)) {
-                    result.ok = false;
-                    goto breakfree;
-                }
-            } else {
-                trailEnd = trailSpaceSize;
-            }
-
-            // Level 3 (see the walkthrough above the outer `while`).
-            for (uint64_t i = trailStart; i < trailEnd; ) {
-                uint64_t chunkEnd = std::min(trailEnd, (i / batchSize + 1) * batchSize);
-                uint64_t count = chunkEnd - i;
-                int r = runCudaBatch(trailingLen, i, count, req.targetHashA, req.targetHashB, params, fout, bufs,
-                                      alphabetSize, suffix_size, abortRequested, onPartialMatch, foundFilename, pauseRequested);
-                i = chunkEnd;
-                if (r == -1) {
-                    aborted = true;
-                    goto breakfree;
-                }
-                if (r == 1) {
-                    found_match = true;
-                    goto breakfree;
-                }
-            }
-        }
-
-        candidateLen += 1;
-        start_candidate = lowerBoundLimit;
-        if (!req.continuous) {
-            printf("Reached the upper limit - exiting\n");
-            goto breakfree;
-        }
-    }
-breakfree:
-
-    CUDA_CHECK(cudaFree(bufs.matches));
-    CUDA_CHECK(cudaFree(bufs.matchIdx));
-    CUDA_CHECK(cudaFree(bufs.results));
-    fclose(fout);
-
-    result.aborted = aborted;
-    result.found = found_match;
-    if (found_match) {
-        result.filename = std::string(foundFilename);
-    }
-    return result;
+std::unique_ptr<SearchBackend> makeCudaBackend() {
+    return std::make_unique<CudaBackend>();
 }

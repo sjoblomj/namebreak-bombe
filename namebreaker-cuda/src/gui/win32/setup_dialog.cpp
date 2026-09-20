@@ -19,6 +19,7 @@
 
 #include <deque>
 
+#include "backends/backends.h"
 #include "common/string_util.h"
 #include "gui/win32/about_dialog.h"
 #include "gui/win32/app_icons.h"
@@ -333,9 +334,9 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
 
     makeLabel(ps, "Alphabet:", kL1, row(1) + 3, 100);
     state.hwndAlphabet = makeEdit(ps, fields.alphabet, kE1, row(1), 150);
-    addHelp(ps, kH1, row(1) + 2,
-            "Every character a candidate may contain, typed out with no separators. The number of characters must be 42, 43, 47, 48, 49 "
-            "or 50.");
+    std::string alphabetHelp = "Every character a candidate may contain, typed out with no separators. The number of characters must be " +
+                               describeAlphabetSizes(*createDefaultBackend()) + ".";
+    addHelp(ps, kH1, row(1) + 2, alphabetHelp.c_str());
     makeLabel(ps, "Max backslash:", kL2, row(1) + 3, 110);
     state.hwndMaxBackslash = makeEdit(ps, fields.maxBackslashCount, kE2, row(1), 60);
     addHelp(ps, kE2 + 68, row(1) + 2,

@@ -1,5 +1,8 @@
 #include "gui/win32/worker.h"
 
+#include <memory>
+
+#include "backends/backends.h"
 #include "net/coordinator_runner.h"
 #include "net/protocol.h"
 
@@ -75,7 +78,8 @@ void runLocalSearch(const SearchRequest& req, bool continuous) {
         g_status.rangeJustFinished = false;
         g_status.statusText = std::string("Running ") + (continuous ? "continuous" : "bounded") + " search...";
     }
-    SearchResult result = runSearch(req, &g_quitRequested, nullptr, &g_pauseRequested);
+    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+    SearchResult result = runSearch(*backend, req, &g_quitRequested, nullptr, &g_pauseRequested);
     std::lock_guard<std::mutex> lock(g_status.mutex);
     g_status.hasActiveRange = false;
     g_status.rangeJustFinished = true;

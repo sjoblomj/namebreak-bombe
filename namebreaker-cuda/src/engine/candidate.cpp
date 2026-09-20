@@ -1,7 +1,7 @@
 #include "engine/candidate.h"
 
 #include <algorithm>
-#include "engine/constants.h"
+#include "engine/limits.h"
 
 static bool isAlnumMpq_CPU(char c) {
     return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');

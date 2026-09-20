@@ -73,18 +73,19 @@ else
     DEPFLAGS := -MMD -MP
 endif
 
-COMPILE := $(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -Isrc
+COMPILE := $(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -Isrc -DNAMEBREAK_WITH_CUDA
 
 # --- Sources ---------------------------------------------------------------
 #
 # src/engine    the search itself: runSearch(), candidate/bound arithmetic, hashing
-# src/backends  the GPU code (CUDA)
+# src/backends  what runSearch() runs its batches on (CUDA)
 # src/common    config file, OS-specific helpers
 # src/net       the coordinator client (NETWORK=1 only)
 # src/cli       the console program's main()
 # src/gui       the Windows GUI's main() and windows (Windows only)
-ENGINE_SRC := src/engine/mpq_hash.cpp src/engine/candidate.cpp
+ENGINE_SRC := src/engine/search.cpp src/engine/mpq_hash.cpp src/engine/candidate.cpp
 CUDA_SRC   := src/backends/cuda/cuda_backend.cu
+BACKEND_SRC := src/backends/backends.cpp $(CUDA_SRC)
 # platform.cpp is always built: it isn't networking code - it holds the OS-
 # specific terminal/keypress helpers behind the pause key (used in every mode),
 # alongside the hostname/username lookups the coordinator client wants.
@@ -94,7 +95,7 @@ CLI_SRC    := src/cli/main.cpp
 GUI_SRC    := $(wildcard src/gui/win32/*.cpp)
 
 # What the search needs, and nothing else - all the tests link.
-SEARCH_SRC := $(ENGINE_SRC) $(CUDA_SRC)
+SEARCH_SRC := $(ENGINE_SRC) $(BACKEND_SRC)
 
 APP_SRC := $(CLI_SRC) $(SEARCH_SRC) $(COMMON_SRC)
 ifeq ($(NETWORK),1)
@@ -121,7 +122,7 @@ CFLAGS_window6      := -DNAMEBREAK_GPU_WINDOW_CHARS=6
 CFLAGS_overflow     := -DMAX_MATCHES=1
 # WINDOW controls the GPU window for search_bench only (make WINDOW=6
 # search_bench), to re-sweep that tuning value against real hardware without
-# hand-editing the source - see src/engine/constants.h. Unset, the shipped
+# hand-editing the source - see src/backends/cuda/tuning.h. Unset, the shipped
 # default is used.
 WINDOW ?=
 BENCH_CONFIG := bench$(if $(WINDOW),-window$(WINDOW))
@@ -222,7 +223,7 @@ prefix_hasher_bench: $(BUILD)/tests/prefix_hasher_bench
 #
 # The same test source is built in several configurations (see "Build
 # configurations" above), because the tuning values in
-# src/engine/constants.h change which code paths a search exercises - every
+# src/backends/cuda/tuning.h change which code paths a search exercises - every
 # case derives its geometry from those values:
 #   test             the shipped configuration
 #   small_launch     3 rows per launch: forces many launches per leading value,
@@ -235,7 +236,7 @@ INTEGRATION_CONFIGS := test small_launch window2 window6
 INTEGRATION_TESTS := $(patsubst %,$(BUILD)/tests/search_integration_test-%,$(INTEGRATION_CONFIGS))
 
 define INTEGRATION_RULE
-$(BUILD)/tests/search_integration_test-$(1): $(call objs,$(1),tests/search_integration_test.cu $(SEARCH_SRC))
+$(BUILD)/tests/search_integration_test-$(1): $(call objs,$(1),tests/search_integration_test.cpp $(SEARCH_SRC))
 	@mkdir -p $$(@D)
 	$(COMPILE) -o $$@ $$^
 endef
@@ -243,7 +244,7 @@ $(foreach c,$(INTEGRATION_CONFIGS),$(eval $(call INTEGRATION_RULE,$(c))))
 
 # What runSearch() does when a launch has more hashA hits than MAX_MATCHES can
 # record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
-$(BUILD)/tests/search_overflow_test: $(call objs,overflow,tests/search_overflow_test.cu $(SEARCH_SRC))
+$(BUILD)/tests/search_overflow_test: $(call objs,overflow,tests/search_overflow_test.cpp $(SEARCH_SRC))
 	@mkdir -p $(@D)
 	$(COMPILE) -o $@ $^
 
@@ -261,7 +262,7 @@ test: $(BUILD)/tests/prefix_hasher_test $(INTEGRATION_TESTS) $(BUILD)/tests/sear
 
 # Real-code throughput check - times the actual runSearch() (not a proxy
 # kernel) over a ~28.8B-candidate range. See WINDOW above.
-$(BUILD)/tests/search_bench$(if $(WINDOW),-window$(WINDOW)): $(call objs,$(BENCH_CONFIG),tests/search_bench.cu $(SEARCH_SRC))
+$(BUILD)/tests/search_bench$(if $(WINDOW),-window$(WINDOW)): $(call objs,$(BENCH_CONFIG),tests/search_bench.cpp $(SEARCH_SRC))
 	@mkdir -p $(@D)
 	$(COMPILE) -o $@ $^
 

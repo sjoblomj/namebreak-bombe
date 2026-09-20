@@ -1,4 +1,4 @@
-// Correctness test for what runSearch() does when one launch has more hashA
+// Correctness test for what runSearch() does when one batch has more hashA
 // hits than MAX_MATCHES can record - a situation that can't happen in
 // practice with MAX_MATCHES = 1024 (a single 32-bit hashA collision is
 // already a ~1-in-4-billion event), so this build shrinks it to 1
@@ -7,8 +7,8 @@
 // on the CPU) to overflow it with just two hits.
 //
 // What must hold - the point being that a both-hashes match must never go
-// unchecked just because of how many other hashA hits share its launch:
-//  * runSearch() falls back to searching the launch's range in halves, so
+// unchecked just because of how many other hashA hits share its batch:
+//  * runSearch() falls back to searching the batch's range in halves, so
 //    *every* hit is checked against hashB: the hashB-matching candidate is
 //    found whether it is the earlier or the later of the pair,
 //  * hits are still reported in enumeration order, exactly once each, and
@@ -21,11 +21,11 @@
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
 // to the current directory - `make test` runs this from build/testrun/.
 
-#include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -38,10 +38,13 @@
 #include "engine/search.h"
 #include "engine/candidate.h"
 #include "engine/mpq_hash.h"
-#include "engine/constants.h"
+#include "backends/backends.h"
+#include "engine/limits.h"
+#include "engine/search.h"
 
 static_assert(MAX_MATCHES == 1, "this test must be built with -DMAX_MATCHES=1 (see the Makefile)");
 
+static std::unique_ptr<SearchBackend> g_backend;
 static uint32_t g_cryptTable[0x500];
 static uint32_t hashWithTable(const std::string& s, int off) {
     uint32_t s1 = 0x7FED7FED, s2 = 0xEEEEEEEE;
@@ -58,7 +61,7 @@ static std::string runCaptured(const SearchRequest& req, SearchResult& result, s
     int savedOut = dup(1), savedErr = dup(2);
     dup2(fd, 1); dup2(fd, 2);
 #endif
-    result = runSearch(req, nullptr, [&](const std::string& f) { reported.push_back(removePrefixAndSuffix(f, req.prefix, req.suffix)); });
+    result = runSearch(*g_backend, req, nullptr, [&](const std::string& f) { reported.push_back(removePrefixAndSuffix(f, req.prefix, req.suffix)); });
 #ifndef _WIN32
     fflush(stdout); fflush(stderr);
     dup2(savedOut, 1); dup2(savedErr, 2);
@@ -75,9 +78,23 @@ static std::string runCaptured(const SearchRequest& req, SearchResult& result, s
 static int g_failures = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { fprintf(stderr, "FAILED: %s\n", msg); ++g_failures; } else printf("  ok: %s\n", msg); } while (0)
 
-int main() {
+int main(int argc, char** argv) {
+    std::string backendName = availableBackends().front();
+    if (argc == 3 && std::string(argv[1]) == "--backend") {
+        backendName = argv[2];
+    } else if (argc != 1) {
+        fprintf(stderr, "Usage: %s [--backend <name>]\n", argv[0]);
+        return 1;
+    }
+    std::string error;
+    g_backend = createBackend(backendName, error);
+    if (!g_backend) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
+
     prepareCryptTable(g_cryptTable);
-    printf("MAX_MATCHES=%d\n", MAX_MATCHES);
+    printf("backend=%s, MAX_MATCHES=%d\n", g_backend->name(), MAX_MATCHES);
 
     const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
     const std::string prefix = "REZ\\", suffix = ".WAV";
@@ -109,7 +126,7 @@ int main() {
         return req;
     };
 
-    // Both candidates are in one launch (2 hits, room for 1).
+    // Both candidates are in one batch (2 hits, room for 1).
     const std::string note = "note: 2 hashA hits in one batch";
     auto noKernelDisagreement = [](const std::string& log) {
         return log.find("WARNING") == std::string::npos;

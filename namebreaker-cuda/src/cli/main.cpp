@@ -8,8 +8,10 @@
 #include <atomic>
 #include <csignal>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <thread>
+#include "backends/backends.h"
 #include "common/config.h"
 #include "common/platform.h"
 #include "engine/search.h"
@@ -17,7 +19,7 @@
 #include "net/coordinator_runner.h"
 #endif
 
-// Toggled by pauseKeyListener below, polled by runCudaBatch (via runSearch's
+// Toggled by pauseKeyListener below, polled by runSearch (via its
 // pauseRequested parameter) so a pause takes effect between batches rather
 // than needing to interrupt one mid-flight.
 std::atomic<bool> g_paused{false};
@@ -158,7 +160,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    SearchResult result = runSearch(req, nullptr, nullptr, &g_paused);
+    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+    SearchResult result = runSearch(*backend, req, nullptr, nullptr, &g_paused);
 
     if (!result.ok) {
         fprintf(stderr, "%s\n", result.error.c_str());

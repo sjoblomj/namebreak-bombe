@@ -2,8 +2,9 @@
 // standalone proxy kernel) over a bounded candidateLen=10 range of about
 // 28.8 billion candidates, using this project's real 49-character
 // alphabet and an unreachable target hash so it runs to completion instead
-// of stopping early on a match. Linked against cuda_backend.cu directly, so
-// this measures the exact code that ships, not a reimplementation of it.
+// of stopping early on a match, on the build's default backend. Linked
+// against the real search code, so this measures the exact code that ships,
+// not a reimplementation of it.
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
 // to the current directory - `make search_bench` runs this from
@@ -11,11 +12,12 @@
 // the binary directly from somewhere else disposable if not going through
 // `make search_bench`.
 
-#include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include "backends/backends.h"
 #include "engine/search.h"
 #include "engine/candidate.h"
 
@@ -26,10 +28,10 @@ int main(int argc, char** argv) {
     const std::string suffix = ".WAV";
     const int candidateLen = 10;
     // Chosen directly in full-candidate space (not tied to any particular
-    // leading/trailing split - cuda_backend.cu picks that internally via
-    // gpuWindowChars) so this bound, and therefore this benchmark, works
-    // unchanged regardless of what NAMEBREAK_GPU_WINDOW_CHARS is compiled
-    // with - a fixed ~28.8B total, for direct comparability across runs.
+    // leading/trailing split - runSearch() picks that internally via the
+    // backend's windowChars()) so this bound, and therefore this benchmark,
+    // works unchanged regardless of what NAMEBREAK_GPU_WINDOW_CHARS is
+    // compiled with - a fixed ~28.8B total, for direct comparability across runs.
     const uint64_t targetTotalCandidates = 28'800'000'000ULL;
     std::string upper = indexToString(targetTotalCandidates, candidateLen, alphabet);
     std::string lower(candidateLen, alphabet[0]);
@@ -51,7 +53,8 @@ int main(int argc, char** argv) {
     auto onPartialMatch = [&](const std::string&) { matchCount++; };
 
     auto start = std::chrono::steady_clock::now();
-    SearchResult result = runSearch(req, nullptr, onPartialMatch);
+    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+    SearchResult result = runSearch(*backend, req, nullptr, onPartialMatch);
     auto end = std::chrono::steady_clock::now();
 
     if (!result.ok) {

@@ -1,20 +1,22 @@
-// End-to-end correctness test for the *actual* runSearch() (cuda_backend.cu),
-// not a reimplementation of it - linked in directly.
+// End-to-end correctness test for the *actual* runSearch() (engine/search.cpp)
+// and backends, not a reimplementation of them - linked in directly.
 //
 // Every case compares runSearch()'s results against an independent CPU
 // reference that brute-forces the same range one candidate at a time (with
 // its own copy of the leading-only pruning rule), so a bug anywhere in the
-// GPU pipeline looks like what this whole exercise is worried about: a
+// search pipeline looks like what this whole exercise is worried about: a
 // candidate silently missing from a real search (or a spurious one), no
 // crash, no error. Nothing here trusts the code under test to say what the
 // right answer is.
 //
-// This binary is built several times by `make test`, with different
-// -DNAMEBREAK_GPU_WINDOW_CHARS / -DNAMEBREAK_ROWS_PER_LAUNCH values (see
-// constants.h and the Makefile), so the same cases exercise different
-// leading/trailing splits, kernel row-decode depths and launch-chunking
-// boundaries. Every case derives its geometry from those macros; none
-// hard-codes a window size.
+// It tests one backend (--backend <name>, default: the build's default - see
+// backends/backends.h). This binary is built several times by `make test`,
+// with different -DNAMEBREAK_GPU_WINDOW_CHARS / -DNAMEBREAK_ROWS_PER_LAUNCH
+// values (see backends/cuda/tuning.h and the Makefile), so the same cases
+// exercise different leading/trailing splits, kernel row-decode depths and
+// launch-chunking boundaries. Every case derives its geometry from the
+// backend under test (SearchBackend::windowChars/batchSize); none hard-codes
+// a window size.
 //
 // Groups:
 //  1-5. The original scenarios: leading/trailing split, pruneSymbolRuns and
@@ -54,7 +56,6 @@
 // keep it away from the project's real matches.txt; run the binary directly
 // from somewhere else disposable if not going through `make test`.
 
-#include <cuda_runtime.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -62,6 +63,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <set>
 #include <sstream>
@@ -76,10 +78,13 @@
 #include "engine/search.h"
 #include "engine/candidate.h"
 #include "engine/mpq_hash.h"
-#include "engine/constants.h"
+#include "backends/backends.h"
+#include "engine/limits.h"
+#include "engine/search.h"
 
-static const int kWindow = NAMEBREAK_GPU_WINDOW_CHARS;
-static const uint64_t kRowsPerLaunch = NAMEBREAK_ROWS_PER_LAUNCH;
+// The backend under test, and its window size (set in main()).
+static std::unique_ptr<SearchBackend> g_backend;
+static int g_window = 0;
 static const int kAlphabetSizes[] = {42, 43, 47, 48, 49, 50};
 
 static uint32_t g_cryptTable[0x500];
@@ -139,7 +144,7 @@ static uint32_t hashA(const std::string& s) { return hashWithTable(s, 0x100); }
 static uint32_t hashB(const std::string& s) { return hashWithTable(s, 0x200); }
 
 // Mirrors runSearch()'s own computation of how many candidate characters the
-// GPU enumerates (cuda_backend.cu: maxSafeIndexLen / trailingLen) - needed
+// backend enumerates (search.cpp: maxSafeIndexLen / trailingLen) - needed
 // because the leading-only pruning rules apply to exactly the other characters.
 static int maxSafeIndexLenFor(int alphabetSize) {
     uint64_t product = 1;
@@ -151,7 +156,7 @@ static int maxSafeIndexLenFor(int alphabetSize) {
     return n;
 }
 static int trailingLenFor(int candidateLen, int alphabetSize) {
-    return std::min(candidateLen, std::max(kWindow, candidateLen - maxSafeIndexLenFor(alphabetSize)));
+    return std::min(candidateLen, std::max(g_window, candidateLen - maxSafeIndexLenFor(alphabetSize)));
 }
 
 static bool isPruned(const std::string& candidate, int leadingLen, bool pruneSymbolRuns, int maxBackslashCount) {
@@ -299,7 +304,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
 
     OutputCapture capture;
     capture.start();
-    SearchResult result = runSearch(req, nullptr, onPartialMatch);
+    SearchResult result = runSearch(*g_backend, req, nullptr, onPartialMatch);
     std::string log = capture.stop();
 
     bool ok = true;
@@ -338,9 +343,9 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
         fail("a WARNING was printed (the kernels disagree with the reference hashing path): " + log.substr(at, 200));
     }
     if (!ok) {
-        fprintf(stderr, "  alphabet size %d, prefix '%s' (%zu), suffix '%s' (%zu), range '%s'..'%s', window %d, rows/launch %llu\n",
+        fprintf(stderr, "  alphabet size %d, prefix '%s' (%zu), suffix '%s' (%zu), range '%s'..'%s', backend %s, window %d, batch size %llu\n",
                 alphabetSize, c.prefix.c_str(), c.prefix.size(), c.suffix.c_str(), c.suffix.size(), c.lower.c_str(), c.upper.c_str(),
-                kWindow, (unsigned long long) kRowsPerLaunch);
+                g_backend->name(), g_window, (unsigned long long) g_backend->batchSize(alphabetSize));
         ++g_failures;
     }
     return ok;
@@ -402,8 +407,8 @@ static bool runNoMatchCase(const std::string& label, const std::string& alphabet
 static bool scenarioSplit() {
     printf("=== 1: leading/trailing split (pruning disabled) ===\n");
     const std::string alphabet = alphabetOfSize(42);
-    const int len = kWindow + 1; // leadingLen = 1
-    const uint64_t T = ipow(alphabet.size(), kWindow);
+    const int len = g_window + 1; // leadingLen = 1
+    const uint64_t T = ipow(alphabet.size(), g_window);
     bool ok = true;
     // Straddling one leading-value boundary (a range covering more than that would be
     // a whole leading value - far too many candidates for the CPU reference at larger
@@ -420,8 +425,8 @@ static bool scenarioSplit() {
 static bool pruningScenario(const char* name, const std::string& alphabet, const std::string& prefix, bool prune, int maxBackslash,
                              int leadingLen, uint64_t prunedLeadingIdx, uint64_t survivingLeadingIdx) {
     printf("=== %s ===\n", name);
-    const int len = kWindow + leadingLen;
-    const uint64_t T = ipow(alphabet.size(), kWindow);
+    const int len = g_window + leadingLen;
+    const uint64_t T = ipow(alphabet.size(), g_window);
     // The range must run from the tail of one leading value into the head of the next.
     if (survivingLeadingIdx != prunedLeadingIdx + 1) {
         fprintf(stderr, "TEST BUG: %s needs adjacent leading values\n", name);
@@ -475,8 +480,8 @@ static bool scenarioPrefixBackslashes() {
     // characters: leadingIdx 42 ("\\A", 1 backslash) survives, 43 ("\\\\", 2) is pruned.
     const std::string alphabet = "A\\ &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV";
     printf("=== 4: maxBackslashCount excludes the prefix ===\n");
-    const int len = kWindow + 2;
-    const uint64_t T = ipow(alphabet.size(), kWindow);
+    const int len = g_window + 2;
+    const uint64_t T = ipow(alphabet.size(), g_window);
     const std::string prefix = "TEST\\\\\\";
     bool ok = true;
     auto mk = [&](uint64_t start, uint64_t end, uint64_t targetIdx, bool expectSurvives, const char* what) {
@@ -517,7 +522,7 @@ static bool scenarioPrefixBackslashes() {
 static bool scenarioSingleCandidate() {
     printf("=== 5: lower_bound == upper_bound (single-candidate search) ===\n");
     bool ok = true;
-    for (int len : {1, 2, kWindow, kWindow + 1, kWindow + 2}) {
+    for (int len : {1, 2, g_window, g_window + 1, g_window + 2}) {
         const std::string alphabet = alphabetOfSize(49);
         uint64_t idx = 123456789ULL % ipow(alphabet.size(), std::min(len, 8));
         ok &= runIndexCase("5: single candidate, length " + std::to_string(len), alphabet, "TEST_", ".DAT", len, idx, idx, idx);
@@ -531,8 +536,8 @@ static bool scenarioSingleCandidate() {
 static bool geometryForAlphabet(int as) {
     const std::string alphabet = alphabetOfSize(as);
     const uint64_t AS = as;
-    const int len = kWindow + 1; // one leading character
-    const uint64_t T = ipow(AS, kWindow);
+    const int len = g_window + 1; // one leading character
+    const uint64_t T = ipow(AS, g_window);
     const uint64_t rows = T / AS;
     const std::string prefix = "TEST_", suffix = ".DAT";
     const uint64_t base = 3 * T;             // leading value 3
@@ -571,8 +576,8 @@ static bool geometryForAlphabet(int as) {
     run("first candidates", 0, 300, {0, 1, 300});
     const uint64_t last = ipow(AS, len) - 1;
     run("last candidates", last - 300, last, {last - 300, last - 1, last});
-    // Straddling launch boundaries (only exist when a leading value spans more than one launch).
-    const uint64_t batch = AS * kRowsPerLaunch;
+    // Straddling batch boundaries (only exist when a leading value spans more than one batch).
+    const uint64_t batch = g_backend->batchSize(as);
     for (uint64_t k : {1ULL, 2ULL, 3ULL}) {
         uint64_t b = k * batch;
         if (b + 300 < T) {
@@ -605,8 +610,8 @@ static bool scenarioEveryLastCharacter() {
         printf("=== K: every last-character position, alphabet size %d ===\n", as);
         const std::string alphabet = alphabetOfSize(as);
         const uint64_t AS = as;
-        const int len = kWindow + 1;
-        const uint64_t T = ipow(AS, kWindow);
+        const int len = g_window + 1;
+        const uint64_t T = ipow(AS, g_window);
         const uint64_t rows = T / AS;
         for (uint64_t k = 0; k < AS; ++k) {
             uint64_t row = (k * 7919 + 13) % rows;
@@ -634,8 +639,8 @@ static bool scenarioPrefixSuffixLengths() {
     printf("=== P: prefix/suffix lengths and byte values ===\n");
     bool ok = true;
     const std::string alphabet = alphabetOfSize(49);
-    const int len = kWindow + 1;
-    const uint64_t T = ipow(alphabet.size(), kWindow);
+    const int len = g_window + 1;
+    const uint64_t T = ipow(alphabet.size(), g_window);
     const uint64_t start = 2 * T + 5000, end = 2 * T + 5000 + 3 * 49 + 5, target = start + 60;
     // Includes bytes >= 0x80: the hash's per-character table index must be an
     // unsigned char on both sides or it would read a negative index.
@@ -670,7 +675,7 @@ static bool scenarioPrefixSuffixLengths() {
         req.targetHashB = 2;
         OutputCapture capture;
         capture.start();
-        SearchResult r = runSearch(req);
+        SearchResult r = runSearch(*g_backend, req);
         capture.stop();
         if (r.ok || r.found) {
             fprintf(stderr, "FAILED: %s: expected runSearch() to reject this request\n", label);
@@ -682,7 +687,9 @@ static bool scenarioPrefixSuffixLengths() {
     ok &= expectError("P: suffix of 64 characters", "TEST_", std::string(64, 'x'), alphabet);
     ok &= expectError("P: prefix 52 + suffix 60 (would overflow MAX_FILENAME_LEN)", std::string(52, 'x'), std::string(60, 'y'), alphabet);
     ok &= expectError("P: prefix of 53 characters", std::string(53, 'x'), ".DAT", alphabet);
-    ok &= expectError("P: alphabet of an unsupported size (41)", "TEST_", ".DAT", alphabetOfSize(42).substr(0, 41));
+    std::vector<int> supportedSizes = g_backend->supportedAlphabetSizes();
+    if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), 41) == supportedSizes.end())
+        ok &= expectError("P: alphabet of an unsupported size (41)", "TEST_", ".DAT", alphabetOfSize(42).substr(0, 41));
     {
         // An empty candidate has zero trailing characters, which the kernel can't enumerate.
         ++g_cases;
@@ -694,7 +701,7 @@ static bool scenarioPrefixSuffixLengths() {
         req.targetHashB = 2;
         OutputCapture capture;
         capture.start();
-        SearchResult r = runSearch(req); // startCandidate/lowerBound/upperBound all empty
+        SearchResult r = runSearch(*g_backend, req); // startCandidate/lowerBound/upperBound all empty
         capture.stop();
         if (r.ok || r.found) {
             fprintf(stderr, "FAILED: P: an empty start candidate must be rejected, not silently searched wrongly\n");
@@ -712,8 +719,8 @@ static bool scenarioFound() {
     printf("=== F: both-hashes-match path ===\n");
     bool ok = true;
     const std::string alphabet = alphabetOfSize(49);
-    const int len = kWindow + 1;
-    const uint64_t T = ipow(alphabet.size(), kWindow);
+    const int len = g_window + 1;
+    const uint64_t T = ipow(alphabet.size(), g_window);
     const std::string prefix = "REZ\\", suffix = ".WAV";
     const uint64_t start = 4 * T + 1000;
 
@@ -802,7 +809,7 @@ static bool scenarioAbort() {
     printf("=== A: abort ===\n");
     ++g_cases;
     const std::string alphabet = alphabetOfSize(49);
-    const int len = kWindow + 1;
+    const int len = g_window + 1;
     SearchRequest req;
     req.alphabet = alphabet;
     req.prefix = "TEST_";
@@ -816,7 +823,7 @@ static bool scenarioAbort() {
     int reports = 0;
     OutputCapture capture;
     capture.start();
-    SearchResult r = runSearch(req, &abort, [&](const std::string&) { ++reports; });
+    SearchResult r = runSearch(*g_backend, req, &abort, [&](const std::string&) { ++reports; });
     capture.stop();
     if (!r.ok || !r.aborted || r.found || reports != 0) {
         fprintf(stderr, "FAILED: A: a pre-set abort flag must stop the search before any batch runs (ok=%d aborted=%d found=%d reports=%d)\n",
@@ -862,7 +869,7 @@ static bool fuzz(int iterations, uint64_t seed) {
         c.prefix = randomBytes(pl);
         c.suffix = randomBytes(sl);
 
-        int len = uni(10) < 7 ? 1 + (int) uni(kWindow + 3) : 6 + (int) uni(11); // mostly short, sometimes up to 16
+        int len = uni(10) < 7 ? 1 + (int) uni(g_window + 3) : 6 + (int) uni(11); // mostly short, sometimes up to 16
         std::string lower(len, c.alphabet[0]);
         for (int i = 0; i < len; ++i) lower[i] = c.alphabet[uni(as)];
         lower[0] = c.alphabet[uni(as - 1)]; // leave head-room above the first character
@@ -909,9 +916,32 @@ static bool fuzz(int iterations, uint64_t seed) {
     return ok;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    std::string backendName = availableBackends().front();
+    if (argc == 3 && std::string(argv[1]) == "--backend") {
+        backendName = argv[2];
+    } else if (argc != 1) {
+        fprintf(stderr, "Usage: %s [--backend <name>]\n", argv[0]);
+        return 1;
+    }
+    std::string error;
+    g_backend = createBackend(backendName, error);
+    if (!g_backend) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
+    g_window = g_backend->windowChars();
+    std::vector<int> supportedSizes = g_backend->supportedAlphabetSizes();
+    for (int as : kAlphabetSizes) {
+        if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), as) == supportedSizes.end()) {
+            fprintf(stderr, "TEST BUG: the %s backend doesn't support alphabet size %d\n", g_backend->name(), as);
+            return 1;
+        }
+    }
+
     prepareCryptTable(g_cryptTable);
-    printf("window=%d, rows per launch=%llu, MAX_MATCHES=%d\n", kWindow, (unsigned long long) kRowsPerLaunch, MAX_MATCHES);
+    printf("backend=%s, window=%d, batch size=%llu (49-character alphabet), MAX_MATCHES=%d\n", g_backend->name(), g_window,
+           (unsigned long long) g_backend->batchSize(49), MAX_MATCHES);
 
     auto start = std::chrono::steady_clock::now();
     bool allPassed = true;

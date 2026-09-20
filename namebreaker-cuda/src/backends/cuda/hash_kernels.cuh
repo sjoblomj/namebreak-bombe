@@ -3,33 +3,22 @@
 
 #include <cstdint>
 #include <cstring>
-#include "engine/constants.h"
+#include "engine/backend.h"
+#include "engine/limits.h"
 
-// Device-side hashing/candidate-decoding building blocks shared between
-// cuda_backend.cu's real search kernel and this project's GPU-backed tests
-// (tests/search_bench.cu, tests/search_integration_test.cu, ...) - kept in
-// one header so the code under test is always exactly the code that ships,
-// never a copy that could drift out of sync.
-
-// Capacity of BatchParams::prefix below (including the terminating NUL) -
-// what runSearch checks the extended prefix against.
-constexpr int kMaxPrefixSize = 64;
-
-// Everything that changes from one leading value to the next (i.e. once per
-// kernel launch in the common case), passed to the kernel by value as a kernel
-// argument rather than uploaded to __constant__ symbols with
-// cudaMemcpyToSymbol. Those uploads were synchronous driver calls that each
-// cost ~6us of GPU idle time between two consecutive kernels - a kernel
-// argument rides along with the launch itself for free.
-struct BatchParams {
-    char prefix[kMaxPrefixSize]; // req.prefix + the leading characters, NUL-terminated
-    short prefixSize;
-    uint32_t seed1Start;         // hash state after the (extended) prefix - see
-    uint32_t seed2Start;         // mpqHashWithPrefixCache_CPU / IncrementalPrefixHasher
-};
+// Device-side hashing/candidate-decoding building blocks for cuda_backend.cu's
+// search kernels.
+//
+// What changes from one leading value to the next (BatchParams, engine/
+// backend.h) is passed to the kernels by value as a kernel argument rather
+// than uploaded to __constant__ symbols with cudaMemcpyToSymbol. Those
+// uploads were synchronous driver calls that each cost ~6us of GPU idle time
+// between two consecutive kernels - a kernel argument rides along with the
+// launch itself for free. Only what stays the same for a whole search lives
+// in the symbols below.
 
 __device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
-__device__ __constant__ char d_suffix[64];
+__device__ __constant__ char d_suffix[kMaxSuffixSize];
 __device__ __constant__ short d_suffix_size;
 
 // Per-search tables precomputed on the host so the search kernel can read them
@@ -41,7 +30,7 @@ __device__ __constant__ short d_suffix_size;
 //   d_suffixKey[i]   = d_cryptTable[0x100 + suffix[i]]
 __device__ __constant__ uint32_t d_alphabetKey[MAX_ALPHABET_SIZE];
 __device__ __constant__ uint32_t d_alphabetOrd[MAX_ALPHABET_SIZE];
-__device__ __constant__ uint32_t d_suffixKey[64];
+__device__ __constant__ uint32_t d_suffixKey[kMaxSuffixSize];
 
 __device__ __constant__ uint32_t d_cryptTable[0x500];
 
@@ -122,8 +111,8 @@ __device__ uint32_t mpqHashSeed1(const char* str) {
 // AlphabetSize is a compile-time template parameter so this modulus/division -
 // run once per candidate character, for every thread - stays a cheap
 // compiler-optimized constant instead of a real (much slower) GPU integer
-// division. See runCudaBatch in cuda_backend.cu for the fixed set of sizes this
-// gets instantiated for and the runtime dispatch between them.
+// division. See SupportedAlphabetSizes in cuda_backend.cu for the fixed set of
+// sizes this gets instantiated for and the runtime dispatch between them.
 template<int AlphabetSize>
 __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCandidate) {
     for (int i = candidateLen - 1; i >= 0; --i) {

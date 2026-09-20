@@ -121,8 +121,9 @@ The alphabet's *size* (not its exact characters) is baked into the binary as
 a compile-time template instantiation per size, for performance - the fixed
 set of sizes this build supports (`42, 43, 47, 48, 49, 50`) is checked early
 and fails fast with a clear message if `config.conf`'s alphabet doesn't
-match one of them. Supporting a new size means editing the dispatch table in
-`src/backends/cuda/cuda_backend.cu` and recompiling.
+match one of them. Supporting a new size means adding it to
+`SupportedAlphabetSizes` in `src/backends/cuda/cuda_backend.cu` and
+recompiling.
 
 `make test` runs the correctness test suite: a pure-CPU unit test, plus
 end-to-end GPU tests that compare real search results against an independent
@@ -141,7 +142,7 @@ built into `build/`; `make clean` removes it.
 | Directory | What's in it |
 |---|---|
 | `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU |
-| `src/backends/cuda/` | The CUDA kernels and the code that launches them |
+| `src/backends/` | What the search runs its batches on - `cuda/` holds the CUDA kernels and the code that launches them |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
 | `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `make NETWORK=0`) |
 | `src/cli/` | The console program's `main()` |
@@ -151,18 +152,31 @@ built into `build/`; `make clean` removes it.
 
 Includes are written relative to `src/` (e.g. `#include "engine/search.h"`).
 
+### Backends
+
+`runSearch()` (`src/engine/search.cpp`) walks the search space and does
+everything that isn't hashing - validation, bounds, the leading/trailing
+split, pruning, pause/abort, writing matches. It hands each chunk of
+candidates to a *backend* (`SearchBackend`, `src/engine/backend.h`), which
+hashes them and returns the hits. The CUDA backend is
+`src/backends/cuda/`, and `src/backends/backends.cpp` lists the backends a
+build has; the program uses the first. A new backend (say, for AMD GPUs)
+implements `SearchBackend`, gets a directory under `src/backends/` and an
+entry in `backends.cpp`, and is covered by the same tests: they take a
+`--backend <name>` argument.
+
 ## Design decisions
 
 ### The GPU doesn't brute-force the whole candidate
 
-Only a small, fixed-size trailing window of each candidate (`gpuWindowChars`
-characters, currently 5, set in `src/engine/constants.h`) is enumerated directly on the
-GPU. Anything beyond that is treated as an extension of the prefix: every
+Only a small, fixed-size trailing window of each candidate
+(`NAMEBREAK_GPU_WINDOW_CHARS` characters, currently 5, set in
+`src/backends/cuda/tuning.h`) is enumerated directly on the GPU. Anything beyond that is treated as an extension of the prefix: every
 combination of those leading characters is enumerated on the CPU and its
 hash contribution folded in once (incrementally - O(1) amortized per step,
 not a full rehash) before the GPU launches for that leading value. The
-window is bounded above (`MAX_TRAILING_LEN`, 6) because the kernel indexes
-rows with 32-bit integers.
+window is bounded above (`kMaxTrailingLen`, 6, in the same file) because the
+kernel indexes rows with 32-bit integers.
 
 With the current kernel the window is a launch-size knob more than a
 per-thread-cost knob (see below), and 5 measured best on the reference
@@ -194,8 +208,8 @@ of them separately re-hashing the whole trailing window from scratch.
 One kernel launch doesn't necessarily cover a whole leading value's
 trailing space at once, though - it covers at most
 `NAMEBREAK_ROWS_PER_LAUNCH` rows (8,388,608 by default, set in
-`src/engine/constants.h`), and always a whole number of them: a launch's boundaries
-land on row boundaries, except possibly at the very start or end of the
+`src/backends/cuda/tuning.h`), and always a whole number of them: a launch's
+boundaries land on row boundaries, except possibly at the very start or end of the
 range being searched. That's what makes the window above a *launch-size*
 knob rather than only a per-thread-cost one - and it's also what bounds how
 long any single launch can run for, since pause and abort are only checked
@@ -222,8 +236,8 @@ bit-for-bit identical hashes.
 That fast kernel only *records where* each hashA hit is - it doesn't build
 the filename or check hashB, keeping its hot path as small as possible. A
 second, much smaller kernel (`verifyMatchesKernel`) runs only when a batch
-actually had a hit: it rebuilds that candidate's complete filename, checks
-hashB, and prints - using the *original*, independent hashing code (not
+actually had a hit: it rebuilds that candidate's complete filename and
+checks hashB - using the *original*, independent hashing code (not
 the row-based fast path), so every hit gets cross-checked by a second
 implementation at runtime. Any disagreement between the two prints a
 `WARNING`, which the test suite treats as a failure.
@@ -234,7 +248,7 @@ again as two halves (recursively, if needed), so every hit still gets
 checked against hashB rather than silently lost. With a real 32-bit hash
 this essentially never happens in practice (it would take over a thousand
 collisions in a single launch), but it's handled explicitly and tested
-(`tests/search_overflow_test.cu`).
+(`tests/search_overflow_test.cpp`).
 
 ### `prune_symbol_runs` and `max_backslash_count` only run on the CPU
 
@@ -269,5 +283,4 @@ measured, not an oversight:
   cold-start effects from comparing freshly-recompiled binaries).
 
 The upshot: `prune_symbol_runs`/`max_backslash_count` only ever examine a
-candidate's leading characters (everything except the last `gpuWindowChars`
-of it).
+candidate's leading characters (everything except the trailing window).

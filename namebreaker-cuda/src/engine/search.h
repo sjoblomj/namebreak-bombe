@@ -6,6 +6,8 @@
 #include <functional>
 #include <string>
 
+#include "engine/backend.h"
+
 // One request to search a candidate space for a target MPQ hash pair. All of
 // startCandidate/lowerBound/upperBound are candidate-only strings (no
 // prefix/suffix) - see removePrefixAndSuffix/getStartCandidate in
@@ -46,7 +48,7 @@ struct SearchResult {
 };
 
 // Runs an exhaustive (bounded) or open-ended (continuous) search over
-// `req`'s candidate space, appending every Hash-A-only match to
+// `req`'s candidate space on `backend`, appending every Hash-A-only match to
 // `req.outputFilePath`. `abortRequested`, if given, is polled
 // between batches so a caller can interrupt a long-running search (e.g. once
 // a coordinator learns the target was solved elsewhere); `onPartialMatch`,
@@ -58,12 +60,12 @@ struct SearchResult {
 // the *next* one is held back. See src/cli/main.cpp's main() for the key
 // listener that drives this.
 //
-// Safe to call more than once in the same process (e.g. once per claimed
-// coordinator range): all device state this depends on is reset at the
-// start of each call.
-SearchResult runSearch(const SearchRequest& req,
-                        std::atomic<bool>* abortRequested = nullptr,
-                        std::function<void(const std::string&)> onPartialMatch = nullptr,
-                        const std::atomic<bool>* pauseRequested = nullptr);
+// Safe to call more than once in the same process, with the same backend
+// (e.g. once per claimed coordinator range): all backend state this depends
+// on is reset at the start of each call.
+SearchResult runSearch(SearchBackend& backend, const SearchRequest& req,
+                       std::atomic<bool>* abortRequested = nullptr,
+                       std::function<void(const std::string&)> onPartialMatch = nullptr,
+                       const std::atomic<bool>* pauseRequested = nullptr);
 
 #endif // NAMEBREAK_ENGINE_SEARCH_H

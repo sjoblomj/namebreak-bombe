@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -15,6 +16,7 @@
 
 #include <curl/curl.h>
 
+#include "backends/backends.h"
 #include "common/config.h"
 #include "common/matches_file.h"
 #include "net/coordinator_client.h"
@@ -145,8 +147,8 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& mat
 // `quitRequested`/`callbacks`, if given, are as documented on runCoordinator
 // (coordinator_runner.h) - both default null for the CLI's own call site
 // below, so this function's added behavior is opt-in.
-void runOneRange(const CoordinatorArgs& args, const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested,
-                  std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
+void runOneRange(SearchBackend& backend, const CoordinatorArgs& args, const std::string& token, const ClaimResponse& claim,
+                 const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
     printf("[coordinator] starting range %lld (target %s) [%s .. %s]\n",
            (long long) claim.rangeId, claim.targetName.c_str(), claim.lowerBoundFilename.c_str(), claim.upperBoundFilename.c_str());
 
@@ -281,7 +283,7 @@ void runOneRange(const CoordinatorArgs& args, const std::string& token, const Cl
     });
 
     auto started = std::chrono::steady_clock::now();
-    SearchResult result = runSearch(req, &abortRequested, [&](const std::string& filename) {
+    SearchResult result = runSearch(backend, req, &abortRequested, [&](const std::string& filename) {
         std::lock_guard<std::mutex> mlock(lastMatchMutex);
         lastHashAMatch = filename;
         haveLastHashAMatch = true;
@@ -431,6 +433,10 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
             callbacks->onStatus(msg);
     }
 
+    // One backend for every range this client claims - runSearch() resets
+    // its state at the start of each.
+    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
     auto claimBackoff = pollInterval;
     std::mt19937 rng(std::random_device{}());
@@ -480,7 +486,7 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
             continue;
         }
 
-        runOneRange(args, client.token(), *claim, pauseRequested, quitRequested, callbacks);
+        runOneRange(*backend, args, client.token(), *claim, pauseRequested, quitRequested, callbacks);
         if (quitRequested && quitRequested->load(std::memory_order_relaxed))
             return 0;
     }
