@@ -11,7 +11,7 @@ TARGET  := namebreak
 # platform.cpp is always built: it isn't networking code - it holds the OS-
 # specific terminal/keypress helpers behind the pause key (used in every mode),
 # alongside the hostname/username lookups the coordinator client wants.
-SOURCES := namebreak.cu cpu-utils.cpp config.cpp platform.cpp
+SOURCES := main.cpp namebreak.cu cpu-utils.cpp config.cpp platform.cpp
 HEADERS_CORE := cpu-utils.h constants.h search.h hash_kernels.cuh
 HEADERS := cpu-utils.h constants.h search.h config.h hash_kernels.cuh platform.h
 
@@ -75,10 +75,8 @@ endif
 # A little native Win32 GUI wrapper around coordinator mode (gui_win32.cpp) -
 # Windows-only (Win32 API), so `make gui`/this target simply doesn't exist on
 # the Linux branch above. Always built with networking (it's coordinator-only,
-# unaffected by NETWORK=0 above) and with namebreak.cu's own console main()
-# excluded via -DNAMEBREAK_NO_MAIN - the same flag/precedent the test
-# executables further down already use to get runSearch()/the CUDA kernels
-# without a duplicate main() symbol. /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup
+# unaffected by NETWORK=0 above) and without the console main() (main.cpp) -
+# gui_win32.cpp has its own. /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup
 # gives the process no console while still letting gui_win32.cpp use an
 # ordinary main() instead of WinMain() - see that file's own header comment.
 # NOTE: like the Windows OS branch above, this is untested - no Windows+CUDA
@@ -93,7 +91,7 @@ GUI_LDFLAGS := $(NETWORK_LDFLAGS) -lcomctl32 -lshell32 -Xlinker /SUBSYSTEM:WINDO
 gui: $(GUI_TARGET)$(EXE_EXT)
 
 $(GUI_TARGET)$(EXE_EXT): $(GUI_SOURCES) $(HEADERS) logo_bmp.h icon_bmp.h
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_WITH_NETWORK $(if $(CURL_INC),-I$(CURL_INC)) \
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_WITH_NETWORK $(if $(CURL_INC),-I$(CURL_INC)) \
 	    -o $(GUI_TARGET)$(EXE_EXT) $(GUI_SOURCES) $(GUI_LDFLAGS)
 endif
 
@@ -128,7 +126,7 @@ prefix_hasher_bench: tests/prefix_hasher_bench
 	./tests/prefix_hasher_bench
 
 # End-to-end correctness check for runSearch() itself (namebreak.cu, linked
-# in directly, main() excluded via -DNAMEBREAK_NO_MAIN) against a CPU
+# in directly, main() excluded via) against a CPU
 # brute-force reference - see the file for why this is a separate concern
 # from prefix_hasher_test above. Built without NETWORK (doesn't need it).
 #
@@ -147,21 +145,21 @@ INTEGRATION_TESTS := tests/search_integration_test tests/search_integration_test
                      tests/search_integration_test_window2 tests/search_integration_test_window6
 
 tests/search_integration_test: $(INTEGRATION_DEPS)
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
 
 tests/search_integration_test_small_launch: $(INTEGRATION_DEPS)
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_ROWS_PER_LAUNCH=3 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_ROWS_PER_LAUNCH=3 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
 
 tests/search_integration_test_window2: $(INTEGRATION_DEPS)
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_GPU_WINDOW_CHARS=2 -DNAMEBREAK_ROWS_PER_LAUNCH=5 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_GPU_WINDOW_CHARS=2 -DNAMEBREAK_ROWS_PER_LAUNCH=5 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
 
 tests/search_integration_test_window6: $(INTEGRATION_DEPS)
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DNAMEBREAK_GPU_WINDOW_CHARS=6 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_GPU_WINDOW_CHARS=6 -o $@ tests/search_integration_test.cu namebreak.cu cpu-utils.cpp
 
 # What runSearch() does when a launch has more hashA hits than MAX_MATCHES can
 # record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
 tests/search_overflow_test: tests/search_overflow_test.cu namebreak.cu cpu-utils.cpp $(HEADERS_CORE)
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN -DMAX_MATCHES=1 -o $@ tests/search_overflow_test.cu namebreak.cu cpu-utils.cpp
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DMAX_MATCHES=1 -o $@ tests/search_overflow_test.cu namebreak.cu cpu-utils.cpp
 
 # Each configuration takes about a minute to compile (the search kernel is
 # instantiated per alphabet size and suffix length) - `make -j test` builds
@@ -184,7 +182,7 @@ test: tests/prefix_hasher_test $(INTEGRATION_TESTS) tests/search_overflow_test
 # NETWORK/etc. convention) - combine with `make clean` first if switching it.
 WINDOW ?=
 tests/search_bench: tests/search_bench.cu namebreak.cu cpu-utils.cpp hash_kernels.cuh cpu-utils.h constants.h search.h
-	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -DNAMEBREAK_NO_MAIN $(if $(WINDOW),-DNAMEBREAK_GPU_WINDOW_CHARS=$(WINDOW)) -o tests/search_bench tests/search_bench.cu namebreak.cu cpu-utils.cpp
+	$(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) $(if $(WINDOW),-DNAMEBREAK_GPU_WINDOW_CHARS=$(WINDOW)) -o tests/search_bench tests/search_bench.cu namebreak.cu cpu-utils.cpp
 
 search_bench: tests/search_bench
 	mkdir -p tests/.testrun

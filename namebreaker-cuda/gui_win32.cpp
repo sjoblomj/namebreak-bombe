@@ -1,10 +1,8 @@
 // A little native Win32 GUI for namebreak - built only on Windows (see the
 // Makefile's `namebreak-gui` target), linking the same search/coordinator/
-// config/platform sources the console `namebreak` binary does. namebreak.cu
-// is compiled with -DNAMEBREAK_NO_MAIN there (the same flag the test
-// executables already use, see namebreak.cu's own comment on it) so this
-// file's own main() - not namebreak.cu's console one - is the process entry
-// point. Built with /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup (see the
+// config/platform sources the console `namebreak` binary does - everything
+// but its main.cpp, so this file's own main() is the process entry point.
+// Built with /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup (see the
 // Makefile) so the process has no console, but the CRT still calls this
 // ordinary main() rather than requiring a WinMain() - which also means this
 // GUI can honor the same --config <file> the CLI does (kDefaultConfigPath,
@@ -1163,7 +1161,7 @@ void onStatus(const std::string& text) {
 }
 
 // Runs a single bounded/continuous search directly (no coordinator server
-// involved - see namebreak.cu's main() for the CLI's equivalent one-shot
+// involved - see main.cpp's main() for the CLI's equivalent one-shot
 // call). Bounded mode searches one fixed candidate length - a real finish
 // line, same as a coordinator range - so alphabet/lowerBound/upperBound are
 // populated for it too. Continuous mode has no such line (it moves on to

@@ -2,9 +2,8 @@
 // standalone proxy kernel) over a bounded candidateLen=10 range of about
 // 28.8 billion candidates, using this project's real 49-character
 // alphabet and an unreachable target hash so it runs to completion instead
-// of stopping early on a match. Linked against namebreak.cu directly (built
-// with -DNAMEBREAK_NO_MAIN), so this measures the exact code that ships, not
-// a reimplementation of it.
+// of stopping early on a match. Linked against namebreak.cu directly, so
+// this measures the exact code that ships, not a reimplementation of it.
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
 // to the current directory - `make search_bench` runs this from

@@ -56,7 +56,7 @@ struct SearchResult {
 // abortRequested is - but instead of ending the search, blocks (still
 // letting a caller's own heartbeat/etc. threads run) until it's cleared
 // again, so the batch already in flight always finishes normally and only
-// the *next* one is held back. See namebreak.cu's main() for the key
+// the *next* one is held back. See main.cpp's main() for the key
 // listener that drives this.
 //
 // Safe to call more than once in the same process (e.g. once per claimed

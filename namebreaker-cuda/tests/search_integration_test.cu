@@ -1,6 +1,5 @@
 // End-to-end correctness test for the *actual* runSearch() (namebreak.cu),
-// not a reimplementation of it - linked in directly (built with
-// -DNAMEBREAK_NO_MAIN so this file's main() doesn't collide with its own).
+// not a reimplementation of it - linked in directly.
 //
 // Every case compares runSearch()'s results against an independent CPU
 // reference that brute-forces the same range one candidate at a time (with
