@@ -180,7 +180,7 @@ void runOneRange(const std::string& serverUrl, const std::string& token, const C
     }
 
     if (callbacks && callbacks->onRangeClaimed)
-        callbacks->onRangeClaimed(claim, req.outputFilePath);
+        callbacks->onRangeClaimed(claim, req);
 
     std::mutex lastMatchMutex;
     std::string lastHashAMatch;

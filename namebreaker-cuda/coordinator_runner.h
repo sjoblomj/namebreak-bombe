@@ -8,6 +8,7 @@
 
 #include "config.h"
 #include "protocol.h"
+#include "search.h"
 
 struct CoordinatorArgs {
     std::string serverUrl;
@@ -41,13 +42,18 @@ bool buildCoordinatorArgs(const std::map<std::string, std::string>& section, Coo
 // inside one of these; write into caller-owned, mutex-protected state
 // instead and let the GUI's own thread read that on its own schedule.
 struct CoordinatorCallbacks {
-    // Fired once a range is claimed, before it's searched - gives the
-    // target name, leaseSeconds (usable as a rough progress-bar time
-    // budget - see search.h/ClaimResponse's doc comments; there's no live
-    // "candidates processed so far" counter available anywhere, client or
-    // server), and the resolved matches file path (SearchRequest::
-    // outputFilePath) that range's Hash-A matches will be appended to.
-    std::function<void(const ClaimResponse&, const std::string& outputFilePath)> onRangeClaimed;
+    // Fired once a range is claimed, before it's searched - gives the target
+    // name and the exact SearchRequest that range is about to run (including
+    // outputFilePath - where that range's Hash-A matches will be appended -
+    // and alphabet/lowerBound/upperBound, which a caller can use together
+    // with the matches file's own last line to derive real progress through
+    // the range: candidates are enumerated in a fixed order (see cpu-utils.h's
+    // stringToIndex), so the most recent Hash-A-only match's position in that
+    // order is a truer measure of how far a search has gotten than any
+    // time-based guess - there's no live "candidates processed so far"
+    // counter available anywhere, client or server, so this is the best
+    // signal there is).
+    std::function<void(const ClaimResponse&, const SearchRequest&)> onRangeClaimed;
     // Fired when the current range's search ends, however it ended (found,
     // exhausted, or aborted) - lets a progress bar be reset/completed.
     std::function<void(bool found)> onRangeFinished;
