@@ -1,4 +1,4 @@
-#include "platform.h"
+#include "common/platform.h"
 
 #include <cstdlib>
 #include <cstdio>
@@ -135,7 +135,7 @@ int readKeypressBlocking() {
         ssize_t n = read(fileno(stdin), &c, 1);
         if (n == 1)
             return (int) c;
-        // A signal (namebreak.cu's own SIGINT handler, e.g.) interrupting
+        // A signal (cuda_backend.cu's own SIGINT handler, e.g.) interrupting
         // this blocking read looks identical to any other error unless
         // EINTR is checked for and retried - without this, the first Ctrl+C
         // would silently kill this listener thread (read() returning -1

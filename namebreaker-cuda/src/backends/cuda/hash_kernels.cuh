@@ -3,10 +3,10 @@
 
 #include <cstdint>
 #include <cstring>
-#include "constants.h"
+#include "engine/constants.h"
 
 // Device-side hashing/candidate-decoding building blocks shared between
-// namebreak.cu's real search kernel and this project's GPU-backed tests
+// cuda_backend.cu's real search kernel and this project's GPU-backed tests
 // (tests/search_bench.cu, tests/search_integration_test.cu, ...) - kept in
 // one header so the code under test is always exactly the code that ships,
 // never a copy that could drift out of sync.
@@ -69,7 +69,7 @@ __device__ __constant__ uint32_t d_cryptTable[0x500];
 __device__ uint32_t mpqHashCandidateAndSuffix(const char* candidate, int candidateLen, uint32_t seed1, uint32_t seed2) {
     // unsigned so a byte >= 0x80 zero-extends into the crypt-table index/seed
     // arithmetic instead of sign-extending to a negative value - must match
-    // cpu-utils.cpp's host-side hash exactly, or a match found on one side
+    // cpu_utils.cpp's host-side hash exactly, or a match found on one side
     // would never reproduce on the other.
     for (int i = 0; i < candidateLen; ++i) {
         unsigned char ch = candidate[i];
@@ -122,7 +122,7 @@ __device__ uint32_t mpqHashSeed1(const char* str) {
 // AlphabetSize is a compile-time template parameter so this modulus/division -
 // run once per candidate character, for every thread - stays a cheap
 // compiler-optimized constant instead of a real (much slower) GPU integer
-// division. See runCudaBatch in namebreak.cu for the fixed set of sizes this
+// division. See runCudaBatch in cuda_backend.cu for the fixed set of sizes this
 // gets instantiated for and the runtime dispatch between them.
 template<int AlphabetSize>
 __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCandidate) {
@@ -133,8 +133,8 @@ __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCand
 }
 
 // No hasForbiddenSymbolRun/countBackslashes here (deliberately - see
-// bruteForceKernel's doc comment in namebreak.cu and
-// hasForbiddenSymbolRun_CPU's in cpu-utils.h): those checks only ever run on
+// bruteForceKernel's doc comment in cuda_backend.cu and
+// hasForbiddenSymbolRun_CPU's in cpu_utils.h): those checks only ever run on
 // the CPU now, against the leading characters, before this candidate's batch
 // is even launched.
 

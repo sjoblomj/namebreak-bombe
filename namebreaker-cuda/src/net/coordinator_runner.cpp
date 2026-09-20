@@ -1,4 +1,4 @@
-#include "coordinator_runner.h"
+#include "net/coordinator_runner.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,11 +16,11 @@
 
 #include <curl/curl.h>
 
-#include "config.h"
-#include "coordinator_client.h"
-#include "cpu-utils.h"
-#include "platform.h"
-#include "search.h"
+#include "common/config.h"
+#include "net/coordinator_client.h"
+#include "engine/cpu_utils.h"
+#include "common/platform.h"
+#include "engine/search.h"
 
 namespace {
 

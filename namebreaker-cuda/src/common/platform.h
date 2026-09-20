@@ -23,7 +23,7 @@ std::string resolveUsername();
 bool isInteractiveTerminal();
 
 // Enables raw, unbuffered, no-echo single-keypress reading on stdin (used by
-// the pause/resume key listener - see main.cpp's main()). POSIX: puts
+// the pause/resume key listener - see src/cli/main.cpp's main()). POSIX: puts
 // the terminal into "cbreak" mode (ICANON/ECHO off) but deliberately leaves
 // ISIG on, so Ctrl+C/Ctrl+Z keep working exactly as normal; also installs a
 // best-effort SIGINT/SIGTERM handler that restores the terminal before the
@@ -31,7 +31,7 @@ bool isInteractiveTerminal();
 // coordinator mode's infinite loop would kill the process while stdin is
 // still in raw/no-echo mode, leaving the user's shell needing `stty sane` to
 // recover. A caller is free to install its own SIGINT handler afterward to
-// customize just that signal's behavior further (see main.cpp's main(),
+// customize just that signal's behavior further (see src/cli/main.cpp's main(),
 // which does this to make a first Ctrl+C pause instead of quit) - SIGTERM's
 // handler is left as this function installed it either way, since SIGTERM
 // should always just mean "terminate", never "pause". Windows: a no-op that

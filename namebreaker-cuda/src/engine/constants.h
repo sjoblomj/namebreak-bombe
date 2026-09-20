@@ -3,14 +3,14 @@
 
 // Upper bound on the alphabet's character count, sizing the device-side
 // d_alphabet buffer. Must be >= the largest size in the fixed set of
-// compile-time-templated sizes runCudaBatch() dispatches on in namebreak.cu -
+// compile-time-templated sizes runCudaBatch() dispatches on in cuda_backend.cu -
 // bump this and add a matching dispatch branch to support a bigger alphabet.
 #define MAX_ALPHABET_SIZE 50
 #define MAX_CANDIDATE_LEN 16
 #define MAX_FILENAME_LEN 128
 // How many hashA hits one kernel launch can record. More than this in a single
 // launch is handled by re-searching that launch's range in halves (see
-// runCudaBatch in namebreak.cu), so it only bounds a buffer, not correctness.
+// runCudaBatch in cuda_backend.cu), so it only bounds a buffer, not correctness.
 // Overridable at compile time (-DMAX_MATCHES=N) so tests/search_overflow_test.cu
 // can exercise that path with just a couple of colliding candidates instead of
 // needing >1024 of them. Must be >= 1.
@@ -23,8 +23,8 @@
 // value per group of GPU launches). Overridable at compile time
 // (-DNAMEBREAK_GPU_WINDOW_CHARS=N) so tests can force a different leading/
 // trailing split and benchmarks can re-sweep it. Lives here, not in
-// namebreak.cu, so the tests derive their expectations from the same value
-// instead of duplicating it. See namebreak.cu (runSearch) and README.md's
+// cuda_backend.cu, so the tests derive their expectations from the same value
+// instead of duplicating it. See cuda_backend.cu (runSearch) and README.md's
 // "Design decisions" for what it trades off.
 #ifndef NAMEBREAK_GPU_WINDOW_CHARS
 #define NAMEBREAK_GPU_WINDOW_CHARS 5
@@ -32,7 +32,7 @@
 
 // How many *rows* one kernel launch covers at most (a row = every value of a
 // candidate's last character, for one combination of its other trailing
-// characters - see bruteForceKernel in namebreak.cu), so one launch covers
+// characters - see bruteForceKernel in cuda_backend.cu), so one launch covers
 // at most kRowsPerLaunch * alphabetSize candidates. Bounds how long a single
 // launch can run (pause/abort are only polled between launches). Overridable
 // at compile time (-DNAMEBREAK_ROWS_PER_LAUNCH=N) so tests can force many

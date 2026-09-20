@@ -10,11 +10,11 @@
 #include <cstdio>
 #include <string>
 #include <thread>
-#include "config.h"
-#include "platform.h"
-#include "search.h"
+#include "common/config.h"
+#include "common/platform.h"
+#include "engine/search.h"
 #ifdef NAMEBREAK_WITH_NETWORK
-#include "coordinator_runner.h"
+#include "net/coordinator_runner.h"
 #endif
 
 // Toggled by pauseKeyListener below, polled by runCudaBatch (via runSearch's

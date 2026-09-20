@@ -1,8 +1,11 @@
 #!/bin/bash
 
-# namebreak reads its parameters from config.conf (see config.h) - this
-# script (re)generates that file's [search] section, recomputing the resume
-# point from matches.txt each time, then runs namebreak in "continuous" mode.
+# namebreak reads its parameters from config.conf (see src/common/config.h) -
+# this script (re)generates that file's [search] section in the current
+# directory, recomputing the resume point from matches.txt each time, then
+# runs namebreak (build it first with `make`) in "continuous" mode.
+
+NAMEBREAK="$(dirname "$0")/../build/namebreak"
 
 ALPHABET=" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"
 MAX_BACKSLASH_COUNT=0 # 0 = unlimited
@@ -37,7 +40,7 @@ hash_b = $HASH_B
 prune_symbol_runs = $PRUNE_SYMBOL_RUNS
 EOF
 
-./namebreak
+"$NAMEBREAK"
 
 ## Looking for the real deal
 # prefix = "ART\CHAT_"

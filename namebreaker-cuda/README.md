@@ -16,7 +16,7 @@ suffix** - the prefix and suffix are fixed, known strings (e.g. `REZ\` and
 ## Modes
 
 `namebreak` runs in one of three modes, set via `config.conf`'s `mode = ...`
-(or overridden by passing `--mode <mode>`, e.g. `./namebreak --mode bounded`).
+(or overridden by passing `--mode <mode>`, e.g. `build/namebreak --mode bounded`).
 A different config file can be used instead of `config.conf` via
 `--config <file>`.
 
@@ -96,7 +96,7 @@ plus optional `username`, `hostname` (auto-detected and interactively
 confirmed if omitted), and `poll_interval_secs` (default `30`) - see the
 coordinator README linked above for the full picture.
 
-`run.sh` is a working example: it regenerates `config.conf`'s `[search]`
+`scripts/run.sh` is a working example: it regenerates `config.conf`'s `[search]`
 section from a few shell variables (recomputing `start_candidate` from the
 last line of `matches.txt` each time) and launches `continuous` mode.
 
@@ -105,7 +105,7 @@ last line of `matches.txt` each time) and launches `continuous` mode.
 Requires the CUDA Toolkit (`nvcc`) and a CUDA-capable GPU.
 
 ```sh
-make                          # builds ./namebreak
+make                          # builds build/namebreak
 make ARCH=sm_75               # for a different GPU (see nvidia-smi --query-gpu=compute_cap --format=csv)
 make NETWORK=0                # omit coordinator mode / the libcurl dependency
 ```
@@ -115,7 +115,7 @@ a compile-time template instantiation per size, for performance - the fixed
 set of sizes this build supports (`42, 43, 47, 48, 49, 50`) is checked early
 and fails fast with a clear message if `config.conf`'s alphabet doesn't
 match one of them. Supporting a new size means editing the dispatch table in
-`namebreak.cu` and recompiling.
+`src/backends/cuda/cuda_backend.cu` and recompiling.
 
 `make test` runs the correctness test suite: a pure-CPU unit test, plus
 end-to-end GPU tests that compare real search results against an independent
@@ -126,14 +126,30 @@ crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
 is built in several configurations (different GPU window / launch sizes),
 and each takes about a minute to compile, so `make -j test` is much faster.
 `make search_bench` times the real search over a fixed range; `make
-WINDOW=6 search_bench` re-runs it with a different GPU window.
+WINDOW=6 search_bench` re-runs it with a different GPU window. Everything is
+built into `build/`; `make clean` removes it.
+
+## Source layout
+
+| Directory | What's in it |
+|---|---|
+| `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU |
+| `src/backends/cuda/` | The CUDA kernels and the code that launches them |
+| `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
+| `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `make NETWORK=0`) |
+| `src/cli/` | The console program's `main()` |
+| `src/gui/win32/` | The Windows GUI (`make gui`, Windows only) |
+| `tests/` | Correctness tests and benchmarks (`make test`, `make search_bench`) |
+| `scripts/` | `run.sh`, and the generator for the GUI's embedded icon |
+
+Includes are written relative to `src/` (e.g. `#include "engine/search.h"`).
 
 ## Design decisions
 
 ### The GPU doesn't brute-force the whole candidate
 
 Only a small, fixed-size trailing window of each candidate (`gpuWindowChars`
-characters, currently 5, set in `constants.h`) is enumerated directly on the
+characters, currently 5, set in `src/engine/constants.h`) is enumerated directly on the
 GPU. Anything beyond that is treated as an extension of the prefix: every
 combination of those leading characters is enumerated on the CPU and its
 hash contribution folded in once (incrementally - O(1) amortized per step,
@@ -171,7 +187,7 @@ of them separately re-hashing the whole trailing window from scratch.
 One kernel launch doesn't necessarily cover a whole leading value's
 trailing space at once, though - it covers at most
 `NAMEBREAK_ROWS_PER_LAUNCH` rows (8,388,608 by default, set in
-`constants.h`), and always a whole number of them: a launch's boundaries
+`src/engine/constants.h`), and always a whole number of them: a launch's boundaries
 land on row boundaries, except possibly at the very start or end of the
 range being searched. That's what makes the window above a *launch-size*
 knob rather than only a per-thread-cost one - and it's also what bounds how

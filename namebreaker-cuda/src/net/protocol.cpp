@@ -4,7 +4,7 @@
 // (string/number/bool/null fields only, no nesting) - in keeping with the
 // rest of this codebase (hand-rolled MPQ hashing, alphabet indexing, etc.)
 // rather than pulling in an external dependency for this small a job.
-#include "protocol.h"
+#include "net/protocol.h"
 
 #include <cctype>
 #include <cstdio>

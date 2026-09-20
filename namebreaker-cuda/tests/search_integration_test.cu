@@ -1,4 +1,4 @@
-// End-to-end correctness test for the *actual* runSearch() (namebreak.cu),
+// End-to-end correctness test for the *actual* runSearch() (cuda_backend.cu),
 // not a reimplementation of it - linked in directly.
 //
 // Every case compares runSearch()'s results against an independent CPU
@@ -19,7 +19,7 @@
 // Groups:
 //  1-5. The original scenarios: leading/trailing split, pruneSymbolRuns and
 //     maxBackslashCount (CPU-side, leading characters only - see
-//     hasForbiddenSymbolRun_CPU's comment in cpu-utils.h), maxBackslashCount
+//     hasForbiddenSymbolRun_CPU's comment in cpu_utils.h), maxBackslashCount
 //     excluding the prefix, and lower_bound == upper_bound. Pruning ones run
 //     twice: once with the target on the surviving side (must be found) and
 //     once on the pruned side (must NOT be).
@@ -50,7 +50,7 @@
 // disagrees with the fast kernel that reported it.
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - `make test` runs this from tests/.testrun/ to
+// to the current directory - `make test` runs this from build/testrun/ to
 // keep it away from the project's real matches.txt; run the binary directly
 // from somewhere else disposable if not going through `make test`.
 
@@ -73,9 +73,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
-#include "../search.h"
-#include "../cpu-utils.h"
-#include "../constants.h"
+#include "engine/search.h"
+#include "engine/cpu_utils.h"
+#include "engine/constants.h"
 
 static const int kWindow = NAMEBREAK_GPU_WINDOW_CHARS;
 static const uint64_t kRowsPerLaunch = NAMEBREAK_ROWS_PER_LAUNCH;
@@ -138,7 +138,7 @@ static uint32_t hashA(const std::string& s) { return hashWithTable(s, 0x100); }
 static uint32_t hashB(const std::string& s) { return hashWithTable(s, 0x200); }
 
 // Mirrors runSearch()'s own computation of how many candidate characters the
-// GPU enumerates (namebreak.cu: maxSafeIndexLen / trailingLen) - needed
+// GPU enumerates (cuda_backend.cu: maxSafeIndexLen / trailingLen) - needed
 // because the leading-only pruning rules apply to exactly the other characters.
 static int maxSafeIndexLenFor(int alphabetSize) {
     uint64_t product = 1;

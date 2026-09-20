@@ -1,4 +1,4 @@
-#include "coordinator_client.h"
+#include "net/coordinator_client.h"
 
 namespace {
 std::string authHeader(const std::string& token) {

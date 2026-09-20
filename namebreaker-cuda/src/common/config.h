@@ -5,7 +5,7 @@
 #include <set>
 #include <string>
 
-#include "search.h"
+#include "engine/search.h"
 
 // Where namebreak reads its config from absent a --config <file> argument -
 // see ConfigFile below. Shared so every file that needs to reference it (for

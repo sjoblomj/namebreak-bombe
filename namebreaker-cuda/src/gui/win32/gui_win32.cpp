@@ -1,7 +1,7 @@
 // A little native Win32 GUI for namebreak - built only on Windows (see the
 // Makefile's `namebreak-gui` target), linking the same search/coordinator/
 // config/platform sources the console `namebreak` binary does - everything
-// but its main.cpp, so this file's own main() is the process entry point.
+// but its src/cli/main.cpp, so this file's own main() is the process entry point.
 // Built with /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup (see the
 // Makefile) so the process has no console, but the CRT still calls this
 // ordinary main() rather than requiring a WinMain() - which also means this
@@ -56,13 +56,13 @@
 #include <utility>
 #include <vector>
 
-#include "config.h"
-#include "coordinator_runner.h"
-#include "cpu-utils.h"
-#include "icon_bmp.h"
-#include "logo_bmp.h"
-#include "platform.h"
-#include "protocol.h"
+#include "common/config.h"
+#include "net/coordinator_runner.h"
+#include "engine/cpu_utils.h"
+#include "gui/win32/resources/icon_bmp.h"
+#include "gui/win32/resources/logo_bmp.h"
+#include "common/platform.h"
+#include "net/protocol.h"
 
 namespace {
 
@@ -125,7 +125,7 @@ struct SharedStatus {
     // derives a real progress fraction from these plus the matches file's
     // own last line (see matchProgressFraction/updateUiFromSharedState)
     // instead of guessing from elapsed time: candidates are enumerated in a
-    // fixed order (cpu-utils.h's stringToIndex), so the most recent Hash-A-
+    // fixed order (cpu_utils.h's stringToIndex), so the most recent Hash-A-
     // only match's position in that order is a true measure of how far a
     // search has gotten - the same signal the coordinator server itself
     // already uses for stall detection (see coordinator/README.md). When
@@ -204,7 +204,7 @@ std::vector<std::string> readLastLines(const std::string& path, size_t maxLines)
 
 // Fraction (0.0-1.0) of the way `matchFilename` (a full prefix+candidate+
 // suffix line from the matches file) sits between `lowerBound` and
-// `upperBound` in `alphabet`'s enumeration order (cpu-utils.h's
+// `upperBound` in `alphabet`'s enumeration order (cpu_utils.h's
 // stringToIndex - the same fixed odometer order runSearch() itself
 // enumerates candidates in). Returns -1.0 if it can't be computed (mismatched
 // candidate lengths - shouldn't happen for a single bounded-shaped range/
@@ -1161,7 +1161,7 @@ void onStatus(const std::string& text) {
 }
 
 // Runs a single bounded/continuous search directly (no coordinator server
-// involved - see main.cpp's main() for the CLI's equivalent one-shot
+// involved - see src/cli/main.cpp's main() for the CLI's equivalent one-shot
 // call). Bounded mode searches one fixed candidate length - a real finish
 // line, same as a coordinator range - so alphabet/lowerBound/upperBound are
 // populated for it too. Continuous mode has no such line (it moves on to

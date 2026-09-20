@@ -43,7 +43,7 @@ struct RegisterResponse {
 // lowerBoundFilename/upperBoundFilename are both inclusive, full filenames
 // (prefix+candidate+suffix) - directly usable as SearchRequest's
 // startCandidate/lowerBound/upperBound once stripped of prefix/suffix (see
-// remove_prefix_and_suffix in cpu-utils.h).
+// remove_prefix_and_suffix in cpu_utils.h).
 struct ClaimResponse {
     int64_t rangeId = 0;
     int64_t targetId = 0;

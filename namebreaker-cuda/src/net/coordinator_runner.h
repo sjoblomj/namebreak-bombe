@@ -6,9 +6,9 @@
 #include <map>
 #include <string>
 
-#include "config.h"
-#include "protocol.h"
-#include "search.h"
+#include "common/config.h"
+#include "net/protocol.h"
+#include "engine/search.h"
 
 struct CoordinatorArgs {
     std::string serverUrl;
@@ -47,7 +47,7 @@ struct CoordinatorCallbacks {
     // outputFilePath - where that range's Hash-A matches will be appended -
     // and alphabet/lowerBound/upperBound, which a caller can use together
     // with the matches file's own last line to derive real progress through
-    // the range: candidates are enumerated in a fixed order (see cpu-utils.h's
+    // the range: candidates are enumerated in a fixed order (see cpu_utils.h's
     // stringToIndex), so the most recent Hash-A-only match's position in that
     // order is a truer measure of how far a search has gotten than any
     // time-based guess - there's no live "candidates processed so far"

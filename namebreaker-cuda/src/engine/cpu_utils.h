@@ -10,7 +10,7 @@
 std::pair<uint32_t, uint32_t > mpqHashWithPrefixCache_CPU(const char* str, const uint32_t* cryptTable);
 
 // CPU-side pruning, applied to the *leading* characters of a candidate
-// (runSearch's leadingIdx loop, namebreak.cu) - the GPU-brute-forced trailing
+// (runSearch's leadingIdx loop, cuda_backend.cu) - the GPU-brute-forced trailing
 // characters are never checked at all. See README.md's "Design decisions"
 // section for why.
 //
@@ -110,7 +110,7 @@ std::string remove_prefix_and_suffix(std::string base, std::string prefix, std::
 
 // Returns false (with `error` set) if `input` contains a character not in
 // `alphabet`; otherwise fills `out` per getLowerBound/getUpperBound's own
-// doc comments (in cpu-utils.cpp) and returns true.
+// doc comments (in cpu_utils.cpp) and returns true.
 bool getLowerBound(const std::string& input, const std::string& alphabet, std::string& out, std::string& error);
 bool getUpperBound(const std::string& input, const std::string& alphabet, std::string& out, std::string& error);
 

@@ -4,8 +4,8 @@
 #include <algorithm>
 #include <vector>
 #include <string>
-#include "constants.h"
-#include "cpu-utils.h"
+#include "engine/constants.h"
+#include "engine/cpu_utils.h"
 
 // Terminology:
 // * Candidate = The part of the name that we are brute-forcing
@@ -17,7 +17,7 @@ std::pair<uint32_t, uint32_t > mpqHashWithPrefixCache_CPU(const char* str, const
     uint32_t seed2 = 0xEEEEEEEE;
     // unsigned so a byte >= 0x80 zero-extends into the crypt-table index/seed
     // arithmetic below instead of sign-extending to a negative value - must
-    // match namebreak.cu's device-side hash functions exactly, or a match
+    // match cuda_backend.cu's device-side hash functions exactly, or a match
     // found on one side would never reproduce on the other.
     unsigned char ch;
 

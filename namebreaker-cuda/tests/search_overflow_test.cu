@@ -19,7 +19,7 @@
 //  * and it doesn't poison the next runSearch() call (matchCount is reset).
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - `make test` runs this from tests/.testrun/.
+// to the current directory - `make test` runs this from build/testrun/.
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -35,9 +35,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
-#include "../search.h"
-#include "../cpu-utils.h"
-#include "../constants.h"
+#include "engine/search.h"
+#include "engine/cpu_utils.h"
+#include "engine/constants.h"
 
 static_assert(MAX_MATCHES == 1, "this test must be built with -DMAX_MATCHES=1 (see the Makefile)");
 

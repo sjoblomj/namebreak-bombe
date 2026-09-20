@@ -9,7 +9,7 @@
 // One request to search a candidate space for a target MPQ hash pair. All of
 // startCandidate/lowerBound/upperBound are candidate-only strings (no
 // prefix/suffix) - see remove_prefix_and_suffix/getStartCandidate in
-// cpu-utils.h for stripping a full filename down to just the candidate.
+// cpu_utils.h for stripping a full filename down to just the candidate.
 struct SearchRequest {
     std::string alphabet;
     int maxBackslashCount = 0;
@@ -56,7 +56,7 @@ struct SearchResult {
 // abortRequested is - but instead of ending the search, blocks (still
 // letting a caller's own heartbeat/etc. threads run) until it's cleared
 // again, so the batch already in flight always finishes normally and only
-// the *next* one is held back. See main.cpp's main() for the key
+// the *next* one is held back. See src/cli/main.cpp's main() for the key
 // listener that drives this.
 //
 // Safe to call more than once in the same process (e.g. once per claimed

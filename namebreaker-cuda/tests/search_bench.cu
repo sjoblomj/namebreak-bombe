@@ -2,12 +2,12 @@
 // standalone proxy kernel) over a bounded candidateLen=10 range of about
 // 28.8 billion candidates, using this project's real 49-character
 // alphabet and an unreachable target hash so it runs to completion instead
-// of stopping early on a match. Linked against namebreak.cu directly, so
+// of stopping early on a match. Linked against cuda_backend.cu directly, so
 // this measures the exact code that ships, not a reimplementation of it.
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
 // to the current directory - `make search_bench` runs this from
-// tests/.testrun/ to keep it away from the project's real matches.txt; run
+// build/testrun/ to keep it away from the project's real matches.txt; run
 // the binary directly from somewhere else disposable if not going through
 // `make search_bench`.
 
@@ -16,8 +16,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <string>
-#include "../search.h"
-#include "../cpu-utils.h"
+#include "engine/search.h"
+#include "engine/cpu_utils.h"
 
 int main(int argc, char** argv) {
     bool pruneSymbolRuns = !(argc >= 2 && std::string(argv[1]) == "noprune");
@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     const std::string suffix = ".WAV";
     const int candidateLen = 10;
     // Chosen directly in full-candidate space (not tied to any particular
-    // leading/trailing split - namebreak.cu picks that internally via
+    // leading/trailing split - cuda_backend.cu picks that internally via
     // gpuWindowChars) so this bound, and therefore this benchmark, works
     // unchanged regardless of what NAMEBREAK_GPU_WINDOW_CHARS is compiled
     // with - a fixed ~28.8B total, for direct comparability across runs.

@@ -7,8 +7,8 @@ pair to search for), carves each target's candidate space into time-boxed
 directly in `namebreak` itself (`../namebreaker-cuda`) as its `coordinator`
 mode: it registers, claims a range, searches it in-process (no subprocess),
 heartbeats progress, and reports back when it's done - see
-`../namebreaker-cuda/coordinator_runner.h` for that loop and
-`../namebreaker-cuda/protocol.h` for the wire types, kept in sync by hand with
+`../namebreaker-cuda/src/net/coordinator_runner.h` for that loop and
+`../namebreaker-cuda/src/net/protocol.h` for the wire types, kept in sync by hand with
 this directory's `protocol/` crate below (same JSON shapes, same server).
 
 ```
@@ -73,11 +73,11 @@ See the top-level plan/design notes for the full rationale; the short version:
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
   without brackets/backslash and with a reduced punctuation set, currently
   `size50`, `size49`, `size48`, `size47`, `size43` and `size42`. The set of
-  distinct *sizes* (42/43/47/48/49/50) is compiled into `namebreak.cu` as
+  distinct *sizes* (42/43/47/48/49/50) is compiled into namebreak's CUDA backend as
   separate template instantiations (the same zero-cost trick already used for
   `--prune-symbol-runs`), so picking a different alphabet costs no performance -
   but it does mean a genuinely new *size* (not just a new named profile at an
-  existing size) requires editing `namebreak.cu`'s dispatch and
+  existing size) requires editing its dispatch and
   recompiling/redistributing the binary to volunteers.
 - **Backslash limiting**: each target also has a `max_backslash_count` (default
   `0` = unlimited). `namebreak` discards any candidate with more `\` occurrences
@@ -224,7 +224,7 @@ curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecre
 Build `namebreak` as usual first (see `../namebreaker-cuda/Makefile` - the
 default build includes coordinator support; `make NETWORK=0` omits it). Then,
 from wherever you want `matches.txt` written, create a `config.conf` (see
-`../namebreaker-cuda/config.h`) with a `[coordinator]` section:
+`../namebreaker-cuda/src/common/config.h`) with a `[coordinator]` section:
 
 ```sh
 cd run   # or any working directory of your choice
@@ -235,7 +235,7 @@ mode = coordinator
 server_url = http://localhost:8080
 username = yourname
 EOF
-../namebreaker-cuda/namebreak
+../namebreaker-cuda/build/namebreak
 ```
 
 `hostname` (optional) defaults to the machine's actual hostname;

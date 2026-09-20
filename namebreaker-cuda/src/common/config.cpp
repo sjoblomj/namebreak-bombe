@@ -1,10 +1,10 @@
-#include "config.h"
+#include "common/config.h"
 
 #include <cctype>
 #include <fstream>
 #include <vector>
 
-#include "cpu-utils.h"
+#include "engine/cpu_utils.h"
 
 namespace {
 

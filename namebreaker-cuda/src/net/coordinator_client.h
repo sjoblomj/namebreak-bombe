@@ -5,8 +5,8 @@
 #include <optional>
 #include <string>
 
-#include "http_client.h"
-#include "protocol.h"
+#include "net/http_client.h"
+#include "net/protocol.h"
 
 // Talks to the coordinator server's HTTP API
 // Not thread-safe: each thread that needs to make requests (the
