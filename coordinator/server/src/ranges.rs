@@ -314,11 +314,11 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         // 1) Reuse this target's own oldest pending range, if it has one -
         // either a fresh chunk nobody's claimed yet, or the unsearched
         // remainder of a range whose previous claimant's lease expired.
-        // Either way it's already a clean, ready-to-run slice: reclaim_expired
-        // resolves the progress-based resume point (and splits off any
-        // already-searched portion as its own completed row) as soon as it
-        // detects the expiry, so a 'pending' row's start_index is always
-        // correct here - there's nothing left to compute.
+        // A released range keeps its checkpointed progress_index while it
+        // sits pending (see `release_range`), so its previous claimant can
+        // still re-adopt it as-is - only now that it's actually being handed
+        // out is its already-searched portion split off as its own completed
+        // row, leaving just the unsearched remainder to assign here.
         let pending = sqlx::query_as::<_, Range>(
             "SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1",
         )
@@ -327,6 +327,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         .await?;
 
         if let Some(range) = pending {
+            let range = split_off_searched_portion(&mut tx, range, now).await?;
             let lease_seconds = lease_seconds_for(config, range.end_index - range.start_index, rate);
 
             sqlx::query(
@@ -560,14 +561,40 @@ pub async fn heartbeat_range(
 ) -> Result<HeartbeatOutcome, AppError> {
     let mut tx = pool.begin().await?;
 
-    let range = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?")
+    let mut range = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?")
         .bind(range_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound)?;
 
-    if range.status != "in_progress" || range.assigned_user_id != Some(user.id) {
+    let target_status: String = sqlx::query_scalar("SELECT status FROM targets WHERE id = ?")
+        .bind(range.target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let target_solved = target_status == "solved";
+
+    let owns_range = range.status == "in_progress" && range.assigned_user_id == Some(user.id);
+    // A client that lost its lease (a network outage outlasting it, say) but
+    // kept searching regardless: if nobody else has claimed the range in the
+    // meantime, it's still sitting pending exactly as this client left it
+    // (see `release_range`), so hand it straight back rather than making the
+    // client abort and someone else redo the work. Only for an active target
+    // - the same work claim_range itself would be willing to hand out.
+    let can_readopt = range.status == "pending" && range.last_assigned_user_id == Some(user.id) && target_status == "active";
+    if !owns_range && !can_readopt {
         return Err(AppError::Conflict("range is not currently assigned to you".into()));
+    }
+    if can_readopt {
+        let now = now_unix();
+        sqlx::query("UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, assigned_at = COALESCE(assigned_at, ?) WHERE id = ?")
+            .bind(user.id)
+            .bind(now)
+            .bind(range_id)
+            .execute(&mut *tx)
+            .await?;
+        range.status = "in_progress".into();
+        range.assigned_user_id = Some(user.id);
+        tracing::info!(range_id, user_id = user.id, "re-adopted a released range for its returning previous claimant");
     }
 
     // True only if this heartbeat's reported progress is genuinely new, not
@@ -590,12 +617,6 @@ pub async fn heartbeat_range(
                 .await?;
         }
     }
-
-    let target_status: String = sqlx::query_scalar("SELECT status FROM targets WHERE id = ?")
-        .bind(range.target_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let target_solved = target_status == "solved";
 
     let lease_seconds = range.lease_seconds.unwrap_or(300);
     let now = now_unix();
@@ -707,15 +728,27 @@ pub async fn complete_range(
     // with a fabricated filename was always possible, since the server
     // never re-verifies a reported filename's hash - the ownership check
     // was only ever a staleness filter, not real authentication of the claim.
-    let owns_range = range.status == "in_progress" && range.assigned_user_id == Some(user.id);
+    //
+    // A range released back to pending but not yet claimed by anyone else
+    // still counts as this client's own, same as for heartbeat_range's
+    // re-adoption: a client that lost its lease (a network outage, say) but
+    // kept searching and finished offline reports in with /complete first,
+    // never getting a heartbeat in to re-adopt it. Unlike re-adoption, the
+    // target doesn't need to still be active - the work is already done, so
+    // there's nothing left to hand out, only a result to record.
+    let owns_range = (range.status == "in_progress" && range.assigned_user_id == Some(user.id))
+        || (range.status == "pending" && range.last_assigned_user_id == Some(user.id));
     if !owns_range && !found {
         return Err(AppError::Conflict("range is not currently assigned to you".into()));
     }
 
     let now = now_unix();
     if owns_range {
-        sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ? WHERE id = ?")
+        // assigned_user_id is only for the pending case, where it was cleared
+        // on release - for an in_progress range it's already this user.
+        sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ?, assigned_user_id = ? WHERE id = ?")
             .bind(now)
+            .bind(user.id)
             .bind(range_id)
             .execute(&mut *tx)
             .await?;
@@ -764,26 +797,11 @@ pub async fn complete_range(
     Ok(CompleteOutcome { target_solved })
 }
 
-/// Resolves any range whose lease expired while still `in_progress`, one at a
+/// Releases any range whose lease expired while still `in_progress`, one at a
 /// time (each in its own transaction, so a concurrent `/claim` can never see a
 /// half-updated row - it only ever sees the fully-resolved end state, exactly
-/// as if this had run instantaneously). For each expired range, resumes from
-/// wherever a previous client's heartbeats confirmed as searched
-/// (`progress_index`), same three outcomes `claim_range` used to compute
-/// lazily on the next claim:
-///   - fully searched already (checkpoint reached the end, no match ever
-///     reported) -> close it out, nothing left to hand out;
-///   - real progress was made -> split it: finalize the searched portion as
-///     its own `completed` row (still credited to whoever actually searched
-///     it, via `last_assigned_user_id`), and leave a fresh `pending` row for
-///     just the unsearched remainder;
-///   - no progress was ever checkpointed -> make the whole thing `pending`
-///     again as-is.
-///
-/// Doing this here rather than lazily in `claim_range` means a range sitting
-/// reclaimed-but-unclaimed already shows its accurate split/resume state (on
-/// the dashboard, in `/status`) instead of only resolving once someone happens
-/// to claim it.
+/// as if this had run instantaneously). See `release_range` for what releasing
+/// means.
 pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     let now = now_unix();
     let mut resolved = 0u64;
@@ -809,29 +827,27 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     Ok(resolved)
 }
 
-/// Releases `range` back to the pool: resumes from wherever a previous
-/// client's heartbeats confirmed as searched (`progress_index`), same three
-/// outcomes `claim_range` used to compute lazily on the next claim:
+/// Releases `range` back to the pool:
 ///   - fully searched already (checkpoint reached the end, no match ever
 ///     reported) -> close it out, nothing left to hand out;
-///   - real progress was made -> split it: finalize the searched portion as
-///     its own `completed` row (still credited to whoever actually searched
-///     it, via `last_assigned_user_id`), and leave a fresh `pending` row for
-///     just the unsearched remainder;
-///   - no progress was ever checkpointed -> make the whole thing `pending`
-///     again as-is.
+///   - otherwise -> make it `pending` again, as a single row, still carrying
+///     its `progress_index` and `last_assigned_user_id`.
+///
+/// The already-searched portion (if any) is deliberately *not* split off
+/// here: until someone else claims the range, its previous claimant may yet
+/// come back (a client that lost connectivity but kept searching) and
+/// re-adopt it under the very same range id it's still heartbeating - see
+/// `heartbeat_range`. `claim_range` does the split instead, once the range
+/// is actually handed to someone - see `split_off_searched_portion`.
 ///
 /// Shared by reclaim_expired (lease actually expired) and heartbeat_range
-/// (client paused too long - see PAUSE_RELEASE_SECONDS) - both mean the same
+/// (client stalled too long - see STALL_RELEASE_SECONDS) - both mean the same
 /// thing to this range: whoever holds it isn't making progress, so hand
 /// whatever's left back to the pool.
 async fn release_range(tx: &mut sqlx::SqliteConnection, range: &Range, now: i64) -> Result<(), sqlx::Error> {
-    let effective_start = match range.progress_index {
-        Some(p) if p + 1 > range.start_index => p + 1,
-        _ => range.start_index,
-    };
+    let fully_searched = matches!(range.progress_index, Some(p) if p + 1 >= range.end_index);
 
-    if effective_start >= range.end_index {
+    if fully_searched {
         sqlx::query(
             "UPDATE ranges SET status = 'completed', completed_at = ?, \
              assigned_user_id = NULL, lease_expires_at = NULL, last_progress_at = NULL WHERE id = ?",
@@ -840,41 +856,14 @@ async fn release_range(tx: &mut sqlx::SqliteConnection, range: &Range, now: i64)
         .bind(range.id)
         .execute(&mut *tx)
         .await?;
-    } else if effective_start > range.start_index {
-        sqlx::query(
-            "UPDATE ranges SET end_index = ?, status = 'completed', completed_at = ?, \
-             progress_index = NULL, assigned_user_id = NULL, lease_expires_at = NULL, last_progress_at = NULL WHERE id = ?",
-        )
-        .bind(effective_start)
-        .bind(now)
-        .bind(range.id)
-        .execute(&mut *tx)
-        .await?;
-
-        // Carries the original range's own alphabet and priority-range
-        // origin forward, not the target's current alphabet - the
-        // target's alphabet may have been patched since this range was
-        // originally carved (see `models::Range::alphabet`), and this
-        // remainder is still the same priority range's work if the
-        // original was (see `models::Range::priority_range_id`).
-        sqlx::query(
-            "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-             assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id) \
-             VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?)",
-        )
-        .bind(range.target_id)
-        .bind(range.candidate_len)
-        .bind(effective_start)
-        .bind(range.end_index)
-        .bind(now)
-        .bind(&range.alphabet_name)
-        .bind(&range.alphabet)
-        .bind(range.priority_range_id)
-        .execute(&mut *tx)
-        .await?;
     } else {
+        // assigned_at is kept alongside a checkpoint, since it's still when
+        // the searched portion's work began (split_off_searched_portion's
+        // completed row keeps it) - but with no checkpoint there's nothing
+        // it describes any more.
         sqlx::query(
-            "UPDATE ranges SET status = 'pending', assigned_user_id = NULL, assigned_at = NULL, \
+            "UPDATE ranges SET status = 'pending', assigned_user_id = NULL, \
+             assigned_at = CASE WHEN progress_index IS NULL THEN NULL ELSE assigned_at END, \
              lease_expires_at = NULL, last_progress_at = NULL WHERE id = ?",
         )
         .bind(range.id)
@@ -883,6 +872,53 @@ async fn release_range(tx: &mut sqlx::SqliteConnection, range: &Range, now: i64)
     }
 
     Ok(())
+}
+
+/// Called by `claim_range` on the pending row it's about to hand out. A row
+/// released with real progress (see `release_range`) still spans its
+/// already-searched portion - this finalizes that portion as its own
+/// `completed` row (the original row, shrunk, still credited to whoever
+/// actually searched it via `last_assigned_user_id`) and returns a fresh
+/// `pending` row for just the unsearched remainder. A row without a
+/// checkpoint is returned unchanged.
+async fn split_off_searched_portion(tx: &mut sqlx::SqliteConnection, range: Range, now: i64) -> Result<Range, sqlx::Error> {
+    let effective_start = match range.progress_index {
+        Some(p) if p + 1 > range.start_index => p + 1,
+        _ => return Ok(range),
+    };
+
+    sqlx::query(
+        "UPDATE ranges SET end_index = ?, status = 'completed', completed_at = ?, progress_index = NULL WHERE id = ?",
+    )
+    .bind(effective_start)
+    .bind(now)
+    .bind(range.id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Carries the original range's own alphabet and priority-range origin
+    // forward, not the target's current alphabet - the target's alphabet may
+    // have been patched since this range was originally carved (see
+    // `models::Range::alphabet`), and this remainder is still the same
+    // priority range's work if the original was (see
+    // `models::Range::priority_range_id`).
+    let remainder = sqlx::query_as::<_, Range>(
+        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
+         assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id) \
+         VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?) RETURNING *",
+    )
+    .bind(range.target_id)
+    .bind(range.candidate_len)
+    .bind(effective_start)
+    .bind(range.end_index)
+    .bind(now)
+    .bind(&range.alphabet_name)
+    .bind(&range.alphabet)
+    .bind(range.priority_range_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    Ok(remainder)
 }
 
 /// Permanently removes a target and everything carved for it (its ranges and
@@ -1486,12 +1522,14 @@ mod tests {
         assert_eq!(new_worker, Some(second_user.id));
     }
 
-    /// The split itself (searched portion -> completed, remainder -> a fresh
-    /// pending row) must happen inside reclaim_expired, before anyone claims
-    /// anything - not lazily, as a side effect of the next /claim. Checks DB
-    /// state right after reclaim_expired, with no claim_range call in between.
+    /// Releasing a range with real progress must *not* split it straight
+    /// away: until someone else claims it, it stays a single pending row
+    /// still carrying its checkpoint and previous claimant, so that claimant
+    /// can still come back and re-adopt it under the same range id (see
+    /// heartbeat_range). Checks DB state right after reclaim_expired, with no
+    /// claim_range call in between.
     #[tokio::test]
-    async fn reclaim_expired_splits_the_range_itself_without_needing_a_claim() {
+    async fn reclaim_expired_defers_the_split_until_someone_claims_it() {
         let pool = test_pool().await;
         let first_user = insert_user(&pool, "first").await;
         let (lower, upper) = full_bounds(DEFAULT, 3);
@@ -1511,39 +1549,131 @@ mod tests {
             .unwrap();
         assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
 
-        // No claim_range call at all yet - the split must already be visible.
-        let expected_start = midpoint_index + 1;
-        let (orig_status, orig_end, orig_worker): (String, i64, Option<i64>) =
-            sqlx::query_as("SELECT status, end_index, last_assigned_user_id FROM ranges WHERE id = ?")
-                .bind(claim.range_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(orig_status, "completed", "the searched portion must already be closed out by the sweep itself");
-        assert_eq!(orig_end, expected_start);
-        assert_eq!(orig_worker, Some(first_user.id), "still credited to whoever actually searched it");
-
-        let (new_id, new_status, new_start, new_end, new_assigned, new_worker): (i64, String, i64, i64, Option<i64>, Option<i64>) =
-            sqlx::query_as(
-                "SELECT id, status, start_index, end_index, assigned_user_id, last_assigned_user_id \
-                 FROM ranges WHERE target_id = ? AND id != ?",
-            )
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ranges WHERE target_id = ?")
             .bind(claim.target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row_count, 1, "no split yet - nobody else has claimed the range");
+
+        let (status, start, end, progress, assigned, worker): (String, i64, i64, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, start_index, end_index, progress_index, assigned_user_id, last_assigned_user_id FROM ranges WHERE id = ?",
+        )
+        .bind(claim.range_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!((start, end), (0, space_size(DEFAULT, 3)), "still the whole original range");
+        assert_eq!(progress, Some(midpoint_index), "the checkpoint must survive the release");
+        assert!(assigned.is_none());
+        assert_eq!(worker, Some(first_user.id), "still remembers who it belonged to");
+    }
+
+    /// The scenario deferring the split exists for: a client loses
+    /// connectivity long enough for its lease to lapse, keeps searching
+    /// regardless, and heartbeats again once it's back. Nobody else claimed
+    /// the range in the meantime, so it's handed straight back - same range
+    /// id, checkpoint intact, and the newly reported progress applied.
+    #[tokio::test]
+    async fn heartbeat_readopts_a_released_range_nobody_else_claimed() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "flaky").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 3));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+
+        let quarter_index = space_size(DEFAULT, 3) / 4;
+        let quarter_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, quarter_index, 3));
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some(quarter_filename)).await.unwrap();
+
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
+            .bind(claim.range_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+
+        // Back online, having kept searching past the midpoint meanwhile.
+        let midpoint_index = space_size(DEFAULT, 3) / 2;
+        let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
+        let outcome = heartbeat_range(&pool, &config, &user, claim.range_id, Some(midpoint_filename)).await.unwrap();
+        assert!(!outcome.range_released);
+
+        let (status, start, end, progress, assigned, lease_expires_at, last_progress_at): (String, i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT status, start_index, end_index, progress_index, assigned_user_id, lease_expires_at, last_progress_at FROM ranges WHERE id = ?",
+            )
             .bind(claim.range_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(new_status, "pending", "the remainder must already be a distinct, claimable row - not waiting for a /claim to create it");
-        assert_eq!(new_start, expected_start);
-        assert_eq!(new_end, space_size(DEFAULT, 3));
-        assert!(new_assigned.is_none(), "not assigned to anyone until someone actually claims it");
-        assert!(new_worker.is_none(), "nobody has touched this remainder yet");
+        assert_eq!(status, "in_progress");
+        assert_eq!((start, end), (0, space_size(DEFAULT, 3)));
+        assert_eq!(progress, Some(midpoint_index), "the progress reported on return must be applied");
+        assert_eq!(assigned, Some(user.id));
+        assert!(lease_expires_at.unwrap() > now_unix(), "a fresh lease");
+        assert!(last_progress_at.is_some(), "the stall clock must be running again");
 
-        // Claiming it afterward should just hand out this exact pre-split row,
-        // not compute anything new.
+        // And it completes normally under the same range id.
+        complete_range(&pool, &config, &user, claim.range_id, false, None, 1.0, 1).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    /// Re-adoption is only for the range's own previous claimant, and only
+    /// while it's still unclaimed: once someone else has claimed it (splitting
+    /// off the searched portion), a returning claimant's heartbeat is stale
+    /// and its reported progress must be discarded, exactly as before.
+    #[tokio::test]
+    async fn heartbeat_does_not_readopt_a_range_claimed_by_someone_else() {
+        let pool = test_pool().await;
+        let first_user = insert_user(&pool, "first").await;
         let second_user = insert_user(&pool, "second").await;
-        let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("the pre-split remainder should be claimable");
-        assert_eq!(resumed.range_id, new_id);
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 3));
+        let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
+
+        let quarter_index = space_size(DEFAULT, 3) / 4;
+        let quarter_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, quarter_index, 3));
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(quarter_filename)).await.unwrap();
+
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
+            .bind(claim.range_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+
+        // Some other user's heartbeat against the pending row mustn't adopt it either.
+        let result = heartbeat_range(&pool, &config, &second_user, claim.range_id, None).await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+
+        let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("reassignable");
+        assert_ne!(resumed.range_id, claim.range_id);
+
+        let midpoint_index = space_size(DEFAULT, 3) / 2;
+        let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
+        let result = heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename)).await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+
+        let (status, end, progress): (String, i64, Option<i64>) =
+            sqlx::query_as("SELECT status, end_index, progress_index FROM ranges WHERE id = ?")
+                .bind(claim.range_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed", "the searched portion, split off by the second user's claim");
+        assert_eq!(end, quarter_index + 1);
+        assert!(progress.is_none(), "the stale heartbeat's progress must not have been recorded");
+
+        let (resumed_progress,): (Option<i64>,) =
+            sqlx::query_as("SELECT progress_index FROM ranges WHERE id = ?").bind(resumed.range_id).fetch_one(&pool).await.unwrap();
+        assert!(resumed_progress.is_none(), "nor leaked onto the second user's remainder");
     }
 
     /// If a client's last heartbeat before disconnecting already covered the very
@@ -1852,8 +1982,13 @@ mod tests {
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
         assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
 
+        // The split happens once someone else claims it.
+        let second_user = insert_user(&pool, "second").await;
+        let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("remainder should be claimable");
+        assert_ne!(resumed.range_id, claim.range_id);
+
         let (new_priority_range_id,): (Option<i64>,) =
-            sqlx::query_as("SELECT priority_range_id FROM ranges WHERE target_id = ? AND status = 'pending'").bind(target_id).fetch_one(&pool).await.unwrap();
+            sqlx::query_as("SELECT priority_range_id FROM ranges WHERE id = ?").bind(resumed.range_id).fetch_one(&pool).await.unwrap();
         assert_eq!(new_priority_range_id, Some(priority_range_id));
     }
 
@@ -2329,6 +2464,54 @@ mod tests {
 
         let result = complete_range(&pool, &config, &finder, claim.range_id, false, None, 1.0, 1).await;
         assert!(matches!(result, Err(AppError::Conflict(_))));
+    }
+
+    /// A client that lost its lease but kept searching may finish the whole
+    /// range offline, so its first contact on return is /complete rather than
+    /// a heartbeat. If nobody else has claimed the range meanwhile, that
+    /// report must be accepted - closing out the whole range, credited to
+    /// this client - rather than rejected and the range redone.
+    #[tokio::test]
+    async fn complete_range_accepts_a_not_found_report_for_its_own_released_but_unclaimed_range() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "flaky").await;
+        let other = insert_user(&pool, "other").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let target_id = insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+
+        let quarter_index = space_size(DEFAULT, 2) / 4;
+        let quarter_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, quarter_index, 2));
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some(quarter_filename)).await.unwrap();
+
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
+        assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
+
+        // Some other user reporting against the pending row is still stale.
+        let result = complete_range(&pool, &config, &other, claim.range_id, false, None, 1.0, 1).await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+
+        complete_range(&pool, &config, &user, claim.range_id, false, None, 1.0, 1).await.unwrap();
+
+        let (status, start, end, assigned, worker): (String, i64, i64, Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT status, start_index, end_index, assigned_user_id, last_assigned_user_id FROM ranges WHERE id = ?")
+                .bind(claim.range_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!((start, end), (0, space_size(DEFAULT, 2)), "the whole range, not just the checkpointed part");
+        assert_eq!(assigned, Some(user.id));
+        assert_eq!(worker, Some(user.id));
+
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ranges WHERE target_id = ? AND status = 'pending'")
+            .bind(target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0, "nothing left over to hand out again");
     }
 
     #[tokio::test]

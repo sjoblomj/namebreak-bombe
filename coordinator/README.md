@@ -48,8 +48,14 @@ See the top-level plan/design notes for the full rationale; the short version:
 - **Ranges**: a target's candidate space is carved into contiguous chunks sized
   from each user's observed candidates/sec, so a chunk takes roughly
   `TARGET_CHUNK_SECONDS` regardless of GPU speed. A range that isn't completed
-  or heartbeated before its lease expires is automatically reassigned to
-  someone else.
+  or heartbeated before its lease expires is released back to pending, to be
+  reassigned to someone else. Until someone else actually claims it, the
+  client that lost it (e.g. a flaky connection that kept searching offline)
+  can take it back just by heartbeating again - it keeps the same range id and
+  its recorded progress - or, if it finished the range while offline, have its
+  completion accepted as normal. Once another client has claimed it, the
+  returning client's heartbeat or not-found completion is rejected and its
+  reported progress discarded.
 - **Priority ranges**: an operator can flag specific candidate prefixes within
   a target (at one exact length each) as claimable ahead of everything else -
   useful for testing a hunch about the answer without waiting for ordinary
@@ -85,7 +91,8 @@ See the top-level plan/design notes for the full rationale; the short version:
   any. `namebreak` only logs a match after the CUDA batch containing it has
   finished, so everything up to that candidate is known to be searched - the
   server records it as the range's `progress_index`. If the range is later
-  reassigned (lease expired, client disconnected) with real progress recorded,
+  reassigned to another client (lease expired, client disconnected) with real
+  progress recorded,
   the original row is shrunk down to exactly the searched portion and marked
   `completed` (still credited to whoever searched it), and a *new* row is
   carved for the remainder and handed to the next claimer - so the range is
