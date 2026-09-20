@@ -91,7 +91,7 @@ CUDA_SRC   := src/backends/cuda/cuda_backend.cu
 COMMON_SRC := src/common/config.cpp src/common/matches_file.cpp src/common/platform.cpp
 NET_SRC    := src/net/coordinator_runner.cpp src/net/coordinator_client.cpp src/net/http_client.cpp src/net/protocol.cpp
 CLI_SRC    := src/cli/main.cpp
-GUI_SRC    := src/gui/win32/gui_win32.cpp
+GUI_SRC    := $(wildcard src/gui/win32/*.cpp)
 
 # What the search needs, and nothing else - all the tests link.
 SEARCH_SRC := $(ENGINE_SRC) $(CUDA_SRC)

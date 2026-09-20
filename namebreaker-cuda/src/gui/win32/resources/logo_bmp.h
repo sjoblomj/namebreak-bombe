@@ -1,4 +1,4 @@
-// Embedded logo for gui_win32.cpp's setup dialog and About box: a 192x128,
+// Embedded logo for the GUI's setup dialog and About box: a 192x128,
 // 24-bit bottom-up BMP (complete with its BITMAPFILEHEADER), downscaled from
 // namebreak-cuda.png (at the repository root). Embedded as bytes (rather than loaded from disk or a
 // .rc resource) so the GUI stays a single self-contained .exe with no

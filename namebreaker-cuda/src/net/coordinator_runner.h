@@ -36,10 +36,10 @@ struct CoordinatorArgs {
 // section - see CoordinatorArgs above.
 bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::string& error);
 
-// Optional hooks a caller (e.g. the Windows GUI, gui_win32.cpp) can pass into
-// runCoordinator() to observe its progress without a console - the CLI's
-// main() passes none of these (all fields default-null), so its behavior is
-// completely unaffected. Every callback may be called from a background
+// Optional hooks a caller (e.g. the Windows GUI, src/gui/win32/worker.cpp)
+// can pass into runCoordinator() to observe its progress without a console -
+// the CLI's main() passes none of these (all fields default-null), so its
+// behavior is completely unaffected. Every callback may be called from a background
 // thread (the same thread running runCoordinator()/runOneRange()), never
 // the caller's own thread - a GUI must not touch its widgets directly from
 // inside one of these; write into caller-owned, mutex-protected state
