@@ -153,32 +153,65 @@ candidates than they did at a window of 4 (never more).
 
 ### How the GPU kernel is structured
 
-Hashing a candidate is a sequential chain of one step per character, and most
-of a candidate's characters are the same as its neighbours', so the kernel
-works on *rows*: one GPU thread owns one combination of the trailing part's
-first `trailingLen - 1` characters, hashes that shared part once, and then
-loops the last character over the whole alphabet - each candidate costs just
-one more character step plus the suffix. That loop is fully unrolled with the
-alphabet position a compile-time constant, so the per-character hash table
-values are read as constant-bank operands of the ALU instructions themselves
-rather than through a data-dependent lookup (which serializes across a warp
-whenever its threads need different entries). The suffix length is a
-compile-time template parameter too (0-8; longer suffixes take a slower
-runtime-length path). Together these made the kernel about 16x faster than
-the previous one-thread-per-candidate design, while producing bit-identical
-hashes.
+Hashing a candidate means feeding its characters through the hash function
+one at a time, each step depending on the one before it. That means two
+candidates sharing the same first few characters redo the exact same first
+few steps, if hashed independently - wasted, repeated work.
 
-The kernel only *records* the position of each hashA hit. A second, tiny
-kernel (`verifyMatchesKernel`), launched only for a batch that had hits,
-rebuilds each hit's complete filename, checks hashB, and prints - using the
-original, independent hashing code path, so every hit the fast kernel reports
-is cross-checked against a second implementation at runtime (a disagreement
-prints a `WARNING`, and the test suite fails on any). Only the first
-`MAX_MATCHES` (1024) hits of a launch can be recorded; if a launch has more,
-its range is searched again as two halves (recursively) so that every hit is
-still checked against hashB. With a real 32-bit hash that never happens in
-practice (it would take over a thousand collisions in a single launch), but
-it is handled explicitly and tested (`tests/search_overflow_test.cu`).
+The kernel avoids that by working on **rows** instead of individual
+candidates. A row is one fixed value for every trailing character *except
+the last* - e.g. with a 3-character trailing window and alphabet `A..Z`,
+the row `XY*` covers the 26 candidates `XYA`, `XYB`, `XYC`, ... `XYZ`. One
+GPU thread owns one whole row: it hashes the shared part (`XY`) exactly
+once, then loops just the last character over the alphabet, reusing that
+one result for every candidate in the row. So each of those 26 candidates
+costs only one more character step plus the suffix, instead of every one
+of them separately re-hashing the whole trailing window from scratch.
+
+One kernel launch doesn't necessarily cover a whole leading value's
+trailing space at once, though - it covers at most
+`NAMEBREAK_ROWS_PER_LAUNCH` rows (8,388,608 by default, set in
+`constants.h`), and always a whole number of them: a launch's boundaries
+land on row boundaries, except possibly at the very start or end of the
+range being searched. That's what makes the window above a *launch-size*
+knob rather than only a per-thread-cost one - and it's also what bounds how
+long any single launch can run for, since pause and abort are only checked
+*between* launches, not in the middle of one.
+
+Two more things make that per-row loop fast:
+
+- **It's fully unrolled**, with the last character's alphabet position
+  known at compile time for every iteration of the loop. That lets the
+  compiler bake each character's hash-table value directly into the
+  generated instructions, instead of looking it up from memory at runtime.
+  This matters because GPU threads execute in lockstep, 32 at a time (a
+  "warp") - a runtime lookup where each of those 32 threads needs a
+  different table entry serializes the whole warp, one lookup at a time,
+  while a compile-time constant costs nothing extra.
+- **The suffix length is a compile-time parameter too** (for lengths 0-8;
+  longer suffixes fall back to a slower runtime-length loop), for the same
+  reason.
+
+Together, this row-based design measured about 16x faster than the
+previous one-thread-per-candidate kernel, while still producing
+bit-for-bit identical hashes.
+
+That fast kernel only *records where* each hashA hit is - it doesn't build
+the filename or check hashB, keeping its hot path as small as possible. A
+second, much smaller kernel (`verifyMatchesKernel`) runs only when a batch
+actually had a hit: it rebuilds that candidate's complete filename, checks
+hashB, and prints - using the *original*, independent hashing code (not
+the row-based fast path), so every hit gets cross-checked by a second
+implementation at runtime. Any disagreement between the two prints a
+`WARNING`, which the test suite treats as a failure.
+
+Only the first `MAX_MATCHES` (1024) hits from one launch can be recorded
+at all. If a launch somehow has more than that, its range is searched
+again as two halves (recursively, if needed), so every hit still gets
+checked against hashB rather than silently lost. With a real 32-bit hash
+this essentially never happens in practice (it would take over a thousand
+collisions in a single launch), but it's handled explicitly and tested
+(`tests/search_overflow_test.cu`).
 
 ### `prune_symbol_runs` and `max_backslash_count` only run on the CPU
 
