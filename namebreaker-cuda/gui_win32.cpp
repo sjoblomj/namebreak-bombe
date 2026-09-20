@@ -48,6 +48,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -59,6 +61,8 @@
 #include "config.h"
 #include "coordinator_runner.h"
 #include "cpu-utils.h"
+#include "icon_bmp.h"
+#include "logo_bmp.h"
 #include "platform.h"
 #include "protocol.h"
 
@@ -83,16 +87,22 @@ constexpr UINT WM_APP_WORKER_STOPPED = WM_APP + 2;
 
 constexpr int kIdPauseButton = 101;
 constexpr int kIdQuitButton = 102;
+constexpr int kIdAboutButton = 103;
 constexpr int kIdTrayShow = 201;
 constexpr int kIdTrayPause = 202;
 constexpr int kIdTrayQuit = 203;
+constexpr int kIdTrayAbout = 204;
 constexpr int kIdSetupOk = 301;
 constexpr int kIdSetupCancel = 302;
 constexpr int kIdSetupBoundedRadio = 303;
 constexpr int kIdSetupContinuousRadio = 304;
 constexpr int kIdSetupPruneCheckbox = 305;
+constexpr int kIdSetupAbout = 306;
 
 constexpr size_t kMaxMatchLines = 100;
+// Prefilled into the setup dialog's Server URL field when the config doesn't
+// already have one.
+constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.fly.dev";
 // Tab indices in the setup dialog's SysTabControl32 - also doubles as which
 // group of controls (coordinator vs. search) is shown/enabled at a time.
 constexpr int kTabCoordinator = 0;
@@ -144,6 +154,7 @@ HWND g_hwndProgress = nullptr;
 HWND g_hwndMatches = nullptr;
 HWND g_hwndPauseButton = nullptr;
 HWND g_hwndQuitButton = nullptr;
+HWND g_hwndAboutButton = nullptr;
 
 NOTIFYICONDATAA g_trayIcon{};
 bool g_trayIconAdded = false;
@@ -216,6 +227,206 @@ double matchProgressFraction(const std::string& matchFilename, const std::string
         return -1.0;
     matchIdx = std::min(std::max(matchIdx, lowerIdx), upperIdx);
     return double(matchIdx - lowerIdx) / double(upperIdx - lowerIdx);
+}
+
+// ---------------------------------------------------------------------
+// Logo + About box - shared by the setup dialog and the main window.
+// ---------------------------------------------------------------------
+
+// Builds an HBITMAP of an embedded BMP file image (logo_bmp.h/icon_bmp.h)
+// scaled to `w` x `h`. The caller owns it and must DeleteObject() it. HALFTONE
+// stretch mode so heavily downscaled artwork averages rather than drops pixels.
+HBITMAP makeBitmapFromBmp(const unsigned char* bmp, int w, int h) {
+    BITMAPFILEHEADER fileHeader;
+    BITMAPINFOHEADER infoHeader;
+    memcpy(&fileHeader, bmp, sizeof(fileHeader));
+    memcpy(&infoHeader, bmp + sizeof(fileHeader), sizeof(infoHeader));
+    const unsigned char* bits = bmp + fileHeader.bfOffBits;
+
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, w, h);
+    HGDIOBJ old = SelectObject(mem, bitmap);
+    SetStretchBltMode(mem, HALFTONE);
+    SetBrushOrgEx(mem, 0, 0, nullptr);
+    StretchDIBits(mem, 0, 0, w, h, 0, 0, infoHeader.biWidth, infoHeader.biHeight, bits,
+                  reinterpret_cast<const BITMAPINFO*>(bmp + sizeof(fileHeader)), DIB_RGB_COLORS, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return bitmap;
+}
+
+// For a SS_BITMAP static (STM_SETIMAGE); the caller deletes it once the
+// control showing it is gone.
+HBITMAP makeLogoBitmap(int w, int h) {
+    return makeBitmapFromBmp(kLogoBmp, w, h);
+}
+
+// The application icon (icon_bmp.h) at `size` x `size` pixels - Windows asks
+// for different sizes in different places (title bar/tray vs. taskbar/Alt-Tab,
+// see SM_CXSMICON/SM_CXICON, and again at other DPI scalings). Each embedded
+// size is rendered separately for crispness, so this uses the smallest one
+// that is at least `size` (or the largest, if none is) - an exact match is
+// copied 1:1 with no resampling at all, only an in-between request (e.g. 20
+// or 40) gets scaled, and only slightly. Fully opaque (an all-zero AND mask).
+// Never freed: a handful of icons for the life of the process.
+HICON makeAppIcon(int size) {
+    const IconImage* image = &kIconImages[0];
+    for (const IconImage& candidate : kIconImages) {
+        image = &candidate;
+        if (candidate.size >= size)
+            break;
+    }
+    HBITMAP color = makeBitmapFromBmp(image->bmp, size, size);
+    std::vector<unsigned char> maskBits(((size + 15) / 16) * 2 * size, 0); // 1bpp rows are word-aligned
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, maskBits.data());
+    ICONINFO info{};
+    info.fIcon = TRUE;
+    info.hbmMask = mask;
+    info.hbmColor = color;
+    HICON icon = CreateIconIndirect(&info);
+    DeleteObject(mask);
+    DeleteObject(color);
+    return icon;
+}
+
+HICON appIconLarge() {
+    static HICON icon = makeAppIcon(GetSystemMetrics(SM_CXICON));
+    return icon;
+}
+
+HICON appIconSmall() {
+    static HICON icon = makeAppIcon(GetSystemMetrics(SM_CXSMICON));
+    return icon;
+}
+
+constexpr const char* kAboutClassName = "NamebreakAboutDialog";
+
+struct AboutState {
+    HWND owner = nullptr;
+    bool done = false;
+};
+
+LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<AboutState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK)
+                SendMessage(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        case WM_CLOSE:
+            if (state) {
+                // Re-enabled *before* this window goes away, so Windows hands
+                // focus back to the owner instead of some other application.
+                if (state->owner)
+                    EnableWindow(state->owner, TRUE);
+                state->done = true;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// A classic modal About box: logo, name, one-line description, and the
+// coordinator protocol version this build speaks (protocol.h - the only
+// version number this project actually has). `owner` is disabled while it's
+// up and gets focus back afterwards; it may be hidden (e.g. opened from the
+// tray menu while the main window is minimized to the tray).
+void showAboutDialog(HWND owner) {
+    HINSTANCE hInstance = GetModuleHandleA(nullptr);
+    static bool classRegistered = false;
+    if (!classRegistered) {
+        WNDCLASSEXA wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = AboutWndProc;
+        wc.hInstance = hInstance;
+        wc.hIcon = appIconLarge();
+        wc.hIconSm = appIconSmall();
+        wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH) (COLOR_BTNFACE + 1);
+        wc.lpszClassName = kAboutClassName;
+        RegisterClassExA(&wc);
+        classRegistered = true;
+    }
+
+    constexpr DWORD kStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    constexpr DWORD kExStyle = WS_EX_DLGMODALFRAME;
+    RECT rect = {0, 0, 450, 210}; // desired client area
+    AdjustWindowRectEx(&rect, kStyle, FALSE, kExStyle);
+    int width = rect.right - rect.left, height = rect.bottom - rect.top;
+
+    // Centered over the owner if it's actually showing, else on the screen.
+    RECT anchor;
+    if (owner && IsWindowVisible(owner) && !IsIconic(owner))
+        GetWindowRect(owner, &anchor);
+    else
+        SetRect(&anchor, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    int x = anchor.left + ((anchor.right - anchor.left) - width) / 2;
+    int y = anchor.top + ((anchor.bottom - anchor.top) - height) / 2;
+
+    AboutState state;
+    state.owner = owner;
+    HWND hwnd = CreateWindowExA(kExStyle, kAboutClassName, "About namebreak", kStyle, x, y, width, height, owner, nullptr, hInstance, nullptr);
+    if (!hwnd)
+        return;
+    SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR) &state);
+
+    HBITMAP logo = makeLogoBitmap(192, 128);
+    HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 16, 16, 192, 128, hwnd, nullptr, hInstance, nullptr);
+    SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
+
+    std::string protocolLine = std::string("Coordinator protocol v") + kProtocolVersion;
+    HWND title = CreateWindowExA(0, "STATIC", "namebreak", WS_CHILD | WS_VISIBLE, 226, 16, 210, 28, hwnd, nullptr, hInstance, nullptr);
+    // Wide-character API for this one label: the byline has a non-ASCII
+    // letter, which the ANSI API would only show correctly on codepages that
+    // happen to contain it.
+    HWND byline = CreateWindowExW(0, L"STATIC", L"By: Ojan (Johan Sj\u00f6blom)", WS_CHILD | WS_VISIBLE, 226, 44, 210, 16, hwnd, nullptr,
+                                   hInstance, nullptr);
+    HWND body = CreateWindowExA(0, "STATIC",
+                                 "A GPU-accelerated MPQ filename brute-forcer: finds the filename behind a pair of MPQ hashes by hashing "
+                                 "every candidate name on the graphics card.",
+                                 WS_CHILD | WS_VISIBLE, 226, 68, 210, 58, hwnd, nullptr, hInstance, nullptr);
+    HWND protocol = CreateWindowExA(0, "STATIC", protocolLine.c_str(), WS_CHILD | WS_VISIBLE, 226, 130, 210, 16, hwnd, nullptr, hInstance, nullptr);
+    HWND link = CreateWindowExA(0, "STATIC", "Background: zezula.net/en/mpq/namebreak.html", WS_CHILD | WS_VISIBLE, 226, 150, 210, 32, hwnd,
+                                 nullptr, hInstance, nullptr);
+    HWND ok = CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 360, 176, 74, 26, hwnd, (HMENU) (INT_PTR) IDOK,
+                               hInstance, nullptr);
+
+    HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
+    HFONT titleFont = CreateFontA(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    for (HWND h : {byline, body, protocol, link, ok})
+        SendMessage(h, WM_SETFONT, (WPARAM) font, TRUE);
+    SendMessage(title, WM_SETFONT, (WPARAM) titleFont, TRUE);
+
+    if (owner)
+        EnableWindow(owner, FALSE);
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+
+    MSG msg;
+    while (!state.done) {
+        BOOL got = GetMessage(&msg, nullptr, 0, 0);
+        if (got == 0) {
+            // WM_QUIT arrived while we were modal (the app is shutting down) -
+            // hand it back to the outer loop and get out of its way.
+            PostQuitMessage((int) msg.wParam);
+            if (owner)
+                EnableWindow(owner, TRUE);
+            if (IsWindow(hwnd))
+                DestroyWindow(hwnd);
+            break;
+        }
+        if (got < 0)
+            break;
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    DeleteObject(logo);
+    DeleteObject(titleFont);
 }
 
 // ---------------------------------------------------------------------
@@ -405,12 +616,13 @@ bool ensureConfigForMode(const std::string& path, const std::string& mode, const
 // One SysTabControl32 with two tabs - Coordinator, and Local Search (which
 // covers both bounded and continuous, since they share the exact same
 // [search] config keys and differ only in that one mode value - a radio
-// pair inside the tab picks between them). Both tabs' controls are created
-// up front as ordinary siblings of the dialog (not children of the tab
-// control itself - simpler than reparenting on every switch); only the
-// active tab's controls are shown at a time (see showTabPage). Whichever tab
-// is active when OK is pressed is what gets validated/submitted - the user
-// picks a mode by picking a tab, not through a separate control.
+// pair inside the tab picks between them). Each tab's controls live on their
+// own plain page window laid over the tab control's body (see
+// SetupPageWndProc for why), created up front; only the active tab's page is
+// shown at a time (see showTabPage). Whichever tab is active when OK is
+// pressed is what gets validated/submitted - the user picks a mode by
+// picking a tab, not through a separate control. Every option has a blue "?"
+// beside it whose tooltip explains it.
 // ---------------------------------------------------------------------
 
 struct SetupDialogFields {
@@ -444,24 +656,49 @@ struct SetupDialogFields {
     std::string mode;
 };
 
+// Marker stored in a help "?" control's GWLP_USERDATA so SetupPageWndProc can
+// tell it apart from an ordinary label when coloring it.
+constexpr LONG_PTR kHelpMarker = 0x4E42484C;
+constexpr const char* kSetupPageClassName = "NamebreakSetupPage";
+
 struct SetupDialogState {
     HWND hwndTab = nullptr;
+    HWND hwndTooltip = nullptr;
+    // One plain child window per tab, covering the tab control's body and
+    // holding that tab's controls; showTabPage shows exactly one at a time.
+    HWND hwndPageCoordinator = nullptr;
+    HWND hwndPageSearch = nullptr;
     HWND hwndUsername = nullptr, hwndHostname = nullptr, hwndServerUrl = nullptr, hwndPollInterval = nullptr;
     HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr;
     HWND hwndAlphabet = nullptr, hwndMaxBackslash = nullptr, hwndPrefix = nullptr, hwndSuffix = nullptr, hwndStartCandidate = nullptr,
          hwndLowerBound = nullptr, hwndUpperBound = nullptr, hwndHashA = nullptr, hwndHashB = nullptr;
-    std::vector<HWND> coordinatorControls;
-    std::vector<HWND> searchControls;
+    // Tooltip strings must outlive the tooltip (it keeps pointers, not
+    // copies); a deque never moves existing elements as it grows.
+    std::deque<std::string> helpTexts;
     SetupDialogFields* fields = nullptr; // caller-owned; filled in on accept
     bool accepted = false;
     bool done = false;
 };
 
 void showTabPage(SetupDialogState* state, int sel) {
-    for (HWND h : state->coordinatorControls)
-        ShowWindow(h, sel == kTabCoordinator ? SW_SHOW : SW_HIDE);
-    for (HWND h : state->searchControls)
-        ShowWindow(h, sel == kTabLocalSearch ? SW_SHOW : SW_HIDE);
+    ShowWindow(state->hwndPageCoordinator, sel == kTabCoordinator ? SW_SHOW : SW_HIDE);
+    ShowWindow(state->hwndPageSearch, sel == kTabLocalSearch ? SW_SHOW : SW_HIDE);
+}
+
+// The tab pages sit over the tab control's own body (rather than being
+// drawn straight onto it) so their labels' background is the same plain
+// dialog gray as the page itself - with visual styles on, the tab control's
+// own body is drawn a different shade, which would leave every label as a
+// visible gray box. All this adds over a stock window is coloring the help
+// "?" marks.
+LRESULT CALLBACK SetupPageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_CTLCOLORSTATIC && GetWindowLongPtr((HWND) lParam, GWLP_USERDATA) == kHelpMarker) {
+        HDC hdc = (HDC) wParam;
+        SetTextColor(hdc, RGB(0, 70, 200));
+        SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
+        return (LRESULT) GetSysColorBrush(COLOR_BTNFACE);
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
 LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -479,6 +716,9 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (!state)
                 break;
             switch (LOWORD(wParam)) {
+                case kIdSetupAbout:
+                    showAboutDialog(hwnd);
+                    return 0;
                 case kIdSetupOk: {
                     char buf[512];
                     auto getField = [&](HWND h) {
@@ -552,6 +792,11 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
+BOOL CALLBACK setFontEnumProc(HWND child, LPARAM font) {
+    SendMessage(child, WM_SETFONT, (WPARAM) font, TRUE);
+    return TRUE;
+}
+
 // Shows the setup form pre-filled from `fields`; on OK, fills `fields` with
 // whatever tab was active and its values (plus `fields.mode`) and returns
 // true. Returns false (leaving `fields` untouched) on Cancel/close.
@@ -562,9 +807,14 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = SetupDialogWndProc;
         wc.hInstance = hInstance;
+        wc.hIcon = appIconLarge();
+        wc.hIconSm = appIconSmall();
         wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
         wc.hbrBackground = (HBRUSH) (COLOR_BTNFACE + 1);
         wc.lpszClassName = kSetupClassName;
+        RegisterClassExA(&wc);
+        wc.lpfnWndProc = SetupPageWndProc;
+        wc.lpszClassName = kSetupPageClassName;
         RegisterClassExA(&wc);
         classRegistered = true;
     }
@@ -572,20 +822,44 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     SetupDialogState state;
     state.fields = &fields;
 
-    HWND hwndDialog = CreateWindowExA(WS_EX_DLGMODALFRAME, kSetupClassName, "namebreak - first-run setup",
-                                       WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 440, nullptr, nullptr,
-                                       hInstance, nullptr);
+    constexpr DWORD kStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    constexpr DWORD kExStyle = WS_EX_DLGMODALFRAME;
+    RECT rect = {0, 0, 620, 550}; // desired client area
+    AdjustWindowRectEx(&rect, kStyle, FALSE, kExStyle);
+    HWND hwndDialog = CreateWindowExA(kExStyle, kSetupClassName, "namebreak - first-run setup", kStyle, CW_USEDEFAULT, CW_USEDEFAULT,
+                                       rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, hInstance, nullptr);
     if (!hwndDialog)
         return false;
     SetWindowLongPtr(hwndDialog, GWLP_USERDATA, (LONG_PTR) &state);
 
-    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE, 10, 10, 530, 300, hwndDialog, nullptr, hInstance, nullptr);
+    // --- Header: logo + what this window is for ---
+    HBITMAP logo = makeLogoBitmap(120, 80);
+    HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 12, 10, 120, 80, hwndDialog, nullptr, hInstance, nullptr);
+    SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
+    HWND title = CreateWindowExA(0, "STATIC", "namebreak", WS_CHILD | WS_VISIBLE, 150, 14, 450, 28, hwndDialog, nullptr, hInstance, nullptr);
+    CreateWindowExA(0, "STATIC",
+                     "First-run setup. Choose how this machine should search, then press OK - your choices are saved to the configuration "
+                     "file and used on every later start. Hover over a blue ? for help with any option.",
+                     WS_CHILD | WS_VISIBLE, 150, 46, 455, 46, hwndDialog, nullptr, hInstance, nullptr);
+
+    // --- Tabs, each with a page window over the tab body ---
+    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE, 10, 100, 600, 400, hwndDialog, nullptr, hInstance, nullptr);
     TCITEMA tie{};
     tie.mask = TCIF_TEXT;
     tie.pszText = (LPSTR) "Coordinator";
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabCoordinator, (LPARAM) &tie);
-    tie.pszText = (LPSTR) "Local Search (bounded/continuous)";
+    tie.pszText = (LPSTR) "Local Search";
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabLocalSearch, (LPARAM) &tie);
+    state.hwndPageCoordinator = CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, 592, 364, hwndDialog, nullptr, hInstance, nullptr);
+    state.hwndPageSearch = CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, 592, 364, hwndDialog, nullptr, hInstance, nullptr);
+
+    // One tooltip window serves every help "?" mark. Long delay before it
+    // disappears (the texts are a few lines) and a max width so they wrap.
+    state.hwndTooltip = CreateWindowExA(WS_EX_TOPMOST, TOOLTIPS_CLASSA, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT,
+                                         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hwndDialog, nullptr, hInstance, nullptr);
+    SendMessage(state.hwndTooltip, TTM_SETMAXTIPWIDTH, 0, 340);
+    SendMessage(state.hwndTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 250);
+    SendMessage(state.hwndTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
 
     // ES_AUTOHSCROLL matters here, not just cosmetically: a single-line EDIT
     // control without it refuses to accept any more typed/pasted characters
@@ -594,71 +868,139 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     // full. Long values (e.g. a real server URL) would otherwise silently
     // get truncated right there, with no error and no obvious reason why.
     constexpr DWORD kEditStyle = WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL;
-    auto makeLabel = [&](const char* text, int x, int y, int w) {
-        return CreateWindowExA(0, "STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, 18, hwndDialog, nullptr, hInstance, nullptr);
+    auto makeLabel = [&](HWND page, const char* text, int x, int y, int w, int h = 18) {
+        return CreateWindowExA(0, "STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, h, page, nullptr, hInstance, nullptr);
     };
-    auto makeEdit = [&](const std::string& initial, int x, int y, int w) {
-        return CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", initial.c_str(), kEditStyle, x, y, w, 22, hwndDialog, nullptr, hInstance, nullptr);
+    auto makeEdit = [&](HWND page, const std::string& initial, int x, int y, int w) {
+        return CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", initial.c_str(), kEditStyle, x, y, w, 22, page, nullptr, hInstance, nullptr);
     };
-    auto makeRadio = [&](const char* text, int x, int y, int w, int id, bool startsGroup) {
+    auto makeRadio = [&](HWND page, const char* text, int x, int y, int w, int id, bool startsGroup) {
         DWORD style = WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | (startsGroup ? WS_GROUP : 0);
-        return CreateWindowExA(0, "BUTTON", text, style, x, y, w, 20, hwndDialog, (HMENU) (INT_PTR) id, hInstance, nullptr);
+        return CreateWindowExA(0, "BUTTON", text, style, x, y, w, 20, page, (HMENU) (INT_PTR) id, hInstance, nullptr);
     };
-    auto makeCheckbox = [&](const char* text, int x, int y, int w, bool checked) {
-        HWND h = CreateWindowExA(0, "BUTTON", text, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x, y, w, 20, hwndDialog,
+    auto makeCheckbox = [&](HWND page, const char* text, int x, int y, int w, bool checked) {
+        HWND h = CreateWindowExA(0, "BUTTON", text, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x, y, w, 20, page,
                                   (HMENU) (INT_PTR) kIdSetupPruneCheckbox, hInstance, nullptr);
         SendMessage(h, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
         return h;
     };
+    // A blue "?" that shows `text` as a tooltip on hover. SS_NOTIFY is what
+    // makes a static control receive mouse messages at all (they're
+    // otherwise transparent to the mouse), and TTF_SUBCLASS lets the tooltip
+    // watch those messages itself, with no relaying from our message loop.
+    auto addHelp = [&](HWND page, int x, int y, const char* text) {
+        HWND q = CreateWindowExA(0, "STATIC", "?", WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER | SS_NOTIFY, x, y, 18, 18, page, nullptr,
+                                  hInstance, nullptr);
+        SetWindowLongPtr(q, GWLP_USERDATA, kHelpMarker);
+        state.helpTexts.emplace_back(text);
+        TOOLINFOA ti{};
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;
+        ti.hwnd = page;
+        ti.uId = (UINT_PTR) q;
+        ti.lpszText = (LPSTR) state.helpTexts.back().c_str();
+        SendMessage(state.hwndTooltip, TTM_ADDTOOLA, 0, (LPARAM) &ti);
+        return q;
+    };
 
-    // --- Coordinator tab ---
-    std::vector<HWND>& coordCtrls = state.coordinatorControls;
-    coordCtrls.push_back(makeLabel("Username:", 20, 50, 90));
-    coordCtrls.push_back(state.hwndUsername = makeEdit(fields.username, 115, 47, 170));
-    coordCtrls.push_back(makeLabel("Hostname:", 300, 50, 90));
-    coordCtrls.push_back(state.hwndHostname = makeEdit(fields.hostname, 395, 47, 140));
-    coordCtrls.push_back(makeLabel("Server URL:", 20, 85, 90));
-    coordCtrls.push_back(state.hwndServerUrl = makeEdit(fields.serverUrl, 115, 82, 250));
-    coordCtrls.push_back(makeLabel("Poll interval (s):", 20, 120, 120));
-    coordCtrls.push_back(state.hwndPollInterval = makeEdit(fields.pollIntervalSecs, 145, 117, 60));
+    // --- Coordinator page (one column: label, field, help) ---
+    HWND pc = state.hwndPageCoordinator;
+    makeLabel(pc, "Join a shared search. This client registers with a coordinator server, is handed a slice of a target's search space, "
+                  "searches it on this machine's GPU, reports back, and repeats until you quit. The server decides what to search - "
+                  "you only say who you are and where the server is.",
+              8, 6, 570, 62);
+    constexpr int kCoordRow0 = 82, kRowStep = 34;
+    makeLabel(pc, "Username:", 8, kCoordRow0 + 3, 100);
+    state.hwndUsername = makeEdit(pc, fields.username, 112, kCoordRow0, 330);
+    addHelp(pc, 450, kCoordRow0 + 2,
+            "The name this client registers under on the coordinator server.\r\nLeave blank to use the detected Windows user name.");
+    makeLabel(pc, "Hostname:", 8, kCoordRow0 + kRowStep + 3, 100);
+    state.hwndHostname = makeEdit(pc, fields.hostname, 112, kCoordRow0 + kRowStep, 330);
+    addHelp(pc, 450, kCoordRow0 + kRowStep + 2,
+            "Identifies this machine to the coordinator server.\r\nLeave blank to use the detected computer name.");
+    makeLabel(pc, "Server URL:", 8, kCoordRow0 + 2 * kRowStep + 3, 100);
+    state.hwndServerUrl = makeEdit(pc, fields.serverUrl, 112, kCoordRow0 + 2 * kRowStep, 330);
+    addHelp(pc, 450, kCoordRow0 + 2 * kRowStep + 2,
+            "Required. The base address of the coordinator server, for example https://coordinator.example.com (no trailing path).");
+    makeLabel(pc, "Poll interval (s):", 8, kCoordRow0 + 3 * kRowStep + 3, 104);
+    state.hwndPollInterval = makeEdit(pc, fields.pollIntervalSecs, 112, kCoordRow0 + 3 * kRowStep, 80);
+    addHelp(pc, 200, kCoordRow0 + 3 * kRowStep + 2,
+            "How many seconds to wait before asking the server for work again when none was available. It is also the starting delay "
+            "after a failed request, which then backs off. Default: 30.");
 
-    // --- Local Search tab ---
-    std::vector<HWND>& searchCtrls = state.searchControls;
-    searchCtrls.push_back(makeLabel("Search type:", 20, 50, 90));
-    searchCtrls.push_back(state.hwndBoundedRadio = makeRadio("Bounded", 115, 48, 90, kIdSetupBoundedRadio, true));
-    searchCtrls.push_back(state.hwndContinuousRadio = makeRadio("Continuous", 215, 48, 100, kIdSetupContinuousRadio, false));
+    // --- Local Search page (two columns: label, field, help) ---
+    HWND ps = state.hwndPageSearch;
+    makeLabel(ps, "Search on your own, without a server. Describe the filename you're after - its fixed prefix and suffix, the characters "
+                  "its unknown middle may contain, and its two MPQ hash values - and this machine's GPU tries every candidate in the "
+                  "range. Bounded stops once the range is exhausted; Continuous never stops on its own.",
+              8, 6, 570, 62);
+    constexpr int kSearchRow0 = 82;
+    // Column geometry: label x / edit x / help x, for the left and right columns.
+    constexpr int kL1 = 8, kE1 = 112, kH1 = 270, kL2 = 306, kE2 = 420, kH2 = 548;
+    auto row = [&](int n) { return kSearchRow0 + n * kRowStep; };
+
+    makeLabel(ps, "Search type:", kL1, row(0) + 3, 100);
+    state.hwndBoundedRadio = makeRadio(ps, "Bounded", kE1, row(0) + 1, 90, kIdSetupBoundedRadio, true);
+    state.hwndContinuousRadio = makeRadio(ps, "Continuous", kE1 + 100, row(0) + 1, 100, kIdSetupContinuousRadio, false);
     SendMessage(fields.initialContinuous ? state.hwndContinuousRadio : state.hwndBoundedRadio, BM_SETCHECK, BST_CHECKED, 0);
-    searchCtrls.push_back(makeLabel("Alphabet:", 20, 80, 90));
-    searchCtrls.push_back(state.hwndAlphabet = makeEdit(fields.alphabet, 115, 77, 170));
-    searchCtrls.push_back(makeLabel("Max backslash:", 300, 80, 110));
-    searchCtrls.push_back(state.hwndMaxBackslash = makeEdit(fields.maxBackslashCount, 415, 77, 60));
-    searchCtrls.push_back(makeLabel("Prefix:", 20, 110, 90));
-    searchCtrls.push_back(state.hwndPrefix = makeEdit(fields.prefix, 115, 107, 170));
-    searchCtrls.push_back(makeLabel("Suffix:", 300, 110, 90));
-    searchCtrls.push_back(state.hwndSuffix = makeEdit(fields.suffix, 395, 107, 140));
-    searchCtrls.push_back(makeLabel("Start candidate:", 20, 140, 110));
-    searchCtrls.push_back(state.hwndStartCandidate = makeEdit(fields.startCandidate, 135, 137, 150));
-    searchCtrls.push_back(state.hwndPrune = makeCheckbox("Prune symbol runs", 300, 140, 220, fields.pruneSymbolRuns));
-    searchCtrls.push_back(makeLabel("Lower bound:", 20, 170, 90));
-    searchCtrls.push_back(state.hwndLowerBound = makeEdit(fields.lowerBound, 115, 167, 170));
-    searchCtrls.push_back(makeLabel("Upper bound:", 300, 170, 90));
-    searchCtrls.push_back(state.hwndUpperBound = makeEdit(fields.upperBound, 395, 167, 140));
-    searchCtrls.push_back(makeLabel("Hash A (hex):", 20, 200, 90));
-    searchCtrls.push_back(state.hwndHashA = makeEdit(fields.hashA, 115, 197, 170));
-    searchCtrls.push_back(makeLabel("Hash B (hex):", 300, 200, 90));
-    searchCtrls.push_back(state.hwndHashB = makeEdit(fields.hashB, 395, 197, 140));
+    addHelp(ps, kE1 + 208, row(0) + 2,
+            "Bounded searches only candidates of exactly the start candidate's length, between the lower and upper bound, then stops.\r\n"
+            "Continuous does the same, then moves on to longer candidates and keeps going until you quit.");
 
-    CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 200, 340, 80, 26, hwndDialog,
-                     (HMENU) (INT_PTR) kIdSetupOk, hInstance, nullptr);
-    CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 290, 340, 80, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupCancel, hInstance,
+    makeLabel(ps, "Alphabet:", kL1, row(1) + 3, 100);
+    state.hwndAlphabet = makeEdit(ps, fields.alphabet, kE1, row(1), 150);
+    addHelp(ps, kH1, row(1) + 2,
+            "Every character a candidate may contain, typed out with no separators. The number of characters must be 42, 43, 47, 48, 49 "
+            "or 50.");
+    makeLabel(ps, "Max backslash:", kL2, row(1) + 3, 110);
+    state.hwndMaxBackslash = makeEdit(ps, fields.maxBackslashCount, kE2, row(1), 60);
+    addHelp(ps, kE2 + 68, row(1) + 2,
+            "The most backslashes a candidate may contain before it is skipped. 0 means no limit (to forbid backslashes entirely, leave "
+            "them out of the alphabet instead).");
+
+    makeLabel(ps, "Prefix:", kL1, row(2) + 3, 100);
+    state.hwndPrefix = makeEdit(ps, fields.prefix, kE1, row(2), 150);
+    addHelp(ps, kH1, row(2) + 2, "The fixed text every filename starts with, before the unknown part being searched for.");
+    makeLabel(ps, "Suffix:", kL2, row(2) + 3, 110);
+    state.hwndSuffix = makeEdit(ps, fields.suffix, kE2, row(2), 120);
+    addHelp(ps, kH2, row(2) + 2, "The fixed text every filename ends with, after the unknown part (for example a file extension).");
+
+    makeLabel(ps, "Start candidate:", kL1, row(3) + 3, 104);
+    state.hwndStartCandidate = makeEdit(ps, fields.startCandidate, kE1, row(3), 150);
+    addHelp(ps, kH1, row(3) + 2,
+            "The full filename (prefix + candidate + suffix) to begin searching from. Lets a long search resume where it left off.");
+    state.hwndPrune = makeCheckbox(ps, "Prune symbol runs", kL2, row(3) + 1, 150, fields.pruneSymbolRuns);
+    addHelp(ps, kH2, row(3) + 2,
+            "Skip candidates containing three or more symbols in a row that are neither letters, digits nor spaces - real filenames "
+            "practically never have those. Makes the search faster.");
+
+    makeLabel(ps, "Lower bound:", kL1, row(4) + 3, 100);
+    state.hwndLowerBound = makeEdit(ps, fields.lowerBound, kE1, row(4), 150);
+    addHelp(ps, kH1, row(4) + 2, "The full filename (inclusive) the search range starts at.");
+    makeLabel(ps, "Upper bound:", kL2, row(4) + 3, 110);
+    state.hwndUpperBound = makeEdit(ps, fields.upperBound, kE2, row(4), 120);
+    addHelp(ps, kH2, row(4) + 2, "The full filename (inclusive) the search range ends at.");
+
+    makeLabel(ps, "Hash A (hex):", kL1, row(5) + 3, 100);
+    state.hwndHashA = makeEdit(ps, fields.hashA, kE1, row(5), 150);
+    addHelp(ps, kH1, row(5) + 2, "The first of the two 32-bit MPQ hashes of the filename you're looking for, in hex (a 0x prefix is optional).");
+    makeLabel(ps, "Hash B (hex):", kL2, row(5) + 3, 110);
+    state.hwndHashB = makeEdit(ps, fields.hashB, kE2, row(5), 120);
+    addHelp(ps, kH2, row(5) + 2, "The second of the two 32-bit MPQ hashes, in hex (a 0x prefix is optional).");
+
+    // --- Buttons ---
+    CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 512, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout, hInstance,
+                     nullptr);
+    CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, 512, 80, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupOk,
+                     hInstance, nullptr);
+    CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 520, 512, 80, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupCancel, hInstance,
                      nullptr);
 
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
-    SendMessage(state.hwndTab, WM_SETFONT, (WPARAM) font, TRUE);
-    for (HWND h : coordCtrls)
-        SendMessage(h, WM_SETFONT, (WPARAM) font, TRUE);
-    for (HWND h : searchCtrls)
-        SendMessage(h, WM_SETFONT, (WPARAM) font, TRUE);
+    HFONT titleFont = CreateFontA(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    EnumChildWindows(hwndDialog, setFontEnumProc, (LPARAM) font);
+    SendMessage(title, WM_SETFONT, (WPARAM) titleFont, TRUE);
 
     SendMessage(state.hwndTab, TCM_SETCURSEL, fields.initialTab, 0);
     showTabPage(&state, fields.initialTab);
@@ -673,6 +1015,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
         DispatchMessage(&msg);
     }
 
+    DeleteObject(logo);
+    DeleteObject(titleFont);
     return state.accepted;
 }
 
@@ -710,7 +1054,7 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         };
         fields.username = get(config.coordinator, "username", resolveUsername());
         fields.hostname = get(config.coordinator, "hostname", resolveHostname());
-        fields.serverUrl = get(config.coordinator, "server_url", "");
+        fields.serverUrl = get(config.coordinator, "server_url", kDefaultServerUrl);
         fields.pollIntervalSecs = get(config.coordinator, "poll_interval_secs", "30");
         fields.alphabet = get(config.search, "alphabet", "");
         fields.maxBackslashCount = get(config.search, "max_backslash_count", "0");
@@ -889,7 +1233,7 @@ void addTrayIcon(HWND hwnd) {
     g_trayIcon.uID = 1;
     g_trayIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_trayIcon.uCallbackMessage = WM_APP_TRAYICON;
-    g_trayIcon.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    g_trayIcon.hIcon = appIconSmall();
     lstrcpynA(g_trayIcon.szTip, kWindowTitle, sizeof(g_trayIcon.szTip));
     Shell_NotifyIconA(NIM_ADD, &g_trayIcon);
     g_trayIconAdded = true;
@@ -914,6 +1258,7 @@ void showTrayContextMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     AppendMenuA(menu, MF_STRING, kIdTrayShow, "Show GUI");
     AppendMenuA(menu, MF_STRING, kIdTrayPause, g_pauseRequested.load(std::memory_order_relaxed) ? "Resume" : "Pause");
+    AppendMenuA(menu, MF_STRING, kIdTrayAbout, "About...");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, kIdTrayQuit, "Quit");
     // Standard idiom (see Shell_NotifyIcon's docs) so the popup dismisses
@@ -1071,10 +1416,12 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
 
     g_hwndPauseButton = CreateWindowExA(0, "BUTTON", "Pause", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 405, 150, 30, hwnd,
                                          (HMENU) (INT_PTR) kIdPauseButton, hInstance, nullptr);
+    g_hwndAboutButton = CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 170, 405, 150, 30, hwnd,
+                                         (HMENU) (INT_PTR) kIdAboutButton, hInstance, nullptr);
     g_hwndQuitButton = CreateWindowExA(0, "BUTTON", "Quit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 330, 405, 150, 30, hwnd,
                                         (HMENU) (INT_PTR) kIdQuitButton, hInstance, nullptr);
 
-    for (HWND child : {g_hwndTargetLabel, g_hwndStatusLabel, g_hwndMatches, g_hwndPauseButton, g_hwndQuitButton})
+    for (HWND child : {g_hwndTargetLabel, g_hwndStatusLabel, g_hwndMatches, g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton})
         setFont(child);
 }
 
@@ -1094,6 +1441,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 case kIdQuitButton:
                 case kIdTrayQuit:
                     requestQuit(hwnd);
+                    return 0;
+                case kIdAboutButton:
+                case kIdTrayAbout:
+                    showAboutDialog(hwnd);
                     return 0;
                 case kIdTrayShow:
                     showMainWindow(hwnd);
@@ -1181,7 +1532,7 @@ int main(int argc, char* argv[]) {
 
     INITCOMMONCONTROLSEX icex{};
     icex.dwSize = sizeof(icex);
-    icex.dwICC = ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES;
+    icex.dwICC = ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_WIN95_CLASSES;
     InitCommonControlsEx(&icex);
 
     AppConfig config;
@@ -1194,7 +1545,8 @@ int main(int argc, char* argv[]) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
-    wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    wc.hIcon = appIconLarge();
+    wc.hIconSm = appIconSmall();
     wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH) (COLOR_BTNFACE + 1);
     wc.lpszClassName = kWindowClassName;
