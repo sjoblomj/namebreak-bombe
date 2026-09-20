@@ -96,15 +96,17 @@
     font-weight: 600;
   }
   /* These sit directly on the card, not inside a .table-scroll, so unlike a
-     table's mono cells they have nowhere to scroll if their content is wide
-     - and lower_bound/upper_bound in particular can be a long unbroken run
-     of the alphabet's lowest/highest character (e.g. all spaces / all
-     underscores) with no natural break point. Without this, `white-space:
-     pre` (from the shared .mono rule) refuses to wrap it no matter how
-     narrow the screen is, silently forcing the whole page to scroll
-     horizontally - pre-wrap keeps the exact spacing `.mono` is for, while
-     overflow-wrap lets a line break mid-run as a last resort. */
-  .target-hashes.mono, .target-bounds.mono, .target-alphabet .mono, .target-skip .mono {
+     table's mono cells they have nowhere to scroll if their content is wide.
+     target-bounds isn't here - its lower_bound/upper_bound are boxed via
+     candidateChip now, which carries this same wrap-safety itself (see
+     .candidate below); these three are still plain mono text, and an
+     unlucky alphabet name or skip pattern could in principle be just as
+     wide. Without this, `white-space: pre` (from the shared .mono rule)
+     refuses to wrap no matter how narrow the screen is, silently forcing
+     the whole page to scroll horizontally - pre-wrap keeps the exact
+     spacing `.mono` is for, while overflow-wrap lets a line break mid-run
+     as a last resort. */
+  .target-hashes.mono, .target-alphabet .mono, .target-skip .mono {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
@@ -192,7 +194,7 @@
     padding: 2px 8px;
     border-radius: 6px;
   }
-  .found-banner .found-by {
+  .found-banner .found-by, .found-banner .found-at {
     font-weight: 500;
     font-size: 13px;
   }
@@ -268,23 +270,8 @@
     background: var(--detail-bg);
     font-size: 12px;
   }
-  /* This candidate-range span is the single widest thing in the whole
-     table - a `.mono`/`white-space: pre` cell that flatly refuses to wrap,
-     the same trap target-bounds fell into above. Unlike target-bounds it's
-     inside a .table-scroll, so it can't force the whole PAGE to scroll -
-     but it was still forcing this table's own Pattern column wide enough
-     to need its own (real, if contained) horizontal scrollbar on a phone.
-     pre-wrap keeps the padded-candidate spacing `.mono` is for; overflow-wrap
-     lets it break as a last resort instead of setting the column's minimum. */
   .priority-carved-indent {
     padding-left: 22px;
-  }
-  /* Compound selector, not just .priority-carved-indent - this element also
-     carries .mono (same class, same specificity), defined later below, so a
-     single-class override here would silently lose to it on source order. */
-  .priority-carved-indent.mono {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
   }
   .table-scroll {
     overflow-x: auto;
@@ -311,6 +298,25 @@
     letter-spacing: 0.03em;
   }
   td.mono, .mono { font-family: var(--mono); white-space: pre; }
+  /* The classic "inline code" treatment - a little rounded box, for actual
+     candidate/bound strings specifically (see candidateChip above), not for
+     every mono value (a Len digit or a Priority number isn't "code"). Sets
+     its own wrapping rather than relying on an ancestor cell's, since it's
+     just as often dropped mid-sentence (priorityGapNote) as it is a table
+     cell's entire content - pre-wrap keeps a candidate's meaningful trailing
+     spaces (the alphabet's lowest character, padding it out to its full
+     length) visible up to the box's edge, rather than trailing off
+     invisibly the way plain pre text did; overflow-wrap lets it break as a
+     last resort instead of forcing its container wider than the screen. */
+  .candidate {
+    font-family: var(--mono);
+    background: var(--detail-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 4px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
   td.worker { color: var(--text); }
   td.worker.none, .muted { color: var(--muted); font-style: italic; }
   .lease-note {
@@ -517,6 +523,19 @@
     return Number(n).toLocaleString();
   }
 
+  // A single candidate/bound string, boxed like inline code - the standard
+  // way to set literal text apart within a sentence or table cell. Carries
+  // its own mono font, wrapping and overflow-wrap (see .candidate below), so
+  // callers never need a separate .mono class alongside it, and it stays
+  // safe to drop into a normal sentence (priorityGapNote) as well as a bare
+  // table cell (target-bounds, rangeRow's First/last candidate column).
+  function candidateChip(text) {
+    const span = document.createElement('span');
+    span.className = 'candidate';
+    span.textContent = text;
+    return span;
+  }
+
   function statusBadge(status, label) {
     const span = document.createElement('span');
     span.className = 'badge status-' + status;
@@ -604,13 +623,12 @@
     tr.appendChild(tdLen);
 
     const tdRange = document.createElement('td');
-    tdRange.className = 'mono';
-    tdRange.textContent = `${r.first_candidate} – ${r.last_candidate}`;
+    tdRange.append(candidateChip(r.first_candidate), ' – ', candidateChip(r.last_candidate));
     if (r.status === 'in_progress' && r.progress_candidate) {
       const note = document.createElement('span');
-      note.className = 'progress-note mono';
-      note.textContent = 'Progress: ' + r.progress_candidate +
-        (r.progress_percent != null ? ' (' + fmtPercent(r.progress_percent) + ')' : '');
+      note.className = 'progress-note';
+      note.append('Progress: ', candidateChip(r.progress_candidate));
+      if (r.progress_percent != null) note.append(' (' + fmtPercent(r.progress_percent) + ')');
       tdRange.appendChild(note);
     }
     tr.appendChild(tdRange);
@@ -653,7 +671,7 @@
     }
     if (r.status === 'in_progress') {
       const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
-      grid.appendChild(detailField(progressLabel, r.progress_candidate || 'not started', true));
+      grid.appendChild(detailField(progressLabel, r.progress_candidate ? candidateChip(r.progress_candidate) : 'not started', false));
       if (r.lease_expires_at) {
         const t = fmtTime(r.lease_expires_at);
         const expired = r.lease_expires_at * 1000 < Date.now();
@@ -839,15 +857,23 @@
   // behind its start_index (see ranges::claim_priority_range_chunk). So a
   // range can show real, substantial progress in its own row while this note
   // still - correctly - reports the ordinary candidates ahead of it as not
-  // yet carved. Returned as plain text (not a row of its own) so the caller
-  // can attach it directly to the one priority range it describes, rather
-  // than leaving readers to guess whether a standalone row talks about the
-  // range above or below it.
+  // yet carved. Returned as a DOM fragment (not a row of its own, and not
+  // plain text - t.cursor_candidate gets the same boxed candidateChip
+  // treatment as everywhere else) so the caller can attach it directly to
+  // the one priority range it describes, rather than leaving readers to
+  // guess whether a standalone row talks about the range above or below it.
   function priorityGapNote(t, pr) {
     if (t.cursor_candidate_len === pr.candidate_len && t.cursor_next_index < pr.start_index) {
-      return `Main sweep hasn't reached here yet - still at ${t.cursor_candidate}`;
+      const frag = document.createDocumentFragment();
+      frag.append("Main sweep hasn't reached here yet - still at ");
+      frag.appendChild(candidateChip(t.cursor_candidate));
+      return frag;
     } else if (t.cursor_candidate_len < pr.candidate_len) {
-      return `Main sweep hasn't reached this length yet - still at length ${t.cursor_candidate_len} (${t.cursor_candidate})`;
+      const frag = document.createDocumentFragment();
+      frag.append(`Main sweep hasn't reached this length yet - still at length ${t.cursor_candidate_len} (`);
+      frag.appendChild(candidateChip(t.cursor_candidate));
+      frag.append(')');
+      return frag;
     }
     return null;
   }
@@ -871,8 +897,8 @@
     tr.appendChild(document.createElement('td'));
 
     const tdRange = document.createElement('td');
-    tdRange.className = 'mono priority-carved-indent';
-    tdRange.textContent = `${r.first_candidate} – ${r.last_candidate}`;
+    tdRange.className = 'priority-carved-indent';
+    tdRange.append(candidateChip(r.first_candidate), ' – ', candidateChip(r.last_candidate));
     tr.appendChild(tdRange);
 
     const tdStatus = document.createElement('td');
@@ -884,8 +910,7 @@
 
     const tdDetail = document.createElement('td');
     if (r.status === 'in_progress' && r.progress_candidate) {
-      tdDetail.className = 'mono';
-      tdDetail.textContent = 'Progress: ' + r.progress_candidate;
+      tdDetail.append('Progress: ', candidateChip(r.progress_candidate));
     } else if (r.status === 'completed') {
       setTimeCell(tdDetail, r.completed_at);
     } else {
@@ -982,11 +1007,11 @@
       tdPattern.className = 'mono';
       tdPattern.textContent = pr.pattern;
       tdPattern.title = `"${pr.alphabet}"`;
-      const gapText = priorityGapNote(t, pr);
-      if (gapText) {
+      const gapNote = priorityGapNote(t, pr);
+      if (gapNote) {
         const note = document.createElement('span');
         note.className = 'priority-gap-note';
-        note.textContent = gapText;
+        note.appendChild(gapNote);
         tdPattern.appendChild(note);
       }
       tr.appendChild(tdPattern);
@@ -999,9 +1024,14 @@
       const tdProgress = document.createElement('td');
       const total = pr.end_index - pr.start_index;
       const done = pr.next_index - pr.start_index;
-      tdProgress.textContent = isPriorityRangeDone(pr)
-        ? `Done (${fmtNum(total)})`
-        : `${fmtNum(done)} / ${fmtNum(total)}` + (pr.next_candidate ? ` (next: ${pr.next_candidate})` : '');
+      if (isPriorityRangeDone(pr)) {
+        tdProgress.textContent = `Done (${fmtNum(total)})`;
+      } else {
+        tdProgress.append(`${fmtNum(done)} / ${fmtNum(total)}`);
+        if (pr.next_candidate) {
+          tdProgress.append(' (next: ', candidateChip(pr.next_candidate), ')');
+        }
+      }
       tr.appendChild(tdProgress);
 
       tbody.appendChild(tr);
@@ -1150,8 +1180,8 @@
     }
 
     const bounds = document.createElement('div');
-    bounds.className = 'target-bounds mono';
-    bounds.textContent = `${t.lower_bound} → ${t.upper_bound}`;
+    bounds.className = 'target-bounds';
+    bounds.append(candidateChip(t.lower_bound), ' → ', candidateChip(t.upper_bound));
     card.appendChild(bounds);
 
     if (t.skip_regex) {
@@ -1182,6 +1212,14 @@
         by.textContent = 'by ' + t.found_by;
         banner.appendChild(by);
       }
+      const foundAt = fmtTime(t.found_at);
+      if (foundAt) {
+        const at = document.createElement('span');
+        at.className = 'found-at';
+        at.textContent = 'at ' + foundAt.display;
+        at.title = foundAt.iso;
+        banner.appendChild(at);
+      }
       card.appendChild(banner);
     }
 
@@ -1204,12 +1242,12 @@
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
 
-      // Solved targets first, so a find is never buried below the fold; then
-      // by priority (highest first), matching the order the server itself
-      // claims work in.
+      // Solved targets last, so the ones still being worked on come first;
+      // then by priority (highest first), matching the order the server
+      // itself claims work in.
       const targets = data.targets.slice().sort((a, b) => {
-        const aSolved = a.status === 'solved' ? 0 : 1;
-        const bSolved = b.status === 'solved' ? 0 : 1;
+        const aSolved = a.status === 'solved' ? 1 : 0;
+        const bSolved = b.status === 'solved' ? 1 : 0;
         if (aSolved !== bSolved) return aSolved - bSolved;
         return (b.priority || 0) - (a.priority || 0);
       });

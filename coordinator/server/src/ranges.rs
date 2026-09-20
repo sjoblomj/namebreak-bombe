@@ -745,13 +745,14 @@ pub async fn complete_range(
     let mut target_solved = false;
     if found {
         let result = sqlx::query(
-            "UPDATE targets SET status = 'solved', found_filename = ?, found_by_user_id = ? \
+            "UPDATE targets SET status = 'solved', found_filename = ?, found_by_user_id = ?, found_at = ? \
              WHERE status = 'active' \
              AND hash_a = (SELECT hash_a FROM targets WHERE id = ?) \
              AND hash_b = (SELECT hash_b FROM targets WHERE id = ?)",
         )
         .bind(&filename)
         .bind(user.id)
+        .bind(now)
         .bind(range.target_id)
         .bind(range.target_id)
         .execute(&mut *tx)

@@ -36,6 +36,8 @@ pub struct DashboardTarget {
     pub hash_b_hex: String,
     pub found_filename: Option<String>,
     pub found_by: Option<String>,
+    /// Unix seconds - `None` for a target solved before this was recorded.
+    pub found_at: Option<i64>,
     /// Higher claims first - see ranges::claim_range. Defaults to 0.
     pub priority: i64,
     /// Operator note shown in the target's card header. Rendered as raw
@@ -131,10 +133,10 @@ fn display_name(username: Option<String>, hostname: Option<String>) -> Option<St
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
     #[allow(clippy::type_complexity)]
-    let target_rows: Vec<(i64, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+    let target_rows: Vec<(i64, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT targets.id, targets.name, targets.status, \
                 targets.lower_bound, targets.upper_bound, targets.hash_a, targets.hash_b, targets.found_filename, \
-                found_user.username, found_user.hostname, targets.alphabet_name, targets.alphabet, targets.priority, \
+                found_user.username, found_user.hostname, targets.found_at, targets.alphabet_name, targets.alphabet, targets.priority, \
                 targets.description, targets.skip_regex \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
          ORDER BY targets.priority DESC, targets.created_at ASC",
@@ -184,7 +186,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     }
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_username, found_hostname, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
+    for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_username, found_hostname, found_at, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
 
         let ranges = range_rows
@@ -256,6 +258,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             hash_b_hex: format!("0x{:08X}", i64_to_u32(hash_b)),
             found_filename,
             found_by: display_name(found_username, found_hostname),
+            found_at,
             priority,
             description,
             skip_regex,
