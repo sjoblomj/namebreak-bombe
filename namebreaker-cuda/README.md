@@ -131,7 +131,7 @@ Options, passed to the first command as `-D<option>=<value>`:
 |---|---|---|
 | `CMAKE_CUDA_ARCHITECTURES` | `86` | The GPU's compute capability, without the dot (`nvidia-smi --query-gpu=compute_cap --format=csv`), or `native` |
 | `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode and the libcurl dependency |
-| `NAMEBREAK_GPU` | `cuda` | `none` builds without any CUDA code (see Backends below) - or use the `portable` preset, which builds into `build-portable/` |
+| `NAMEBREAK_GPU` | `cuda` | `none` builds without any CUDA code, leaving the CPU backends (see Backends below) - or use the `portable` preset, which builds into `build-portable/` |
 | `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
 
 On Windows, use a Visual Studio developer prompt (MSVC is the host compiler
@@ -188,6 +188,11 @@ backends a build has, most preferred first; unless told otherwise (see
 so a GPU build still works on a machine without that GPU:
 
 - `cuda/` - the CUDA kernels and the code that launches them.
+- `cpu/` - every core of the CPU, with the same row trick as the CUDA
+  kernel and the candidates of a row hashed several at a time with SIMD
+  instructions (AVX2 on x86-64 CPUs that have it, picked at runtime; SSE2
+  or NEON otherwise). About 9 G candidates/s on a laptop i9-12900H - a
+  fifteenth of its GPU, but it lets any machine contribute. Every build has it.
 - `reference/` - one thread, every candidate hashed from scratch. Far too
   slow for real searches, but simple enough to be obviously right: it's what
   the others are held to. Every build has it.

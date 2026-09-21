@@ -1,5 +1,6 @@
 #include "backends/backends.h"
 
+#include "backends/cpu/cpu_backend.h"
 #include "backends/reference/reference_backend.h"
 #ifdef NAMEBREAK_WITH_CUDA
 #include "backends/cuda/cuda_backend.h"
@@ -24,6 +25,7 @@ const std::vector<BackendEntry>& backendEntries() {
 #ifdef NAMEBREAK_WITH_CUDA
         {"cuda", makeCudaBackend},
 #endif
+        {"cpu", makeCpuBackend},
         {"reference", makeReference},
     };
     return entries;

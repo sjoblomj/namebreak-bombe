@@ -65,6 +65,8 @@ set(SEARCH_SOURCES
     src/engine/mpq_hash.cpp
     src/engine/candidate.cpp
     src/backends/backends.cpp
+    src/backends/common/row_batch.cpp
+    src/backends/cpu/cpu_backend.cpp
     src/backends/reference/reference_backend.cpp)
 if(NAMEBREAK_GPU STREQUAL "cuda")
     list(APPEND SEARCH_SOURCES src/backends/cuda/cuda_backend.cu)
@@ -162,6 +164,7 @@ set(ROW_BACKENDS "")
 if(NAMEBREAK_GPU STREQUAL "cuda")
     list(APPEND ROW_BACKENDS cuda)
 endif()
+list(APPEND ROW_BACKENDS cpu)
 
 # End-to-end correctness check for runSearch() itself, against a brute-force
 # reference - see the file. Every backend is tested with its shipped tuning
@@ -175,15 +178,17 @@ endif()
 #                  CPU-side leading part, and a shallower row decode
 #   window6        the widest supported window: 5 prefix digits per row and
 #                  trailing indices beyond 32 bits
+# All three also make the cpu backend split every batch, however small,
+# across its threads, and window2 makes it use its portable (non-AVX2) code.
 namebreak_test_executable(search_integration_test tests/search_integration_test.cpp namebreak_search)
 foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(integration-${backend} search_integration_test --backend ${backend})
 endforeach()
 if(ROW_BACKENDS)
     foreach(config IN ITEMS
-            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3"
-            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5"
-            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6")
+            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
+            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_CPU_NO_AVX2"
+            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
         list(POP_FRONT config suffix)
         namebreak_search_library(namebreak_search_${suffix} ${config})
         namebreak_test_executable(search_integration_test_${suffix} tests/search_integration_test.cpp namebreak_search_${suffix})
