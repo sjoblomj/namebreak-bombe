@@ -7,7 +7,7 @@
 
 #include "engine/backend.h"
 
-// The search backends compiled into this build (see `make BACKEND=...`), and
+// The search backends compiled into this build (see NAMEBREAK_BACKEND in CMakeLists.txt), and
 // picking one of them.
 
 // The names of the backends in this build, the default first.

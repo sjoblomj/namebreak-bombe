@@ -109,14 +109,32 @@ last line of `matches/matches.txt` each time) and launches `continuous` mode.
 
 ## Compiling
 
-Requires the CUDA Toolkit (`nvcc`) and a CUDA-capable GPU.
+Requires CMake (3.24 or later), the CUDA Toolkit (`nvcc`), a CUDA-capable
+GPU, and libcurl. The build is described by `CMakeLists.txt`, and
+`CMakePresets.json` has the usual configurations - CLion and Visual Studio
+pick those up directly.
 
 ```sh
-make                          # builds build/namebreak
-make ARCH=sm_75               # for a different GPU (see nvidia-smi --query-gpu=compute_cap --format=csv)
-make NETWORK=0                # omit coordinator mode / the libcurl dependency
-make BACKEND=cpu              # no CUDA at all: g++ only, searching on the CPU (see Backends below)
+cmake --preset default            # configure into build/
+cmake --build --preset default    # builds build/namebreak, and the tests in build/tests/
+ctest --preset default            # runs the tests
 ```
+
+Options, passed to the first command as `-D<option>=<value>`:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `CMAKE_CUDA_ARCHITECTURES` | `86` | The GPU's compute capability, without the dot (`nvidia-smi --query-gpu=compute_cap --format=csv`), or `native` |
+| `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode and the libcurl dependency |
+| `NAMEBREAK_BACKEND` | `cuda` | `cpu` builds without any CUDA code, searching on the CPU (see Backends below) - or use the `cpu` preset, which builds into `build-cpu/` |
+| `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
+
+On Windows, use a Visual Studio developer prompt (MSVC is the host compiler
+the CUDA Toolkit supports there) and point CMake at a libcurl, e.g. vcpkg's:
+`cmake --preset default -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake`.
+That also builds the GUI, `namebreak-gui.exe`. There's no Windows machine
+with CUDA to verify this on; the CPU-only build has been cross-compiled with
+MinGW-w64, and its tests pass under Wine.
 
 The alphabet's *size* (not its exact characters) is baked into the binary as
 a compile-time template instantiation per size, for performance - the fixed
@@ -126,17 +144,17 @@ match one of them. Supporting a new size means adding it to
 `SupportedAlphabetSizes` in `src/backends/cuda/cuda_backend.cu` and
 recompiling.
 
-`make test` runs the correctness test suite: a pure-CPU unit test, plus
+`ctest` runs the correctness test suite: a pure-CPU unit test, plus
 end-to-end tests of every backend that compare real search results against
-an independent brute-force reference (thousands of cases: every supported alphabet
-size, every last-character position, ranges starting/ending mid-row and
+an independent brute-force reference (thousands of cases: every supported
+alphabet size, every last-character position, ranges starting/ending mid-row and
 crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
-0x80, the both-hashes-match path, and a seeded fuzzer). The same test source
-is built in several configurations (different GPU window / launch sizes),
-and each takes about a minute to compile, so `make -j test` is much faster.
-`make search_bench` times the real search over a fixed range; `make
-WINDOW=6 search_bench` re-runs it with a different GPU window. Everything is
-built into `build/`; `make clean` removes it.
+0x80, the both-hashes-match path, and a seeded fuzzer). The CUDA backend is
+built in several configurations for this (different GPU window / launch
+sizes), and each takes about a minute to compile - the build runs them in
+parallel. `cmake --build --preset default --target run_search_bench` times
+the real search over a fixed range. Everything is built into `build/`;
+deleting it is the clean build.
 
 ## Source layout
 
@@ -145,10 +163,10 @@ built into `build/`; `make clean` removes it.
 | `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU |
 | `src/backends/` | What the search runs its batches on: `cuda/`, and the `cpu/` reference (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
-| `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `make NETWORK=0`) |
+| `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `NAMEBREAK_NETWORK=OFF`) |
 | `src/cli/` | The console program's `main()` |
-| `src/gui/win32/` | The Windows GUI (`make gui`, Windows only) |
-| `tests/` | Correctness tests and benchmarks (`make test`, `make search_bench`) |
+| `src/gui/win32/` | The Windows GUI (Windows only) |
+| `tests/` | Correctness tests and benchmarks (`ctest`, `run_search_bench`) |
 | `scripts/` | `run.sh`, and the generator for the GUI's embedded icon |
 
 Includes are written relative to `src/` (e.g. `#include "engine/search.h"`).
@@ -165,10 +183,10 @@ backends a build has; the program uses the first:
 - `cuda/` - the CUDA kernels and the code that launches them.
 - `cpu/` - a reference backend: one thread, every candidate hashed from
   scratch. Far too slow for real searches, but simple enough to be obviously
-  right. Every build has it, and `make test` runs the end-to-end tests
-  against it as well as against CUDA. `make BACKEND=cpu` builds with it
-  alone, without any CUDA code - e.g. to check the rest builds and works
-  without the CUDA Toolkit.
+  right. Every build has it, and `ctest` runs the end-to-end tests against
+  it as well as against CUDA. `NAMEBREAK_BACKEND=cpu` (the `cpu` preset)
+  builds with it alone, without any CUDA code - e.g. to check the rest
+  builds and works without the CUDA Toolkit.
 
 A new backend (say, for AMD GPUs) implements `SearchBackend`, gets a
 directory under `src/backends/` and an entry in `backends.cpp`, and is

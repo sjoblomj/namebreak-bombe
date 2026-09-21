@@ -2,7 +2,7 @@
 // amortized per leadingIdx step vs. the old from-scratch
 // mpqHashWithPrefixCache_CPU(prefix + indexToString(leadingIdx, ...)) every
 // step - independent of the separate GPU-window-size question (that's
-// tests/search_bench.cpp's job, via `make WINDOW=N search_bench`). Pure CPU, no
+// tests/search_bench.cpp's job, with -DNAMEBREAK_BENCH_WINDOW=N). Pure CPU, no
 // GPU involved, so unaffected by anything the GPU is doing.
 //
 // Both variants build the same `prefix + leading` string every iteration

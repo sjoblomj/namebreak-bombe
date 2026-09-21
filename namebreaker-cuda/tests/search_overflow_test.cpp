@@ -2,7 +2,7 @@
 // hits than MAX_MATCHES can record - a situation that can't happen in
 // practice with MAX_MATCHES = 1024 (a single 32-bit hashA collision is
 // already a ~1-in-4-billion event), so this build shrinks it to 1
-// (-DMAX_MATCHES=1, see the Makefile) and uses a real hashA collision pair
+// (-DMAX_MATCHES=1, see CMakeLists.txt) and uses a real hashA collision pair
 // (two different candidates with the same hashA, found by a birthday search
 // on the CPU) to overflow it with just two hits.
 //
@@ -19,7 +19,7 @@
 //  * and it doesn't poison the next runSearch() call (matchCount is reset).
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - `make test` runs this from build/testrun/.
+// to the current directory - ctest runs it in its own directory under build/testrun/.
 
 #include <algorithm>
 #include <cstdio>
@@ -42,7 +42,7 @@
 #include "engine/limits.h"
 #include "engine/search.h"
 
-static_assert(MAX_MATCHES == 1, "this test must be built with -DMAX_MATCHES=1 (see the Makefile)");
+static_assert(MAX_MATCHES == 1, "this test must be built with -DMAX_MATCHES=1 (see CMakeLists.txt)");
 
 static std::unique_ptr<SearchBackend> g_backend;
 static uint32_t g_cryptTable[0x500];

@@ -10,9 +10,9 @@
 // right answer is.
 //
 // It tests one backend (--backend <name>, default: the build's default - see
-// backends/backends.h). This binary is built several times by `make test`,
+// backends/backends.h). This binary is built several times (CMakeLists.txt),
 // with different -DNAMEBREAK_GPU_WINDOW_CHARS / -DNAMEBREAK_ROWS_PER_LAUNCH
-// values (see backends/cuda/tuning.h and the Makefile), so the same cases
+// values (see backends/cuda/tuning.h and CMakeLists.txt), so the same cases
 // exercise different leading/trailing splits, kernel row-decode depths and
 // launch-chunking boundaries. Every case derives its geometry from the
 // backend under test (SearchBackend::windowChars/batchSize); none hard-codes
@@ -52,9 +52,9 @@
 // disagrees with the fast kernel that reported it.
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - `make test` runs this from build/testrun/ to
-// keep it away from the project's real matches.txt; run the binary directly
-// from somewhere else disposable if not going through `make test`.
+// to the current directory - ctest runs each test in its own directory under
+// build/testrun/ to keep it away from any real matches; run the binary
+// directly from somewhere else disposable if not going through ctest.
 
 #include <algorithm>
 #include <atomic>

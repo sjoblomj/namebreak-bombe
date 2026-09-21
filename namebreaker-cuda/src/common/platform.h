@@ -9,7 +9,7 @@
 // the pause key - see platform.cpp for the Windows/POSIX implementation of
 // each. Nothing else in this codebase (the CUDA search, libcurl, JSON/config
 // parsing, std::thread-based orchestration) needs any OS-specific code at all.
-// Built in every configuration, including NETWORK=0 (see the Makefile).
+// Built in every configuration, including NAMEBREAK_NETWORK=OFF.
 
 // The machine's hostname, or "unknown-host" if it can't be determined.
 std::string resolveHostname();

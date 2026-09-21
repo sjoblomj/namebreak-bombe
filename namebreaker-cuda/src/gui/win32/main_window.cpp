@@ -1,8 +1,9 @@
 // A little native Win32 GUI for namebreak - built only on Windows (see the
-// Makefile's `gui` target), linking the same search/coordinator/config/
-// platform sources the console `namebreak` binary does - everything but its
-// src/cli/main.cpp, so this file's own main() is the process entry point.
-// Built with /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup (see the Makefile) so
+// namebreak-gui target in CMakeLists.txt), linking the same search/
+// coordinator/config/platform sources the console `namebreak` binary does -
+// everything but its src/cli/main.cpp, so this file's own main() is the
+// process entry point.
+// Built with /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup (see CMakeLists.txt) so
 // the process has no console, but the CRT still calls this ordinary main()
 // rather than requiring a WinMain() - which also means this GUI can honor the
 // same --config <file> the CLI does (kDefaultConfigPath, config.h).

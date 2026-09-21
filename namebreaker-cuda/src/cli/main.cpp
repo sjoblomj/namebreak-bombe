@@ -149,7 +149,7 @@ int main(int argc, char* argv[]) {
     }
 #else
     if (mode == "coordinator") {
-        fprintf(stderr, "This build of %s was compiled without networking support (rebuild without NETWORK=0 to enable 'coordinator' mode).\n", argv[0]);
+        fprintf(stderr, "This build of %s was compiled without networking support (rebuild with NAMEBREAK_NETWORK=ON to enable 'coordinator' mode).\n", argv[0]);
         return 1;
     }
 #endif

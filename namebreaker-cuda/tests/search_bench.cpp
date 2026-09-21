@@ -7,10 +7,10 @@
 // not a reimplementation of it.
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - `make search_bench` runs this from
-// build/testrun/ to keep it away from the project's real matches.txt; run
-// the binary directly from somewhere else disposable if not going through
-// `make search_bench`.
+// to the current directory - the run_search_bench target (CMakeLists.txt)
+// runs this from build/testrun/search_bench/ to keep it away from any real
+// matches; run the binary directly from somewhere else disposable if not
+// going through that target.
 
 #include <chrono>
 #include <cstdio>

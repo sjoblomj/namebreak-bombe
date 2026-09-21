@@ -5,7 +5,7 @@
 // needs - include this instead of <windows.h> directly.
 
 #ifndef _WIN32
-#error "src/gui/win32 is Windows-only - see the Makefile's gui target"
+#error "src/gui/win32 is Windows-only - see the namebreak-gui target in CMakeLists.txt"
 #endif
 
 #ifndef _WIN32_WINNT

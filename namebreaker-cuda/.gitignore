@@ -1,4 +1,5 @@
-# Everything the Makefile produces
+# Build trees (the CMake presets)
 /build/
+/build-cpu/
 # Where namebreak writes its matches when run from here (scripts/run.sh)
 /matches/

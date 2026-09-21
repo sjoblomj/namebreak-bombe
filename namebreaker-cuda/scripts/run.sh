@@ -3,7 +3,7 @@
 # namebreak reads its parameters from config.conf (see src/common/config.h) -
 # this script (re)generates that file's [search] section in the current
 # directory, recomputing the resume point from matches/matches.txt each time, then
-# runs namebreak (build it first with `make`) in "continuous" mode.
+# runs namebreak (build it first - see README.md's "Compiling") in "continuous" mode.
 
 NAMEBREAK="$(dirname "$0")/../build/namebreak"
 

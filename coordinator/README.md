@@ -221,10 +221,11 @@ curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecre
 
 ## Running a client
 
-Build `namebreak` as usual first (see `../namebreaker-cuda/Makefile` - the
-default build includes coordinator support; `make NETWORK=0` omits it). Then,
-in the directory you want its `matches/` directory in, create a `config.conf`
-(see `../namebreaker-cuda/src/common/config.h`) with a `[coordinator]` section:
+Build `namebreak` as usual first (see `../namebreaker-cuda/README.md` - the
+default build includes coordinator support; `-DNAMEBREAK_NETWORK=OFF` omits
+it). Then, in the directory you want its `matches/` directory in, create a
+`config.conf` (see `../namebreaker-cuda/src/common/config.h`) with a
+`[coordinator]` section:
 
 ```sh
 cd run   # or any working directory of your choice

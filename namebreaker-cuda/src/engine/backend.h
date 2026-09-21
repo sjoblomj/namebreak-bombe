@@ -58,7 +58,7 @@ class SearchBackend {
 public:
     virtual ~SearchBackend() = default;
 
-    // Short lowercase name, as in `make BACKEND=<name>`.
+    // Short lowercase name, as in --backend <name>.
     virtual const char* name() const = 0;
 
     // The alphabet sizes this backend can search, ascending - or empty if it

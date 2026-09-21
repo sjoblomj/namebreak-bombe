@@ -1,0 +1,28 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "CUDA",
+      "description": "The program as it ships: the CUDA backend, with coordinator mode",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "NAMEBREAK_BACKEND": "cuda" }
+    },
+    {
+      "name": "cpu",
+      "displayName": "CPU only",
+      "description": "No CUDA at all: the CPU reference backend",
+      "binaryDir": "${sourceDir}/build-cpu",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "NAMEBREAK_BACKEND": "cpu" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default", "jobs": 0 },
+    { "name": "cpu", "configurePreset": "cpu", "jobs": 0 }
+  ],
+  "testPresets": [
+    { "name": "default", "configurePreset": "default", "output": { "outputOnFailure": true }, "execution": { "jobs": 0 } },
+    { "name": "cpu", "configurePreset": "cpu", "output": { "outputOnFailure": true }, "execution": { "jobs": 0 } }
+  ]
+}
