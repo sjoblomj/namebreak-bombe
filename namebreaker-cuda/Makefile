@@ -7,13 +7,20 @@ OPT     := -O3
 # override on the command line for a different GPU, e.g.: make ARCH=sm_75
 ARCH    := sm_86
 
+# Which backend the program searches with (see src/backends/ and README.md's
+# "Backends"): `cuda` (the default - needs the CUDA Toolkit), or `cpu` - no
+# GPU code at all, built with $(CXX) alone, searching with the CPU reference
+# backend every build has for the tests. That one is far slower; it's for
+# checking the rest builds and works without CUDA: make BACKEND=cpu
+BACKEND ?= cuda
+
 # Everything this Makefile produces goes under build/: the binaries at its top
-# level, the tests in build/tests/, and object files in build/obj/<ARCH>/
-# <config>/ - one directory per set of compile flags (see "Build
+# level, the tests in build/tests/, and object files in build/obj/<ARCH or
+# cpu>/<config>/ - one directory per set of compile flags (see "Build
 # configurations" below), so switching between them never mixes objects
 # compiled with different flags.
 BUILD   := build
-OBJ     := $(BUILD)/obj/$(ARCH)
+OBJ     := $(BUILD)/obj/$(if $(filter cpu,$(BACKEND)),cpu,$(ARCH))
 TESTRUN := $(BUILD)/testrun
 
 # Set to 0 to build without any networking: no coordinator client, HTTP or
@@ -73,19 +80,25 @@ else
     DEPFLAGS := -MMD -MP
 endif
 
+ifeq ($(BACKEND),cuda)
 COMPILE := $(NVCC) -std=$(CXXSTD) $(OPT) -arch=$(ARCH) -Isrc -DNAMEBREAK_WITH_CUDA
+else ifeq ($(BACKEND),cpu)
+COMPILE := $(CXX) -std=$(CXXSTD) $(OPT) -Isrc
+else
+$(error BACKEND must be cuda or cpu, not '$(BACKEND)')
+endif
 
 # --- Sources ---------------------------------------------------------------
 #
 # src/engine    the search itself: runSearch(), candidate/bound arithmetic, hashing
-# src/backends  what runSearch() runs its batches on (CUDA)
+# src/backends  what runSearch() runs its batches on (CUDA, and the CPU reference)
 # src/common    config file, OS-specific helpers
 # src/net       the coordinator client (NETWORK=1 only)
 # src/cli       the console program's main()
 # src/gui       the Windows GUI's main() and windows (Windows only)
 ENGINE_SRC := src/engine/search.cpp src/engine/mpq_hash.cpp src/engine/candidate.cpp
 CUDA_SRC   := src/backends/cuda/cuda_backend.cu
-BACKEND_SRC := src/backends/backends.cpp $(CUDA_SRC)
+BACKEND_SRC := src/backends/backends.cpp src/backends/cpu/cpu_backend.cpp $(if $(filter cuda,$(BACKEND)),$(CUDA_SRC))
 # platform.cpp is always built: it isn't networking code - it holds the OS-
 # specific terminal/keypress helpers behind the pause key (used in every mode),
 # alongside the hostname/username lookups the coordinator client wants.
@@ -155,12 +168,16 @@ all: $(TARGET)
 $(TARGET): $(call objs,$(APP_CONFIG),$(APP_SRC)) $(BUILD)/app-config
 	$(COMPILE) -o $@ $(filter %.o,$^) $(APP_LDFLAGS)
 
-# Holds the name of the configuration build/namebreak was last linked from,
-# and is only rewritten when that changes - so switching NETWORK relinks it,
-# even though the other configuration's objects may all be older than it.
+# Hold which objects build/namebreak (app-config) and the tests
+# (backend-config) were last linked from, and are only rewritten when that
+# changes - so switching NETWORK/BACKEND/ARCH relinks them, even though the
+# other configuration's objects may all be older than they are.
 $(BUILD)/app-config: FORCE
 	@mkdir -p $(@D)
-	@echo '$(APP_CONFIG)' | cmp -s - $@ || echo '$(APP_CONFIG)' > $@
+	@echo '$(OBJ)/$(APP_CONFIG)' | cmp -s - $@ || echo '$(OBJ)/$(APP_CONFIG)' > $@
+$(BUILD)/backend-config: FORCE
+	@mkdir -p $(@D)
+	@echo '$(OBJ)' | cmp -s - $@ || echo '$(OBJ)' > $@
 
 .PHONY: FORCE
 FORCE:
@@ -169,6 +186,7 @@ FORCE:
 # report - useful when checking whether the kernel still fits comfortably
 # within occupancy limits. Nothing is written but a throwaway object file.
 verbose:
+	$(if $(filter cuda,$(BACKEND)),,$(error `make verbose` reports on the CUDA kernels - it needs BACKEND=cuda))
 	@mkdir -p $(OBJ)
 	$(COMPILE) $(CFLAGS_$(APP_CONFIG)) --ptxas-options=-v -c -o $(OBJ)/verbose.o $(CUDA_SRC)
 
@@ -185,6 +203,9 @@ clean:
 # NOTE: like the Windows OS branch above, this is untested - no Windows+CUDA
 # machine is available to build-verify it on.
 ifeq ($(OS),Windows_NT)
+ifneq ($(BACKEND),cuda)
+$(error the Windows build (and its GUI) is only set up for BACKEND=cuda)
+endif
 GUI_TARGET  := $(BUILD)/namebreak-gui$(EXE_EXT)
 GUI_LDFLAGS := $(NETWORK_LDFLAGS) -lcomctl32 -lshell32 -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup
 
@@ -203,16 +224,16 @@ endif
 
 # Pure-CPU correctness check for IncrementalPrefixHasher
 # (src/engine/mpq_hash.h) - no GPU involved.
-$(BUILD)/tests/prefix_hasher_test: $(call objs,test,tests/prefix_hasher_test.cpp $(ENGINE_SRC))
+$(BUILD)/tests/prefix_hasher_test: $(call objs,test,tests/prefix_hasher_test.cpp $(ENGINE_SRC)) $(BUILD)/backend-config
 	@mkdir -p $(@D)
-	$(COMPILE) -o $@ $^
+	$(COMPILE) -o $@ $(filter %.o,$^)
 
 # Pure-CPU benchmark isolating IncrementalPrefixHasher's own speedup (O(1)
 # amortized vs. from-scratch rehashing per leadingIdx step) from the separate
 # GPU-window-size question - no GPU involved.
-$(BUILD)/tests/prefix_hasher_bench: $(call objs,test,tests/prefix_hasher_bench.cpp $(ENGINE_SRC))
+$(BUILD)/tests/prefix_hasher_bench: $(call objs,test,tests/prefix_hasher_bench.cpp $(ENGINE_SRC)) $(BUILD)/backend-config
 	@mkdir -p $(@D)
-	$(COMPILE) -o $@ $^
+	$(COMPILE) -o $@ $(filter %.o,$^)
 
 prefix_hasher_bench: $(BUILD)/tests/prefix_hasher_bench
 	./$<
@@ -232,21 +253,29 @@ prefix_hasher_bench: $(BUILD)/tests/prefix_hasher_bench
 #                    longer CPU-side leading part, and a shallower row decode
 #   window6          the widest supported window: 5 prefix digits per row and
 #                    trailing indices beyond 32 bits
+#
+# The first configuration's binary is also run against the CPU reference
+# backend (--backend cpu); the others only change the CUDA backend's tuning,
+# so a BACKEND=cpu build only builds and runs the first.
+ifeq ($(BACKEND),cuda)
 INTEGRATION_CONFIGS := test small_launch window2 window6
+else
+INTEGRATION_CONFIGS := test
+endif
 INTEGRATION_TESTS := $(patsubst %,$(BUILD)/tests/search_integration_test-%,$(INTEGRATION_CONFIGS))
 
 define INTEGRATION_RULE
-$(BUILD)/tests/search_integration_test-$(1): $(call objs,$(1),tests/search_integration_test.cpp $(SEARCH_SRC))
+$(BUILD)/tests/search_integration_test-$(1): $(call objs,$(1),tests/search_integration_test.cpp $(SEARCH_SRC)) $(BUILD)/backend-config
 	@mkdir -p $$(@D)
-	$(COMPILE) -o $$@ $$^
+	$(COMPILE) -o $$@ $$(filter %.o,$$^)
 endef
 $(foreach c,$(INTEGRATION_CONFIGS),$(eval $(call INTEGRATION_RULE,$(c))))
 
 # What runSearch() does when a launch has more hashA hits than MAX_MATCHES can
 # record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
-$(BUILD)/tests/search_overflow_test: $(call objs,overflow,tests/search_overflow_test.cpp $(SEARCH_SRC))
+$(BUILD)/tests/search_overflow_test: $(call objs,overflow,tests/search_overflow_test.cpp $(SEARCH_SRC)) $(BUILD)/backend-config
 	@mkdir -p $(@D)
-	$(COMPILE) -o $@ $^
+	$(COMPILE) -o $@ $(filter %.o,$^)
 
 # The CUDA backend takes about a minute to compile per configuration (the
 # search kernel is instantiated per alphabet size and suffix length) -
@@ -255,16 +284,21 @@ test: $(BUILD)/tests/prefix_hasher_test $(INTEGRATION_TESTS) $(BUILD)/tests/sear
 	./$(BUILD)/tests/prefix_hasher_test
 	mkdir -p $(TESTRUN)
 	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_integration_test-test
+	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_overflow_test
+ifeq ($(BACKEND),cuda)
 	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_integration_test-small_launch
 	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_integration_test-window2
 	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_integration_test-window6
-	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_overflow_test
+	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_integration_test-test --backend cpu
+	cd $(TESTRUN) && $(CURDIR)/$(BUILD)/tests/search_overflow_test --backend cpu
+endif
 
 # Real-code throughput check - times the actual runSearch() (not a proxy
-# kernel) over a ~28.8B-candidate range. See WINDOW above.
-$(BUILD)/tests/search_bench$(if $(WINDOW),-window$(WINDOW)): $(call objs,$(BENCH_CONFIG),tests/search_bench.cpp $(SEARCH_SRC))
+# kernel) over a ~28.8B-candidate range, on the default backend. See WINDOW
+# above. (Meant for GPU backends: the CPU one would take many minutes.)
+$(BUILD)/tests/search_bench$(if $(WINDOW),-window$(WINDOW)): $(call objs,$(BENCH_CONFIG),tests/search_bench.cpp $(SEARCH_SRC)) $(BUILD)/backend-config
 	@mkdir -p $(@D)
-	$(COMPILE) -o $@ $^
+	$(COMPILE) -o $@ $(filter %.o,$^)
 
 search_bench: $(BUILD)/tests/search_bench$(if $(WINDOW),-window$(WINDOW))
 	mkdir -p $(TESTRUN)

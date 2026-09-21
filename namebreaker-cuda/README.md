@@ -115,6 +115,7 @@ Requires the CUDA Toolkit (`nvcc`) and a CUDA-capable GPU.
 make                          # builds build/namebreak
 make ARCH=sm_75               # for a different GPU (see nvidia-smi --query-gpu=compute_cap --format=csv)
 make NETWORK=0                # omit coordinator mode / the libcurl dependency
+make BACKEND=cpu              # no CUDA at all: g++ only, searching on the CPU (see Backends below)
 ```
 
 The alphabet's *size* (not its exact characters) is baked into the binary as
@@ -126,8 +127,8 @@ match one of them. Supporting a new size means adding it to
 recompiling.
 
 `make test` runs the correctness test suite: a pure-CPU unit test, plus
-end-to-end GPU tests that compare real search results against an independent
-brute-force CPU reference (thousands of cases: every supported alphabet
+end-to-end tests of every backend that compare real search results against
+an independent brute-force reference (thousands of cases: every supported alphabet
 size, every last-character position, ranges starting/ending mid-row and
 crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
 0x80, the both-hashes-match path, and a seeded fuzzer). The same test source
@@ -142,7 +143,7 @@ built into `build/`; `make clean` removes it.
 | Directory | What's in it |
 |---|---|
 | `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU |
-| `src/backends/` | What the search runs its batches on - `cuda/` holds the CUDA kernels and the code that launches them |
+| `src/backends/` | What the search runs its batches on: `cuda/`, and the `cpu/` reference (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
 | `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `make NETWORK=0`) |
 | `src/cli/` | The console program's `main()` |
@@ -158,12 +159,20 @@ Includes are written relative to `src/` (e.g. `#include "engine/search.h"`).
 everything that isn't hashing - validation, bounds, the leading/trailing
 split, pruning, pause/abort, writing matches. It hands each chunk of
 candidates to a *backend* (`SearchBackend`, `src/engine/backend.h`), which
-hashes them and returns the hits. The CUDA backend is
-`src/backends/cuda/`, and `src/backends/backends.cpp` lists the backends a
-build has; the program uses the first. A new backend (say, for AMD GPUs)
-implements `SearchBackend`, gets a directory under `src/backends/` and an
-entry in `backends.cpp`, and is covered by the same tests: they take a
-`--backend <name>` argument.
+hashes them and returns the hits. `src/backends/backends.cpp` lists the
+backends a build has; the program uses the first:
+
+- `cuda/` - the CUDA kernels and the code that launches them.
+- `cpu/` - a reference backend: one thread, every candidate hashed from
+  scratch. Far too slow for real searches, but simple enough to be obviously
+  right. Every build has it, and `make test` runs the end-to-end tests
+  against it as well as against CUDA. `make BACKEND=cpu` builds with it
+  alone, without any CUDA code - e.g. to check the rest builds and works
+  without the CUDA Toolkit.
+
+A new backend (say, for AMD GPUs) implements `SearchBackend`, gets a
+directory under `src/backends/` and an entry in `backends.cpp`, and is
+covered by the same tests: they take a `--backend <name>` argument.
 
 ## Design decisions
 
