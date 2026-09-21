@@ -199,7 +199,7 @@ bool getBool(const std::map<std::string, JsonValue>& obj, const std::string& key
 
 std::string toJson(const RegisterRequest& req) {
     return "{\"username\":" + escapeJsonString(req.username) + ",\"hostname\":" + escapeJsonString(req.hostname) +
-           ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) + "}";
+           ",\"backend\":" + escapeJsonString(req.backend) + ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) + "}";
 }
 
 std::string toJson(const HeartbeatRequest& req) {

@@ -43,6 +43,7 @@ pub async fn register(
         return Err(AppError::BadRequest("username and hostname are required".into()));
     }
     let client_version = resolve_client_protocol_version(&req)?.to_string();
+    let backend = req.backend.trim();
 
     let now = now_unix();
 
@@ -55,9 +56,10 @@ pub async fn register(
         // Refreshed on every registration, not just created once: a
         // returning client may have been upgraded (or downgraded) since it
         // last registered, and claim_range always wants the current picture.
-        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ? WHERE id = ?")
             .bind(now)
             .bind(&client_version)
+            .bind(backend)
             .bind(existing.id)
             .execute(&state.pool)
             .await?;
@@ -66,7 +68,7 @@ pub async fn register(
 
     let token = generate_token();
     let user_id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(username)
     .bind(hostname)
@@ -74,6 +76,7 @@ pub async fn register(
     .bind(now)
     .bind(now)
     .bind(&client_version)
+    .bind(backend)
     .fetch_one(&state.pool)
     .await?;
 
@@ -513,7 +516,7 @@ mod tests {
     use super::*;
 
     fn register_request(protocol_version: &str) -> RegisterRequest {
-        RegisterRequest { username: "u".into(), hostname: "h".into(), protocol_version: protocol_version.to_string() }
+        RegisterRequest { username: "u".into(), hostname: "h".into(), backend: "cuda".into(), protocol_version: protocol_version.to_string() }
     }
 
     #[test]

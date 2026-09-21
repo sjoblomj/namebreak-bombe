@@ -1131,6 +1131,7 @@ mod tests {
             created_at: now,
             last_seen_at: now,
             protocol_version: "1.0.0".to_string(),
+            backend: String::new(),
         }
     }
 
@@ -1161,6 +1162,7 @@ mod tests {
             created_at: now,
             last_seen_at: now,
             protocol_version: protocol_version.to_string(),
+            backend: String::new(),
         }
     }
 

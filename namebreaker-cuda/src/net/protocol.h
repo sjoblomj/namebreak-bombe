@@ -23,6 +23,9 @@ constexpr const char* kProtocolVersion = "1.0.0";
 struct RegisterRequest {
     std::string username;
     std::string hostname;
+    // The backend this client searches with (SearchBackend::name(), e.g.
+    // "cuda") - informational only; the server just records it.
+    std::string backend;
     std::string protocolVersion = kProtocolVersion;
 };
 

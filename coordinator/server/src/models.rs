@@ -17,6 +17,9 @@ pub struct User {
     /// hands this client a target using an alphabet introduced after the
     /// version it declared - see `alphabet::alphabet_available_to`.
     pub protocol_version: String,
+    /// The backend this client searches with (e.g. "cuda"), as declared at
+    /// `/register` time - informational only.
+    pub backend: String,
 }
 
 #[allow(dead_code)]

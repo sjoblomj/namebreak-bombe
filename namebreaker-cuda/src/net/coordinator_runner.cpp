@@ -414,11 +414,16 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
     // curl_global_cleanup() via this guard's destructor on every return path.
     CurlGlobalGuard curlGuard;
 
+    // One backend for every range this client claims - runSearch() resets
+    // its state at the start of each. Created before registering, which
+    // tells the server which backend this client uses.
+    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+
     CoordinatorClient client(args.serverUrl);
     int64_t userId = 0;
     std::string serverProtocolVersion;
     std::string error;
-    if (!client.registerClient(args.username, args.hostname, userId, serverProtocolVersion, error)) {
+    if (!client.registerClient(args.username, args.hostname, backend->name(), userId, serverProtocolVersion, error)) {
         std::string msg = "failed to register with coordinator: " + error;
         fprintf(stderr, "%s\n", msg.c_str());
         if (callbacks && callbacks->onStatus)
@@ -427,15 +432,12 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
     }
     {
         std::string msg = "[coordinator] registered with coordinator as user " + std::to_string(userId) + " (" + args.username + "@" +
-                           args.hostname + ") - client protocol v" + kProtocolVersion + ", server protocol v" + serverProtocolVersion;
+                           args.hostname + ", " + backend->name() + " backend) - client protocol v" + kProtocolVersion + ", server protocol v" +
+                           serverProtocolVersion;
         printf("%s\n", msg.c_str());
         if (callbacks && callbacks->onStatus)
             callbacks->onStatus(msg);
     }
-
-    // One backend for every range this client claims - runSearch() resets
-    // its state at the start of each.
-    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
     auto claimBackoff = pollInterval;

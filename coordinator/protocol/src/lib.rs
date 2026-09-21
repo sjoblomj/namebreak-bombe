@@ -79,6 +79,11 @@ pub const PROTOCOL_VERSION: Version = Version::new(1, 0, 0);
 pub struct RegisterRequest {
     pub username: String,
     pub hostname: String,
+    /// The backend this client searches with (e.g. `"cuda"`, `"cpu"`) -
+    /// informational only: stored on the user, never consulted. Empty for a
+    /// client that doesn't send it.
+    #[serde(default)]
+    pub backend: String,
     /// This client's own protocol version (`"X.Y.Z"`, see `PROTOCOL_VERSION`).
     pub protocol_version: String,
 }

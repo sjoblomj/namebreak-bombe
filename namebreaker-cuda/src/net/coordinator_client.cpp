@@ -6,8 +6,12 @@ std::string authHeader(const std::string& token) {
 }
 } // namespace
 
-bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, int64_t& outUserId, std::string& outServerProtocolVersion, std::string& error) {
-    RegisterRequest req{username, hostname};
+bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t& outUserId,
+                                       std::string& outServerProtocolVersion, std::string& error) {
+    RegisterRequest req;
+    req.username = username;
+    req.hostname = hostname;
+    req.backend = backend;
     HttpResponse resp = http_.post(baseUrl_ + "/api/v1/register", {}, toJson(req));
     if (resp.status == 0) {
         error = "request failed: " + resp.error;
