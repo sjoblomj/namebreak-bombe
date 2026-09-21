@@ -5,8 +5,10 @@
 
 #include "engine/backend.h"
 
-// Searches on an NVIDIA GPU. Constructing one doesn't touch the GPU - that
-// only happens once a search begins.
-std::unique_ptr<SearchBackend> makeCudaBackend();
+#include <string>
+
+// Searches on an NVIDIA GPU. Null, with `error` set, if there's no CUDA
+// device (or driver) to search on.
+std::unique_ptr<SearchBackend> makeCudaBackend(std::string& error);
 
 #endif // NAMEBREAK_BACKENDS_CUDA_CUDA_BACKEND_H

@@ -401,6 +401,7 @@ bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::s
         return false;
     }
     out.matchesDir = config.matchesDir;
+    out.backend = config.backend;
     return true;
 }
 
@@ -417,7 +418,14 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
     // One backend for every range this client claims - runSearch() resets
     // its state at the start of each. Created before registering, which
     // tells the server which backend this client uses.
-    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+    std::string backendError;
+    std::unique_ptr<SearchBackend> backend = createBackend(args.backend, backendError);
+    if (!backend) {
+        fprintf(stderr, "%s\n", backendError.c_str());
+        if (callbacks && callbacks->onStatus)
+            callbacks->onStatus(backendError);
+        return 1;
+    }
 
     CoordinatorClient client(args.serverUrl);
     int64_t userId = 0;

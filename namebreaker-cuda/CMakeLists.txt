@@ -8,15 +8,13 @@
 cmake_minimum_required(VERSION 3.24)
 project(namebreak LANGUAGES CXX)
 
-# Which backend the program searches with (see src/backends/ and README.md's
-# "Backends"): `cuda` (the default - needs the CUDA Toolkit), or `cpu` - no
-# GPU code at all, searching with the CPU reference backend every build has
-# for the tests. That one is far slower; it's for checking the rest builds and
-# works without CUDA.
-set(NAMEBREAK_BACKEND cuda CACHE STRING "Backend the program searches with: cuda or cpu")
-set_property(CACHE NAMEBREAK_BACKEND PROPERTY STRINGS cuda cpu)
-if(NOT NAMEBREAK_BACKEND MATCHES "^(cuda|cpu)$")
-    message(FATAL_ERROR "NAMEBREAK_BACKEND must be cuda or cpu, not '${NAMEBREAK_BACKEND}'")
+# Which GPU backends to build (see src/backends/ and README.md's "Backends").
+# The CPU backends are in every build.
+#   NAMEBREAK_GPU  `cuda` (the default - needs the CUDA Toolkit), or `none`
+set(NAMEBREAK_GPU cuda CACHE STRING "CUDA-dialect GPU backend: cuda or none")
+set_property(CACHE NAMEBREAK_GPU PROPERTY STRINGS cuda none)
+if(NOT NAMEBREAK_GPU MATCHES "^(cuda|none)$")
+    message(FATAL_ERROR "NAMEBREAK_GPU must be cuda or none, not '${NAMEBREAK_GPU}'")
 endif()
 
 # OFF builds without any networking: no coordinator client, HTTP or protocol
@@ -33,7 +31,7 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NAMEBREAK_BACKEND STREQUAL "cuda")
+if(NAMEBREAK_GPU STREQUAL "cuda")
     # The GPU architecture to compile for, as a compute capability without the
     # dot (see `nvidia-smi --query-gpu=compute_cap --format=csv`). 86 is this
     # machine's RTX 3080 Ti Laptop GPU; override for another GPU, e.g.
@@ -67,8 +65,8 @@ set(SEARCH_SOURCES
     src/engine/mpq_hash.cpp
     src/engine/candidate.cpp
     src/backends/backends.cpp
-    src/backends/cpu/cpu_backend.cpp)
-if(NAMEBREAK_BACKEND STREQUAL "cuda")
+    src/backends/reference/reference_backend.cpp)
+if(NAMEBREAK_GPU STREQUAL "cuda")
     list(APPEND SEARCH_SOURCES src/backends/cuda/cuda_backend.cu)
 endif()
 
@@ -78,7 +76,7 @@ function(namebreak_search_library name)
     target_include_directories(${name} PUBLIC src)
     # Public, so what's compiled against the library (the tests) sees the same values.
     target_compile_definitions(${name} PUBLIC ${ARGN})
-    if(NAMEBREAK_BACKEND STREQUAL "cuda")
+    if(NAMEBREAK_GPU STREQUAL "cuda")
         target_compile_definitions(${name} PRIVATE NAMEBREAK_WITH_CUDA)
     endif()
     target_link_libraries(${name} PUBLIC Threads::Threads)
@@ -137,10 +135,13 @@ enable_testing()
 # relative to the current directory - so each runs in its own directory under
 # build/testrun/, away from any real matches and from each other (ctest -j).
 # namebreak_test(<name> <executable> [<argument>...])
+# A test exits with 77 when its backend can't run on this machine (a GPU
+# backend without that kind of GPU), which ctest then reports as skipped.
 function(namebreak_test name executable)
     set(dir ${CMAKE_BINARY_DIR}/testrun/${name})
     file(MAKE_DIRECTORY ${dir})
     add_test(NAME ${name} COMMAND ${executable} ${ARGN} WORKING_DIRECTORY ${dir})
+    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
 
 # namebreak_test_executable(<name> <source> <search library>)
@@ -154,23 +155,31 @@ endfunction()
 namebreak_test_executable(prefix_hasher_test tests/prefix_hasher_test.cpp namebreak_search)
 namebreak_test(prefix_hasher_test prefix_hasher_test)
 
+# The backends this build has (backends/backends.cpp); every one is tested.
+# Every backend except `reference` searches in rows (the same batch geometry
+# as the CUDA one) and honours the same tuning overrides.
+set(ROW_BACKENDS "")
+if(NAMEBREAK_GPU STREQUAL "cuda")
+    list(APPEND ROW_BACKENDS cuda)
+endif()
+
 # End-to-end correctness check for runSearch() itself, against a brute-force
-# reference - see the file. The CUDA backend is tested in several
-# configurations of its tuning values (src/backends/cuda/tuning.h), because
-# they change which code paths a search exercises - every case derives its
-# geometry from them:
-#   default        the shipped configuration
+# reference - see the file. Every backend is tested with its shipped tuning
+# values, and the row-based ones in a few more configurations
+# (NAMEBREAK_GPU_WINDOW_CHARS/NAMEBREAK_ROWS_PER_LAUNCH, see
+# src/backends/cuda/tuning.h), because they change which code paths a search
+# exercises - every case derives its geometry from them:
 #   small_launch   3 rows per launch: forces many launches per leading value,
 #                  so the chunk boundaries are actually exercised
-#   window2        a 2-character GPU window (5 rows per launch): a much longer
+#   window2        a 2-character window (5 rows per launch): a much longer
 #                  CPU-side leading part, and a shallower row decode
 #   window6        the widest supported window: 5 prefix digits per row and
 #                  trailing indices beyond 32 bits
-# The CPU reference backend is tested once, with the default configuration.
 namebreak_test_executable(search_integration_test tests/search_integration_test.cpp namebreak_search)
-namebreak_test(integration-${NAMEBREAK_BACKEND} search_integration_test --backend ${NAMEBREAK_BACKEND})
-if(NAMEBREAK_BACKEND STREQUAL "cuda")
-    namebreak_test(integration-cpu search_integration_test --backend cpu)
+foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
+    namebreak_test(integration-${backend} search_integration_test --backend ${backend})
+endforeach()
+if(ROW_BACKENDS)
     foreach(config IN ITEMS
             "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3"
             "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5"
@@ -178,7 +187,9 @@ if(NAMEBREAK_BACKEND STREQUAL "cuda")
         list(POP_FRONT config suffix)
         namebreak_search_library(namebreak_search_${suffix} ${config})
         namebreak_test_executable(search_integration_test_${suffix} tests/search_integration_test.cpp namebreak_search_${suffix})
-        namebreak_test(integration-cuda-${suffix} search_integration_test_${suffix} --backend cuda)
+        foreach(backend IN LISTS ROW_BACKENDS)
+            namebreak_test(integration-${backend}-${suffix} search_integration_test_${suffix} --backend ${backend})
+        endforeach()
     endforeach()
 endif()
 
@@ -186,16 +197,16 @@ endif()
 # record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
 namebreak_search_library(namebreak_search_overflow MAX_MATCHES=1)
 namebreak_test_executable(search_overflow_test tests/search_overflow_test.cpp namebreak_search_overflow)
-namebreak_test(overflow-${NAMEBREAK_BACKEND} search_overflow_test --backend ${NAMEBREAK_BACKEND})
-if(NAMEBREAK_BACKEND STREQUAL "cuda")
-    namebreak_test(overflow-cpu search_overflow_test --backend cpu)
-endif()
+foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
+    namebreak_test(overflow-${backend} search_overflow_test --backend ${backend})
+endforeach()
 
 # Benchmarks - not tests, run with `cmake --build --preset default --target
 # <name>`:
 #   run_search_bench         times the real runSearch() over a ~28.8B-candidate
-#                            range, on the default backend (meant for GPU
-#                            backends: the CPU one would take many minutes)
+#                            range, on the default backend (run
+#                            build/tests/search_bench --backend <name> for
+#                            another; not `reference`, which would take hours)
 #   run_prefix_hasher_bench  IncrementalPrefixHasher's own speedup, CPU only
 # NAMEBREAK_BENCH_WINDOW sets the GPU window for search_bench only, to
 # re-sweep that tuning value against real hardware without hand-editing the

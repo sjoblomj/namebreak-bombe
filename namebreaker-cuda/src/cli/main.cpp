@@ -76,18 +76,25 @@ void handleSigintPauseOrQuit(int sig) {
 // Usage/error message for a malformed command line - shared by every exit
 // path in the argv-parsing loop below so they all describe the same syntax.
 void printUsage(const char* argv0) {
-    fprintf(stderr, "Usage: %s [--mode continuous|bounded|coordinator] [--config <file>]\n"
+    std::string backends;
+    for (const std::string& name : backendNames())
+        backends += (backends.empty() ? "" : "|") + name;
+    fprintf(stderr, "Usage: %s [--mode continuous|bounded|coordinator] [--config <file>] [--backend %s]\n"
                      "Reads the given --config file (default: %s, in the current directory) for\n"
-                     "everything else; --mode, if given, overrides that file's own 'mode = ...'.\n",
-            argv0, kDefaultConfigPath);
+                     "everything else; --mode and --backend, if given, override that file's own\n"
+                     "'mode = ...'/'backend = ...'. Without either, the first backend listed that\n"
+                     "can run on this machine is used.\n",
+            argv0, backends.c_str(), kDefaultConfigPath);
 }
 
 int main(int argc, char* argv[]) {
-    // Two optional, order-independent flags: --mode, overriding config.conf's
-    // own `mode = ...` (see config.h), and --config <file>, overriding which
-    // file that config (and everything else below) is read from. Everything
-    // other than these two lives in the config file itself.
+    // Three optional, order-independent flags: --mode and --backend,
+    // overriding config.conf's own `mode = ...`/`backend = ...` (see
+    // config.h), and --config <file>, overriding which file that config (and
+    // everything else below) is read from. Everything else lives in the
+    // config file itself.
     std::string modeOverride;
+    std::string backendOverride;
     std::string configPath = kDefaultConfigPath;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -97,6 +104,12 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             configPath = argv[++i];
+        } else if (arg == "--backend") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--backend requires a backend name\n");
+                return 1;
+            }
+            backendOverride = argv[++i];
         } else if (arg == "--mode") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--mode requires an argument (continuous, bounded, or coordinator)\n");
@@ -119,6 +132,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "%s\n", error.c_str());
         return 1;
     }
+
+    if (!backendOverride.empty())
+        config.backend = backendOverride;
 
     std::string mode = !modeOverride.empty() ? modeOverride : config.mode;
     if (mode != "continuous" && mode != "bounded" && mode != "coordinator") {
@@ -160,7 +176,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+    std::unique_ptr<SearchBackend> backend = createBackend(config.backend, error);
+    if (!backend) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
     SearchResult result = runSearch(*backend, req, nullptr, nullptr, &g_paused);
 
     if (!result.ok) {

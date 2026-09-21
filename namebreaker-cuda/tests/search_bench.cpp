@@ -22,7 +22,21 @@
 #include "engine/candidate.h"
 
 int main(int argc, char** argv) {
-    bool pruneSymbolRuns = !(argc >= 2 && std::string(argv[1]) == "noprune");
+    // [noprune] [--backend <name>] - the default backend is the first that
+    // can run here (see backends/backends.h).
+    bool pruneSymbolRuns = true;
+    std::string backendName;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "noprune") {
+            pruneSymbolRuns = false;
+        } else if (arg == "--backend" && i + 1 < argc) {
+            backendName = argv[++i];
+        } else {
+            fprintf(stderr, "Usage: %s [noprune] [--backend <name>]\n", argv[0]);
+            return 1;
+        }
+    }
     const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"; // real, 49 chars
     const std::string prefix = "REZ\\";
     const std::string suffix = ".WAV";
@@ -53,7 +67,12 @@ int main(int argc, char** argv) {
     auto onPartialMatch = [&](const std::string&) { matchCount++; };
 
     auto start = std::chrono::steady_clock::now();
-    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+    std::string error;
+    std::unique_ptr<SearchBackend> backend = createBackend(backendName, error);
+    if (!backend) {
+        fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
     SearchResult result = runSearch(*backend, req, nullptr, onPartialMatch);
     auto end = std::chrono::steady_clock::now();
 

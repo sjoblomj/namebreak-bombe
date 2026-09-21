@@ -79,7 +79,8 @@ static int g_failures = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { fprintf(stderr, "FAILED: %s\n", msg); ++g_failures; } else printf("  ok: %s\n", msg); } while (0)
 
 int main(int argc, char** argv) {
-    std::string backendName = availableBackends().front();
+    // Default: the first backend that can run here (see backends/backends.h).
+    std::string backendName;
     if (argc == 3 && std::string(argv[1]) == "--backend") {
         backendName = argv[2];
     } else if (argc != 1) {
@@ -89,8 +90,10 @@ int main(int argc, char** argv) {
     std::string error;
     g_backend = createBackend(backendName, error);
     if (!g_backend) {
-        fprintf(stderr, "%s\n", error.c_str());
-        return 1;
+        // 77: "skipped" to ctest (see SKIP_RETURN_CODE in CMakeLists.txt) - a
+        // GPU backend on a machine without that kind of GPU.
+        fprintf(stderr, "%s - skipping\n", error.c_str());
+        return 77;
     }
 
     prepareCryptTable(g_cryptTable);

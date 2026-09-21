@@ -191,9 +191,11 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 out.mode = value;
             } else if (key == "matches_dir") {
                 out.matchesDir = value;
+            } else if (key == "backend") {
+                out.backend = value;
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search] or [coordinator] section (only 'mode' and 'matches_dir' are allowed before any section)";
+                        "' must be inside a [search] or [coordinator] section (only 'mode', 'matches_dir' and 'backend' are allowed before any section)";
                 return false;
             }
         } else {

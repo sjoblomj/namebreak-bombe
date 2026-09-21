@@ -56,7 +56,7 @@ void onStatus(const std::string& text) {
 // those are left empty and updateUiFromSharedState shows the indeterminate
 // marquee style for its whole run instead of a fraction that would stop
 // meaning anything once it moves past its first length.
-void runLocalSearch(const SearchRequest& req, bool continuous) {
+void runLocalSearch(const SearchRequest& req, bool continuous, const std::string& backendName) {
     {
         std::lock_guard<std::mutex> lock(g_status.mutex);
         g_status.targetName = req.prefix + "..." + req.suffix;
@@ -78,7 +78,14 @@ void runLocalSearch(const SearchRequest& req, bool continuous) {
         g_status.rangeJustFinished = false;
         g_status.statusText = std::string("Running ") + (continuous ? "continuous" : "bounded") + " search...";
     }
-    std::unique_ptr<SearchBackend> backend = createDefaultBackend();
+    std::string backendError;
+    std::unique_ptr<SearchBackend> backend = createBackend(backendName, backendError);
+    if (!backend) {
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        g_status.hasActiveRange = false;
+        g_status.statusText = backendError;
+        return;
+    }
     SearchResult result = runSearch(*backend, req, &g_quitRequested, nullptr, &g_pauseRequested);
     std::lock_guard<std::mutex> lock(g_status.mutex);
     g_status.hasActiveRange = false;
@@ -105,7 +112,7 @@ void workerThreadMain(AppConfig config, HWND notifyWindow) {
         callbacks.onStatus = onStatus;
         runCoordinator(config.coordinatorArgs, &g_pauseRequested, &g_quitRequested, &callbacks);
     } else {
-        runLocalSearch(config.searchRequest, config.mode == "continuous");
+        runLocalSearch(config.searchRequest, config.mode == "continuous", config.backend);
     }
     // Marshal back onto the UI thread rather than touching any Win32 API
     // from here - see WM_APP_WORKER_STOPPED in MainWndProc.

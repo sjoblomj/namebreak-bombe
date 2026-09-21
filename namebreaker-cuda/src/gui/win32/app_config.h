@@ -14,6 +14,8 @@ namespace gui {
 // selected by `mode` (see workerThreadMain).
 struct AppConfig {
     std::string mode;
+    // config.conf's `backend` - empty for the first one that can run here.
+    std::string backend;
     CoordinatorArgs coordinatorArgs;
     SearchRequest searchRequest;
 };

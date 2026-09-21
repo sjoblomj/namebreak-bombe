@@ -1,4 +1,4 @@
-#include "backends/cpu/cpu_backend.h"
+#include "backends/reference/reference_backend.h"
 
 #include <cstdio>
 #include <string>
@@ -9,9 +9,9 @@ namespace {
 // Hashes every candidate from scratch (every trailing character, then the
 // suffix) - none of the CUDA backend's row trick - so the only thing it
 // shares with the fast path is the hash recurrence itself.
-class CpuBackend : public SearchBackend {
+class ReferenceBackend : public SearchBackend {
 public:
-    const char* name() const override { return "cpu"; }
+    const char* name() const override { return "reference"; }
     std::vector<int> supportedAlphabetSizes() const override { return {}; }
     int windowChars() const override { return 4; }
     // The trailing index is a uint64_t and the engine keeps the trailing
@@ -55,7 +55,7 @@ private:
     uint32_t targetB_ = 0;
 };
 
-BatchOutcome CpuBackend::runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) {
+BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) {
     BatchOutcome outcome;
     const std::string prefix(params.prefix, params.prefixSize);
     const uint64_t alphabetSize = alphabet_.size();
@@ -114,6 +114,6 @@ BatchOutcome CpuBackend::runBatch(int trailingLen, uint64_t start, uint64_t coun
 
 } // namespace
 
-std::unique_ptr<SearchBackend> makeCpuBackend() {
-    return std::make_unique<CpuBackend>();
+std::unique_ptr<SearchBackend> makeReferenceBackend() {
+    return std::make_unique<ReferenceBackend>();
 }

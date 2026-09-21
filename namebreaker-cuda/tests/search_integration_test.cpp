@@ -9,8 +9,8 @@
 // crash, no error. Nothing here trusts the code under test to say what the
 // right answer is.
 //
-// It tests one backend (--backend <name>, default: the build's default - see
-// backends/backends.h). This binary is built several times (CMakeLists.txt),
+// It tests one backend (--backend <name>, default: the first that can run
+// here - see backends/backends.h). This binary is built several times (CMakeLists.txt),
 // with different -DNAMEBREAK_GPU_WINDOW_CHARS / -DNAMEBREAK_ROWS_PER_LAUNCH
 // values (see backends/cuda/tuning.h and CMakeLists.txt), so the same cases
 // exercise different leading/trailing splits, kernel row-decode depths and
@@ -917,7 +917,8 @@ static bool fuzz(int iterations, uint64_t seed) {
 }
 
 int main(int argc, char** argv) {
-    std::string backendName = availableBackends().front();
+    // Default: the first backend that can run here (see backends/backends.h).
+    std::string backendName;
     if (argc == 3 && std::string(argv[1]) == "--backend") {
         backendName = argv[2];
     } else if (argc != 1) {
@@ -927,8 +928,10 @@ int main(int argc, char** argv) {
     std::string error;
     g_backend = createBackend(backendName, error);
     if (!g_backend) {
-        fprintf(stderr, "%s\n", error.c_str());
-        return 1;
+        // 77: "skipped" to ctest (see SKIP_RETURN_CODE in CMakeLists.txt) - a
+        // GPU backend on a machine without that kind of GPU.
+        fprintf(stderr, "%s - skipping\n", error.c_str());
+        return 77;
     }
     g_window = g_backend->windowChars();
     std::vector<int> supportedSizes = g_backend->supportedAlphabetSizes();

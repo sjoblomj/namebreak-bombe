@@ -20,6 +20,11 @@ suffix** - the prefix and suffix are fixed, known strings (e.g. `REZ\` and
 A different config file can be used instead of `config.conf` via
 `--config <file>`.
 
+It searches on the first backend (see [Backends](#backends)) that can run
+on the machine - normally the GPU. A top-level `backend = <name>` line in
+`config.conf`, or `--backend <name>`, picks one instead; running with an
+unknown name lists the ones the build has.
+
 - **`bounded`** - exhaustively searches candidates of exactly
   `start_candidate`'s length, between `lower_bound` and `upper_bound`, then
   exits.
@@ -126,7 +131,7 @@ Options, passed to the first command as `-D<option>=<value>`:
 |---|---|---|
 | `CMAKE_CUDA_ARCHITECTURES` | `86` | The GPU's compute capability, without the dot (`nvidia-smi --query-gpu=compute_cap --format=csv`), or `native` |
 | `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode and the libcurl dependency |
-| `NAMEBREAK_BACKEND` | `cuda` | `cpu` builds without any CUDA code, searching on the CPU (see Backends below) - or use the `cpu` preset, which builds into `build-cpu/` |
+| `NAMEBREAK_GPU` | `cuda` | `none` builds without any CUDA code (see Backends below) - or use the `portable` preset, which builds into `build-portable/` |
 | `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
 
 On Windows, use a Visual Studio developer prompt (MSVC is the host compiler
@@ -161,7 +166,7 @@ deleting it is the clean build.
 | Directory | What's in it |
 |---|---|
 | `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU |
-| `src/backends/` | What the search runs its batches on: `cuda/`, and the `cpu/` reference (see Backends below) |
+| `src/backends/` | What the search runs its batches on (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
 | `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `NAMEBREAK_NETWORK=OFF`) |
 | `src/cli/` | The console program's `main()` |
@@ -178,19 +183,20 @@ everything that isn't hashing - validation, bounds, the leading/trailing
 split, pruning, pause/abort, writing matches. It hands each chunk of
 candidates to a *backend* (`SearchBackend`, `src/engine/backend.h`), which
 hashes them and returns the hits. `src/backends/backends.cpp` lists the
-backends a build has; the program uses the first:
+backends a build has, most preferred first; unless told otherwise (see
+[Modes](#modes)) the program uses the first one that can run on the machine,
+so a GPU build still works on a machine without that GPU:
 
 - `cuda/` - the CUDA kernels and the code that launches them.
-- `cpu/` - a reference backend: one thread, every candidate hashed from
-  scratch. Far too slow for real searches, but simple enough to be obviously
-  right. Every build has it, and `ctest` runs the end-to-end tests against
-  it as well as against CUDA. `NAMEBREAK_BACKEND=cpu` (the `cpu` preset)
-  builds with it alone, without any CUDA code - e.g. to check the rest
-  builds and works without the CUDA Toolkit.
+- `reference/` - one thread, every candidate hashed from scratch. Far too
+  slow for real searches, but simple enough to be obviously right: it's what
+  the others are held to. Every build has it.
 
-A new backend (say, for AMD GPUs) implements `SearchBackend`, gets a
-directory under `src/backends/` and an entry in `backends.cpp`, and is
-covered by the same tests: they take a `--backend <name>` argument.
+`ctest` runs the end-to-end tests against every backend in the build; a
+test whose backend can't run on the machine is reported as skipped. A new
+backend implements `SearchBackend`, gets a directory under `src/backends/`
+and an entry in `backends.cpp` and `CMakeLists.txt`, and is covered by the
+same tests: they take a `--backend <name>` argument.
 
 ## Design decisions
 

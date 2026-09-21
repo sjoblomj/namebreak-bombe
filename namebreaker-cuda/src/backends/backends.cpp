@@ -1,33 +1,68 @@
 #include "backends/backends.h"
 
-#include "backends/cpu/cpu_backend.h"
+#include "backends/reference/reference_backend.h"
 #ifdef NAMEBREAK_WITH_CUDA
 #include "backends/cuda/cuda_backend.h"
 #endif
 
-// The CPU backend is in every build - as the reference the tests hold the
-// others to - but last, so it's only the default when there's nothing else.
-std::vector<std::string> availableBackends() {
-    std::vector<std::string> names;
+namespace {
+
+// One backend this build has: its name, and how to make one (null, with
+// `error` set, if it can't run on this machine).
+struct BackendEntry {
+    const char* name;
+    std::unique_ptr<SearchBackend> (*make)(std::string& error);
+};
+
+std::unique_ptr<SearchBackend> makeReference(std::string&) {
+    return makeReferenceBackend();
+}
+
+// Most preferred first.
+const std::vector<BackendEntry>& backendEntries() {
+    static const std::vector<BackendEntry> entries = {
 #ifdef NAMEBREAK_WITH_CUDA
-    names.push_back("cuda");
+        {"cuda", makeCudaBackend},
 #endif
-    names.push_back("cpu");
+        {"reference", makeReference},
+    };
+    return entries;
+}
+
+} // namespace
+
+std::vector<std::string> backendNames() {
+    std::vector<std::string> names;
+    for (const BackendEntry& entry : backendEntries())
+        names.push_back(entry.name);
     return names;
 }
 
 std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error) {
-#ifdef NAMEBREAK_WITH_CUDA
-    if (name == "cuda")
-        return makeCudaBackend();
-#endif
-    if (name == "cpu")
-        return makeCpuBackend();
-    error = "this build has no '" + name + "' backend";
+    if (name.empty()) {
+        // The reference backend is always there, so something always succeeds.
+        std::string reasons;
+        for (const BackendEntry& entry : backendEntries()) {
+            std::string why;
+            if (std::unique_ptr<SearchBackend> backend = entry.make(why))
+                return backend;
+            reasons += std::string(reasons.empty() ? "" : "; ") + entry.name + ": " + why;
+        }
+        error = "no backend can run on this machine (" + reasons + ")";
+        return nullptr;
+    }
+    for (const BackendEntry& entry : backendEntries()) {
+        if (name == entry.name) {
+            std::string why;
+            std::unique_ptr<SearchBackend> backend = entry.make(why);
+            if (!backend)
+                error = "the " + name + " backend can't run on this machine: " + why;
+            return backend;
+        }
+    }
+    std::string names;
+    for (const BackendEntry& entry : backendEntries())
+        names += std::string(names.empty() ? "" : ", ") + entry.name;
+    error = "this build has no '" + name + "' backend (it has: " + names + ")";
     return nullptr;
-}
-
-std::unique_ptr<SearchBackend> createDefaultBackend() {
-    std::string error;
-    return createBackend(availableBackends().front(), error);
 }

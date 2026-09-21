@@ -482,6 +482,16 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
 
 } // namespace
 
-std::unique_ptr<SearchBackend> makeCudaBackend() {
+std::unique_ptr<SearchBackend> makeCudaBackend(std::string& error) {
+    int deviceCount = 0;
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+    if (err != cudaSuccess) {
+        error = std::string("no usable CUDA device: ") + cudaGetErrorString(err);
+        return nullptr;
+    }
+    if (deviceCount == 0) {
+        error = "no CUDA device";
+        return nullptr;
+    }
     return std::make_unique<CudaBackend>();
 }

@@ -28,10 +28,13 @@ struct CoordinatorArgs {
     // Where each target's matches file goes - config.conf's matches_dir (see
     // matches_file.h).
     std::string matchesDir = kDefaultMatchesDir;
+    // The backend to search with - config.conf's `backend`, or --backend;
+    // empty for the first one that can run here (see backends/backends.h).
+    std::string backend;
 };
 
 // Builds a CoordinatorArgs from `config`'s [coordinator] section (and its
-// matches_dir - see config.h). Returns false with `error` set if a required key is missing or
+// matches_dir and backend - see config.h). Returns false with `error` set if a required key is missing or
 // a value doesn't parse. username/hostname are left "" if absent from the
 // section - see CoordinatorArgs above.
 bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::string& error);

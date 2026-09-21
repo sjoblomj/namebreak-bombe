@@ -21,15 +21,18 @@ inline constexpr const char* kDefaultConfigPath = "config.conf";
 //   [search]      - bounded/continuous parameters (mode picks which of the
 //                   two actually runs; both take the same parameters)
 //   [coordinator] - coordinator-mode parameters (see coordinator_runner.h)
-// plus two keys allowed before any section: `mode = continuous|bounded|
-// coordinator` (overridable by passing --mode <mode> - see main()), and
-// `matches_dir = <directory>` (optional - see matches_file.h). '#'-led lines
+// plus three keys allowed before any section: `mode = continuous|bounded|
+// coordinator` (overridable by passing --mode <mode> - see main()),
+// `matches_dir = <directory>` (optional - see matches_file.h), and
+// `backend = <name>` (optional, overridable by --backend <name> - see
+// backends/backends.h; unset, the first one that can run here). '#'-led lines
 // and blank lines are ignored; a value may optionally be wrapped in "..." if
 // it needs meaningful leading/trailing whitespace (no other escaping - a
 // candidate/prefix/suffix containing a literal backslash needs none).
 struct ConfigFile {
     std::string mode;
     std::string matchesDir = kDefaultMatchesDir;
+    std::string backend;
     std::map<std::string, std::string> search;
     std::map<std::string, std::string> coordinator;
 };
