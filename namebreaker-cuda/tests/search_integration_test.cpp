@@ -19,8 +19,8 @@
 // a window size.
 //
 // Groups:
-//  1-5. The original scenarios: leading/trailing split, pruneSymbolRuns and
-//     maxBackslashCount (CPU-side, leading characters only - see
+//  1-5. The original scenarios: leading/trailing split, pruneSymbolRuns,
+//     pruneUnopenedBrackets and maxBackslashCount (CPU-side, leading characters only - see
 //     hasForbiddenSymbolRun_CPU's comment in candidate.h), maxBackslashCount
 //     excluding the prefix, and lower_bound == upper_bound. Pruning ones run
 //     twice: once with the target on the surviving side (must be found) and
@@ -159,11 +159,14 @@ static int trailingLenFor(int candidateLen, int alphabetSize) {
     return std::min(candidateLen, std::max(g_window, candidateLen - maxSafeIndexLenFor(alphabetSize)));
 }
 
-static bool isPruned(const std::string& candidate, int leadingLen, bool pruneSymbolRuns, int maxBackslashCount) {
+static bool isPruned(const std::string& candidate, int leadingLen, bool pruneSymbolRuns, int maxBackslashCount, bool pruneUnopenedBrackets,
+                     const std::string& prefix) {
     std::string_view leading(candidate.data(), leadingLen);
     if (pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
         return true;
     if (maxBackslashCount != 0 && countBackslashes_CPU(leading) > maxBackslashCount)
+        return true;
+    if (pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, openBracketsAfter_CPU(prefix)))
         return true;
     return false;
 }
@@ -220,6 +223,7 @@ struct CaseSpec {
     std::string alphabet, prefix, suffix, lower, upper;
     bool pruneSymbolRuns = false;
     int maxBackslashCount = 0;
+    bool pruneUnopenedBrackets = false;
     uint32_t targetHashA = 0x12345678;
     uint32_t targetHashB = 0xDEADBEEF;
     // A candidate the reference must contain in its match set (a sanity check
@@ -246,7 +250,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
         const uint64_t kMaxRange = 20'000'000;
         while (true) {
             ++total;
-            if (isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount)) {
+            if (isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix)) {
                 ++pruned;
             } else {
                 ++checked;
@@ -273,7 +277,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
     };
     if (c.requireBothPrunedAndChecked && (pruned == 0 || checked == 0))
         return testBug("pruning is enabled but the range doesn't exercise both pruned and surviving values");
-    if (!c.requireBothPrunedAndChecked && (c.pruneSymbolRuns || c.maxBackslashCount != 0) == false && pruned != 0)
+    if (!c.requireBothPrunedAndChecked && (c.pruneSymbolRuns || c.maxBackslashCount != 0 || c.pruneUnopenedBrackets) == false && pruned != 0)
         return testBug("pruning is disabled but the reference pruned something");
     if (checked == 0)
         return testBug("nothing survived to be checked at all");
@@ -292,6 +296,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
     req.targetHashA = c.targetHashA;
     req.targetHashB = c.targetHashB;
     req.pruneSymbolRuns = c.pruneSymbolRuns;
+    req.pruneUnopenedBrackets = c.pruneUnopenedBrackets;
     req.continuous = false;
 
     std::set<std::string> reported;
@@ -423,7 +428,7 @@ static bool scenarioSplit() {
 // pruned and the second not, each only partially covered by the range so the
 // CPU reference stays cheap regardless of the window size.
 static bool pruningScenario(const char* name, const std::string& alphabet, const std::string& prefix, bool prune, int maxBackslash,
-                             int leadingLen, uint64_t prunedLeadingIdx, uint64_t survivingLeadingIdx) {
+                             int leadingLen, uint64_t prunedLeadingIdx, uint64_t survivingLeadingIdx, bool pruneBrackets = false) {
     printf("=== %s ===\n", name);
     const int len = g_window + leadingLen;
     const uint64_t T = ipow(alphabet.size(), g_window);
@@ -441,6 +446,7 @@ static bool pruningScenario(const char* name, const std::string& alphabet, const
         c.suffix = ".DAT";
         c.pruneSymbolRuns = prune;
         c.maxBackslashCount = maxBackslash;
+        c.pruneUnopenedBrackets = pruneBrackets;
         c.lower = indexToString(start, len, alphabet);
         c.upper = indexToString(end, len, alphabet);
         std::string target = indexToString(targetIdx, len, alphabet);
@@ -470,6 +476,22 @@ static bool scenarioMaxBackslash() {
     // "\\\\\\" (3 backslashes: pruned), leadingIdx 1 is "\\\\A" (2: not pruned).
     return pruningScenario("3: maxBackslashCount (CPU-side, leading characters only)", "\\A &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV",
                             "TEST_", false, /*maxBackslash=*/2, /*leadingLen=*/3, 0, 1);
+}
+
+static bool scenarioPruneUnopenedBrackets() {
+    // alphabet[0]='A', alphabet[1]=')', alphabet[2]=' ', 2 leading characters,
+    // no brackets in the prefix: leadingIdx 1 is "A)" (closes a bracket
+    // never opened: pruned), leadingIdx 2 is "A " (not pruned).
+    bool ok = pruningScenario("3b: pruneUnopenedBrackets (CPU-side, leading characters only)", "A) &'(+,-.!0123456789BCDEFGHIJKLMNOPQRSTUV",
+                              "TEST_", false, 0, /*leadingLen=*/2, 1, 2, /*pruneBrackets=*/true);
+    // The prefix opens one bracket, which a candidate may close - but only
+    // once. alphabet[0]=')', alphabet[1]='A': leadingIdx 0 is "))" (the second
+    // closes one never opened: pruned), leadingIdx 1 is ")A" (closes the
+    // prefix's: not pruned). If the prefix's bracket weren't counted, both
+    // would be pruned.
+    ok &= pruningScenario("3c: pruneUnopenedBrackets counts brackets opened in the prefix", ")A &'(+,-.!0123456789BCDEFGHIJKLMNOPQRSTUV",
+                          "TEST(", false, 0, /*leadingLen=*/2, 0, 1, /*pruneBrackets=*/true);
+    return ok;
 }
 
 static bool scenarioPrefixBackslashes() {
@@ -882,6 +904,7 @@ static bool fuzz(int iterations, uint64_t seed) {
 
         if (!highBytes && uni(3) == 0) c.pruneSymbolRuns = true;
         if (!highBytes && uni(4) == 0) c.maxBackslashCount = 1 + (int) uni(3);
+        if (uni(3) == 0) c.pruneUnopenedBrackets = true;
 
         // Plant a target at a random position in the range (or none).
         if (uni(10) < 8) {
@@ -889,7 +912,7 @@ static bool fuzz(int iterations, uint64_t seed) {
             advanceBy(planted, c.alphabet, uni(steps + 1));
             c.targetHashA = hashA(c.prefix + planted + c.suffix);
             int leadingLen = len - trailingLenFor(len, as);
-            bool survives = !isPruned(planted, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount);
+            bool survives = !isPruned(planted, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix);
             if (survives) c.mustBeFound = planted;
             if (uni(2) == 0) {
                 c.targetHashB = hashB(c.prefix + planted + c.suffix);
@@ -897,15 +920,16 @@ static bool fuzz(int iterations, uint64_t seed) {
             }
         }
         char label[200];
-        snprintf(label, sizeof(label), "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d high=%d",
-                 (unsigned long long) seed, it, as, len, (unsigned long long) n, pl, sl, c.pruneSymbolRuns, c.maxBackslashCount, highBytes);
+        snprintf(label, sizeof(label), "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d brackets=%d high=%d",
+                 (unsigned long long) seed, it, as, len, (unsigned long long) n, pl, sl, c.pruneSymbolRuns, c.maxBackslashCount,
+                 c.pruneUnopenedBrackets, highBytes);
         // An entirely-pruned range is a legitimate outcome here; skip the reference's "nothing survived" TEST BUG check for those.
         {
             int leadingLen = len - trailingLenFor(len, as);
             std::string cand = lower;
             bool anySurvives = false;
             for (uint64_t i = 0; i <= steps && !anySurvives; ++i) {
-                if (!isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount)) anySurvives = true;
+                if (!isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix)) anySurvives = true;
                 stepCandidate(cand, c.alphabet);
             }
             if (!anySurvives) continue;
@@ -951,6 +975,7 @@ int main(int argc, char** argv) {
     allPassed &= scenarioSplit();
     allPassed &= scenarioPruneSymbolRuns();
     allPassed &= scenarioMaxBackslash();
+    allPassed &= scenarioPruneUnopenedBrackets();
     allPassed &= scenarioPrefixBackslashes();
     allPassed &= scenarioSingleCandidate();
     allPassed &= scenarioGeometry();

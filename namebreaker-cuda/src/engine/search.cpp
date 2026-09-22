@@ -216,6 +216,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
     printf("pruneSymbolRuns: %s (leading characters only)\n", req.pruneSymbolRuns ? "true" : "false");
+    printf("pruneUnopenedBrackets: %s (leading characters only)\n", req.pruneUnopenedBrackets ? "true" : "false");
     printf("maxBackslashCount: %d%s (leading characters only)\n", req.maxBackslashCount,
            req.maxBackslashCount == 0 ? " (unlimited)" : "");
 
@@ -226,6 +227,10 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     // leadingIdx) - the base every leadingIdx loop's IncrementalPrefixHasher
     // extends by that iteration's leading characters.
     std::pair<uint32_t, uint32_t> prefixBaseState = mpqHashWithPrefixCache_CPU(req.prefix.c_str(), h_cryptTable);
+
+    // Brackets req.prefix leaves open, which a candidate is free to close -
+    // see req.pruneUnopenedBrackets.
+    const int prefixOpenBrackets = openBracketsAfter_CPU(req.prefix);
 
     std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
     if (!outputDir.empty()) {
@@ -363,7 +368,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             }
             const std::string& leading = leadingHasher.leading();
 
-            // req.pruneSymbolRuns/req.maxBackslashCount examine `leading` -
+            // req.pruneSymbolRuns/req.pruneUnopenedBrackets/req.maxBackslashCount examine `leading` -
             // the CPU-computed first leadingLen characters of the candidate
             // (see README.md's "Design decisions" section for why checking it
             // here, instead of in the backend, is worth doing). A prune here
@@ -374,6 +379,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
                 continue;
             if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
+                continue;
+            if (req.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, prefixOpenBrackets))
                 continue;
 
             // Handed to every runBatch call below; see BatchParams.

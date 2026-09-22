@@ -27,6 +27,30 @@ int countBackslashes_CPU(std::string_view s) {
     return count;
 }
 
+int openBracketsAfter_CPU(std::string_view s) {
+    int open = 0;
+    for (char c : s) {
+        if (c == '(' || c == '[') {
+            open++;
+        } else if ((c == ')' || c == ']') && open > 0) {
+            open--;
+        }
+    }
+    return open;
+}
+
+bool hasUnopenedBracket_CPU(std::string_view s, int openBefore) {
+    int open = openBefore;
+    for (char c : s) {
+        if (c == '(' || c == '[') {
+            open++;
+        } else if ((c == ')' || c == ']') && --open < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool stringToIndex(const std::string& str, const std::string& alphabet, uint64_t& out, std::string& error) {
     uint64_t index = 0;
     for (char c : str) {

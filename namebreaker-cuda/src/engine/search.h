@@ -23,6 +23,10 @@ struct SearchRequest {
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
     bool pruneSymbolRuns = false;
+    // Skip candidates that close a bracket nobody opened - see
+    // hasUnopenedBracket_CPU (candidate.h). Brackets opened in `prefix`
+    // count as open, so a candidate may close those.
+    bool pruneUnopenedBrackets = false;
     // false ("bounded"): stop once upperBound is exhausted at its own length.
     // true ("continuous"): keep going to longer candidateLens indefinitely.
     bool continuous = false;

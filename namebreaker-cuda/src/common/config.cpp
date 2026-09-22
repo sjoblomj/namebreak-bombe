@@ -219,6 +219,7 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     if (!r.getRequired("hash_a", hashAHex, error)) return false;
     if (!r.getRequired("hash_b", hashBHex, error)) return false;
     std::string pruneStr = r.getOptional("prune_symbol_runs", "false");
+    std::string pruneBracketsStr = r.getOptional("prune_unopened_brackets", "false");
 
     std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
@@ -234,6 +235,10 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     }
     if (!parseBool(pruneStr, out.pruneSymbolRuns)) {
         error = "invalid prune_symbol_runs: '" + pruneStr + "' (expected true/false)";
+        return false;
+    }
+    if (!parseBool(pruneBracketsStr, out.pruneUnopenedBrackets)) {
+        error = "invalid prune_unopened_brackets: '" + pruneBracketsStr + "' (expected true/false)";
         return false;
     }
     if (!hexToU32(hashAHex, out.targetHashA)) {

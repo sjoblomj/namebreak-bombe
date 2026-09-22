@@ -16,6 +16,7 @@ UPPER_BOUND="REZ\\GAMEMENU.BIN"
 HASH_A=0xF60F5D90
 HASH_B=0xCE0A9BDB
 PRUNE_SYMBOL_RUNS=true
+PRUNE_UNOPENED_BRACKETS=true
 
 if [ ! -f matches/matches.txt ]; then
     start_candidate="REZ\\ .WAV"
@@ -38,6 +39,7 @@ upper_bound = "$UPPER_BOUND"
 hash_a = $HASH_A
 hash_b = $HASH_B
 prune_symbol_runs = $PRUNE_SYMBOL_RUNS
+prune_unopened_brackets = $PRUNE_UNOPENED_BRACKETS
 EOF
 
 "$NAMEBREAK"

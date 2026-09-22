@@ -39,6 +39,7 @@ constexpr int kIdSetupBoundedRadio = 303;
 constexpr int kIdSetupContinuousRadio = 304;
 constexpr int kIdSetupPruneCheckbox = 305;
 constexpr int kIdSetupAbout = 306;
+constexpr int kIdSetupPruneBracketsCheckbox = 307;
 
 // Marker stored in a help "?" control's GWLP_USERDATA so SetupPageWndProc can
 // tell it apart from an ordinary label when coloring it.
@@ -53,7 +54,7 @@ struct SetupDialogState {
     HWND hwndPageCoordinator = nullptr;
     HWND hwndPageSearch = nullptr;
     HWND hwndUsername = nullptr, hwndHostname = nullptr, hwndServerUrl = nullptr, hwndPollInterval = nullptr;
-    HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr;
+    HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr, hwndPruneBrackets = nullptr;
     HWND hwndAlphabet = nullptr, hwndMaxBackslash = nullptr, hwndPrefix = nullptr, hwndSuffix = nullptr, hwndStartCandidate = nullptr,
          hwndLowerBound = nullptr, hwndUpperBound = nullptr, hwndHashA = nullptr, hwndHashB = nullptr;
     // Tooltip strings must outlive the tooltip (it keeps pointers, not
@@ -150,6 +151,7 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         state->fields->hashA = hashA;
                         state->fields->hashB = hashB;
                         state->fields->pruneSymbolRuns = SendMessage(state->hwndPrune, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                        state->fields->pruneUnopenedBrackets = SendMessage(state->hwndPruneBrackets, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         bool continuous = SendMessage(state->hwndContinuousRadio, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->mode = continuous ? "continuous" : "bounded";
                     }
@@ -263,9 +265,9 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
         DWORD style = WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | (startsGroup ? WS_GROUP : 0);
         return CreateWindowExA(0, "BUTTON", text, style, x, y, w, 20, page, (HMENU) (INT_PTR) id, hInstance, nullptr);
     };
-    auto makeCheckbox = [&](HWND page, const char* text, int x, int y, int w, bool checked) {
+    auto makeCheckbox = [&](HWND page, const char* text, int x, int y, int w, int id, bool checked) {
         HWND h = CreateWindowExA(0, "BUTTON", text, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, x, y, w, 20, page,
-                                  (HMENU) (INT_PTR) kIdSetupPruneCheckbox, hInstance, nullptr);
+                                  (HMENU) (INT_PTR) id, hInstance, nullptr);
         SendMessage(h, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
         return h;
     };
@@ -355,10 +357,6 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     state.hwndStartCandidate = makeEdit(ps, fields.startCandidate, kE1, row(3), 150);
     addHelp(ps, kH1, row(3) + 2,
             "The full filename (prefix + candidate + suffix) to begin searching from. Lets a long search resume where it left off.");
-    state.hwndPrune = makeCheckbox(ps, "Prune symbol runs", kL2, row(3) + 1, 150, fields.pruneSymbolRuns);
-    addHelp(ps, kH2, row(3) + 2,
-            "Skip candidates containing three or more symbols in a row that are neither letters, digits nor spaces - real filenames "
-            "practically never have those. Makes the search faster.");
 
     makeLabel(ps, "Lower bound:", kL1, row(4) + 3, 100);
     state.hwndLowerBound = makeEdit(ps, fields.lowerBound, kE1, row(4), 150);
@@ -373,6 +371,17 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     makeLabel(ps, "Hash B (hex):", kL2, row(5) + 3, 110);
     state.hwndHashB = makeEdit(ps, fields.hashB, kE2, row(5), 120);
     addHelp(ps, kH2, row(5) + 2, "The second of the two 32-bit MPQ hashes, in hex (a 0x prefix is optional).");
+
+    // Checkboxes go beneath all the input fields, one per column.
+    state.hwndPrune = makeCheckbox(ps, "Prune symbol runs", kL1, row(6) + 1, 150, kIdSetupPruneCheckbox, fields.pruneSymbolRuns);
+    addHelp(ps, kH1, row(6) + 2,
+            "Skip candidates containing three or more symbols in a row that are neither letters, digits nor spaces - real filenames "
+            "practically never have those. Makes the search faster.");
+    state.hwndPruneBrackets =
+        makeCheckbox(ps, "Prune unopened brackets", kL2, row(6) + 1, 170, kIdSetupPruneBracketsCheckbox, fields.pruneUnopenedBrackets);
+    addHelp(ps, kH2, row(6) + 2,
+            "Skip candidates that close a bracket that was never opened - a ) or ] with no ( or [ before it (brackets opened in the "
+            "prefix count). Real filenames practically never have those. Makes the search faster.");
 
     // --- Buttons ---
     CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 512, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout, hInstance,

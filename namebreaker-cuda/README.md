@@ -82,6 +82,7 @@ upper_bound = "REZ\\GAMEMENU.BIN"
 hash_a = 0xF60F5D90
 hash_b = 0xCE0A9BDB
 prune_symbol_runs = true
+prune_unopened_brackets = true
 ```
 
 `[search]` keys (used by both `bounded` and `continuous` mode):
@@ -95,6 +96,7 @@ prune_symbol_runs = true
 | `lower_bound` / `upper_bound` | yes | Full filenames (inclusive) bounding the search alphabetically, at every candidate length searched. |
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex (`0x` prefix optional). |
 | `prune_symbol_runs` | no (default `false`) | Skip candidates containing 3+ consecutive non-alphanumeric, non-space characters (real MPQ filenames essentially never have runs like that) - see [Design decisions](#design-decisions). |
+| `prune_unopened_brackets` | no (default `false`) | Skip candidates that close a bracket never opened: reading left to right, a `)` or `]` at a point where more have been closed than opened. `(` and `[` count together, as do `)` and `]`. Brackets left open by `prefix` count as opened, so a candidate may close those - see [Design decisions](#design-decisions). |
 
 `[coordinator]` keys (`coordinator` mode only) are `server_url` (required),
 plus optional `username`, `hostname` (auto-detected and interactively
@@ -254,9 +256,9 @@ per-thread-cost knob (see below), and 5 measured best on the reference
 hardware (about 155 G candidates/s at a window of 4, 222 at 5, 216 at 6):
 a window of 4 makes each leading value's launch so short (~25 us) that
 per-launch overhead becomes a large fraction of the runtime. Note the window
-also decides how much `prune_symbol_runs`/`max_backslash_count` can see (they
-only examine the leading characters, see below): a larger window means fewer
-characters are pruned on, so those two settings skip slightly fewer
+also decides how much `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count`
+can see (they only examine the leading characters, see below): a larger window means fewer
+characters are pruned on, so those settings skip slightly fewer
 candidates than they did at a window of 4 (never more).
 
 ### How the GPU kernel is structured
@@ -321,11 +323,11 @@ this essentially never happens in practice (it would take over a thousand
 collisions in a single launch), but it's handled explicitly and tested
 (`tests/search_overflow_test.cpp`).
 
-### `prune_symbol_runs` and `max_backslash_count` only run on the CPU
+### `prune_symbol_runs`, `prune_unopened_brackets` and `max_backslash_count` only run on the CPU
 
-Both are cheap heuristics for skipping implausible candidates before
+All three are cheap heuristics for skipping implausible candidates before
 spending a hash chain on them - not correctness rules (a real match could in
-principle violate either one; these just trade a small amount of
+principle violate any of them; these just trade a small amount of
 completeness for a lot of throughput). They're applied only to the CPU-
 enumerated *leading* characters described above, never to the GPU-brute-
 forced trailing window - and this was a deliberate choice, tried and
@@ -353,5 +355,9 @@ measured, not an oversight:
   benchmarked properly (warmed-up GPU, multiple samples, no confounding
   cold-start effects from comparing freshly-recompiled binaries).
 
-The upshot: `prune_symbol_runs`/`max_backslash_count` only ever examine a
-candidate's leading characters (everything except the trailing window).
+The upshot: `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count`
+only ever examine a candidate's leading characters (everything except the
+trailing window). For `prune_unopened_brackets` that is still exact as far as
+it goes: once the leading characters have closed a bracket nobody opened,
+nothing in the trailing window can change that - it just never looks at a
+stray closer that only appears in the trailing window.

@@ -98,8 +98,8 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, uint32_t& seed1, uin
     }
 }
 
-// No maxBackslashCount check, and no pruneSymbolRuns check, here - both are
-// applied only to the leading characters, on the CPU, before this kernel is
+// No maxBackslashCount, pruneSymbolRuns or pruneUnopenedBrackets check here -
+// all are applied only to the leading characters, on the CPU, before this kernel is
 // ever launched (see the leadingIdx loop in runSearch), not to the trailing
 // characters this kernel brute-forces. See README.md's "Design decisions"
 // section for why.
