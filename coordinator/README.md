@@ -86,6 +86,11 @@ See the top-level plan/design notes for the full rationale; the short version:
   targeting one specific character instead. To forbid `\` entirely, use an
   alphabet that doesn't contain it rather than `max_backslash_count: 0` - `0` is
   the "no limit" sentinel, not "zero allowed".
+- **Bracket pruning**: a target with `prune_unopened_brackets` (default
+  `false`) has `namebreak` discard candidates that close a bracket never
+  opened - a `)` or `]` at a point where more brackets have been closed than
+  opened, counting `(` and `[` together. Brackets left open by the target's
+  prefix count as opened.
 - **Progress checkpointing**: every 60s the client heartbeats the most recent
   partial (Hash A only) match `namebreak` has printed for its current range, if
   any. `namebreak` only logs a match after the CUDA batch containing it has
@@ -134,6 +139,7 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "lower_bound": "FINZ09BX",
     "upper_bound": "GAMEMENU",
     "prune_symbol_runs": true,
+    "prune_unopened_brackets": true,
     "alphabet_name": "size49",
     "max_backslash_count": 0,
     "priority": 0,

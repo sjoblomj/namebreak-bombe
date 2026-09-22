@@ -38,6 +38,7 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
         hash_a_hex: format!("0x{:08X}", i64_to_u32(target.hash_a)),
         hash_b_hex: format!("0x{:08X}", i64_to_u32(target.hash_b)),
         prune_symbol_runs: target.prune_symbol_runs != 0,
+        prune_unopened_brackets: target.prune_unopened_brackets != 0,
         max_backslash_count: target.max_backslash_count,
         lower_bound_filename,
         upper_bound_filename,
@@ -2204,6 +2205,22 @@ mod tests {
         let config = test_config(space_size(DEFAULT, 2));
         let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
         assert_eq!(claim.max_backslash_count, 3);
+    }
+
+    #[tokio::test]
+    async fn claim_includes_the_targets_prune_unopened_brackets() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let target_id = insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2) / 2);
+        let before = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert!(!before.prune_unopened_brackets, "off unless the target asks for it");
+
+        sqlx::query("UPDATE targets SET prune_unopened_brackets = 1 WHERE id = ?").bind(target_id).execute(&pool).await.unwrap();
+        let after = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert!(after.prune_unopened_brackets);
     }
 
     /// Once a target is solved (via one range's completion), any other client

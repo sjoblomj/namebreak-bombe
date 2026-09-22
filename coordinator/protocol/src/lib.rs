@@ -113,6 +113,10 @@ pub struct ClaimResponse {
     pub hash_a_hex: String,
     pub hash_b_hex: String,
     pub prune_symbol_runs: bool,
+    /// Skip candidates that close a bracket never opened - see
+    /// `AdminCreateTargetRequest::prune_unopened_brackets`.
+    #[serde(default)]
+    pub prune_unopened_brackets: bool,
     /// Max '\' occurrences namebreak will allow in a candidate; 0 means unlimited.
     pub max_backslash_count: i64,
     pub lower_bound_filename: String,
@@ -197,6 +201,12 @@ pub struct AdminCreateTargetRequest {
     pub upper_bound: String,
     #[serde(default)]
     pub prune_symbol_runs: bool,
+    /// Skip candidates that close a bracket never opened: reading left to
+    /// right, a ')' or ']' at a point where more brackets have been closed
+    /// than opened ('(' and '[' count together, as do ')' and ']'). Brackets
+    /// the prefix leaves open count as opened. Defaults to false.
+    #[serde(default)]
+    pub prune_unopened_brackets: bool,
     /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`.
     #[serde(default)]
     pub alphabet_name: Option<String>,

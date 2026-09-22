@@ -56,6 +56,8 @@ struct ClaimResponse {
     std::string hashAHex;
     std::string hashBHex;
     bool pruneSymbolRuns = false;
+    // Optional in the response (false when absent).
+    bool pruneUnopenedBrackets = false;
     int64_t maxBackslashCount = 0;
     std::string lowerBoundFilename;
     std::string upperBoundFilename;

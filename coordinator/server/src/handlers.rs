@@ -221,8 +221,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, max_backslash_count, alphabet_name, alphabet, status, priority, description, skip_regex, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, max_backslash_count, alphabet_name, alphabet, status, priority, description, skip_regex, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -232,6 +232,7 @@ pub async fn admin_create_target(
     .bind(lower_bound)
     .bind(upper_bound)
     .bind(req.prune_symbol_runs as i64)
+    .bind(req.prune_unopened_brackets as i64)
     .bind(req.max_backslash_count)
     .bind(alphabet_name)
     .bind(alphabet)

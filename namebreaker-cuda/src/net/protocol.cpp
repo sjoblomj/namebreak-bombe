@@ -195,6 +195,11 @@ bool getBool(const std::map<std::string, JsonValue>& obj, const std::string& key
     return true;
 }
 
+// Like getBool, but a missing key leaves `out` untouched instead of failing.
+bool getOptionalBool(const std::map<std::string, JsonValue>& obj, const std::string& key, bool& out) {
+    return obj.find(key) == obj.end() || getBool(obj, key, out);
+}
+
 } // namespace
 
 std::string toJson(const RegisterRequest& req) {
@@ -239,6 +244,7 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getString(obj, "hash_a_hex", out.hashAHex) &&
            getString(obj, "hash_b_hex", out.hashBHex) &&
            getBool(  obj, "prune_symbol_runs", out.pruneSymbolRuns) &&
+           getOptionalBool(obj, "prune_unopened_brackets", out.pruneUnopenedBrackets) &&
            getInt64( obj, "max_backslash_count", out.maxBackslashCount) &&
            getString(obj, "lower_bound_filename", out.lowerBoundFilename) &&
            getString(obj, "upper_bound_filename", out.upperBoundFilename) &&
