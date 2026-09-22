@@ -163,6 +163,18 @@ parallel. `cmake --build --preset default --target run_search_bench` times
 the real search over a fixed range. Everything is built into `build/`;
 deleting it is the clean build.
 
+## Releases
+
+Pushing a version tag (`git tag v1.2.3 && git push origin v1.2.3`) runs
+`.github/workflows/client-release.yml`, which builds the client for Linux
+(CUDA + OpenCL + CPU, and a separate AMD/HIP build), Windows (CUDA + OpenCL +
+CPU, and the GUI) and macOS on Apple Silicon (Metal + OpenCL + CPU), runs the
+tests on each, and attaches the archives to a GitHub release for the tag. A
+build that fails is left out and the release is created as a draft instead.
+The workflow can also be started by hand from the Actions tab, to get the
+same builds without a release. The runners have no GPUs, so only the CPU
+backends' tests actually run there.
+
 ## Source layout
 
 | Directory | What's in it |

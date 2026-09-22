@@ -1,0 +1,203 @@
+# Builds the namebreak client (namebreaker-cuda/) for every platform it ships
+# on, runs its tests there, and - for a pushed version tag (v1.2.3) - attaches
+# the builds to a GitHub release for that tag. Run it by hand (Actions tab ->
+# "Run workflow") to get the same builds as workflow artifacts, without a
+# release.
+#
+# The hosted runners have no GPU, so the tests exercise the CPU backends
+# there; every GPU backend's tests report themselves as skipped.
+name: Client release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Every NVIDIA GPU generation from Pascal (GTX 10x0) to Blackwell (RTX 50x0),
+  # plus PTX for newer GPUs to compile at runtime.
+  CUDA_ARCHITECTURES: "61-real;70-real;75-real;80-real;86-real;89-real;120-real;120-virtual"
+  # AMD Radeon RX 6000 (RDNA2), RX 7000 (RDNA3) and RX 9000 (RDNA4).
+  HIP_ARCHITECTURES: "gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+  # The release's version, or "dev" for a manual run.
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+
+jobs:
+  linux-cuda:
+    name: Linux x86-64 (CUDA, OpenCL, CPU)
+    runs-on: ubuntu-latest
+    # Ubuntu 22.04's glibc, so the binary also runs on older distributions.
+    container: nvidia/cuda:12.9.1-devel-ubuntu22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              git python3-pip libcurl4-openssl-dev opencl-headers ocl-icd-opencl-dev
+          # Ubuntu 22.04's CMake is older than the 3.25 CMakePresets.json needs.
+          pip3 install cmake
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: >
+          cmake -S namebreaker-cuda -B build -DCMAKE_BUILD_TYPE=Release
+          -DNAMEBREAK_GPU=cuda -DNAMEBREAK_OPENCL=ON -DNAMEBREAK_TEST_VARIANTS=OFF
+          "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES" -DCMAKE_CUDA_FLAGS=-Wno-deprecated-gpu-targets
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          dir="namebreak-$VERSION-linux-x86_64-cuda"
+          mkdir "$dir"
+          cp build/namebreak namebreaker-cuda/README.md LICENSE "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-cuda
+          path: namebreak-*.tar.gz
+          if-no-files-found: error
+
+  linux-hip:
+    name: Linux x86-64 (HIP for AMD, CPU)
+    runs-on: ubuntu-latest
+    container: rocm/dev-ubuntu-22.04:6.4.1
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3-pip libcurl4-openssl-dev
+          pip3 install cmake
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: >
+          cmake -S namebreaker-cuda -B build -DCMAKE_BUILD_TYPE=Release
+          -DNAMEBREAK_GPU=hip -DNAMEBREAK_OPENCL=OFF -DNAMEBREAK_TEST_VARIANTS=OFF
+          -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm
+          "-DCMAKE_HIP_ARCHITECTURES=$HIP_ARCHITECTURES"
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          dir="namebreak-$VERSION-linux-x86_64-hip"
+          mkdir "$dir"
+          cp build/namebreak namebreaker-cuda/README.md LICENSE "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-hip
+          path: namebreak-*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86-64 (CUDA, OpenCL, CPU, GUI)
+    # Visual Studio 2022: the newest MSVC this CUDA version supports.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the CUDA Toolkit
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: "12.9.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+      - name: Install libcurl and OpenCL
+        # The DLLs they come as are copied next to the programs by the build
+        # (vcpkg's applocal step), and shipped with them.
+        run: vcpkg install curl opencl --triplet x64-windows
+      - name: Configure
+        run: >
+          cmake -S namebreaker-cuda -B build -G "Visual Studio 17 2022" -A x64 -T "cuda=$env:CUDA_PATH"
+          -DNAMEBREAK_GPU=cuda -DNAMEBREAK_OPENCL=ON -DNAMEBREAK_TEST_VARIANTS=OFF
+          "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES" -DCMAKE_CUDA_FLAGS=-Wno-deprecated-gpu-targets
+          "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        run: |
+          $dir = "namebreak-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item build/Release/namebreak.exe, build/Release/namebreak-gui.exe, build/Release/*.dll, namebreaker-cuda/README.md, LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64
+          path: namebreak-*.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS arm64 (Metal, OpenCL, CPU)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake --preset portable
+        working-directory: namebreaker-cuda
+      - name: Build
+        run: cmake --build --preset portable
+        working-directory: namebreaker-cuda
+      - name: Test
+        run: ctest --preset portable
+        working-directory: namebreaker-cuda
+      - name: Package
+        run: |
+          dir="namebreak-$VERSION-macos-arm64"
+          mkdir "$dir"
+          cp namebreaker-cuda/build-portable/namebreak namebreaker-cuda/README.md LICENSE "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: namebreak-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    if: github.ref_type == 'tag' && !cancelled()
+    needs: [linux-cuda, linux-hip, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create the release, or update it if it exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # A build that failed is left out; the release is then a draft,
+          # for someone to look at before it's published.
+          ANY_FAILED: ${{ contains(needs.*.result, 'failure') }}
+        run: |
+          cat > notes.md <<EOF
+          Builds of the namebreak client:
+
+          | File | For |
+          |---|---|
+          | \`*-linux-x86_64-cuda.tar.gz\` | Linux with an NVIDIA GPU - also searches with OpenCL (AMD, Intel) or the CPU when there isn't one. Needs \`libcurl4\` and \`ocl-icd-libopencl1\`. |
+          | \`*-linux-x86_64-hip.tar.gz\` | Linux with an AMD GPU and ROCm installed (not yet tested on AMD hardware). |
+          | \`*-windows-x86_64.zip\` | Windows: \`namebreak-gui.exe\`, or the console \`namebreak.exe\`. NVIDIA GPUs through CUDA, others through OpenCL, else the CPU. Needs the Microsoft Visual C++ runtime. |
+          | \`*-macos-arm64.tar.gz\` | Macs with Apple Silicon: Metal, OpenCL or the CPU. |
+
+          See README.md in each archive for how to configure and run it.
+          EOF
+          extra=()
+          if [ "$ANY_FAILED" = "true" ]; then
+            echo "> **Draft:** at least one build failed, so its files are missing - see the workflow run." >> notes.md
+            extra+=(--draft)
+          fi
+          ls -l artifacts
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* --title "namebreak client $GITHUB_REF_NAME" --notes-file notes.md "${extra[@]}"
+          fi

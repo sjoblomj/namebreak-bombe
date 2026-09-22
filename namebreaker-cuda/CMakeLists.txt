@@ -18,6 +18,11 @@ if(NOT NAMEBREAK_GPU MATCHES "^(cuda|hip|none)$")
     message(FATAL_ERROR "NAMEBREAK_GPU must be cuda, hip or none, not '${NAMEBREAK_GPU}'")
 endif()
 
+# OFF skips the tests' extra tuning configurations (see "Tests and
+# benchmarks" below) - they multiply the build time and only matter on a
+# machine with the GPUs to run them on. The CI release builds turn them off.
+option(NAMEBREAK_TEST_VARIANTS "Build the tests' extra tuning configurations" ON)
+
 # OFF builds without any networking: no coordinator client, HTTP or protocol
 # code, no libcurl dependency, and `coordinator` mode is unavailable at
 # runtime (the bounded and continuous modes are unaffected).
@@ -264,7 +269,7 @@ namebreak_test_executable(search_integration_test tests/search_integration_test.
 foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(integration-${backend} search_integration_test --backend ${backend})
 endforeach()
-if(ROW_BACKENDS)
+if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
     foreach(config IN ITEMS
             "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
             "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_CPU_NO_AVX2"
