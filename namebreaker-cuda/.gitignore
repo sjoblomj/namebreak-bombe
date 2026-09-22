@@ -1,5 +1,6 @@
 # Build trees (the CMake presets)
 /build/
+/build-hip/
 /build-portable/
 # Where namebreak writes its matches when run from here (scripts/run.sh)
 /matches/

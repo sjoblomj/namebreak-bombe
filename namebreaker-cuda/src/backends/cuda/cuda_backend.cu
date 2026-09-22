@@ -1,9 +1,11 @@
 // The CUDA backend: the search kernels, and the SearchBackend that launches
-// them (see engine/backend.h for what the engine asks of a backend).
+// them (see engine/backend.h for what the engine asks of a backend). The
+// same file, compiled with HIP for AMD GPUs, is the HIP backend - see
+// gpu_runtime.h.
 
 #include "backends/cuda/cuda_backend.h"
 
-#include <cuda_runtime.h>
+#include "backends/cuda/gpu_runtime.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +21,7 @@
 #define CUDA_CHECK(call) do { \
     cudaError_t err__ = (call); \
     if (err__ != cudaSuccess) { \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+        fprintf(stderr, NAMEBREAK_GPU_RUNTIME_NAME " error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
         exit(1); \
     } \
 } while (0)
@@ -308,7 +310,11 @@ namespace {
 
 class CudaBackend : public SearchBackend {
 public:
+#ifdef NAMEBREAK_HIP
+    const char* name() const override { return "hip"; }
+#else
     const char* name() const override { return "cuda"; }
+#endif
     std::vector<int> supportedAlphabetSizes() const override { return alphabetSizesIn(SupportedAlphabetSizes{}); }
     int windowChars() const override { return NAMEBREAK_GPU_WINDOW_CHARS; }
     int maxTrailingLen() const override { return kMaxTrailingLen; }
@@ -486,11 +492,11 @@ std::unique_ptr<SearchBackend> makeCudaBackend(std::string& error) {
     int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
     if (err != cudaSuccess) {
-        error = std::string("no usable CUDA device: ") + cudaGetErrorString(err);
+        error = std::string("no usable " NAMEBREAK_GPU_RUNTIME_NAME " device: ") + cudaGetErrorString(err);
         return nullptr;
     }
     if (deviceCount == 0) {
-        error = "no CUDA device";
+        error = "no " NAMEBREAK_GPU_RUNTIME_NAME " device";
         return nullptr;
     }
     return std::make_unique<CudaBackend>();

@@ -17,6 +17,16 @@
       }
     },
     {
+      "name": "hip",
+      "displayName": "HIP (AMD)",
+      "description": "The HIP backend for AMD GPUs instead of CUDA - needs ROCm or the HIP SDK",
+      "binaryDir": "${sourceDir}/build-hip",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NAMEBREAK_GPU": "hip"
+      }
+    },
+    {
       "name": "portable",
       "displayName": "Portable",
       "description": "No CUDA: the CPU backends, and OpenCL if it is found",
@@ -34,6 +44,11 @@
       "jobs": 0
     },
     {
+      "name": "hip",
+      "configurePreset": "hip",
+      "jobs": 0
+    },
+    {
       "name": "portable",
       "configurePreset": "portable",
       "jobs": 0
@@ -43,6 +58,16 @@
     {
       "name": "default",
       "configurePreset": "default",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 0
+      }
+    },
+    {
+      "name": "hip",
+      "configurePreset": "hip",
       "output": {
         "outputOnFailure": true
       },

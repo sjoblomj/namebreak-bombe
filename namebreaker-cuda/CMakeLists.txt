@@ -10,11 +10,12 @@ project(namebreak LANGUAGES CXX)
 
 # Which GPU backends to build (see src/backends/ and README.md's "Backends").
 # The CPU backends are in every build.
-#   NAMEBREAK_GPU  `cuda` (the default - needs the CUDA Toolkit), or `none`
-set(NAMEBREAK_GPU cuda CACHE STRING "CUDA-dialect GPU backend: cuda or none")
-set_property(CACHE NAMEBREAK_GPU PROPERTY STRINGS cuda none)
-if(NOT NAMEBREAK_GPU MATCHES "^(cuda|none)$")
-    message(FATAL_ERROR "NAMEBREAK_GPU must be cuda or none, not '${NAMEBREAK_GPU}'")
+#   NAMEBREAK_GPU  `cuda` (the default - needs the CUDA Toolkit), `hip` (AMD
+#                  GPUs - the same code compiled with ROCm's HIP), or `none`
+set(NAMEBREAK_GPU cuda CACHE STRING "CUDA-dialect GPU backend: cuda, hip or none")
+set_property(CACHE NAMEBREAK_GPU PROPERTY STRINGS cuda hip none)
+if(NOT NAMEBREAK_GPU MATCHES "^(cuda|hip|none)$")
+    message(FATAL_ERROR "NAMEBREAK_GPU must be cuda, hip or none, not '${NAMEBREAK_GPU}'")
 endif()
 
 # OFF builds without any networking: no coordinator client, HTTP or protocol
@@ -43,6 +44,14 @@ if(NAMEBREAK_GPU STREQUAL "cuda")
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+elseif(NAMEBREAK_GPU STREQUAL "hip")
+    # Needs ROCm (Linux) or the HIP SDK (Windows). The AMD GPU architecture(s)
+    # to compile for come from CMAKE_HIP_ARCHITECTURES, e.g. gfx1030 (Radeon
+    # RX 6000) or gfx1100 (RX 7000) - see `rocminfo`; unset, CMake asks ROCm
+    # which GPUs are installed.
+    enable_language(HIP)
+    set(CMAKE_HIP_STANDARD 17)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
 endif()
 
 # The OpenCL backend: AMD, Intel and NVIDIA GPUs through their vendors'
@@ -85,6 +94,10 @@ set(SEARCH_SOURCES
     src/backends/reference/reference_backend.cpp)
 if(NAMEBREAK_GPU STREQUAL "cuda")
     list(APPEND SEARCH_SOURCES src/backends/cuda/cuda_backend.cu)
+elseif(NAMEBREAK_GPU STREQUAL "hip")
+    # The CUDA backend's source, compiled as HIP (see its gpu_runtime.h).
+    list(APPEND SEARCH_SOURCES src/backends/cuda/cuda_backend.cu)
+    set_source_files_properties(src/backends/cuda/cuda_backend.cu PROPERTIES LANGUAGE HIP)
 endif()
 
 # embed_kernel(<kernel source file> <header to generate, under generated/> <C++ name>)
@@ -111,6 +124,8 @@ function(namebreak_search_library name)
     target_compile_definitions(${name} PUBLIC ${ARGN})
     if(NAMEBREAK_GPU STREQUAL "cuda")
         target_compile_definitions(${name} PRIVATE NAMEBREAK_WITH_CUDA)
+    elseif(NAMEBREAK_GPU STREQUAL "hip")
+        target_compile_definitions(${name} PRIVATE NAMEBREAK_WITH_HIP NAMEBREAK_HIP)
     endif()
     if(WITH_OPENCL)
         target_compile_definitions(${name} PRIVATE NAMEBREAK_WITH_OPENCL)
@@ -197,8 +212,8 @@ namebreak_test(prefix_hasher_test prefix_hasher_test)
 # Every backend except `reference` searches in rows (the same batch geometry
 # as the CUDA one) and honours the same tuning overrides.
 set(ROW_BACKENDS "")
-if(NAMEBREAK_GPU STREQUAL "cuda")
-    list(APPEND ROW_BACKENDS cuda)
+if(NOT NAMEBREAK_GPU STREQUAL "none")
+    list(APPEND ROW_BACKENDS ${NAMEBREAK_GPU})
 endif()
 if(WITH_OPENCL)
     list(APPEND ROW_BACKENDS opencl)

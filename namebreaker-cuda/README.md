@@ -131,7 +131,7 @@ Options, passed to the first command as `-D<option>=<value>`:
 |---|---|---|
 | `CMAKE_CUDA_ARCHITECTURES` | `86` | The GPU's compute capability, without the dot (`nvidia-smi --query-gpu=compute_cap --format=csv`), or `native` |
 | `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode and the libcurl dependency |
-| `NAMEBREAK_GPU` | `cuda` | `none` builds without any CUDA code, leaving the CPU backends and OpenCL (see Backends below) - or use the `portable` preset, which builds into `build-portable/` |
+| `NAMEBREAK_GPU` | `cuda` | `hip` builds the HIP backend for AMD GPUs instead (needs ROCm or the HIP SDK; the `hip` preset, into `build-hip/`, with `CMAKE_HIP_ARCHITECTURES` e.g. `gfx1100` - unset, CMake asks ROCm). `none` builds without either, leaving the CPU backends and OpenCL - or use the `portable` preset, which builds into `build-portable/` |
 | `NAMEBREAK_OPENCL` | `AUTO` | The OpenCL backend: `AUTO` builds it if OpenCL's headers and loader library are found (on Debian/Ubuntu: `opencl-headers ocl-icd-opencl-dev`; on Windows e.g. vcpkg's `opencl`), `ON` insists, `OFF` leaves it out |
 | `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
 
@@ -189,6 +189,11 @@ backends a build has, most preferred first; unless told otherwise (see
 so a GPU build still works on a machine without that GPU:
 
 - `cuda/` - the CUDA kernels and the code that launches them.
+- `hip` - AMD GPUs: `cuda/`'s code compiled with ROCm's HIP instead, which
+  accepts CUDA's kernel syntax as is; `gpu_runtime.h` maps the handful of
+  CUDA runtime calls onto HIP's. Not built by default, and not yet tested on
+  an AMD GPU: it has only been run through HIP's NVIDIA mapping, on an
+  NVIDIA GPU, where its tests pass.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
   installed. The same kernel as CUDA's, ported (`search.cl`); it's compiled

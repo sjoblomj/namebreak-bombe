@@ -2,7 +2,7 @@
 
 #include "backends/cpu/cpu_backend.h"
 #include "backends/reference/reference_backend.h"
-#ifdef NAMEBREAK_WITH_CUDA
+#if defined(NAMEBREAK_WITH_CUDA) || defined(NAMEBREAK_WITH_HIP)
 #include "backends/cuda/cuda_backend.h"
 #endif
 #ifdef NAMEBREAK_WITH_OPENCL
@@ -27,6 +27,10 @@ const std::vector<BackendEntry>& backendEntries() {
     static const std::vector<BackendEntry> entries = {
 #ifdef NAMEBREAK_WITH_CUDA
         {"cuda", makeCudaBackend},
+#endif
+#ifdef NAMEBREAK_WITH_HIP
+        // The CUDA backend's source, compiled with HIP - see cuda_backend.h.
+        {"hip", makeCudaBackend},
 #endif
 #ifdef NAMEBREAK_WITH_OPENCL
         {"opencl", makeOpenClBackend},
