@@ -19,7 +19,7 @@
     {
       "name": "portable",
       "displayName": "Portable",
-      "description": "No CUDA: only the CPU backends",
+      "description": "No CUDA: the CPU backends, and OpenCL if it is found",
       "binaryDir": "${sourceDir}/build-portable",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",

@@ -45,6 +45,21 @@ if(NAMEBREAK_GPU STREQUAL "cuda")
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
+# The OpenCL backend: AMD, Intel and NVIDIA GPUs through their vendors'
+# regular drivers. AUTO builds it if CMake finds OpenCL's headers and loader
+# library (e.g. ocl-icd-opencl-dev and opencl-headers on Debian/Ubuntu).
+set(NAMEBREAK_OPENCL AUTO CACHE STRING "OpenCL backend: AUTO (if OpenCL is found), ON or OFF")
+set_property(CACHE NAMEBREAK_OPENCL PROPERTY STRINGS AUTO ON OFF)
+set(WITH_OPENCL OFF)
+if(NAMEBREAK_OPENCL STREQUAL "ON")
+    find_package(OpenCL REQUIRED)
+    set(WITH_OPENCL ON)
+elseif(NAMEBREAK_OPENCL STREQUAL "AUTO")
+    find_package(OpenCL)
+    set(WITH_OPENCL ${OpenCL_FOUND})
+endif()
+message(STATUS "namebreak: GPU backend ${NAMEBREAK_GPU}, OpenCL backend ${WITH_OPENCL}")
+
 find_package(Threads REQUIRED)
 if(NAMEBREAK_NETWORK)
     # On Windows, point CMake at a libcurl install, e.g. vcpkg's:
@@ -72,6 +87,22 @@ if(NAMEBREAK_GPU STREQUAL "cuda")
     list(APPEND SEARCH_SOURCES src/backends/cuda/cuda_backend.cu)
 endif()
 
+# embed_kernel(<kernel source file> <header to generate, under generated/> <C++ name>)
+# The OpenCL and Metal backends compile their kernels at runtime, from source
+# embedded in the program as a string.
+function(embed_kernel file header symbol)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${file})
+    file(READ ${file} KERNEL_SOURCE)
+    set(KERNEL_FILE ${file})
+    set(KERNEL_SYMBOL ${symbol})
+    configure_file(src/backends/common/embedded_kernel.h.in ${CMAKE_BINARY_DIR}/generated/${header} @ONLY)
+endfunction()
+
+if(WITH_OPENCL)
+    list(APPEND SEARCH_SOURCES src/backends/opencl/opencl_backend.cpp)
+    embed_kernel(src/backends/opencl/search.cl backends/opencl/search_kernel.h kSearchKernelSource)
+endif()
+
 # namebreak_search_library(<name> [<compile definition>...])
 function(namebreak_search_library name)
     add_library(${name} STATIC ${SEARCH_SOURCES})
@@ -81,6 +112,11 @@ function(namebreak_search_library name)
     if(NAMEBREAK_GPU STREQUAL "cuda")
         target_compile_definitions(${name} PRIVATE NAMEBREAK_WITH_CUDA)
     endif()
+    if(WITH_OPENCL)
+        target_compile_definitions(${name} PRIVATE NAMEBREAK_WITH_OPENCL)
+        target_link_libraries(${name} PUBLIC OpenCL::OpenCL)
+    endif()
+    target_include_directories(${name} PRIVATE ${CMAKE_BINARY_DIR}/generated)
     target_link_libraries(${name} PUBLIC Threads::Threads)
 endfunction()
 
@@ -163,6 +199,9 @@ namebreak_test(prefix_hasher_test prefix_hasher_test)
 set(ROW_BACKENDS "")
 if(NAMEBREAK_GPU STREQUAL "cuda")
     list(APPEND ROW_BACKENDS cuda)
+endif()
+if(WITH_OPENCL)
+    list(APPEND ROW_BACKENDS opencl)
 endif()
 list(APPEND ROW_BACKENDS cpu)
 

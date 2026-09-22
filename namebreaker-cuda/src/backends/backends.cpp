@@ -5,6 +5,9 @@
 #ifdef NAMEBREAK_WITH_CUDA
 #include "backends/cuda/cuda_backend.h"
 #endif
+#ifdef NAMEBREAK_WITH_OPENCL
+#include "backends/opencl/opencl_backend.h"
+#endif
 
 namespace {
 
@@ -24,6 +27,9 @@ const std::vector<BackendEntry>& backendEntries() {
     static const std::vector<BackendEntry> entries = {
 #ifdef NAMEBREAK_WITH_CUDA
         {"cuda", makeCudaBackend},
+#endif
+#ifdef NAMEBREAK_WITH_OPENCL
+        {"opencl", makeOpenClBackend},
 #endif
         {"cpu", makeCpuBackend},
         {"reference", makeReference},

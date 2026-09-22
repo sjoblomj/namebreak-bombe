@@ -131,7 +131,8 @@ Options, passed to the first command as `-D<option>=<value>`:
 |---|---|---|
 | `CMAKE_CUDA_ARCHITECTURES` | `86` | The GPU's compute capability, without the dot (`nvidia-smi --query-gpu=compute_cap --format=csv`), or `native` |
 | `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode and the libcurl dependency |
-| `NAMEBREAK_GPU` | `cuda` | `none` builds without any CUDA code, leaving the CPU backends (see Backends below) - or use the `portable` preset, which builds into `build-portable/` |
+| `NAMEBREAK_GPU` | `cuda` | `none` builds without any CUDA code, leaving the CPU backends and OpenCL (see Backends below) - or use the `portable` preset, which builds into `build-portable/` |
+| `NAMEBREAK_OPENCL` | `AUTO` | The OpenCL backend: `AUTO` builds it if OpenCL's headers and loader library are found (on Debian/Ubuntu: `opencl-headers ocl-icd-opencl-dev`; on Windows e.g. vcpkg's `opencl`), `ON` insists, `OFF` leaves it out |
 | `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
 
 On Windows, use a Visual Studio developer prompt (MSVC is the host compiler
@@ -188,6 +189,13 @@ backends a build has, most preferred first; unless told otherwise (see
 so a GPU build still works on a machine without that GPU:
 
 - `cuda/` - the CUDA kernels and the code that launches them.
+- `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
+  integrated ones) and NVIDIA, with nothing but the vendor's regular driver
+  installed. The same kernel as CUDA's, ported (`search.cl`); it's compiled
+  by the driver at runtime, once per alphabet size, suffix length and
+  trailing length, so it takes an alphabet of any size - drivers cache the
+  result, but a new combination's first search starts a moment later. On
+  the RTX 3080 Ti Laptop it runs at about 88% of the CUDA backend's speed.
 - `cpu/` - every core of the CPU, with the same row trick as the CUDA
   kernel and the candidates of a row hashed several at a time with SIMD
   instructions (AVX2 on x86-64 CPUs that have it, picked at runtime; SSE2
