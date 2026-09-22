@@ -29,7 +29,7 @@
     {
       "name": "portable",
       "displayName": "Portable",
-      "description": "No CUDA: the CPU backends, and OpenCL if it is found",
+      "description": "No CUDA: the CPU backends, OpenCL if it is found, and Metal on macOS - the one to use on a Mac",
       "binaryDir": "${sourceDir}/build-portable",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",

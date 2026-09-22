@@ -132,6 +132,7 @@ Options, passed to the first command as `-D<option>=<value>`:
 | `CMAKE_CUDA_ARCHITECTURES` | `86` | The GPU's compute capability, without the dot (`nvidia-smi --query-gpu=compute_cap --format=csv`), or `native` |
 | `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode and the libcurl dependency |
 | `NAMEBREAK_GPU` | `cuda` | `hip` builds the HIP backend for AMD GPUs instead (needs ROCm or the HIP SDK; the `hip` preset, into `build-hip/`, with `CMAKE_HIP_ARCHITECTURES` e.g. `gfx1100` - unset, CMake asks ROCm). `none` builds without either, leaving the CPU backends and OpenCL - or use the `portable` preset, which builds into `build-portable/` |
+| `NAMEBREAK_METAL` | `AUTO` | The Metal backend: `AUTO` builds it on macOS (Xcode's command line tools are all it needs), `OFF` leaves it out |
 | `NAMEBREAK_OPENCL` | `AUTO` | The OpenCL backend: `AUTO` builds it if OpenCL's headers and loader library are found (on Debian/Ubuntu: `opencl-headers ocl-icd-opencl-dev`; on Windows e.g. vcpkg's `opencl`), `ON` insists, `OFF` leaves it out |
 | `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
 
@@ -194,6 +195,13 @@ so a GPU build still works on a machine without that GPU:
   CUDA runtime calls onto HIP's. Not built by default, and not yet tested on
   an AMD GPU: it has only been run through HIP's NVIDIA mapping, on an
   NVIDIA GPU, where its tests pass.
+- `metal/` - the Mac's GPU (Apple Silicon, or an Intel Mac's), through
+  Metal: the OpenCL kernel again, in Metal's shading language
+  (`search.metal`), compiled by Metal at runtime the same way; the host
+  side is Objective-C++ (`metal_backend.mm`). On a Mac, use the `portable`
+  preset. Not yet run on a Mac: its kernel has only been tested on the CPU,
+  compiled as C++ against a stand-in for Metal's standard library and run
+  one GPU thread at a time, where every test configuration passes.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
   installed. The same kernel as CUDA's, ported (`search.cl`); it's compiled

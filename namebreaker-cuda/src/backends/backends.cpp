@@ -5,6 +5,9 @@
 #if defined(NAMEBREAK_WITH_CUDA) || defined(NAMEBREAK_WITH_HIP)
 #include "backends/cuda/cuda_backend.h"
 #endif
+#ifdef NAMEBREAK_WITH_METAL
+#include "backends/metal/metal_backend.h"
+#endif
 #ifdef NAMEBREAK_WITH_OPENCL
 #include "backends/opencl/opencl_backend.h"
 #endif
@@ -31,6 +34,9 @@ const std::vector<BackendEntry>& backendEntries() {
 #ifdef NAMEBREAK_WITH_HIP
         // The CUDA backend's source, compiled with HIP - see cuda_backend.h.
         {"hip", makeCudaBackend},
+#endif
+#ifdef NAMEBREAK_WITH_METAL
+        {"metal", makeMetalBackend},
 #endif
 #ifdef NAMEBREAK_WITH_OPENCL
         {"opencl", makeOpenClBackend},
