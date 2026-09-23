@@ -89,8 +89,8 @@ See the top-level plan/design notes for the full rationale; the short version:
 - **Bracket pruning**: a target with `prune_unopened_brackets` (default
   `false`) has `namebreak` discard candidates that close a bracket never
   opened - a `)` or `]` at a point where more brackets have been closed than
-  opened, counting `(` and `[` together. Brackets left open by the target's
-  prefix count as opened.
+  opened - `(`/`)` and `[`/`]` counted separately. Brackets left open by the
+  target's prefix count as opened.
 - **Progress checkpointing**: every 60s the client heartbeats the most recent
   partial (Hash A only) match `namebreak` has printed for its current range, if
   any. `namebreak` only logs a match after the CUDA batch containing it has
@@ -206,7 +206,8 @@ Check progress:
 curl localhost:8080/api/v1/status
 ```
 
-Pause/resume a target, and/or change its priority, description or skip_regex:
+Pause/resume a target, and/or change its priority, description, skip_regex,
+alphabet_name, prune_symbol_runs or prune_unopened_brackets:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -216,7 +217,10 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 
 Any field can be omitted to leave it unchanged (pass `"description": ""` or
 `"skip_regex": ""` to clear an existing one), but at least one must be given.
-A changed `skip_regex` only affects ranges carved after the patch.
+A changed `skip_regex` only affects ranges carved after the patch. A changed
+`prune_symbol_runs`/`prune_unopened_brackets` affects every range claimed
+after the patch (including already-carved pending ones); ranges already in
+progress finish with the old setting.
 
 Delete a target permanently (also removes its ranges and carving cursor - not
 reversible):

@@ -202,9 +202,9 @@ pub struct AdminCreateTargetRequest {
     #[serde(default)]
     pub prune_symbol_runs: bool,
     /// Skip candidates that close a bracket never opened: reading left to
-    /// right, a ')' or ']' at a point where more brackets have been closed
-    /// than opened ('(' and '[' count together, as do ')' and ']'). Brackets
-    /// the prefix leaves open count as opened. Defaults to false.
+    /// right, a ')' at a point where more ')' than '(' have been seen, or
+    /// likewise a ']' with '['. The two kinds are counted separately.
+    /// Brackets the prefix leaves open count as opened. Defaults to false.
     #[serde(default)]
     pub prune_unopened_brackets: bool,
     /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`.
@@ -264,6 +264,16 @@ pub struct AdminPatchTargetRequest {
     /// is carved for this target (see `ranges::claim_range`).
     #[serde(default)]
     pub alphabet_name: Option<String>,
+    /// See `AdminCreateTargetRequest::prune_symbol_runs`. Leave unset to
+    /// leave it unchanged. Like `prune_unopened_brackets`, it's sent to
+    /// clients with each claim, so a change applies to every range claimed
+    /// after the patch - ranges already in progress keep the old setting.
+    #[serde(default)]
+    pub prune_symbol_runs: Option<bool>,
+    /// See `AdminCreateTargetRequest::prune_unopened_brackets`. Leave unset
+    /// to leave it unchanged.
+    #[serde(default)]
+    pub prune_unopened_brackets: Option<bool>,
 }
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of

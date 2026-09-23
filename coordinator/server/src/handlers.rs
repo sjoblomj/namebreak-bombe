@@ -302,8 +302,18 @@ pub async fn admin_patch_target(
             return Err(AppError::BadRequest("status must be 'active' or 'paused'".into()));
         }
     }
-    if req.status.is_none() && req.priority.is_none() && req.description.is_none() && req.skip_regex.is_none() && req.alphabet_name.is_none() {
-        return Err(AppError::BadRequest("at least one of status, priority, description, skip_regex or alphabet_name must be provided".into()));
+    if req.status.is_none()
+        && req.priority.is_none()
+        && req.description.is_none()
+        && req.skip_regex.is_none()
+        && req.alphabet_name.is_none()
+        && req.prune_symbol_runs.is_none()
+        && req.prune_unopened_brackets.is_none()
+    {
+        return Err(AppError::BadRequest(
+            "at least one of status, priority, description, skip_regex, alphabet_name, prune_symbol_runs or prune_unopened_brackets must be provided"
+                .into(),
+        ));
     }
     validate_skip_regex(&req.skip_regex)?;
 
@@ -335,7 +345,8 @@ pub async fn admin_patch_target(
     let result = sqlx::query(
         "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority), \
          description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex), \
-         alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet) \
+         alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet), \
+         prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets) \
          WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.status)
@@ -344,6 +355,8 @@ pub async fn admin_patch_target(
     .bind(&req.skip_regex)
     .bind(&alphabet_name)
     .bind(&alphabet)
+    .bind(req.prune_symbol_runs.map(i64::from))
+    .bind(req.prune_unopened_brackets.map(i64::from))
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
