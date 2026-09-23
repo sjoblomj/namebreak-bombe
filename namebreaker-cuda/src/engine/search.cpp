@@ -230,7 +230,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
 
     // Brackets req.prefix leaves open, which a candidate is free to close -
     // see req.pruneUnopenedBrackets.
-    const int prefixOpenBrackets = openBracketsAfter_CPU(req.prefix);
+    const OpenBrackets prefixOpenBrackets = openBracketsAfter_CPU(req.prefix);
 
     std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
     if (!outputDir.empty()) {

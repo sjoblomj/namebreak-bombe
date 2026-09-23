@@ -27,24 +27,32 @@ int countBackslashes_CPU(std::string_view s) {
     return count;
 }
 
-int openBracketsAfter_CPU(std::string_view s) {
-    int open = 0;
+OpenBrackets openBracketsAfter_CPU(std::string_view s) {
+    OpenBrackets open;
     for (char c : s) {
-        if (c == '(' || c == '[') {
-            open++;
-        } else if ((c == ')' || c == ']') && open > 0) {
-            open--;
+        if (c == '(') {
+            open.round++;
+        } else if (c == ')' && open.round > 0) {
+            open.round--;
+        } else if (c == '[') {
+            open.square++;
+        } else if (c == ']' && open.square > 0) {
+            open.square--;
         }
     }
     return open;
 }
 
-bool hasUnopenedBracket_CPU(std::string_view s, int openBefore) {
-    int open = openBefore;
+bool hasUnopenedBracket_CPU(std::string_view s, OpenBrackets openBefore) {
+    OpenBrackets open = openBefore;
     for (char c : s) {
-        if (c == '(' || c == '[') {
-            open++;
-        } else if ((c == ')' || c == ']') && --open < 0) {
+        if (c == '(') {
+            open.round++;
+        } else if (c == ')' && --open.round < 0) {
+            return true;
+        } else if (c == '[') {
+            open.square++;
+        } else if (c == ']' && --open.square < 0) {
             return true;
         }
     }

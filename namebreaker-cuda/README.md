@@ -96,7 +96,7 @@ prune_unopened_brackets = true
 | `lower_bound` / `upper_bound` | yes | Full filenames (inclusive) bounding the search alphabetically, at every candidate length searched. |
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex (`0x` prefix optional). |
 | `prune_symbol_runs` | no (default `false`) | Skip candidates containing 3+ consecutive non-alphanumeric, non-space characters (real MPQ filenames essentially never have runs like that) - see [Design decisions](#design-decisions). |
-| `prune_unopened_brackets` | no (default `false`) | Skip candidates that close a bracket never opened: reading left to right, a `)` or `]` at a point where more have been closed than opened. `(` and `[` count together, as do `)` and `]`. Brackets left open by `prefix` count as opened, so a candidate may close those - see [Design decisions](#design-decisions). |
+| `prune_unopened_brackets` | no (default `false`) | Skip candidates that close a bracket never opened: reading left to right, a `)` at a point where more `)` than `(` have been seen, or likewise a `]` with `[`. The two kinds are counted separately (how they nest within each other isn't checked). Brackets left open by `prefix` count as opened, so a candidate may close those - see [Design decisions](#design-decisions). |
 
 `[coordinator]` keys (`coordinator` mode only) are `server_url` (required),
 plus optional `username`, `hostname` (auto-detected and interactively

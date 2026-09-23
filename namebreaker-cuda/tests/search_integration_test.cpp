@@ -491,6 +491,12 @@ static bool scenarioPruneUnopenedBrackets() {
     // would be pruned.
     ok &= pruningScenario("3c: pruneUnopenedBrackets counts brackets opened in the prefix", ")A &'(+,-.!0123456789BCDEFGHIJKLMNOPQRSTUV",
                           "TEST(", false, 0, /*leadingLen=*/2, 0, 1, /*pruneBrackets=*/true);
+    // Round and square brackets are counted separately: the prefix's '['
+    // lets a candidate close it with ']' but not with ')'.
+    // alphabet[0]=')', alphabet[1]=']': leadingIdx 0 is ")" (pruned),
+    // leadingIdx 1 is "]" (not pruned).
+    ok &= pruningScenario("3d: pruneUnopenedBrackets counts ( ) and [ ] separately", ")]A &'(+,-.0123456789BCDEFGHIJKLMNOPQRSTUV",
+                          "TEST[", false, 0, /*leadingLen=*/1, 0, 1, /*pruneBrackets=*/true);
     return ok;
 }
 

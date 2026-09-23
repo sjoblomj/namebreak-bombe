@@ -380,8 +380,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     state.hwndPruneBrackets =
         makeCheckbox(ps, "Prune unopened brackets", kL2, row(6) + 1, 170, kIdSetupPruneBracketsCheckbox, fields.pruneUnopenedBrackets);
     addHelp(ps, kH2, row(6) + 2,
-            "Skip candidates that close a bracket that was never opened - a ) or ] with no ( or [ before it (brackets opened in the "
-            "prefix count). Real filenames practically never have those. Makes the search faster.");
+            "Skip candidates that close a bracket that was never opened - a ) with no ( before it, or a ] with no [ before it "
+            "(brackets opened in the prefix count). Real filenames practically never have those. Makes the search faster.");
 
     // --- Buttons ---
     CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 512, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout, hInstance,

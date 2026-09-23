@@ -24,19 +24,25 @@
 bool hasForbiddenSymbolRun_CPU(std::string_view s);
 int countBackslashes_CPU(std::string_view s);
 
-// Brackets: '(' and '[' both open, ')' and ']' both close - one shared count,
-// with no attempt to pair each closer with an opener of its own kind.
-//
-// How many brackets `s` leaves open. A closer with nothing open to close is
-// ignored rather than driving the count negative - meant for a search's
-// fixed prefix, whose own stray closers aren't any candidate's fault.
-int openBracketsAfter_CPU(std::string_view s);
-// True if `s` closes a bracket it never opened: at some point, more closers
-// than openers have been seen, counting `openBefore` brackets already open
-// when `s` starts (see openBracketsAfter_CPU). Checking a candidate's leading
-// characters this way is sound regardless of what follows them - once the
-// count has dropped below zero, no later character can undo that.
-bool hasUnopenedBracket_CPU(std::string_view s, int openBefore);
+// Brackets: round ( ) and square [ ] are counted separately - a ')' only
+// ever closes a '(', and a ']' only ever closes a '['. How the two kinds nest
+// within each other isn't checked, so "[(])" passes.
+struct OpenBrackets {
+    int round = 0;
+    int square = 0;
+};
+// How many brackets of each kind `s` leaves open. A closer with nothing of
+// its kind open is ignored rather than driving that count negative - meant
+// for a search's fixed prefix, whose own stray closers aren't any
+// candidate's fault.
+OpenBrackets openBracketsAfter_CPU(std::string_view s);
+// True if `s` closes a bracket it never opened: at some point, more ')' than
+// '(' (or more ']' than '[') have been seen, counting `openBefore` brackets
+// already open when `s` starts (see openBracketsAfter_CPU). Checking a
+// candidate's leading characters this way is sound regardless of what
+// follows them - once a count has dropped below zero, no later character can
+// undo that.
+bool hasUnopenedBracket_CPU(std::string_view s, OpenBrackets openBefore);
 
 // Below: every function that can encounter a character outside `alphabet`
 // reports that as a plain false/error-string return instead of exit()ing the
