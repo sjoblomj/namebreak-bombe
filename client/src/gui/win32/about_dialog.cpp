@@ -73,7 +73,7 @@ void showAboutDialog(HWND owner) {
 
     AboutState state;
     state.owner = owner;
-    HWND hwnd = CreateWindowExA(kExStyle, kAboutClassName, "About namebreak", kStyle, x, y, width, height, owner, nullptr, hInstance, nullptr);
+    HWND hwnd = CreateWindowExA(kExStyle, kAboutClassName, "About namebreak-bombe", kStyle, x, y, width, height, owner, nullptr, hInstance, nullptr);
     if (!hwnd)
         return;
     SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR) &state);
@@ -83,7 +83,7 @@ void showAboutDialog(HWND owner) {
     SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
 
     std::string protocolLine = std::string("Coordinator protocol v") + kProtocolVersion;
-    HWND title = CreateWindowExA(0, "STATIC", "namebreak", WS_CHILD | WS_VISIBLE, 226, 16, 210, 28, hwnd, nullptr, hInstance, nullptr);
+    HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 226, 16, 210, 28, hwnd, nullptr, hInstance, nullptr);
     // Wide-character API for this one label: the byline has a non-ASCII
     // letter, which the ANSI API would only show correctly on codepages that
     // happen to contain it.

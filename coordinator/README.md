@@ -1,14 +1,14 @@
 # namebreak coordinator
 
-Distributes `namebreak` (see `../namebreaker-cuda`) across multiple volunteers'
+Distributes `namebreak` (see `../client`) across multiple volunteers'
 GPUs. A central **server** tracks a set of *targets* (a prefix/suffix + hash
 pair to search for), carves each target's candidate space into time-boxed
 *ranges*, and hands ranges out to clients over HTTP. The client side lives
-directly in `namebreak` itself (`../namebreaker-cuda`) as its `coordinator`
+directly in `namebreak` itself (`../client`) as its `coordinator`
 mode: it registers, claims a range, searches it in-process (no subprocess),
 heartbeats progress, and reports back when it's done - see
-`../namebreaker-cuda/src/net/coordinator_runner.h` for that loop and
-`../namebreaker-cuda/src/net/protocol.h` for the wire types, kept in sync by hand with
+`../client/src/net/coordinator_runner.h` for that loop and
+`../client/src/net/protocol.h` for the wire types, kept in sync by hand with
 this directory's `protocol/` crate below (same JSON shapes, same server).
 
 ```
@@ -231,10 +231,10 @@ curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecre
 
 ## Running a client
 
-Build `namebreak` as usual first (see `../namebreaker-cuda/README.md` - the
+Build `namebreak` as usual first (see `../client/README.md` - the
 default build includes coordinator support; `-DNAMEBREAK_NETWORK=OFF` omits
 it). Then, in the directory you want its `matches/` directory in, create a
-`config.conf` (see `../namebreaker-cuda/src/common/config.h`) with a
+`config.conf` (see `../client/src/common/config.h`) with a
 `[coordinator]` section:
 
 ```sh
@@ -246,7 +246,7 @@ mode = coordinator
 server_url = http://localhost:8080
 username = yourname
 EOF
-../namebreaker-cuda/build/namebreak
+../client/build/namebreak
 ```
 
 `hostname` (optional) defaults to the machine's actual hostname;
@@ -282,5 +282,5 @@ fly deploy
 ```
 
 The client is not part of the server image - volunteers build `namebreak`
-(`../namebreaker-cuda`) locally and run its `coordinator` mode with
+(`../client`) locally and run its `coordinator` mode with
 `server_url = https://<your-app>.fly.dev` in their `config.conf`.

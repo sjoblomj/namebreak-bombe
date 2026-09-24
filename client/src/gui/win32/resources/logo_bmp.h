@@ -1,9 +1,9 @@
 // Embedded logo for the GUI's setup dialog and About box: a 192x128,
 // 24-bit bottom-up BMP (complete with its BITMAPFILEHEADER), downscaled from
-// namebreak-cuda.png (at the repository root). Embedded as bytes (rather than loaded from disk or a
+// namebreak.png (at the repository root). Embedded as bytes (rather than loaded from disk or a
 // .rc resource) so the GUI stays a single self-contained .exe with no
 // resource-compiler step or image-decoder dependency. Regenerate with:
-//   convert namebreak-cuda.png -resize 192x128! BMP3:logo.bmp
+//   convert namebreak.png -resize 192x128! BMP3:logo.bmp
 //   (then wrap `xxd -i < logo.bmp` in the array below)
 #ifndef NAMEBREAK_GUI_WIN32_RESOURCES_LOGO_BMP_H
 #define NAMEBREAK_GUI_WIN32_RESOURCES_LOGO_BMP_H
