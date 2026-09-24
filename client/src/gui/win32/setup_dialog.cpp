@@ -136,9 +136,10 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         // - checked here too so a missing field is caught right
                         // where it was left blank, rather than only after
                         // writing+reloading the file.
-                        if (alphabet.empty() || maxBackslash.empty() || prefix.empty() || suffix.empty() || startCandidate.empty() ||
-                            lowerBound.empty() || upperBound.empty() || hashA.empty() || hashB.empty()) {
-                            MessageBoxA(hwnd, "All Local Search fields are required.", "namebreak setup", MB_OK | MB_ICONWARNING);
+                        if (alphabet.empty() || maxBackslash.empty() || prefix.empty() || suffix.empty() || lowerBound.empty() ||
+                            upperBound.empty() || hashA.empty() || hashB.empty()) {
+                            MessageBoxA(hwnd, "All Local Search fields except Start candidate are required.", "namebreak setup",
+                                        MB_OK | MB_ICONWARNING);
                             return 0;
                         }
                         state->fields->alphabet = alphabet;
@@ -356,7 +357,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     makeLabel(ps, "Start candidate:", kL1, row(3) + 3, 104);
     state.hwndStartCandidate = makeEdit(ps, fields.startCandidate, kE1, row(3), 150);
     addHelp(ps, kH1, row(3) + 2,
-            "The full filename (prefix + candidate + suffix) to begin searching from. Lets a long search resume where it left off.");
+            "Optional. The full filename (prefix + candidate + suffix) to begin searching from, to resume a long search where it left "
+            "off. Leave blank to start from the beginning.");
 
     makeLabel(ps, "Lower bound:", kL1, row(4) + 3, 100);
     state.hwndLowerBound = makeEdit(ps, fields.lowerBound, kE1, row(4), 150);

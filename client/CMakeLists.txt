@@ -236,6 +236,11 @@ endfunction()
 namebreak_test_executable(prefix_hasher_test tests/prefix_hasher_test.cpp namebreak_search)
 namebreak_test(prefix_hasher_test prefix_hasher_test)
 
+# Where buildSearchRequest (src/common/config.h) starts a search -
+# start_candidate and resume_from_last_candidate. CPU only.
+namebreak_test_executable(config_test tests/config_test.cpp namebreak_common)
+namebreak_test(config_test config_test)
+
 # The backends this build has (backends/backends.cpp); every one is tested.
 # Every backend except `reference` searches in rows (the same batch geometry
 # as the CUDA one) and honours the same tuning overrides.

@@ -1,6 +1,7 @@
 #include "common/config.h"
 
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <utility>
 #include <vector>
@@ -139,6 +140,35 @@ bool setModeKey(const std::string& path, const std::string& mode, std::string& e
     return true;
 }
 
+// The candidate on the last line of `req`'s matches file, if it has one that
+// belongs to this search (this prefix and suffix, only this alphabet's
+// characters) - a matches file is shared by every local search, so its last
+// line may be another search's.
+bool lastUsableMatch(const SearchRequest& req, std::string& out) {
+    std::vector<std::string> lines = readLastLines(req.outputFilePath, 1);
+    if (lines.empty())
+        return false;
+    std::string candidate, error;
+    if (!getStartCandidate(trim(lines.back()), req.prefix, req.suffix, candidate, error) || candidate.empty() ||
+        candidate.find_first_not_of(req.alphabet) != std::string::npos) {
+        fprintf(stderr, "resume_from_last_candidate: ignoring the last line of %s ('%s'), which isn't a candidate of this search\n",
+                req.outputFilePath.c_str(), lines.back().c_str());
+        return false;
+    }
+    out = candidate;
+    return true;
+}
+
+// Whether the search reaches candidate `a` after `b`: it goes through the
+// lengths shortest first, and each length in `alphabet`'s order.
+bool isLaterInSearchOrder(const std::string& a, const std::string& b, const std::string& alphabet) {
+    if (a.size() != b.size())
+        return a.size() > b.size();
+    bool bIsBefore = false;
+    std::string error;
+    return isBeforeInAlphabet(b, a, alphabet, bIsBefore, error) && bIsBefore;
+}
+
 } // namespace
 
 bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error) {
@@ -213,13 +243,14 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     if (!r.getRequired("max_backslash_count", maxBackslashStr, error)) return false;
     if (!r.getRequired("prefix", prefix, error)) return false;
     if (!r.getRequired("suffix", suffix, error)) return false;
-    if (!r.getRequired("start_candidate", startFilename, error)) return false;
+    startFilename = r.getOptional("start_candidate", "");
     if (!r.getRequired("lower_bound", lowerFilename, error)) return false;
     if (!r.getRequired("upper_bound", upperFilename, error)) return false;
     if (!r.getRequired("hash_a", hashAHex, error)) return false;
     if (!r.getRequired("hash_b", hashBHex, error)) return false;
     std::string pruneStr = r.getOptional("prune_symbol_runs", "false");
     std::string pruneBracketsStr = r.getOptional("prune_unopened_brackets", "false");
+    std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
 
     std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
@@ -241,6 +272,11 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
         error = "invalid prune_unopened_brackets: '" + pruneBracketsStr + "' (expected true/false)";
         return false;
     }
+    bool resume = false;
+    if (!parseBool(resumeStr, resume)) {
+        error = "invalid resume_from_last_candidate: '" + resumeStr + "' (expected true/false)";
+        return false;
+    }
     if (!hexToU32(hashAHex, out.targetHashA)) {
         error = "invalid hash_a: " + hashAHex;
         return false;
@@ -252,13 +288,30 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
 
     out.prefix = prefix;
     out.suffix = suffix;
-    if (!getStartCandidate(startFilename, prefix, suffix, out.startCandidate, error)) {
-        return false;
-    }
     out.lowerBound = removePrefixAndSuffix(lowerFilename, prefix, suffix);
     out.upperBound = removePrefixAndSuffix(upperFilename, prefix, suffix);
     out.continuous = continuous;
     out.outputFilePath = matchesFilePath(config.matchesDir, "");
+
+    // Without a start_candidate, from the beginning: the shortest candidates
+    // in continuous mode (an empty start candidate, see SearchRequest), the
+    // lower bound in bounded mode - which searches its start candidate's
+    // length only, so an empty one would leave nothing to search.
+    if (startFilename.empty()) {
+        out.startCandidate = continuous ? "" : out.lowerBound;
+    } else if (!getStartCandidate(startFilename, prefix, suffix, out.startCandidate, error)) {
+        error = "invalid start_candidate: " + error;
+        return false;
+    }
+
+    if (resume) {
+        std::string lastMatch;
+        if (lastUsableMatch(out, lastMatch) && isLaterInSearchOrder(lastMatch, out.startCandidate, out.alphabet)) {
+            printf("Resuming from the last match in %s: %s%s%s\n", out.outputFilePath.c_str(), prefix.c_str(), lastMatch.c_str(),
+                   suffix.c_str());
+            out.startCandidate = lastMatch;
+        }
+    }
     return true;
 }
 

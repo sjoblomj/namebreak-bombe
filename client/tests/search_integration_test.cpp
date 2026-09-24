@@ -719,20 +719,25 @@ static bool scenarioPrefixSuffixLengths() {
     if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), 41) == supportedSizes.end())
         ok &= expectError("P: alphabet of an unsupported size (41)", "TEST_", ".DAT", alphabetOfSize(42).substr(0, 41));
     {
-        // An empty candidate has zero trailing characters, which the kernel can't enumerate.
+        // An empty start candidate means "from the beginning": the shortest
+        // candidates, one character long - here a bounded search, so only those.
         ++g_cases;
+        const std::string target(1, alphabet[12]);
         SearchRequest req;
         req.alphabet = alphabet;
         req.prefix = "TEST_";
         req.suffix = ".DAT";
-        req.targetHashA = 1;
-        req.targetHashB = 2;
+        req.lowerBound = std::string(1, alphabet[5]);
+        req.upperBound = std::string(1, alphabet[20]);
+        req.targetHashA = hashA(req.prefix + target + req.suffix);
+        req.targetHashB = hashB(req.prefix + target + req.suffix);
         OutputCapture capture;
         capture.start();
-        SearchResult r = runSearch(*g_backend, req); // startCandidate/lowerBound/upperBound all empty
+        SearchResult r = runSearch(*g_backend, req); // startCandidate empty
         capture.stop();
-        if (r.ok || r.found) {
-            fprintf(stderr, "FAILED: P: an empty start candidate must be rejected, not silently searched wrongly\n");
+        if (!r.ok || !r.found || r.filename != req.prefix + target + req.suffix) {
+            fprintf(stderr, "FAILED: P: an empty start candidate must search from the shortest candidates (ok=%d found=%d '%s')\n", r.ok,
+                    r.found, r.filename.c_str());
             ++g_failures;
             ok = false;
         }

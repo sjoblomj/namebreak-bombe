@@ -64,9 +64,9 @@ std::string indexToString(uint64_t index, int len, const std::string& alphabet);
 // and returns true.
 bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::string& alphabet, bool& outIsBefore, std::string& error);
 
-// Returns false (with `error` set) if `path` doesn't start with `prefix` or
-// isn't long enough to also hold `suffix`; otherwise fills `out` with the
-// candidate portion and returns true.
+// Returns false (with `error` set) if `path` doesn't start with `prefix` and
+// end with `suffix`; otherwise fills `out` with the candidate portion between
+// them (empty if `path` is just prefix + suffix) and returns true.
 bool getStartCandidate(const std::string& path, const std::string& prefix, const std::string& suffix, std::string& out, std::string& error);
 
 // `input` extended to `candidateLen` characters by repeating its last

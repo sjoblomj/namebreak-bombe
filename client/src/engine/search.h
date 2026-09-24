@@ -17,6 +17,8 @@ struct SearchRequest {
     int maxBackslashCount = 0;
     std::string prefix;
     std::string suffix;
+    // Empty means "from the beginning": the shortest candidates (length 1),
+    // from lowerBound.
     std::string startCandidate;
     std::string lowerBound;
     std::string upperBound;

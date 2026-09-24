@@ -8,6 +8,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -87,6 +88,28 @@ void printUsage(const char* argv0) {
             argv0, backends.c_str(), kDefaultConfigPath);
 }
 
+// For a first run: where the config file was looked for, and the smallest
+// one that works.
+void printMissingConfigHelp(const std::string& configPath) {
+    std::error_code ec;
+    std::filesystem::path where = std::filesystem::absolute(configPath, ec);
+    fprintf(stderr,
+            "No config file found at %s\n"
+            "\n"
+            "namebreak reads its settings from %s in the current directory, or from\n"
+            "the file given with --config <file>. To join a shared search, this is all it\n"
+            "needs:\n"
+            "\n"
+            "    mode = coordinator\n"
+            "\n"
+            "    [coordinator]\n"
+            "    server_url = %s\n"
+            "\n"
+            "To search on your own instead (mode = bounded or continuous), see the [search]\n"
+            "settings in README.md's \"Configuring\" section.\n",
+            (ec ? configPath : where.string()).c_str(), kDefaultConfigPath, kDefaultServerUrl);
+}
+
 int main(int argc, char* argv[]) {
     // Three optional, order-independent flags: --mode and --backend,
     // overriding config.conf's own `mode = ...`/`backend = ...` (see
@@ -124,6 +147,12 @@ int main(int argc, char* argv[]) {
             printUsage(argv[0]);
             return 1;
         }
+    }
+
+    std::error_code existsError;
+    if (!std::filesystem::exists(configPath, existsError)) {
+        printMissingConfigHelp(configPath);
+        return 1;
     }
 
     ConfigFile config;

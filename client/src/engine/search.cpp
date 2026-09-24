@@ -291,11 +291,13 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     //     of the chunk, each looping over its row's alphabetSize candidates -
     //     see bruteForceKernel's comment.
     if (candidateLen < 1) {
-        // A backend enumerates at least one trailing character; a zero-length
-        // candidate (a range whose lower bound is empty) isn't something it can search.
-        result.ok = false;
-        result.error = "the start candidate must not be empty";
-        goto breakfree;
+        // An empty start candidate (prefix + suffix alone) means "from the
+        // very beginning": the shortest candidates, starting from the lower
+        // bound the way every length after the first does below. The empty
+        // candidate itself is skipped - a backend enumerates at least one
+        // trailing character.
+        candidateLen = 1;
+        start_candidate = lowerBoundLimit;
     }
     while (true) {
         if (candidateLen > MAX_CANDIDATE_LEN) {

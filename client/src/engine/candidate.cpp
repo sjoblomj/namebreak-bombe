@@ -110,9 +110,9 @@ bool isBeforeInAlphabet(const std::string& a, const std::string& b, const std::s
 }
 
 bool getStartCandidate(const std::string& path, const std::string& prefix, const std::string& suffix, std::string& out, std::string& error) {
-    // Remove prefix and suffix
-    if (path.rfind(prefix, 0) != 0 || path.size() <= prefix.size() + suffix.size()) {
-        error = "invalid start filename format";
+    if (path.size() < prefix.size() + suffix.size() || path.compare(0, prefix.size(), prefix) != 0 ||
+        path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        error = "'" + path + "' doesn't start with the prefix '" + prefix + "' and end with the suffix '" + suffix + "'";
         return false;
     }
 

@@ -12,10 +12,6 @@ using gui::SetupDialogFields;
 using gui::kTabCoordinator;
 using gui::kTabLocalSearch;
 
-// Prefilled into the setup dialog's Server URL field when the config doesn't
-// already have one.
-constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.fly.dev";
-
 bool configHasServerUrl(const ConfigFile& config) {
     auto it = config.coordinator.find("server_url");
     return it != config.coordinator.end() && !it->second.empty();

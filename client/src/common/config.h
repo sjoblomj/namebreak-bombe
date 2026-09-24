@@ -15,6 +15,10 @@
 // usage/error messages) agrees on it.
 inline constexpr const char* kDefaultConfigPath = "config.conf";
 
+// The public coordinator server - what the Windows GUI's setup prefills, and
+// the CLI suggests when there's no config file yet.
+inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.fly.dev";
+
 // namebreak's on-disk config.conf - read from "./config.conf" (the current
 // working directory) unless overridden via --config <file>. A flat key=value
 // file with exactly two possible [section] headers:

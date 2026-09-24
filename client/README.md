@@ -26,8 +26,8 @@ on the machine - normally the GPU. A top-level `backend = <name>` line in
 unknown name lists the ones the build has.
 
 - **`bounded`** - exhaustively searches candidates of exactly
-  `start_candidate`'s length, between `lower_bound` and `upper_bound`, then
-  exits.
+  `start_candidate`'s length (or `lower_bound`'s, without one), between
+  `lower_bound` and `upper_bound`, then exits.
 - **`continuous`** - same as `bounded`, but once a length is exhausted it
   moves on to the next candidate length and keeps going indefinitely (up to
   `MAX_CANDIDATE_LEN`, 16 characters).
@@ -62,11 +62,13 @@ pause/resume the search.` on startup when it is.
 
 ## Configuring
 
-`namebreak` reads `config.conf` from the current working directory (not a
-path you pass in) every time it starts. It's a flat `key = value` file with
-up to two `[section]` blocks; `#`-led lines and blank lines are ignored, and
-a value only needs `"..."` quoting if it has meaningful leading/trailing
-whitespace (a literal `\` needs no escaping).
+`namebreak` reads `config.conf` from the current working directory, or the
+file given with `--config <file>`, every time it starts; without one it
+stops and says what the smallest working one looks like (the Windows GUI
+runs its setup dialog instead, and writes one). It's a flat `key = value`
+file with up to two `[section]` blocks; `#`-led lines and blank lines are
+ignored, and a value only needs `"..."` quoting if it has meaningful
+leading/trailing whitespace (a literal `\` needs no escaping).
 
 ```ini
 mode = continuous
@@ -74,15 +76,15 @@ mode = continuous
 [search]
 alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"
 max_backslash_count = 0
-prefix = "REZ\\"
-suffix = ".WAV"
-start_candidate = "REZ\\ .WAV"
-lower_bound = "REZ\\FINZ09BX.TXT"
-upper_bound = "REZ\\GAMEMENU.BIN"
+prefix = REZ\
+suffix = .WAV
+lower_bound = REZ\FINZ09BX.TXT
+upper_bound = REZ\GAMEMENU.BIN
 hash_a = 0xF60F5D90
 hash_b = 0xCE0A9BDB
 prune_symbol_runs = true
 prune_unopened_brackets = true
+resume_from_last_candidate = true
 ```
 
 `[search]` keys (used by both `bounded` and `continuous` mode):
@@ -92,7 +94,8 @@ prune_unopened_brackets = true
 | `alphabet` | yes | Every character a candidate may contain. Size must be one of `42, 43, 47, 48, 49, 50` (see [Compiling](#compiling) for why) and at most `MAX_ALPHABET_SIZE` (50). |
 | `max_backslash_count` | yes | Max `\` occurrences allowed in a candidate before it's skipped; `0` means unlimited. To forbid `\` entirely, leave it out of `alphabet` instead - `0` is "no limit", not "zero allowed". |
 | `prefix` / `suffix` | yes | The fixed parts of the filename around the candidate. |
-| `start_candidate` | yes | Full filename (prefix+candidate+suffix) to begin searching from - lets a long search resume where it left off. |
+| `start_candidate` | no | Full filename (prefix+candidate+suffix) to begin searching from. Without it, the search starts from the beginning: in `continuous` mode the shortest candidates (as if it were just prefix+suffix - that filename itself isn't checked), in `bounded` mode, which searches only one candidate length, `lower_bound`. |
+| `resume_from_last_candidate` | no (default `false`) | Resume from the last line of the matches file (see below), the most recent Hash-A match - so a stopped search can simply be restarted to carry on from about where it was. If there's also a `start_candidate`, it starts from whichever of the two the search reaches later (longer candidates come after shorter ones). A last line that doesn't belong to this search - another prefix or suffix, or characters outside `alphabet`, since `bounded`/`continuous` searches share one matches file - is ignored, with a note. Either way, the search prints the candidate it starts from. |
 | `lower_bound` / `upper_bound` | yes | Full filenames (inclusive) bounding the search alphabetically, at every candidate length searched. |
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex (`0x` prefix optional). |
 | `prune_symbol_runs` | no (default `false`) | Skip candidates containing 3+ consecutive non-alphanumeric, non-space characters (real MPQ filenames essentially never have runs like that) - see [Design decisions](#design-decisions). |
@@ -109,10 +112,6 @@ They all go in one directory - `matches/` in the current directory, or
 whatever a top-level `matches_dir = <directory>` line (next to `mode`) says;
 it's created if missing. `bounded`/`continuous` mode writes `matches.txt`
 there, and `coordinator` mode one `matches-<target name>.txt` per target.
-
-`scripts/run.sh` is a working example: it regenerates `config.conf`'s `[search]`
-section from a few shell variables (recomputing `start_candidate` from the
-last line of `matches/matches.txt` each time) and launches `continuous` mode.
 
 ## Compiling
 
@@ -188,7 +187,7 @@ backends' tests actually run there.
 | `src/cli/` | The console program's `main()` |
 | `src/gui/win32/` | The Windows GUI (Windows only) |
 | `tests/` | Correctness tests and benchmarks (`ctest`, `run_search_bench`) |
-| `scripts/` | `run.sh`, and the generator for the GUI's embedded icon |
+| `scripts/` | The generator for the GUI's embedded icon |
 
 Includes are written relative to `src/` (e.g. `#include "engine/search.h"`).
 

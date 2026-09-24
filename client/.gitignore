@@ -2,5 +2,5 @@
 /build/
 /build-hip/
 /build-portable/
-# Where namebreak writes its matches when run from here (scripts/run.sh)
+# Where namebreak writes its matches when run from here
 /matches/
