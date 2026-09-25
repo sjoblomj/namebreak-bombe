@@ -211,6 +211,26 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+#ifdef NAMEBREAK_WITH_NETWORK
+    CoordinatorArgs cargs;
+    if (mode == "coordinator") {
+        if (!buildCoordinatorArgs(config, cargs, error)) {
+            fprintf(stderr, "%s [coordinator]: %s\n", configPath.c_str(), error.c_str());
+            return 1;
+        }
+        cargs.configPath = configPath;
+        // Any username/hostname prompt has to happen here, before the key
+        // listener below turns off echo and starts reading stdin itself -
+        // see resolveMissingIdentity's doc comment.
+        resolveMissingIdentity(cargs);
+    }
+#else
+    if (mode == "coordinator") {
+        fprintf(stderr, "This build of %s was compiled without networking support (rebuild with NAMEBREAK_NETWORK=ON to enable 'coordinator' mode).\n", argv[0]);
+        return 1;
+    }
+#endif
+
     // Only when stdin is actually a terminal - a piped/redirected/absent
     // stdin (cron, systemd, ...) has no keypresses to listen for, and
     // enableRawKeypressMode() would just fail anyway.
@@ -224,20 +244,8 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef NAMEBREAK_WITH_NETWORK
-    if (mode == "coordinator") {
-        CoordinatorArgs cargs;
-        if (!buildCoordinatorArgs(config, cargs, error)) {
-            fprintf(stderr, "%s [coordinator]: %s\n", configPath.c_str(), error.c_str());
-            return 1;
-        }
-        cargs.configPath = configPath;
+    if (mode == "coordinator")
         return runCoordinator(cargs, &g_paused, nullptr, nullptr, &g_finishRangeThenPause);
-    }
-#else
-    if (mode == "coordinator") {
-        fprintf(stderr, "This build of %s was compiled without networking support (rebuild with NAMEBREAK_NETWORK=ON to enable 'coordinator' mode).\n", argv[0]);
-        return 1;
-    }
 #endif
 
     SearchRequest req;

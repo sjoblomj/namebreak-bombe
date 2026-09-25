@@ -39,6 +39,15 @@ struct CoordinatorArgs {
 // section - see CoordinatorArgs above.
 bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::string& error);
 
+// Fills in whichever of args.username/args.hostname are empty: auto-detects
+// them, and on an interactive terminal asks the user to confirm or override
+// them and saves the result to args.configPath. A no-op when both are set.
+// runCoordinator() calls this itself; the CLI's main() calls it earlier as
+// well, before its pause-key listener puts the terminal into single-key,
+// no-echo mode and starts reading stdin - either of which would otherwise
+// garble the prompt's input.
+void resolveMissingIdentity(CoordinatorArgs& args);
+
 // Optional hooks a caller (e.g. the Windows GUI, src/gui/win32/worker.cpp)
 // can pass into runCoordinator() to observe its progress without a console -
 // the CLI's main() passes none of these (all fields default-null), so its

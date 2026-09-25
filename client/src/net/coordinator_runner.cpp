@@ -64,6 +64,8 @@ void interruptibleSleep(std::chrono::milliseconds duration, const std::atomic<bo
     }
 }
 
+} // namespace
+
 // Interactively confirms (or lets the user override) auto-discovered values
 // for whichever of `args`'s username/hostname were left unset by
 // args.configPath, then persists the final values back into that same file -
@@ -71,6 +73,7 @@ void interruptibleSleep(std::chrono::milliseconds duration, const std::atomic<bo
 // already set there). Falls back to silently using the discovered defaults
 // with no prompt/write when stdin isn't a terminal (e.g. a cron job or
 // systemd service), so a missing config never hangs a non-interactive run.
+// Declared in coordinator_runner.h - see there for why main() calls it too.
 void resolveMissingIdentity(CoordinatorArgs& args) {
     struct Field {
         std::string key;
@@ -121,6 +124,8 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
         }
     }
 }
+
+namespace {
 
 SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& matchesDir, std::string& error) {
     SearchRequest req;
