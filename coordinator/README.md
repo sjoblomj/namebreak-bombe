@@ -207,7 +207,7 @@ curl localhost:8080/api/v1/status
 ```
 
 Pause/resume a target, and/or change its priority, description, skip_regex,
-alphabet_name, prune_symbol_runs or prune_unopened_brackets:
+alphabet_name, prune_symbol_runs, prune_unopened_brackets or max_backslash_count:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -218,7 +218,7 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 Any field can be omitted to leave it unchanged (pass `"description": ""` or
 `"skip_regex": ""` to clear an existing one), but at least one must be given.
 A changed `skip_regex` only affects ranges carved after the patch. A changed
-`prune_symbol_runs`/`prune_unopened_brackets` affects every range claimed
+`prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
 progress finish with the old setting.
 

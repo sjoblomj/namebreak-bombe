@@ -274,6 +274,11 @@ pub struct AdminPatchTargetRequest {
     /// to leave it unchanged.
     #[serde(default)]
     pub prune_unopened_brackets: Option<bool>,
+    /// See `AdminCreateTargetRequest::max_backslash_count`. Leave unset to
+    /// leave it unchanged. Applies to ranges claimed after the patch, like
+    /// `prune_symbol_runs`.
+    #[serde(default)]
+    pub max_backslash_count: Option<i64>,
 }
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of
