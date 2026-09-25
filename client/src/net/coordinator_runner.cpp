@@ -474,8 +474,10 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
         while (true) {
             if (finishRangeThenPause && pauseRequested && finishRangeThenPause->exchange(false, std::memory_order_relaxed)) {
                 pauseRequested->store(true, std::memory_order_relaxed);
+                // The key hint is for the console only - the GUI (onStatus)
+                // resumes with its Resume button instead.
                 const char* msg = "[coordinator] paused before claiming new work, as asked";
-                printf("%s\n", msg);
+                printf("%s. Resume by pressing 'p'\n", msg);
                 if (callbacks && callbacks->onStatus)
                     callbacks->onStatus(msg);
             }

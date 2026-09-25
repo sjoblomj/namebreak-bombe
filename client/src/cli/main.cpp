@@ -75,9 +75,12 @@ void pauseKeyListener() {
         bool nowPaused = !g_paused.load(std::memory_order_relaxed);
         g_paused.store(nowPaused, std::memory_order_relaxed);
         bool finishing = g_coordinatorMode && g_finishRangeThenPause.load(std::memory_order_relaxed);
-        if (nowPaused)
-            printf("\n[paused] finishing the current batch; no new batches will start until resumed (press 'p' to resume%s)\n",
-                   finishing ? " - still set to pause again once the current range is finished" : "");
+        if (nowPaused && finishing)
+            printf("\n[paused] finishing the current batch; no new batches will start until resumed (Press 'p' to resume - still "
+                   "set to pause again once the current range is finished. Press 'f' to keep going afterwards)\n");
+        else if (nowPaused)
+            printf("\n[paused] finishing the current batch; no new batches will start until resumed (press 'p' to resume)\n%s",
+                   g_coordinatorMode ? "Press 'f' to finish the current range and then pause\n" : "");
         else
             printf(finishing ? "\n[resumed until the current range is finished] (press 'f' to keep going afterwards)\n" : "\n[resumed]\n");
         fflush(stdout);
