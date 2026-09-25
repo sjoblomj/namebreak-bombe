@@ -26,7 +26,13 @@ pub struct RangeConfig {
     pub default_rate_per_sec: f64,
     pub min_chunk_candidates: i64,
     pub max_chunk_candidates: i64,
-    pub lease_grace_multiplier: f64,
+    /// How long a claimed range stays leased after the last sign of life
+    /// from its client - the claim itself, then every heartbeat - before
+    /// reclaim_expired releases it. Deliberately the same for every range,
+    /// whatever its size or its claimant's speed: heartbeats (every 60s)
+    /// are what keep a live client's lease going, so this only decides how
+    /// long a quit, crashed or disconnected client's range sits unworked.
+    pub lease_seconds: i64,
     pub reclaim_interval_secs: u64,
     pub ema_alpha: f64,
     /// How long a range may sit claimed with no real progress (its
@@ -55,7 +61,7 @@ impl RangeConfig {
             default_rate_per_sec: env_f64("DEFAULT_RATE_PER_SEC", 500_000_000.0),
             min_chunk_candidates: env_i64("MIN_CHUNK_CANDIDATES", 1_000_000),
             max_chunk_candidates: env_i64("MAX_CHUNK_CANDIDATES", 1_000_000_000_000_000),
-            lease_grace_multiplier: env_f64("LEASE_GRACE_MULTIPLIER", 3.0),
+            lease_seconds: env_i64("LEASE_SECONDS", 6 * 60 * 60),
             reclaim_interval_secs: env_u64("RECLAIM_INTERVAL_SECS", 30),
             ema_alpha: env_f64("EMA_ALPHA", 0.3),
             stall_release_seconds: env_i64("STALL_RELEASE_SECONDS", 24 * 60 * 60),

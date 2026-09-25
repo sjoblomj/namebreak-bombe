@@ -13,12 +13,6 @@ use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Range, Target, TargetProgress, User};
 use crate::state::{now_unix, RangeConfig};
 
-fn lease_seconds_for(config: &RangeConfig, range_size: i64, effective_rate: f64) -> i64 {
-    let expected = range_size as f64 / effective_rate.max(1.0);
-    let leased = (expected * config.lease_grace_multiplier).round() as i64;
-    leased.max(60)
-}
-
 fn effective_rate(config: &RangeConfig, user: &User) -> f64 {
     user.ema_rate_per_sec.unwrap_or(config.default_rate_per_sec)
 }
@@ -231,7 +225,6 @@ async fn claim_priority_range_chunk(
             Some((skip_start, skip_end)) if natural_end >= skip_start => (skip_start, Some((skip_start, skip_end))),
             _ => (natural_end, None),
         };
-        let chunk = end_index - start_index;
 
         let next_index = match skip_to_insert {
             Some((skip_start, skip_end)) => {
@@ -242,7 +235,7 @@ async fn claim_priority_range_chunk(
         };
         sqlx::query("UPDATE priority_ranges SET next_index = ? WHERE id = ?").bind(next_index).bind(pr.id).execute(&mut *tx).await?;
 
-        let lease_seconds = lease_seconds_for(config, chunk, rate);
+        let lease_seconds = config.lease_seconds;
         let range_id: i64 = sqlx::query_scalar(
             "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
              assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id, last_progress_at) \
@@ -329,7 +322,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
 
         if let Some(range) = pending {
             let range = split_off_searched_portion(&mut tx, range, now).await?;
-            let lease_seconds = lease_seconds_for(config, range.end_index - range.start_index, rate);
+            let lease_seconds = config.lease_seconds;
 
             sqlx::query(
                 "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
@@ -497,7 +490,6 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                 Some((b_start, b_end, is_skip)) if natural_end >= b_start => (b_start, Some((b_start, b_end, is_skip))),
                 _ => (natural_end, None),
             };
-            let chunk = end_index - start_index;
 
             let next_index_before_bump = match boundary_to_apply {
                 Some((b_start, b_end, true)) => {
@@ -517,7 +509,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             );
             persist_progress(&mut tx, target.id, new_len, new_next_index, &target.alphabet_name, &target.alphabet).await?;
 
-            let lease_seconds = lease_seconds_for(config, chunk, rate);
+            let lease_seconds = config.lease_seconds;
             let range_id: i64 = sqlx::query_scalar(
                 "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
                  assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, last_progress_at) \
@@ -619,7 +611,9 @@ pub async fn heartbeat_range(
         }
     }
 
-    let lease_seconds = range.lease_seconds.unwrap_or(300);
+    // The current setting, not the range's stored lease_seconds - that's
+    // whatever was in force when it was claimed.
+    let lease_seconds = config.lease_seconds;
     let now = now_unix();
     let mut range_released = false;
     if target_solved {
@@ -1102,7 +1096,7 @@ mod tests {
             // claims instead of taking many small same-length chunks.
             min_chunk_candidates: chunk_at_least,
             max_chunk_candidates: chunk_at_least,
-            lease_grace_multiplier: 3.0,
+            lease_seconds: 6 * 60 * 60,
             reclaim_interval_secs: 30,
             ema_alpha: 0.3,
             stall_release_seconds: 24 * 60 * 60,
@@ -1432,17 +1426,15 @@ mod tests {
         let (lower, upper) = full_bounds(DEFAULT, cap - 1);
         insert_target(&pool, &lower, &upper).await;
 
-        // Not test_config(): its fixed default_rate_per_sec=1.0 combined with a
-        // chunk size this large would blow lease_seconds past i64::MAX. Use a
-        // rate proportional to the chunk size instead, so the computed lease
-        // stays sane regardless of which length's chunk is being leased.
+        // Not test_config(): chunks this large need a rate to match, or the
+        // chunk-size calculation (rate * target_chunk_seconds) couldn't reach them.
         let huge = space_size(DEFAULT, cap);
         let config = RangeConfig {
             target_chunk_seconds: 1.0,
             default_rate_per_sec: huge as f64,
             min_chunk_candidates: huge,
             max_chunk_candidates: huge,
-            lease_grace_multiplier: 3.0,
+            lease_seconds: 6 * 60 * 60,
             reclaim_interval_secs: 30,
             ema_alpha: 0.3,
             stall_release_seconds: 24 * 60 * 60,
@@ -2205,6 +2197,41 @@ mod tests {
         let config = test_config(space_size(DEFAULT, 2));
         let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
         assert_eq!(claim.max_backslash_count, 3);
+    }
+
+    /// A lease is the same fixed length for every range - however big, and
+    /// however fast its claimant - counted from the last sign of life: the
+    /// claim, then each heartbeat. A heartbeat must also use the current
+    /// setting rather than whatever lease length was stored at claim time.
+    #[tokio::test]
+    async fn lease_is_fixed_and_renewed_from_the_last_heartbeat() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
+
+        // default_rate_per_sec is 1.0, so a size-based lease would be enormous.
+        let config = test_config(space_size(DEFAULT, 3));
+        let before = now_unix();
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(claim.lease_seconds, config.lease_seconds);
+        let lease_expires_at: i64 =
+            sqlx::query_scalar("SELECT lease_expires_at FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        assert!((before + config.lease_seconds..=now_unix() + config.lease_seconds).contains(&lease_expires_at));
+
+        // A range claimed under an older, much longer lease setting.
+        sqlx::query("UPDATE ranges SET lease_seconds = 999999, lease_expires_at = ? WHERE id = ?")
+            .bind(now_unix() + 999999)
+            .bind(claim.range_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = now_unix();
+        let outcome = heartbeat_range(&pool, &config, &user, claim.range_id, None).await.unwrap();
+        assert_eq!(outcome.lease_seconds, config.lease_seconds);
+        let lease_expires_at: i64 =
+            sqlx::query_scalar("SELECT lease_expires_at FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        assert!((before + config.lease_seconds..=now_unix() + config.lease_seconds).contains(&lease_expires_at));
     }
 
     #[tokio::test]
