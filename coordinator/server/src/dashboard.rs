@@ -36,6 +36,9 @@ pub struct DashboardTarget {
     pub hash_b_hex: String,
     pub found_filename: Option<String>,
     pub found_by: Option<String>,
+    /// The backend `found_by` searches with ("cuda", "cpu", ...) - see
+    /// `DashboardRange::worker_backend`.
+    pub found_by_backend: Option<String>,
     /// Unix seconds - `None` for a target solved before this was recorded.
     pub found_at: Option<i64>,
     /// Higher claims first - see ranges::claim_range. Defaults to 0.
@@ -107,6 +110,10 @@ pub struct DashboardRange {
     /// "username@hostname" of whoever last claimed this range, even if it was
     /// since reclaimed - see the migration adding `last_assigned_user_id`.
     pub worker: Option<String>,
+    /// The backend `worker` searches with ("cuda", "cpu", ...), as declared
+    /// when it last registered - `None` for users that registered before
+    /// clients sent it. Shown as a badge next to the worker.
+    pub worker_backend: Option<String>,
     pub assigned_at: Option<i64>,
     pub lease_expires_at: Option<i64>,
     pub completed_at: Option<i64>,
@@ -124,19 +131,17 @@ pub struct DashboardRange {
     pub priority_range_id: Option<i64>,
 }
 
-fn display_name(username: Option<String>, hostname: Option<String>) -> Option<String> {
-    match (username, hostname) {
-        (Some(u), Some(h)) => Some(format!("{u}@{h}")),
-        _ => None,
-    }
-}
+// Both queries below build a user's "username@hostname" in SQL (`||` gives
+// NULL if either part is NULL, i.e. no such user) rather than selecting the
+// two separately, since sqlx only maps rows of up to 16 columns to a tuple.
+// An empty backend (users registered before clients sent one) reads as NULL.
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
     #[allow(clippy::type_complexity)]
     let target_rows: Vec<(i64, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT targets.id, targets.name, targets.status, \
                 targets.lower_bound, targets.upper_bound, targets.hash_a, targets.hash_b, targets.found_filename, \
-                found_user.username, found_user.hostname, targets.found_at, targets.alphabet_name, targets.alphabet, targets.priority, \
+                found_user.username || '@' || found_user.hostname, NULLIF(found_user.backend, ''), targets.found_at, targets.alphabet_name, targets.alphabet, targets.priority, \
                 targets.description, targets.skip_regex \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
          ORDER BY targets.priority DESC, targets.created_at ASC",
@@ -153,7 +158,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     #[allow(clippy::type_complexity)]
     let all_ranges: Vec<(i64, i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String, Option<i64>)> = sqlx::query_as(
         "SELECT ranges.target_id, ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
-                ranges.progress_index, worker.username, worker.hostname, \
+                ranges.progress_index, worker.username || '@' || worker.hostname, NULLIF(worker.backend, ''), \
                 ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
                 ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id \
          FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
@@ -186,13 +191,13 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     }
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_username, found_hostname, found_at, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
+    for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_by, found_by_backend, found_at, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
 
         let ranges = range_rows
             .into_iter()
             .map(
-                |(_target_id, range_id, r_status, candidate_len, start_index, end_index, progress_index, worker_username, worker_hostname, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet, priority_range_id)| {
+                |(_target_id, range_id, r_status, candidate_len, start_index, end_index, progress_index, worker, worker_backend, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet, priority_range_id)| {
                     // Each range is decoded with its OWN alphabet, not the
                     // target's current one - a range carved before the
                     // target's alphabet was last patched (see
@@ -210,7 +215,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                         progress_percent: progress_index.map(|p| {
                             (p - start_index + 1) as f64 / (end_index - start_index) as f64 * 100.0
                         }),
-                        worker: display_name(worker_username, worker_hostname),
+                        worker,
+                        worker_backend,
                         assigned_at,
                         lease_expires_at,
                         completed_at,
@@ -257,7 +263,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             hash_a_hex: format!("0x{:08X}", i64_to_u32(hash_a)),
             hash_b_hex: format!("0x{:08X}", i64_to_u32(hash_b)),
             found_filename,
-            found_by: display_name(found_username, found_hostname),
+            found_by,
+            found_by_backend,
             found_at,
             priority,
             description,

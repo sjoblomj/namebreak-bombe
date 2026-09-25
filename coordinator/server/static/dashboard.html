@@ -12,6 +12,15 @@
     --border: #dde1e6;
     --text: #1b1f24;
     --muted: #6b7280;
+    /* Fainter than --muted: a worker's hostname, next to its username. */
+    --faint: #a3a9b3;
+    /* Backend badges - see BACKEND_BADGES. */
+    --b-cuda: #4e8f1a;
+    --b-hip: #c0392b;
+    --b-metal: #5b6472;
+    --b-opencl: #0e7490;
+    --b-cpu: #9a5b13;
+    --b-reference: #6b7280;
     --accent: #2563eb;
     --pending: #9ca3af;
     --in-progress: #d97706;
@@ -31,6 +40,13 @@
       --border: #2b2f36;
       --text: #e7e9ec;
       --muted: #9aa1ab;
+      --faint: #6c737e;
+      --b-cuda: #86c34f;
+      --b-hip: #f07266;
+      --b-metal: #b8c0cc;
+      --b-opencl: #3cc4dc;
+      --b-cpu: #e2a458;
+      --b-reference: #9aa1ab;
       --accent: #5b8def;
       --pending: #7c8290;
       --in-progress: #e0a13a;
@@ -198,6 +214,14 @@
     font-weight: 500;
     font-size: 13px;
   }
+  /* The banner keeps its dark-on-yellow look in both themes, so a worker
+     shown in it gets a plain dark badge and a dimmed (not grey) hostname. */
+  .found-banner .backend-badge {
+    color: #1a1a1a;
+    background: rgba(0,0,0,0.1);
+    border-color: rgba(0,0,0,0.2);
+  }
+  .found-banner .worker-host { color: inherit; opacity: 0.6; }
   .priority-section {
     margin-top: 14px;
   }
@@ -318,6 +342,30 @@
     overflow-wrap: anywhere;
   }
   td.worker { color: var(--text); }
+  .worker-host { color: var(--faint); }
+  /* Which backend a worker searches with: a glyph-only badge, named in its
+     tooltip - see BACKEND_BADGES. */
+  .backend-badge {
+    --c: var(--b-reference);
+    display: inline-grid;
+    place-items: center;
+    width: 17px;
+    height: 17px;
+    margin-right: 5px;
+    border-radius: 4px;
+    vertical-align: -3px;
+    color: var(--c);
+    background: color-mix(in srgb, var(--c) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--c) 32%, transparent);
+    font-style: normal;
+  }
+  .backend-badge svg { width: 11px; height: 11px; display: block; }
+  .backend-badge[data-backend="cuda"] { --c: var(--b-cuda); }
+  .backend-badge[data-backend="hip"] { --c: var(--b-hip); }
+  .backend-badge[data-backend="metal"] { --c: var(--b-metal); }
+  .backend-badge[data-backend="opencl"] { --c: var(--b-opencl); }
+  .backend-badge[data-backend="cpu"] { --c: var(--b-cpu); }
+  .backend-badge[data-backend="reference"] { --c: var(--b-reference); }
   td.worker.none, .muted { color: var(--muted); font-style: italic; }
   .lease-note {
     display: block;
@@ -560,15 +608,47 @@
     return frag;
   }
 
-  // "username@hostname" (see dashboard.rs's display_name) rendered as
-  // "username @ hostname" with a <wbr> right before the hostname, so it only
-  // breaks onto its own line when the column is actually too narrow for it.
-  function workerFragment(worker) {
+  // One glyph per search backend (the client's backend names - see
+  // client/src/backends/backends.cpp), shown before a worker's name. The
+  // NVIDIA, Apple and AMD marks come from Simple Icons (simple-icons 13.21.0,
+  // CC0; the AMD one is just the arrow from its wordmark); the rest are
+  // drawn for this page. Constant markup, so innerHTML is safe here.
+  const BACKEND_BADGES = {
+    cuda: { name: 'CUDA', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8.948 8.798v-1.43a6.7 6.7 0 0 1 .424-.018c3.922-.124 6.493 3.374 6.493 3.374s-2.774 3.851-5.75 3.851c-.398 0-.787-.062-1.158-.185v-4.346c1.528.185 1.837.857 2.747 2.385l2.04-1.714s-1.492-1.952-4-1.952a6.016 6.016 0 0 0-.796.035m0-4.735v2.138l.424-.027c5.45-.185 9.01 4.47 9.01 4.47s-4.08 4.964-8.33 4.964c-.37 0-.733-.035-1.095-.097v1.325c.3.035.61.062.91.062 3.957 0 6.82-2.023 9.593-4.408.459.371 2.34 1.263 2.73 1.652-2.633 2.208-8.772 3.984-12.253 3.984-.335 0-.653-.018-.971-.053v1.864H24V4.063zm0 10.326v1.131c-3.657-.654-4.673-4.46-4.673-4.46s1.758-1.944 4.673-2.262v1.237H8.94c-1.528-.186-2.73 1.245-2.73 1.245s.68 2.412 2.739 3.11M2.456 10.9s2.164-3.197 6.5-3.533V6.201C4.153 6.59 0 10.653 0 10.653s2.35 6.802 8.948 7.42v-1.237c-4.84-.6-6.492-5.936-6.492-5.936z"/></svg>' },
+    hip: { name: 'HIP', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="18.2 9.05 5.9 5.9" fill="currentColor" aria-hidden="true"><path d="M18.324 9.137l1.559 1.56h2.556v2.557L24 14.814V9.137zM19.881 11.01l-1.604 1.603v2.25h2.246l1.604-1.607h-2.246z"/></svg>' },
+    metal: { name: 'Metal', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg>' },
+    opencl: { name: 'OpenCL', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="3.5" width="13" height="8" rx="1"/><circle cx="10" cy="7.5" r="2.25"/><path d="M4 6h2.5M4 9h2.5M4.5 11.5V13.5M7 11.5V13.5"/></svg>' },
+    cpu: { name: 'CPU', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1"/><rect x="6.5" y="6.5" width="3" height="3" rx=".25"/><path d="M6 1.5V4M10 1.5V4M6 12v2.5M10 12v2.5M1.5 6H4M1.5 10H4M12 6h2.5M12 10h2.5"/></svg>' },
+    reference: { name: 'Reference', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="5" width="13" height="6" rx=".75"/><path d="M4 5v2.5M6.5 5v1.5M9 5v2.5M11.5 5v1.5"/></svg>' },
+  };
+
+  function backendBadge(backend) {
+    const badge = BACKEND_BADGES[backend];
+    if (!badge)
+      return null;
+    const el = document.createElement('span');
+    el.className = 'backend-badge';
+    el.dataset.backend = backend;
+    el.title = badge.name;
+    el.setAttribute('role', 'img');
+    el.setAttribute('aria-label', badge.name);
+    el.innerHTML = badge.svg;
+    return el;
+  }
+
+  // "username@hostname" (see dashboard.rs) rendered as "username @ hostname",
+  // with the hostname fainter, a badge for `backend` (if known) in front, and
+  // a <wbr> right before the hostname, so it only breaks onto its own line
+  // when the column is actually too narrow for it.
+  function workerFragment(worker, backend) {
     const frag = document.createDocumentFragment();
     if (!worker) {
       frag.append('Nobody');
       return frag;
     }
+    const badge = backendBadge(backend);
+    if (badge)
+      frag.appendChild(badge);
     const atIndex = worker.indexOf('@');
     if (atIndex === -1) {
       frag.append(worker);
@@ -576,7 +656,10 @@
     }
     frag.append(worker.slice(0, atIndex) + ' @ ');
     frag.appendChild(document.createElement('wbr'));
-    frag.append(worker.slice(atIndex + 1));
+    const host = document.createElement('span');
+    host.className = 'worker-host';
+    host.textContent = worker.slice(atIndex + 1);
+    frag.appendChild(host);
     return frag;
   }
 
@@ -642,7 +725,7 @@
 
     const tdWorker = document.createElement('td');
     tdWorker.className = 'worker col-worker' + (r.worker ? '' : ' none');
-    tdWorker.appendChild(workerFragment(r.worker));
+    tdWorker.appendChild(workerFragment(r.worker, r.worker_backend));
     tr.appendChild(tdWorker);
 
     const tdAssigned = document.createElement('td');
@@ -682,7 +765,7 @@
         grid.appendChild(detailField('Expires', expiresValue));
       }
     }
-    grid.appendChild(detailField('Worker', workerFragment(r.worker)));
+    grid.appendChild(detailField('Worker', workerFragment(r.worker, r.worker_backend)));
     grid.appendChild(detailField('Assigned', tdAssigned.textContent, false, tdAssigned.title));
     grid.appendChild(detailField('Completed', tdCompleted.textContent, false, tdCompleted.title));
     detailTd.appendChild(grid);
@@ -1209,7 +1292,8 @@
       if (t.found_by) {
         const by = document.createElement('span');
         by.className = 'found-by';
-        by.textContent = 'by ' + t.found_by;
+        by.append('by ');
+        by.appendChild(workerFragment(t.found_by, t.found_by_backend));
         banner.appendChild(by);
       }
       const foundAt = fmtTime(t.found_at);
