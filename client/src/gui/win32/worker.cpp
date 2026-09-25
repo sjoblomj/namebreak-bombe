@@ -10,6 +10,7 @@ namespace gui {
 
 SharedStatus g_status;
 std::atomic<bool> g_pauseRequested{false};
+std::atomic<bool> g_finishRangeThenPause{false};
 std::atomic<bool> g_quitRequested{false};
 
 } // namespace gui
@@ -110,7 +111,7 @@ void workerThreadMain(AppConfig config, HWND notifyWindow) {
         callbacks.onRangeClaimed = onRangeClaimed;
         callbacks.onRangeFinished = onRangeFinished;
         callbacks.onStatus = onStatus;
-        runCoordinator(config.coordinatorArgs, &g_pauseRequested, &g_quitRequested, &callbacks);
+        runCoordinator(config.coordinatorArgs, &g_pauseRequested, &g_quitRequested, &callbacks, &g_finishRangeThenPause);
     } else {
         runLocalSearch(config.searchRequest, config.mode == "continuous", config.backend);
     }

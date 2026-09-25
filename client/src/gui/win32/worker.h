@@ -56,6 +56,9 @@ extern SharedStatus g_status;
 
 // Set by the UI thread, polled by the search/coordinator loop.
 extern std::atomic<bool> g_pauseRequested;
+// Coordinator mode only: pause once the current range is finished - see
+// runCoordinator's finishRangeThenPause, which also clears it again.
+extern std::atomic<bool> g_finishRangeThenPause;
 extern std::atomic<bool> g_quitRequested;
 
 // The worker thread's body: runs whichever mode was configured (see

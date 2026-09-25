@@ -25,23 +25,61 @@
 // than needing to interrupt one mid-flight.
 std::atomic<bool> g_paused{false};
 
+// Coordinator mode only: "finish the current range, then pause" - toggled by
+// the 'f' key, and cleared again by runCoordinator() once it has paused
+// (see its finishRangeThenPause parameter). Only honoured in coordinator
+// mode (g_coordinatorMode); local searches have no ranges to finish.
+std::atomic<bool> g_finishRangeThenPause{false};
+bool g_coordinatorMode = false;
+
+// The 'f' key: see g_finishRangeThenPause. Turning it on while paused
+// resumes the search too - that's the point of it: carry on, but only to the
+// end of the range in hand.
+void toggleFinishRangeThenPause() {
+    if (!g_coordinatorMode) {
+        printf("\n['f' only applies in coordinator mode - there are no ranges to finish in a local search]\n");
+        return;
+    }
+    bool nowOn = !g_finishRangeThenPause.load(std::memory_order_relaxed);
+    g_finishRangeThenPause.store(nowOn, std::memory_order_relaxed);
+    if (!nowOn) {
+        printf("\n[finish-then-pause off] new work will be claimed after the current range as usual (press 'f' to turn it back on)\n");
+    } else if (g_paused.exchange(false, std::memory_order_relaxed)) {
+        printf("\n[resumed until the current range is finished] then pausing before claiming new work "
+               "(press 'f' to keep going afterwards, 'p' to pause now)\n");
+    } else {
+        printf("\n[finish-then-pause on] will pause once the current range is finished, before claiming new work "
+               "(press 'f' again to cancel)\n");
+    }
+}
+
 // Runs for the life of the process once main() starts it (only when stdin is
 // an interactive terminal - see its call site), toggling g_paused on 'p'/
 // 'P', the same key cgminer/xmrig and other long-running GPU compute tools
 // already use for this. One key toggles both directions (like a media
 // player's pause button) rather than separate pause/resume keys, since
-// there's only ever one thing to remember.
+// there's only ever one thing to remember. 'f'/'F' toggles
+// g_finishRangeThenPause the same way - see toggleFinishRangeThenPause.
 void pauseKeyListener() {
     for (;;) {
         int key = readKeypressBlocking();
         if (key < 0)
             return; // stdin closed - nothing left to listen for
+        if (key == 'f' || key == 'F') {
+            toggleFinishRangeThenPause();
+            fflush(stdout);
+            continue;
+        }
         if (key != 'p' && key != 'P')
             continue;
         bool nowPaused = !g_paused.load(std::memory_order_relaxed);
         g_paused.store(nowPaused, std::memory_order_relaxed);
-        printf(nowPaused ? "\n[paused] finishing the current batch; no new batches will start until resumed (press 'p' to resume)\n"
-                          : "\n[resumed]\n");
+        bool finishing = g_coordinatorMode && g_finishRangeThenPause.load(std::memory_order_relaxed);
+        if (nowPaused)
+            printf("\n[paused] finishing the current batch; no new batches will start until resumed (press 'p' to resume%s)\n",
+                   finishing ? " - still set to pause again once the current range is finished" : "");
+        else
+            printf(finishing ? "\n[resumed until the current range is finished] (press 'f' to keep going afterwards)\n" : "\n[resumed]\n");
         fflush(stdout);
     }
 }
@@ -176,8 +214,11 @@ int main(int argc, char* argv[]) {
     // Only when stdin is actually a terminal - a piped/redirected/absent
     // stdin (cron, systemd, ...) has no keypresses to listen for, and
     // enableRawKeypressMode() would just fail anyway.
+    g_coordinatorMode = mode == "coordinator";
     if (isInteractiveTerminal() && enableRawKeypressMode()) {
         printf("Press 'p' to pause/resume the search. Ctrl+C pauses too - press it again to quit.\n");
+        if (g_coordinatorMode)
+            printf("Press 'f' to finish the current range and then pause, before claiming new work.\n");
         std::thread(pauseKeyListener).detach();
         std::signal(SIGINT, handleSigintPauseOrQuit);
     }
@@ -190,7 +231,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         cargs.configPath = configPath;
-        return runCoordinator(cargs, &g_paused);
+        return runCoordinator(cargs, &g_paused, nullptr, nullptr, &g_finishRangeThenPause);
     }
 #else
     if (mode == "coordinator") {

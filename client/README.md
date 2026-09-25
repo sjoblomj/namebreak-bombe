@@ -51,11 +51,20 @@ paused by either method, actually quits. In `coordinator` mode,
 heartbeating keeps going while paused (it runs on its own thread,
 independent of the search itself), so a paused client doesn't lose its
 claimed range to a lease timeout - it just makes no progress on it until
-resumed. (Pausing doesn't stop the coordinator loop from claiming a *new*
-range if there isn't one in progress yet, though - if you pause between
-ranges, the next one still gets claimed, and then sits idle, heartbeated
-but unworked, until you resume; it just isn't reassigned to someone else in
-the meantime.) Only available when stdin is an actual interactive terminal
+resumed. No new range is claimed while paused.
+
+Also in `coordinator` mode, `f` (or `F`) means "finish the current range,
+then pause": the client carries on with the range in hand, reports it
+complete, and pauses before claiming new work. Pressed while paused, it
+resumes the search for the rest of that range; pressed while running, it
+just arranges the pause. `p` still pauses and resumes in the meantime
+without cancelling it, and pressing `f` again cancels it, so the client
+carries on claiming new work as usual. With no range in hand (paused
+between ranges, or waiting for work), it pauses right away. The Windows GUI
+has the same option as a "Finish current range, then pause" checkbox, and
+in its tray menu.
+
+Keys are only available when stdin is an actual interactive terminal
 (not when redirected/piped, or with no controlling terminal at all, e.g. a
 cron job or systemd service) - `namebreak` prints `Press 'p' to
 pause/resume the search.` on startup when it is.

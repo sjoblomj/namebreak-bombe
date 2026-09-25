@@ -406,8 +406,8 @@ bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::s
     return true;
 }
 
-int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested,
-                    const CoordinatorCallbacks* callbacks) {
+int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested,
+                    const CoordinatorCallbacks* callbacks, std::atomic<bool>* finishRangeThenPause) {
     resolveMissingIdentity(args);
 
     // Not thread-safe to call lazily once the heartbeat thread may already
@@ -460,7 +460,22 @@ int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested
         // release doesn't touch pauseRequested itself, it just stops the
         // now-invalid range's search and heartbeat - it's this gate, right
         // here, that keeps the loop from immediately claiming a replacement.
-        while (pauseRequested && pauseRequested->load(std::memory_order_relaxed)) {
+        //
+        // It's also where finishRangeThenPause turns into a real pause: this
+        // is the one point between finishing a range and claiming the next.
+        // Checked on every pass, not just once, so that turning it on while
+        // paused here (which also resumes - see its callers) pauses again
+        // straight away rather than claiming a whole new range.
+        while (true) {
+            if (finishRangeThenPause && pauseRequested && finishRangeThenPause->exchange(false, std::memory_order_relaxed)) {
+                pauseRequested->store(true, std::memory_order_relaxed);
+                const char* msg = "[coordinator] paused before claiming new work, as asked";
+                printf("%s\n", msg);
+                if (callbacks && callbacks->onStatus)
+                    callbacks->onStatus(msg);
+            }
+            if (!(pauseRequested && pauseRequested->load(std::memory_order_relaxed)))
+                break;
             if (quitRequested && quitRequested->load(std::memory_order_relaxed))
                 return 0;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));

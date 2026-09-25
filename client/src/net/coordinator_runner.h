@@ -89,7 +89,13 @@ struct CoordinatorCallbacks {
 // claimed range's search so it can be interrupted almost immediately rather
 // than run to completion. `callbacks`, if given, is notified per
 // CoordinatorCallbacks above.
-int runCoordinator(CoordinatorArgs args, const std::atomic<bool>* pauseRequested = nullptr,
-                    std::atomic<bool>* quitRequested = nullptr, const CoordinatorCallbacks* callbacks = nullptr);
+// `finishRangeThenPause`, if given (and `pauseRequested` too), asks for a
+// pause once the range in hand is finished, before any new work is claimed:
+// whenever this loop is about to claim and finds it set, it clears it, sets
+// `*pauseRequested` and waits there like any other pause. Set while no
+// range is in hand (paused between ranges, or waiting for work), that means
+// pausing right away.
+int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested = nullptr, std::atomic<bool>* quitRequested = nullptr,
+                    const CoordinatorCallbacks* callbacks = nullptr, std::atomic<bool>* finishRangeThenPause = nullptr);
 
 #endif // NAMEBREAK_NET_COORDINATOR_RUNNER_H

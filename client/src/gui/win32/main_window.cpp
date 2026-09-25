@@ -34,6 +34,7 @@
 #pragma comment(lib, "shell32.lib")
 
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -61,10 +62,14 @@ constexpr UINT WM_APP_TRAYICON = WM_APP + 1;
 constexpr int kIdPauseButton = 101;
 constexpr int kIdQuitButton = 102;
 constexpr int kIdAboutButton = 103;
+constexpr int kIdFinishCheckbox = 104;
 constexpr int kIdTrayShow = 201;
 constexpr int kIdTrayPause = 202;
 constexpr int kIdTrayQuit = 203;
 constexpr int kIdTrayAbout = 204;
+constexpr int kIdTrayFinish = 205;
+
+constexpr const char* kFinishRangeText = "Finish current range, then pause";
 
 constexpr size_t kMaxMatchLines = 100;
 
@@ -76,6 +81,8 @@ HWND g_hwndMatches = nullptr;
 HWND g_hwndPauseButton = nullptr;
 HWND g_hwndQuitButton = nullptr;
 HWND g_hwndAboutButton = nullptr;
+// Coordinator mode only (null otherwise) - see g_finishRangeThenPause.
+HWND g_hwndFinishCheckbox = nullptr;
 
 NOTIFYICONDATAA g_trayIcon{};
 bool g_trayIconAdded = false;
@@ -128,6 +135,9 @@ void showTrayContextMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     AppendMenuA(menu, MF_STRING, kIdTrayShow, "Show GUI");
     AppendMenuA(menu, MF_STRING, kIdTrayPause, g_pauseRequested.load(std::memory_order_relaxed) ? "Resume" : "Pause");
+    if (g_activeMode == "coordinator")
+        AppendMenuA(menu, MF_STRING | (g_finishRangeThenPause.load(std::memory_order_relaxed) ? MF_CHECKED : MF_UNCHECKED), kIdTrayFinish,
+                    kFinishRangeText);
     AppendMenuA(menu, MF_STRING, kIdTrayAbout, "About...");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, kIdTrayQuit, "Quit");
@@ -143,10 +153,37 @@ void showTrayContextMenu(HWND hwnd) {
 // Main window
 // ---------------------------------------------------------------------
 
+// Brings the Pause button's label and the finish-range checkbox in line with
+// g_pauseRequested/g_finishRangeThenPause - which the worker thread changes
+// too (runCoordinator pauses, and clears the finish flag, once a range it
+// was told to finish is done), so this also runs on every UI timer tick.
+void syncPauseControls() {
+    bool paused = g_pauseRequested.load(std::memory_order_relaxed);
+    char current[16];
+    GetWindowTextA(g_hwndPauseButton, current, sizeof(current));
+    const char* wanted = paused ? "Resume" : "Pause";
+    if (strcmp(current, wanted) != 0)
+        SetWindowTextA(g_hwndPauseButton, wanted);
+    if (g_hwndFinishCheckbox) {
+        bool finishing = g_finishRangeThenPause.load(std::memory_order_relaxed);
+        if ((SendMessage(g_hwndFinishCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED) != finishing)
+            SendMessage(g_hwndFinishCheckbox, BM_SETCHECK, finishing ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+}
+
+// Turning it on while paused resumes too - that's the point of it: carry
+// on, but only to the end of the range in hand.
+void setFinishRangeThenPause(bool on) {
+    g_finishRangeThenPause.store(on, std::memory_order_relaxed);
+    if (on)
+        g_pauseRequested.store(false, std::memory_order_relaxed);
+    syncPauseControls();
+}
+
 void togglePause() {
     bool newState = !g_pauseRequested.load(std::memory_order_relaxed);
     g_pauseRequested.store(newState, std::memory_order_relaxed);
-    SetWindowTextA(g_hwndPauseButton, newState ? "Resume" : "Pause");
+    syncPauseControls();
     // No pause-duration bookkeeping needed here (unlike an earlier,
     // time-based version of this progress bar): matches only ever get
     // appended while actually searching, so the match-based progress
@@ -167,12 +204,15 @@ void requestQuit(HWND hwnd) {
     g_quitting = true;
     EnableWindow(g_hwndPauseButton, FALSE);
     EnableWindow(g_hwndQuitButton, FALSE);
+    if (g_hwndFinishCheckbox)
+        EnableWindow(g_hwndFinishCheckbox, FALSE);
     SetWindowTextA(g_hwndStatusLabel, "Status: shutting down...");
     // Clearing pause too (rather than leaving runCoordinator's pause-wait
     // spin to notice quitRequested on its own, which it does - see
     // coordinator_runner.cpp) just keeps this state visually consistent
     // regardless of whether the user had paused first.
     g_pauseRequested.store(false, std::memory_order_relaxed);
+    g_finishRangeThenPause.store(false, std::memory_order_relaxed);
     g_quitRequested.store(true, std::memory_order_relaxed);
 }
 
@@ -200,6 +240,8 @@ void updateUiFromSharedState() {
     }
 
     bool paused = g_pauseRequested.load(std::memory_order_relaxed);
+    if (!g_quitting)
+        syncPauseControls();
 
     SetWindowTextA(g_hwndTargetLabel, (targetName.empty() ? "Target: (none yet)" : "Target: " + targetName).c_str());
     SetWindowTextA(g_hwndStatusLabel, ("Status: " + statusText + (paused ? " (paused)" : "")).c_str());
@@ -293,6 +335,13 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
 
     for (HWND child : {g_hwndTargetLabel, g_hwndStatusLabel, g_hwndMatches, g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton})
         setFont(child);
+
+    // Local searches have no ranges to finish.
+    if (g_activeMode == "coordinator") {
+        g_hwndFinishCheckbox = CreateWindowExA(0, "BUTTON", kFinishRangeText, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 443, 470, 20,
+                                                hwnd, (HMENU) (INT_PTR) kIdFinishCheckbox, hInstance, nullptr);
+        setFont(g_hwndFinishCheckbox);
+    }
 }
 
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -307,6 +356,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 case kIdPauseButton:
                 case kIdTrayPause:
                     togglePause();
+                    return 0;
+                case kIdFinishCheckbox:
+                    setFinishRangeThenPause(SendMessage(g_hwndFinishCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    return 0;
+                case kIdTrayFinish:
+                    setFinishRangeThenPause(!g_finishRangeThenPause.load(std::memory_order_relaxed));
                     return 0;
                 case kIdQuitButton:
                 case kIdTrayQuit:
