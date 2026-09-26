@@ -66,6 +66,10 @@ See the top-level plan/design notes for the full rationale; the short version:
   character at some position expands into one priority range per concrete
   prefix (capped at `MAX_PRIORITY_PATTERN_EXPANSIONS`, 200, in
   `server/src/alphabet.rs`), each claimed the same way an ordinary range is.
+  A new priority range may not overlap one that's still handing out work.
+  It may start inside work a finished (or deleted) one already handed out,
+  and then simply starts right after that work - handy for narrowing in on
+  what's left after deleting a priority range partway through.
   `DELETE /api/v1/admin/priority-ranges/{id}` removes one without losing any
   candidates: work already handed out from it stays recorded, the rest goes
   back to the main sweep - except any part the main sweep has already jumped

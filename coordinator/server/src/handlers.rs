@@ -479,24 +479,18 @@ pub async fn admin_create_priority_range(
         }
 
         // Each priority range permanently owns its declared span (see
-        // ranges::find_priority_boundary) - two overlapping ones at the same
-        // length *and alphabet* would double-book the same addresses. One
-        // frozen under a different alphabet isn't index-comparable at all
-        // (same reasoning as find_priority_boundary), so it's excluded here
-        // rather than risking a wrong comparison.
-        let overlap: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ? AND start_index < ? AND end_index > ?",
-        )
-        .bind(target_id)
-        .bind(req.length)
-        .bind(&target.alphabet_name)
-        .bind(end_index)
-        .bind(start_index)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some((existing_id,)) = overlap {
-            return Err(AppError::BadRequest(format!("prefix '{prefix}' at length {} overlaps existing priority range #{existing_id}", req.length)));
-        }
+        // ranges::find_priority_boundary), so this one mustn't double-book
+        // another's - beyond starting after work a finished one already
+        // handed out, see ranges::priority_range_start. One frozen under a
+        // different alphabet isn't index-comparable at all (same reasoning
+        // as find_priority_boundary), so it's excluded rather than risking
+        // a wrong comparison.
+        let next_index = ranges::priority_range_start(&mut tx, target_id, req.length, &target.alphabet_name, start_index, end_index, next_index)
+            .await
+            .map_err(|err| match err {
+                AppError::BadRequest(msg) => AppError::BadRequest(format!("prefix '{prefix}' at length {}: {msg}", req.length)),
+                other => other,
+            })?;
 
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO priority_ranges (target_id, priority, pattern, prefix, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \

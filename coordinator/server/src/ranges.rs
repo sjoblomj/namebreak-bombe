@@ -6,8 +6,8 @@ use namebreak_protocol::{ClaimResponse, Version};
 use sqlx::SqlitePool;
 
 use crate::alphabet::{
-    alphabet_available_to, alphabet_size, bound_indices_at_len, candidate_to_index, compile_skip_regex, find_skip_run, max_supported_len,
-    range_bound_filenames, skip_char_mask, strip_prefix_suffix, transition_alphabet_cursor,
+    alphabet_available_to, alphabet_size, bound_indices_at_len, candidate_to_index, compile_skip_regex, find_skip_run, index_to_candidate,
+    max_supported_len, range_bound_filenames, skip_char_mask, strip_prefix_suffix, transition_alphabet_cursor,
 };
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Range, Target, TargetProgress, User};
@@ -929,6 +929,69 @@ pub async fn delete_target(pool: &SqlitePool, target_id: i64) -> Result<bool, Ap
     let result = sqlx::query("DELETE FROM targets WHERE id = ?").bind(target_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Where a new priority range spanning `[start_index, end_index)` should
+/// start handing out work (its `next_index`), given the target's existing
+/// priority ranges at the same length and alphabet. Each existing one
+/// permanently owns its span (see `find_priority_boundary`), so overlapping
+/// one is normally rejected - except that work a finished priority range
+/// already handed out (its whole span, once `next_index == end_index`) can
+/// be skipped when it sits at the new range's start: the new range simply
+/// starts right after it, the same way `handlers::admin_create_priority_range`
+/// starts one after whatever the main sweep has already searched.
+/// `next_index` is where it would start otherwise (`start_index`, or later
+/// if the main sweep is already inside the span).
+///
+/// Rejected: overlapping a priority range that's still handing out work, or
+/// finished work that isn't at the new range's start (it can't skip a block
+/// in its middle or at its end), or a range with nothing left once skipped.
+pub async fn priority_range_start(
+    tx: &mut sqlx::SqliteConnection,
+    target_id: i64,
+    candidate_len: i64,
+    alphabet_name: &str,
+    start_index: i64,
+    end_index: i64,
+    mut next_index: i64,
+) -> Result<i64, AppError> {
+    let overlapping = sqlx::query_as::<_, PriorityRange>(
+        "SELECT * FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ? AND start_index < ? AND end_index > ? \
+         ORDER BY start_index",
+    )
+    .bind(target_id)
+    .bind(candidate_len)
+    .bind(alphabet_name)
+    .bind(end_index)
+    .bind(start_index)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for pr in overlapping {
+        let first = index_to_candidate(&pr.alphabet, pr.start_index, pr.candidate_len);
+        let last = index_to_candidate(&pr.alphabet, pr.end_index - 1, pr.candidate_len);
+        if pr.next_index < pr.end_index {
+            return Err(AppError::BadRequest(format!(
+                "overlaps priority range #{} ('{first}' to '{last}'), which is still handing out work",
+                pr.id
+            )));
+        }
+        if pr.end_index <= next_index {
+            continue; // already behind where this one starts
+        }
+        if pr.start_index > next_index {
+            return Err(AppError::BadRequest(format!(
+                "overlaps work priority range #{} already handed out ('{first}' to '{last}') - a new priority range can only skip such work at its start",
+                pr.id
+            )));
+        }
+        next_index = pr.end_index;
+    }
+
+    if next_index >= end_index {
+        return Err(AppError::BadRequest("already fully handed out by earlier priority ranges - nothing left to prioritize".into()));
+    }
+    Ok(next_index)
 }
 
 /// The outcome of removing a priority range - see `remove_priority_range`.
@@ -2141,6 +2204,87 @@ mod tests {
         let (next_index, end_index): (i64, i64) =
             sqlx::query_as("SELECT next_index, end_index FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
         assert_eq!((next_index, end_index), (start + 5, start + 10));
+    }
+
+    /// A priority range row with an explicit span and carving position, on a
+    /// letters-alphabet target at length 2 - for priority_range_start's tests.
+    async fn insert_raw_priority_range(pool: &SqlitePool, target_id: i64, start_index: i64, end_index: i64, next_index: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
+             VALUES (?, 1, 'x', 2, ?, ?, ?, 'letters', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 0) RETURNING id",
+        )
+        .bind(target_id)
+        .bind(start_index)
+        .bind(end_index)
+        .bind(next_index)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn start_for(pool: &SqlitePool, target_id: i64, start_index: i64, end_index: i64, next_index: i64) -> Result<i64, AppError> {
+        let mut conn = pool.acquire().await.unwrap();
+        priority_range_start(&mut conn, target_id, 2, "letters", start_index, end_index, next_index).await
+    }
+
+    /// The case this exists for: a finished priority range (here "M", MA-MZ
+    /// = 312..338, removed after handing out MA-ME) already covers the start
+    /// of a new one, which then starts right after that work instead of
+    /// being rejected.
+    #[tokio::test]
+    async fn priority_range_start_skips_finished_work_at_its_start() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let config = test_config(5);
+        let (target_id, priority_range_id, start) = partly_carved_priority_range(&pool, &user, &config).await;
+        remove_priority_range(&pool, priority_range_id).await.unwrap().expect("exists");
+
+        assert_eq!(start_for(&pool, target_id, start, start + 26, start).await.unwrap(), start + 5);
+        // Also when the main sweep has already moved the starting point into that work.
+        assert_eq!(start_for(&pool, target_id, start, start + 26, start + 2).await.unwrap(), start + 5);
+        // And when the finished work lies entirely behind the starting point.
+        assert_eq!(start_for(&pool, target_id, start, start + 26, start + 7).await.unwrap(), start + 7);
+    }
+
+    #[tokio::test]
+    async fn priority_range_start_rejects_a_priority_range_still_handing_out_work() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let config = test_config(5);
+        let (target_id, _, start) = partly_carved_priority_range(&pool, &user, &config).await;
+
+        let err = start_for(&pool, target_id, start, start + 26, start).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("still handing out work")));
+    }
+
+    /// Finished work can only be skipped at the start: a block in the middle
+    /// would need the new range to jump over it partway through.
+    #[tokio::test]
+    async fn priority_range_start_rejects_finished_work_past_its_start() {
+        let pool = test_pool().await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "AA", "ZZ").await;
+        insert_raw_priority_range(&pool, target_id, 320, 325, 325).await;
+
+        let err = start_for(&pool, target_id, 312, 338, 312).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("can only skip such work at its start")));
+    }
+
+    /// Several finished blocks back to back at the start are all skipped;
+    /// one covering everything leaves nothing to create.
+    #[tokio::test]
+    async fn priority_range_start_skips_consecutive_finished_work_and_rejects_nothing_left() {
+        let pool = test_pool().await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "AA", "ZZ").await;
+        insert_raw_priority_range(&pool, target_id, 312, 317, 317).await;
+        insert_raw_priority_range(&pool, target_id, 317, 330, 330).await;
+
+        assert_eq!(start_for(&pool, target_id, 312, 338, 312).await.unwrap(), 330);
+
+        insert_raw_priority_range(&pool, target_id, 330, 338, 338).await;
+        let err = start_for(&pool, target_id, 312, 338, 312).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("nothing left")));
     }
 
     /// Migration 0018 repairs priority ranges retired the old way (next_index
