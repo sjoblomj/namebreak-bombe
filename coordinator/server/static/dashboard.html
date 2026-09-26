@@ -636,10 +636,9 @@
     return el;
   }
 
-  // "username@hostname" (see dashboard.rs) rendered as "username @ hostname",
-  // with the hostname fainter, a badge for `backend` (if known) in front, and
-  // a <wbr> right before the hostname, so it only breaks onto its own line
-  // when the column is actually too narrow for it.
+  // "username@hostname" (see dashboard.rs) rendered as "username hostname",
+  // with the hostname fainter and a badge for `backend` (if known) in front.
+  // The hostname only wraps onto its own line when the column is too narrow.
   function workerFragment(worker, backend) {
     const frag = document.createDocumentFragment();
     if (!worker) {
@@ -654,8 +653,7 @@
       frag.append(worker);
       return frag;
     }
-    frag.append(worker.slice(0, atIndex) + ' @ ');
-    frag.appendChild(document.createElement('wbr'));
+    frag.append(worker.slice(0, atIndex) + ' ');
     const host = document.createElement('span');
     host.className = 'worker-host';
     host.textContent = worker.slice(atIndex + 1);
