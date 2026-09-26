@@ -931,59 +931,95 @@ pub async fn delete_target(pool: &SqlitePool, target_id: i64) -> Result<bool, Ap
     Ok(result.rows_affected() > 0)
 }
 
-/// The outcome of removing a priority range - see `retire_or_delete_priority_range`.
-pub enum PriorityRangeRemoval {
-    /// Never claimed anything, so it was safe to remove outright with no trace.
-    Deleted,
-    /// Already produced real `ranges` rows, so it was left in place (with
-    /// `next_index` forced to `end_index`) rather than actually deleted.
-    Retired,
+/// The outcome of removing a priority range - see `remove_priority_range`.
+pub struct PriorityRangeRemoval {
+    /// The row itself is gone: nothing was ever carved from it, and nothing
+    /// of it had to be kept.
+    pub deleted: bool,
+    /// Candidates handed back to the target's main sweep, which will search
+    /// them when it gets there.
+    pub returned_to_main_sweep: i64,
+    /// Candidates the main sweep has already jumped past (it never goes
+    /// back), so they stay with this priority range - still handed out
+    /// ahead of the main sweep - rather than never being searched at all.
+    pub kept: i64,
 }
 
-/// Removes an admin's priority-range hint. If it's never actually produced
-/// any `ranges` row, it's genuinely safe to delete outright - nothing
-/// anywhere refers to it yet. Otherwise it's *retired* in place instead:
-/// `next_index` is forced to `end_index` (so it never offers fresh work
-/// again) but the row itself is kept, because `claim_range`'s main-sweep
-/// exclusion (`find_priority_boundary`) is keyed off this row's mere
-/// existence, not whether it still has remaining work - deleting it outright
-/// would let the main sweep re-carve (and so duplicate) whatever this
-/// priority range already produced. Returns `None` if no such row exists.
+/// How far into `pr`'s span the target's main sweep has already gone past.
+/// The sweep jumps straight over a priority range's span (see
+/// `find_priority_boundary`) and never goes back, so anything of `pr`'s
+/// span before the returned index that `pr` hasn't carved yet can only ever
+/// be searched by `pr` itself. Never less than `pr.next_index` (what `pr`
+/// has already carved is accounted for either way). A cursor walking in a
+/// different alphabet isn't index-comparable to `pr`, so it's treated as
+/// having passed all of it - keeping work prioritized is always safe,
+/// giving it back is only safe when the sweep will really reach it.
+fn main_sweep_passed_to(progress: &TargetProgress, pr: &PriorityRange) -> i64 {
+    let carved_to = pr.next_index.min(pr.end_index);
+    if progress.alphabet_name != pr.alphabet_name || progress.candidate_len > pr.candidate_len {
+        pr.end_index
+    } else if progress.candidate_len < pr.candidate_len {
+        carved_to
+    } else {
+        progress.next_index.clamp(carved_to, pr.end_index)
+    }
+}
+
+/// Removes an admin's priority-range hint, as far as that can be done
+/// without leaving candidates unsearched:
+///   - what it has already carved stays in its span, so the main sweep
+///     keeps jumping over (and so doesn't duplicate) that work;
+///   - of the rest, whatever the main sweep hasn't reached yet is handed
+///     back to it, by shrinking the span;
+///   - whatever the main sweep has already jumped past stays in the span
+///     and keeps being handed out as priority work - see
+///     `main_sweep_passed_to`.
+/// A priority range that never carved anything and keeps nothing is deleted
+/// outright. Returns `None` if no such row exists.
 ///
 /// Deliberately checks for an actual referencing `ranges` row rather than
-/// comparing `next_index` to `start_index`: a same-length priority range can
-/// have its `next_index` clamped ahead of `start_index` at creation time
-/// (see `handlers::admin_create_priority_range`) without anything having
-/// been carved from it yet, which the simpler index comparison would
-/// mistake for "already touched".
-pub async fn retire_or_delete_priority_range(pool: &SqlitePool, priority_range_id: i64) -> Result<Option<PriorityRangeRemoval>, AppError> {
-    // Everything below runs in one transaction so a concurrent `/claim` can't
-    // carve a chunk (and thus create the very `ranges` row this function is
-    // checking for) between the "ever carved" check and the delete - which
-    // would otherwise let a priority range that just started producing work
-    // be deleted outright instead of retired, letting the main sweep re-carve
-    // (and duplicate) whatever that chunk was already covering.
+/// comparing `next_index` to `start_index` to decide on deletion: a
+/// same-length priority range can have its `next_index` clamped ahead of
+/// `start_index` at creation time (see `handlers::admin_create_priority_range`)
+/// without anything having been carved from it yet.
+pub async fn remove_priority_range(pool: &SqlitePool, priority_range_id: i64) -> Result<Option<PriorityRangeRemoval>, AppError> {
+    // One transaction, so a concurrent `/claim` can't carve a chunk (moving
+    // next_index, and creating the very `ranges` row checked for below)
+    // between reading this row and shrinking or deleting it.
     let mut tx = pool.begin().await?;
 
-    let exists: Option<(i64,)> =
-        sqlx::query_as("SELECT 1 FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_optional(&mut *tx).await?;
-    if exists.is_none() {
+    let Some(pr) = sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE id = ?")
+        .bind(priority_range_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
         return Ok(None);
-    }
+    };
+    let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
+        .bind(pr.target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let new_end = main_sweep_passed_to(&progress, &pr);
+    let removal = PriorityRangeRemoval {
+        deleted: false,
+        returned_to_main_sweep: pr.end_index - new_end,
+        kept: new_end - pr.next_index.min(pr.end_index),
+    };
 
     let ever_carved: Option<(i64,)> =
         sqlx::query_as("SELECT 1 FROM ranges WHERE priority_range_id = ? LIMIT 1").bind(priority_range_id).fetch_optional(&mut *tx).await?;
 
-    let outcome = if ever_carved.is_none() {
+    let removal = if ever_carved.is_none() && removal.kept == 0 {
         sqlx::query("DELETE FROM priority_ranges WHERE id = ?").bind(priority_range_id).execute(&mut *tx).await?;
-        PriorityRangeRemoval::Deleted
+        PriorityRangeRemoval { deleted: true, ..removal }
     } else {
-        sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id = ?").bind(priority_range_id).execute(&mut *tx).await?;
-        PriorityRangeRemoval::Retired
+        sqlx::query("UPDATE priority_ranges SET end_index = ? WHERE id = ?").bind(new_end).bind(priority_range_id).execute(&mut *tx).await?;
+        removal
     };
 
     tx.commit().await?;
-    Ok(Some(outcome))
+    Ok(Some(removal))
 }
 
 /// Translates every one of `target_id`'s priority ranges still frozen under
@@ -1987,12 +2023,12 @@ mod tests {
         assert_eq!(new_priority_range_id, Some(priority_range_id));
     }
 
-    /// An untouched priority range (nothing ever carved from it) is safe to
-    /// remove outright; one that's already produced real ranges must be
-    /// retired in place instead, so the main sweep's exclusion of its span
-    /// stays intact forever (see `find_priority_boundary`).
+    /// An untouched priority range (nothing ever carved from it) is removed
+    /// outright; one that has carved everything it had is kept as a record
+    /// of that work, so the main sweep keeps jumping over (and not
+    /// duplicating) it.
     #[tokio::test]
-    async fn retire_or_delete_priority_range_deletes_when_untouched_but_retires_once_claimed() {
+    async fn remove_priority_range_deletes_when_untouched_and_keeps_what_was_carved() {
         let pool = test_pool().await;
         let user = insert_user(&pool, "tester").await;
         let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -2004,16 +2040,147 @@ mod tests {
         let config = test_config(1);
         claim_range(&pool, &config, &user).await.unwrap().expect("should claim the higher-priority one");
 
-        assert!(matches!(retire_or_delete_priority_range(&pool, untouched_id).await.unwrap(), Some(PriorityRangeRemoval::Deleted)));
+        let removal = remove_priority_range(&pool, untouched_id).await.unwrap().expect("exists");
+        assert!(removal.deleted);
+        assert_eq!((removal.returned_to_main_sweep, removal.kept), (1, 0));
         let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM priority_ranges WHERE id = ?").bind(untouched_id).fetch_one(&pool).await.unwrap();
         assert_eq!(remaining, 0);
 
-        assert!(matches!(retire_or_delete_priority_range(&pool, touched_id).await.unwrap(), Some(PriorityRangeRemoval::Retired)));
-        let (next_index, end_index): (i64, i64) =
-            sqlx::query_as("SELECT next_index, end_index FROM priority_ranges WHERE id = ?").bind(touched_id).fetch_one(&pool).await.unwrap();
-        assert_eq!(next_index, end_index, "retiring forces next_index to end_index so it never offers fresh work again");
+        let removal = remove_priority_range(&pool, touched_id).await.unwrap().expect("exists");
+        assert!(!removal.deleted, "work was carved from it, so it stays as the record of that");
+        assert_eq!((removal.returned_to_main_sweep, removal.kept), (0, 0));
 
-        assert!(retire_or_delete_priority_range(&pool, 999_999).await.unwrap().is_none());
+        assert!(remove_priority_range(&pool, 999_999).await.unwrap().is_none());
+    }
+
+    /// Letters alphabet, a target at length 2, and a priority range "M"
+    /// (MA-MZ, indices 312..338) with its first 5 candidates (MA-ME) carved.
+    async fn partly_carved_priority_range(pool: &SqlitePool, user: &User, config: &RangeConfig) -> (i64, i64, i64) {
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(pool, "letters", letters, "AA", "ZZ").await;
+        sqlx::query("UPDATE target_progress SET candidate_len = 2, next_index = 0 WHERE target_id = ?").bind(target_id).execute(pool).await.unwrap();
+        let priority_range_id = insert_priority_range(pool, target_id, letters, "letters", 10, "M", 2).await;
+        let claim = claim_range(pool, config, user).await.unwrap().expect("the priority range should be claimed first");
+        assert_eq!(claim.candidate_count, 5);
+        (target_id, priority_range_id, 312)
+    }
+
+    /// The scenario that used to lose candidates: a priority range is removed
+    /// after carving some of its span. The rest must go back to the main
+    /// sweep (which hasn't reached it yet) - and then actually get searched,
+    /// with every length-2 candidate handed out exactly once.
+    #[tokio::test]
+    async fn remove_priority_range_hands_the_uncarved_rest_back_to_the_main_sweep() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let config = test_config(5);
+        let (target_id, priority_range_id, start) = partly_carved_priority_range(&pool, &user, &config).await;
+
+        let removal = remove_priority_range(&pool, priority_range_id).await.unwrap().expect("exists");
+        assert!(!removal.deleted);
+        assert_eq!((removal.returned_to_main_sweep, removal.kept), (21, 0));
+        let (next_index, end_index): (i64, i64) =
+            sqlx::query_as("SELECT next_index, end_index FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!((next_index, end_index), (start + 5, start + 5), "the span shrinks to just what was carved");
+
+        // Let the main sweep work through all of length 2.
+        for _ in 0..1000 {
+            let len: i64 = sqlx::query_scalar("SELECT candidate_len FROM target_progress WHERE target_id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+            if len > 2 {
+                break;
+            }
+            claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        }
+        let mut spans: Vec<(i64, i64)> = sqlx::query_as("SELECT start_index, end_index FROM ranges WHERE target_id = ? AND candidate_len = 2")
+            .bind(target_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        spans.sort();
+        let mut covered_to = 0;
+        for (lo, hi) in spans {
+            assert_eq!(lo, covered_to, "length-2 candidates must be handed out with no gap or overlap");
+            covered_to = hi;
+        }
+        assert_eq!(covered_to, 26 * 26);
+    }
+
+    /// Once the main sweep has jumped past a priority range, it never comes
+    /// back for it - so removing the priority range must keep its uncarved
+    /// rest as priority work instead of dropping it.
+    #[tokio::test]
+    async fn remove_priority_range_keeps_what_the_main_sweep_has_passed() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let config = test_config(5);
+        let (target_id, priority_range_id, start) = partly_carved_priority_range(&pool, &user, &config).await;
+        sqlx::query("UPDATE target_progress SET candidate_len = 3, next_index = 0 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
+
+        let removal = remove_priority_range(&pool, priority_range_id).await.unwrap().expect("exists");
+        assert!(!removal.deleted);
+        assert_eq!((removal.returned_to_main_sweep, removal.kept), (0, 21));
+
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        let (claimed_from, claimed_start): (Option<i64>, i64) =
+            sqlx::query_as("SELECT priority_range_id, start_index FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!((claimed_from, claimed_start), (Some(priority_range_id), start + 5), "the kept rest is still handed out");
+    }
+
+    /// The main sweep partway through a priority range's span (at the same
+    /// length): what it has passed is kept, the rest goes back to it.
+    #[tokio::test]
+    async fn remove_priority_range_splits_around_the_main_sweep_cursor() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let config = test_config(5);
+        let (target_id, priority_range_id, start) = partly_carved_priority_range(&pool, &user, &config).await;
+        sqlx::query("UPDATE target_progress SET next_index = ? WHERE target_id = ?").bind(start + 10).bind(target_id).execute(&pool).await.unwrap();
+
+        let removal = remove_priority_range(&pool, priority_range_id).await.unwrap().expect("exists");
+        assert_eq!((removal.returned_to_main_sweep, removal.kept), (16, 5));
+        let (next_index, end_index): (i64, i64) =
+            sqlx::query_as("SELECT next_index, end_index FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!((next_index, end_index), (start + 5, start + 10));
+    }
+
+    /// Migration 0018 repairs priority ranges retired the old way (next_index
+    /// forced to end_index, full span kept): one the main sweep hasn't
+    /// reached is cut back so the sweep searches the rest, one it has passed
+    /// gets its rest handed out as priority work again.
+    #[tokio::test]
+    async fn repair_migration_fixes_priority_ranges_retired_the_old_way() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "AA", "ZZ").await;
+        sqlx::query("UPDATE target_progress SET candidate_len = 2, next_index = 0 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
+        let config = test_config(5);
+
+        let m = insert_priority_range(&pool, target_id, letters, "letters", 10, "M", 2).await; // 312..338
+        claim_range(&pool, &config, &user).await.unwrap().expect("carves MA-ME");
+        let q = insert_priority_range(&pool, target_id, letters, "letters", 20, "Q", 2).await; // 416..442
+        claim_range(&pool, &config, &user).await.unwrap().expect("carves QA-QE");
+        let untouched = insert_priority_range(&pool, target_id, letters, "letters", 5, "T", 2).await; // 494..520
+
+        // Retire M and Q the old way, and put the main sweep between them.
+        sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id IN (?, ?)").bind(m).bind(q).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE target_progress SET next_index = 364 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
+
+        sqlx::raw_sql(include_str!("../migrations/0018_repair_retired_priority_ranges.sql")).execute(&pool).await.unwrap();
+
+        let span = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, i64, i64)>("SELECT start_index, next_index, end_index FROM priority_ranges WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(span(m).await, (312, 317, 338), "the sweep is past M: its rest is priority work again");
+        assert_eq!(span(q).await, (416, 421, 421), "the sweep hasn't reached Q: cut back so the sweep searches the rest");
+        assert_eq!(span(untouched).await, (494, 494, 520), "a priority range that wasn't retired is left alone");
     }
 
     /// Regression test: a same-length priority range can have `next_index`
@@ -2021,22 +2188,25 @@ mod tests {
     /// `handlers::admin_create_priority_range`, when the main sweep's cursor
     /// is already partway through that exact length) without the priority
     /// mechanism ever actually carving anything from it. That must still be
-    /// treated as "untouched" and deleted outright, not retired - it was
-    /// deliberately checking for a referencing `ranges` row, not comparing
-    /// `next_index` to `start_index`, precisely so this case works.
+    /// treated as "untouched" and deleted outright - it deliberately checks
+    /// for a referencing `ranges` row, not comparing `next_index` to
+    /// `start_index`, precisely so this case works.
     #[tokio::test]
-    async fn retire_or_delete_priority_range_deletes_a_clamped_but_never_carved_range() {
+    async fn remove_priority_range_deletes_a_clamped_but_never_carved_range() {
         let pool = test_pool().await;
         let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
 
         // Mimics admin_create_priority_range's same-length clamp: start_index
         // is behind next_index, but nothing has been carved from this row.
-        let (start_index, end_index_inclusive) = crate::alphabet::bound_indices_at_len(letters, "A", "A", 1);
+        // The cursor is 5 candidates into length 2, and this row's span (AA-AZ)
+        // starts there - so its first 5 are already searched by the sweep.
+        sqlx::query("UPDATE target_progress SET candidate_len = 2, next_index = 5 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
+        let (start_index, end_index_inclusive) = crate::alphabet::bound_indices_at_len(letters, "A", "A", 2);
         let clamped_next_index = start_index + 5;
         let priority_range_id: i64 = sqlx::query_scalar(
             "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
-             VALUES (?, 10, 'A', 1, ?, ?, ?, 'letters', ?, ?) RETURNING id",
+             VALUES (?, 10, 'A', 2, ?, ?, ?, 'letters', ?, ?) RETURNING id",
         )
         .bind(target_id)
         .bind(start_index)
@@ -2048,7 +2218,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(retire_or_delete_priority_range(&pool, priority_range_id).await.unwrap(), Some(PriorityRangeRemoval::Deleted)));
+        assert!(remove_priority_range(&pool, priority_range_id).await.unwrap().expect("exists").deleted);
         let remaining: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM priority_ranges WHERE id = ?").bind(priority_range_id).fetch_one(&pool).await.unwrap();
         assert_eq!(remaining, 0);

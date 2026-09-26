@@ -66,8 +66,13 @@ See the top-level plan/design notes for the full rationale; the short version:
   character at some position expands into one priority range per concrete
   prefix (capped at `MAX_PRIORITY_PATTERN_EXPANSIONS`, 200, in
   `server/src/alphabet.rs`), each claimed the same way an ordinary range is.
-  `DELETE /api/v1/admin/priority-ranges/{id}` removes one (or, if work on it
-  already started, retires it instead of deleting it outright).
+  `DELETE /api/v1/admin/priority-ranges/{id}` removes one without losing any
+  candidates: work already handed out from it stays recorded, the rest goes
+  back to the main sweep - except any part the main sweep has already jumped
+  past (it never goes back), which stays as priority work so it still gets
+  searched. The response says how much went each way
+  (`{"deleted": false, "returned_to_main_sweep": 21, "kept": 0}`); `deleted`
+  is true only when nothing was ever handed out and nothing had to be kept.
 - **Alphabets**: each target picks one of a small set of predefined alphabets
   (`server/src/alphabet.rs`'s `PREDEFINED_ALPHABETS`, also listable via
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or

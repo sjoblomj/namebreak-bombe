@@ -3,7 +3,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use namebreak_protocol::{
-    AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateTargetRequest, AdminCreateTargetResponse, AdminPatchTargetRequest,
+    AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateTargetRequest, AdminCreateTargetResponse, AdminDeletePriorityRangeResponse,
+    AdminPatchTargetRequest,
     AlphabetInfo, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
     Version, PROTOCOL_VERSION,
 };
@@ -15,7 +16,7 @@ use crate::alphabet::{
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
 use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User};
-use crate::ranges::{self, PriorityRangeRemoval};
+use crate::ranges;
 use crate::state::{generate_token, now_unix, AppState};
 
 /// Parses `req.protocol_version` and rejects a MAJOR-version mismatch
@@ -525,11 +526,13 @@ pub async fn admin_delete_priority_range(
     State(state): State<AppState>,
     _admin: AdminAuth,
     Path(priority_range_id): Path<i64>,
-) -> Result<StatusCode, AppError> {
-    match ranges::retire_or_delete_priority_range(&state.pool, priority_range_id).await? {
-        Some(PriorityRangeRemoval::Deleted) | Some(PriorityRangeRemoval::Retired) => Ok(StatusCode::NO_CONTENT),
-        None => Err(AppError::NotFound),
-    }
+) -> Result<Json<AdminDeletePriorityRangeResponse>, AppError> {
+    let removal = ranges::remove_priority_range(&state.pool, priority_range_id).await?.ok_or(AppError::NotFound)?;
+    Ok(Json(AdminDeletePriorityRangeResponse {
+        deleted: removal.deleted,
+        returned_to_main_sweep: removal.returned_to_main_sweep,
+        kept: removal.kept,
+    }))
 }
 
 #[cfg(test)]

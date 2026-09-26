@@ -315,6 +315,23 @@ pub struct AdminCreatePriorityRangeResponse {
     pub priority_range_ids: Vec<i64>,
 }
 
+/// What `DELETE /api/v1/admin/priority-ranges/{id}` did. Work already
+/// carved from the priority range stays accounted for as it is; of the
+/// rest, whatever the main sweep will still reach is handed back to it, and
+/// whatever the main sweep has already gone past (it never goes back) stays
+/// with the priority range so it still gets searched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminDeletePriorityRangeResponse {
+    /// True if the priority range is gone entirely: nothing was ever carved
+    /// from it and nothing had to be kept.
+    pub deleted: bool,
+    /// Candidates handed back to the main sweep.
+    pub returned_to_main_sweep: i64,
+    /// Candidates kept as priority work because the main sweep is already
+    /// past them.
+    pub kept: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlphabetInfo {
     pub name: String,
