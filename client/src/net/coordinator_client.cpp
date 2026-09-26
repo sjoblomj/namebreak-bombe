@@ -85,14 +85,14 @@ CoordinatorClient::CompleteOutcome CoordinatorClient::complete(int64_t rangeId, 
     HttpResponse resp = http_.post(url, {authHeader(token_)}, toJson(req));
     if (resp.status == 0) {
         error = "request failed: " + resp.error;
-        return CompleteOutcome::Error;
+        return CompleteOutcome::TransientError;
     }
     if (resp.status == 409) {
         return CompleteOutcome::Conflict;
     }
     if (!resp.ok()) {
         error = "complete failed (HTTP " + std::to_string(resp.status) + "): " + parseErrorMessage(resp.body);
-        return CompleteOutcome::Error;
+        return (resp.status >= 500 || resp.status == 429) ? CompleteOutcome::TransientError : CompleteOutcome::Error;
     }
     return CompleteOutcome::Ok;
 }

@@ -45,8 +45,11 @@ public:
     // Distinguishes a 409 (this range's ownership already moved on - e.g. a
     // network outage during heartbeating outlasted the lease and the server
     // already reassigned it) from other failures, mirroring api.rs's
-    // `err.status() == CONFLICT` check.
-    enum class CompleteOutcome { Ok, Conflict, Error };
+    // `err.status() == CONFLICT` check. Failures are further split into
+    // TransientError (the request never got a real answer - transport
+    // failure, 5xx, 429 - so sending it again may well succeed) and Error
+    // (any other rejection, which resending would only repeat).
+    enum class CompleteOutcome { Ok, Conflict, TransientError, Error };
     CompleteOutcome complete(int64_t rangeId, const CompleteRequest& req, std::string& error);
 
 private:

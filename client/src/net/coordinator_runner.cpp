@@ -33,9 +33,38 @@ namespace {
 // client is.
 constexpr int kHeartbeatIntervalSeconds = 60;
 
-// Ceiling for the exponential backoff below, so a prolonged outage doesn't
-// leave a client waiting arbitrarily long once the server comes back.
-constexpr std::chrono::seconds kMaxClaimBackoff{600};
+// Ceiling for RetryBackoff below, so a prolonged outage doesn't leave a
+// client waiting arbitrarily long once the server comes back.
+constexpr std::chrono::seconds kMaxRetryBackoff{600};
+
+// Exponential backoff, capped at kMaxRetryBackoff, so a real outage doesn't
+// get hammered at the normal poll rate. Jittered (sleep a random fraction of
+// the current backoff rather than its full length) so a fleet of clients
+// that all started failing at once - e.g. the coordinator itself going down -
+// doesn't retry in lockstep once it recovers.
+class RetryBackoff {
+public:
+    // Never below 1s, so even a poll_interval_secs of 0 still backs off.
+    explicit RetryBackoff(std::chrono::seconds initial) : initial_(std::max(initial, std::chrono::seconds(1))), current_(initial_) {}
+
+    // The ceiling the next call to nextSleep() draws from - for logging.
+    std::chrono::seconds cap() const { return current_; }
+
+    // How long to sleep before the next attempt; doubles the cap for the one after.
+    std::chrono::seconds nextSleep() {
+        std::uniform_int_distribution<long long> jitter(0, current_.count());
+        auto sleepFor = std::chrono::seconds(jitter(rng_));
+        current_ = std::min(current_ * 2, kMaxRetryBackoff);
+        return sleepFor;
+    }
+
+    void reset() { current_ = initial_; }
+
+private:
+    std::chrono::seconds initial_;
+    std::chrono::seconds current_;
+    std::mt19937 rng_{std::random_device{}()};
+};
 
 // Only libcurl needs pairing at process scope - calling curl_global_init()
 // once up front (before the heartbeat thread starts making concurrent
@@ -356,8 +385,29 @@ void runOneRange(SearchBackend& backend, const CoordinatorArgs& args, const std:
     completeReq.elapsedSeconds = elapsedSeconds;
     completeReq.candidatesProcessed = claim.candidateCount;
 
+    // Retried until it gets a real answer: a lost report either leaves the
+    // range to wait out its whole lease before being redone, or - worse -
+    // drops a found match on the floor. And there's no point moving on to
+    // claim new work while the server can't be reached anyway. Deliberately
+    // not gated on pauseRequested: reporting finished work isn't new work.
+    RetryBackoff backoff(std::chrono::seconds(args.pollIntervalSecs));
     std::string err;
-    auto outcome = completeClient.complete(claim.rangeId, completeReq, err);
+    CoordinatorClient::CompleteOutcome outcome;
+    while ((outcome = completeClient.complete(claim.rangeId, completeReq, err)) == CoordinatorClient::CompleteOutcome::TransientError) {
+        if (quitRequested && quitRequested->load(std::memory_order_relaxed)) {
+            fprintf(stderr, "[coordinator] range %lld: quitting without having reported completion%s\n", (long long) claim.rangeId,
+                    result.found ? (" - the match (" + result.filename + ") is only in " + req.outputFilePath).c_str() : "");
+            return;
+        }
+        auto cap = backoff.cap();
+        auto sleepFor = backoff.nextSleep();
+        std::string msg = "[coordinator] range " + std::to_string(claim.rangeId) + ": failed to report completion, retrying in " +
+                          std::to_string(sleepFor.count()) + "s (backoff cap " + std::to_string(cap.count()) + "s): " + err;
+        fprintf(stderr, "%s\n", msg.c_str());
+        if (callbacks && callbacks->onStatus)
+            callbacks->onStatus(msg);
+        interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(sleepFor), quitRequested);
+    }
     switch (outcome) {
         case CoordinatorClient::CompleteOutcome::Ok:
             break;
@@ -376,6 +426,7 @@ void runOneRange(SearchBackend& backend, const CoordinatorArgs& args, const std:
                        (long long) claim.rangeId);
             }
             break;
+        case CoordinatorClient::CompleteOutcome::TransientError: // unreachable - retried above
         case CoordinatorClient::CompleteOutcome::Error:
             fprintf(stderr, "[coordinator] range %lld: failed to report completion: %s\n", (long long) claim.rangeId, err.c_str());
             break;
@@ -454,8 +505,7 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
     }
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
-    auto claimBackoff = pollInterval;
-    std::mt19937 rng(std::random_device{}());
+    RetryBackoff claimBackoff(pollInterval);
 
     while (true) {
         // Never claim new work while paused - "pause the client" means
@@ -492,24 +542,17 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
 
         std::optional<ClaimResponse> claim;
         if (!client.claim(claim, error)) {
-            // Exponential backoff, capped at kMaxClaimBackoff, so a real
-            // outage doesn't get hammered at the normal poll rate. Jittered
-            // (sleep a random fraction of the current backoff rather than
-            // its full length) so a fleet of clients that all started
-            // failing at once - e.g. the coordinator itself going down -
-            // doesn't retry in lockstep once it recovers.
-            std::uniform_int_distribution<long long> jitter(0, claimBackoff.count());
-            auto sleepFor = std::chrono::seconds(jitter(rng));
+            auto cap = claimBackoff.cap();
+            auto sleepFor = claimBackoff.nextSleep();
             std::string msg = "[coordinator] claim failed, retrying in " + std::to_string(sleepFor.count()) + "s (backoff cap " +
-                               std::to_string(claimBackoff.count()) + "s): " + error;
+                               std::to_string(cap.count()) + "s): " + error;
             fprintf(stderr, "%s\n", msg.c_str());
             if (callbacks && callbacks->onStatus)
                 callbacks->onStatus(msg);
             interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(sleepFor), quitRequested);
-            claimBackoff = std::min(claimBackoff * 2, kMaxClaimBackoff);
             continue;
         }
-        claimBackoff = pollInterval; // reset once the server is reachable again
+        claimBackoff.reset(); // once the server is reachable again
 
         if (!claim) {
             printf("[coordinator] no work available, sleeping\n");
