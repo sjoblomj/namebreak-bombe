@@ -53,7 +53,7 @@ jobs:
         run: |
           dir="namebreak-$VERSION-linux-x86_64-cuda"
           mkdir "$dir"
-          cp build/namebreak client/README.md LICENSE "$dir/"
+          cp build/namebreak client/README.md client/config.conf LICENSE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v7
         with:
@@ -86,7 +86,7 @@ jobs:
         run: |
           dir="namebreak-$VERSION-linux-x86_64-hip"
           mkdir "$dir"
-          cp build/namebreak client/README.md LICENSE "$dir/"
+          cp build/namebreak client/README.md client/config.conf LICENSE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v7
         with:
@@ -124,7 +124,7 @@ jobs:
         run: |
           $dir = "namebreak-$env:VERSION-windows-x86_64"
           New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item build/Release/namebreak.exe, build/Release/namebreak-gui.exe, build/Release/*.dll, client/README.md, LICENSE $dir
+          Copy-Item build/Release/namebreak.exe, build/Release/namebreak-gui.exe, build/Release/*.dll, client/README.md, client/config.conf, LICENSE $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
       - uses: actions/upload-artifact@v7
         with:
@@ -150,7 +150,7 @@ jobs:
         run: |
           dir="namebreak-$VERSION-macos-arm64"
           mkdir "$dir"
-          cp client/build-portable/namebreak client/README.md LICENSE "$dir/"
+          cp client/build-portable/namebreak client/README.md client/config.conf LICENSE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v7
         with:
