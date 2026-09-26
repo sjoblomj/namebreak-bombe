@@ -231,6 +231,15 @@ pub struct AdminCreateTargetRequest {
     /// regex or target creation is rejected; empty/omitted means no skipping.
     #[serde(default)]
     pub skip_regex: Option<String>,
+    /// The shortest candidate length the main sweep carves - every shorter
+    /// candidate is left out entirely. Must be between 1 and the alphabet's
+    /// max supported length. Defaults to 1, i.e. every length.
+    #[serde(default = "default_start_len")]
+    pub start_len: i64,
+}
+
+fn default_start_len() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +288,14 @@ pub struct AdminPatchTargetRequest {
     /// `prune_symbol_runs`.
     #[serde(default)]
     pub max_backslash_count: Option<i64>,
+    /// See `AdminCreateTargetRequest::start_len`. Leave unset to leave it
+    /// unchanged. Raising it past where the main sweep has reached makes the
+    /// sweep jump straight to the start of the new length the next time it
+    /// carves; lowering it never moves the sweep back, so lengths it already
+    /// passed (or jumped over) stay as they are. Ranges already carved are
+    /// untouched either way, and so are priority ranges.
+    #[serde(default)]
+    pub start_len: Option<i64>,
 }
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of

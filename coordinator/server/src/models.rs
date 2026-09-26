@@ -50,6 +50,9 @@ pub struct Target {
     /// See `alphabet::compile_skip_regex`/`find_skip_run` - checked only when
     /// carving fresh ranges, never against already-carved ones.
     pub skip_regex: Option<String>,
+    /// The shortest candidate length the main sweep carves - see
+    /// `AdminCreateTargetRequest::start_len` and `ranges::claim_range`.
+    pub start_len: i64,
 }
 
 #[allow(dead_code)]

@@ -374,6 +374,22 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             let active_alphabet_name = progress.alphabet_name.as_str();
             let active_alphabet = progress.alphabet.as_str();
 
+            // The cursor is below the target's start_len - only possible
+            // after a patch raised it (a new target's cursor starts right
+            // at it). Jump straight to the start of start_len, leaving
+            // everything shorter uncarved: no skipped rows, since priority
+            // ranges at those lengths may already have carved parts of them
+            // (the dashboard shows the jump as a gap instead). Landing at
+            // the very start of a length also settles any pending alphabet
+            // change for free - there's no old-alphabet position left to
+            // translate, so it lands in the target's current alphabet
+            // directly (admin_patch_target checks start_len fits in it).
+            if progress.candidate_len < target.start_len {
+                let start_index = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, target.start_len).0;
+                persist_progress(&mut tx, target.id, target.start_len, start_index, &target.alphabet_name, &target.alphabet).await?;
+                continue 'carve;
+            }
+
             let (_, upper_at_len) = bound_indices_at_len(active_alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
             let remaining = upper_at_len - progress.next_index + 1; // inclusive upper bound
             if remaining <= 0 {
@@ -1955,6 +1971,60 @@ mod tests {
                 .unwrap();
         assert_eq!(progress_alphabet_name, "letters_only", "the cursor itself must now be stamped with the new alphabet");
         assert_eq!(progress_alphabet, new_alphabet);
+    }
+
+    /// Fetches the (candidate_len, start_index) of a carved range.
+    async fn range_position(pool: &SqlitePool, range_id: i64) -> (i64, i64) {
+        sqlx::query_as("SELECT candidate_len, start_index FROM ranges WHERE id = ?").bind(range_id).fetch_one(pool).await.unwrap()
+    }
+
+    /// Raising start_len past the cursor makes the next carve jump straight
+    /// to the start of start_len, persisting nothing for what it jumps over;
+    /// lowering it again never moves the cursor back.
+    #[tokio::test]
+    async fn claim_range_jumps_to_a_raised_start_len_and_never_back() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let target_id = insert_target(&pool, "A", "Z").await;
+        sqlx::query("UPDATE targets SET start_len = 3 WHERE id = ?").bind(target_id).execute(&pool).await.unwrap();
+
+        // Larger than all of length 3 within these bounds, so each claim takes a whole length.
+        let config = test_config(1_000_000);
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available at start_len");
+        assert_eq!(range_position(&pool, claim.range_id).await, (3, bound_indices_at_len(DEFAULT, "A", "Z", 3).0));
+        let range_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ranges WHERE target_id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(range_count, 1, "nothing is persisted for the jumped-over lengths");
+
+        sqlx::query("UPDATE targets SET start_len = 1 WHERE id = ?").bind(target_id).execute(&pool).await.unwrap();
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available at length 4");
+        assert_eq!(range_position(&pool, claim.range_id).await, (4, bound_indices_at_len(DEFAULT, "A", "Z", 4).0));
+    }
+
+    /// A start_len jump lands at the very start of a length, so a pending
+    /// alphabet patch needs no translation: the cursor goes straight to the
+    /// target's current alphabet, with no skipped range for the old one.
+    #[tokio::test]
+    async fn claim_range_start_len_jump_settles_a_pending_alphabet_patch() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAAAAA", "ZZZZZZ").await;
+        let cursor_index = crate::alphabet::candidate_to_index(old_alphabet, "ABC001").unwrap();
+        sqlx::query("UPDATE target_progress SET next_index = ? WHERE target_id = ?").bind(cursor_index).bind(target_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE targets SET alphabet_name = 'letters_only', alphabet = ?, start_len = 7 WHERE id = ?")
+            .bind(new_alphabet)
+            .bind(target_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let claim = claim_range(&pool, &test_config(1_000), &user).await.unwrap().expect("work available at start_len");
+        assert_eq!(claim.alphabet, new_alphabet);
+        assert_eq!(claim.lower_bound_filename, "PREAAAAAAA.SUF");
+        let skipped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ranges WHERE target_id = ? AND status = 'skipped'").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(skipped, 0);
     }
 
     /// The core scheduling behavior a priority range exists for: it's

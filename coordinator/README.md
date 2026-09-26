@@ -153,7 +153,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "max_backslash_count": 0,
     "priority": 0,
     "description": "From the <b>1998</b> demo listing",
-    "skip_regex": "[M-Q]"
+    "skip_regex": "[M-Q]",
+    "start_len": 1
   }'
 ```
 
@@ -174,8 +175,9 @@ than this server's supported maximum length (below) is fine too - only its
 first that-many characters are ever consulted, the rest is simply never
 truncated into relevance.
 
-There's no `min_len`: the server always starts at length 1 and no `max_len`:
-it always searches up to as long as the chosen alphabet supports (capped at
+`start_len` (default 1) is the shortest candidate length the server carves -
+every shorter candidate is left out entirely. It must be between 1 and the
+alphabet's max supported length. There's no `max_len`: the server always searches up to as long as the chosen alphabet supports (capped at
 whatever length still fits a flat 64-bit range index, `alphabet_size^len <=
 i64::MAX` - 11 for every alphabet currently in `PREDEFINED_ALPHABETS`, since
 they're all close enough in size to land on the same cap; a genuinely smaller
@@ -216,7 +218,8 @@ curl localhost:8080/api/v1/status
 ```
 
 Pause/resume a target, and/or change its priority, description, skip_regex,
-alphabet_name, prune_symbol_runs, prune_unopened_brackets or max_backslash_count:
+alphabet_name, prune_symbol_runs, prune_unopened_brackets, max_backslash_count
+or start_len:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -229,7 +232,12 @@ Any field can be omitted to leave it unchanged (pass `"description": ""` or
 A changed `skip_regex` only affects ranges carved after the patch. A changed
 `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
-progress finish with the old setting.
+progress finish with the old setting. Raising `start_len` past where carving
+has reached makes it jump straight to the start of the new length the next
+time it carves, leaving the rest of the shorter lengths uncarved (shown as a
+gap on the dashboard). Lowering it never moves carving back, so lengths it
+already passed or jumped over stay that way. Ranges already carved, including
+pending ones at shorter lengths, and priority ranges are unaffected.
 
 Delete a target permanently (also removes its ranges and carving cursor - not
 reversible):

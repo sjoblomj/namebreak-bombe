@@ -152,6 +152,16 @@ pub async fn alphabets() -> Json<AlphabetsResponse> {
     Json(AlphabetsResponse { alphabets })
 }
 
+/// Rejects a start_len the main sweep could never carve at under `alphabet`
+/// - see `AdminCreateTargetRequest::start_len`.
+fn validate_start_len(start_len: i64, alphabet: &str) -> Result<(), AppError> {
+    let cap = max_supported_len(alphabet);
+    if start_len < 1 || start_len > cap {
+        return Err(AppError::BadRequest(format!("start_len must be between 1 and the alphabet's max supported length ({cap})")));
+    }
+    Ok(())
+}
+
 /// Rejects a skip_regex that doesn't compile as a regex (see
 /// `alphabet::compile_skip_regex`). `None` or an empty/blank string is valid -
 /// both mean "no skipping".
@@ -180,6 +190,7 @@ pub async fn admin_create_target(
         let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _, _)| name).collect();
         return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
     };
+    validate_start_len(req.start_len, alphabet)?;
 
     // Only the first `cap` characters of a bound are ever consulted (carving never
     // searches past this length, and bound_indices_at_len truncates to whatever
@@ -222,8 +233,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, max_backslash_count, alphabet_name, alphabet, status, priority, description, skip_regex, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, max_backslash_count, alphabet_name, alphabet, status, priority, description, skip_regex, start_len, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -240,16 +251,16 @@ pub async fn admin_create_target(
     .bind(req.priority)
     .bind(&req.description)
     .bind(&req.skip_regex)
+    .bind(req.start_len)
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
 
-    // Always start at the shortest possible candidate length, symmetric with always
-    // searching up to max_supported_len at the top end - a bound doesn't get to skip
+    // Start at the operator's start_len (1 unless set) - a bound doesn't get to skip
     // short lengths just because it's itself longer (see the comment above: at length
     // 1, bound_indices_at_len simply truncates each bound down to its first
     // character, which is exactly the right constraint there too).
-    let start_len = 1i64;
+    let start_len = req.start_len;
     let start_index = bound_indices_at_len(alphabet, lower_bound, upper_bound, start_len).0;
     sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, ?, ?)")
         .bind(target_id)
@@ -311,10 +322,11 @@ pub async fn admin_patch_target(
         && req.prune_symbol_runs.is_none()
         && req.prune_unopened_brackets.is_none()
         && req.max_backslash_count.is_none()
+        && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
-            "at least one of status, priority, description, skip_regex, alphabet_name, prune_symbol_runs, prune_unopened_brackets or \
-             max_backslash_count must be provided"
+            "at least one of status, priority, description, skip_regex, alphabet_name, prune_symbol_runs, prune_unopened_brackets, \
+             max_backslash_count or start_len must be provided"
                 .into(),
         ));
     }
@@ -338,14 +350,16 @@ pub async fn admin_patch_target(
     // solved, and thus immutable by design" (409) - the UPDATE's own
     // `status != 'solved'` guard can't distinguish the two on its own, since
     // both leave `rows_affected() == 0`.
-    let current_status: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM targets WHERE id = ?").bind(target_id).fetch_optional(&mut *tx).await?;
-    match current_status {
-        None => return Err(AppError::NotFound),
-        Some((status,)) if status == "solved" => {
-            return Err(AppError::Conflict("target is already solved and can no longer be modified".into()));
-        }
-        Some(_) => {}
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
+    if target.status == "solved" {
+        return Err(AppError::Conflict("target is already solved and can no longer be modified".into()));
+    }
+
+    // Checked against whatever the target ends up with, so a new alphabet
+    // is checked against the existing start_len too, not just the other way
+    // round. The cursor itself is only moved lazily, by ranges::claim_range.
+    if req.start_len.is_some() || alphabet.is_some() {
+        validate_start_len(req.start_len.unwrap_or(target.start_len), alphabet.as_deref().unwrap_or(&target.alphabet))?;
     }
 
     let result = sqlx::query(
@@ -353,7 +367,7 @@ pub async fn admin_patch_target(
          description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex), \
          alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet), \
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
-         max_backslash_count = COALESCE(?, max_backslash_count) \
+         max_backslash_count = COALESCE(?, max_backslash_count), start_len = COALESCE(?, start_len) \
          WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.status)
@@ -365,6 +379,7 @@ pub async fn admin_patch_target(
     .bind(req.prune_symbol_runs.map(i64::from))
     .bind(req.prune_unopened_brackets.map(i64::from))
     .bind(req.max_backslash_count)
+    .bind(req.start_len)
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
@@ -535,6 +550,16 @@ mod tests {
 
     fn register_request(protocol_version: &str) -> RegisterRequest {
         RegisterRequest { username: "u".into(), hostname: "h".into(), backend: "cuda".into(), protocol_version: protocol_version.to_string() }
+    }
+
+    #[test]
+    fn validate_start_len_accepts_exactly_1_through_the_alphabets_max_len() {
+        let alphabet = lookup_predefined_alphabet("size49").unwrap();
+        let cap = max_supported_len(alphabet);
+        assert!(validate_start_len(1, alphabet).is_ok());
+        assert!(validate_start_len(cap, alphabet).is_ok());
+        assert!(matches!(validate_start_len(0, alphabet), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_start_len(cap + 1, alphabet), Err(AppError::BadRequest(_))));
     }
 
     #[test]

@@ -57,6 +57,9 @@ pub struct DashboardTarget {
     /// The resolved characters behind `alphabet_name`, for the dashboard's
     /// hover tooltip.
     pub alphabet: String,
+    /// The shortest candidate length the main sweep carves - see
+    /// `AdminCreateTargetRequest::start_len`.
+    pub start_len: i64,
     /// Where the target's own main sweep will carve next - its stored
     /// position, moved past any priority range span it would jump over on
     /// its next carve (see `effective_sweep_position`). Compared against
@@ -282,10 +285,18 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         ranges_by_target.entry(target_id).or_default().push(row);
     }
 
-    let all_progress: Vec<(i64, i64, i64, String)> =
-        sqlx::query_as("SELECT target_id, candidate_len, next_index, alphabet FROM target_progress").fetch_all(&state.pool).await?;
-    let progress_by_target: HashMap<i64, (i64, i64, String)> =
-        all_progress.into_iter().map(|(target_id, candidate_len, next_index, alphabet)| (target_id, (candidate_len, next_index, alphabet))).collect();
+    // start_len rides along here rather than in target_rows above, which is
+    // already at sqlx's 16-column tuple limit.
+    let all_progress: Vec<(i64, i64, i64, String, i64)> = sqlx::query_as(
+        "SELECT target_progress.target_id, target_progress.candidate_len, target_progress.next_index, target_progress.alphabet, targets.start_len \
+         FROM target_progress JOIN targets ON targets.id = target_progress.target_id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let progress_by_target: HashMap<i64, (i64, i64, String, i64)> = all_progress
+        .into_iter()
+        .map(|(target_id, candidate_len, next_index, alphabet, start_len)| (target_id, (candidate_len, next_index, alphabet, start_len)))
+        .collect();
 
     #[allow(clippy::type_complexity)]
     let all_priority_ranges: Vec<(i64, i64, i64, String, i64, i64, i64, i64, String, String)> = sqlx::query_as(
@@ -339,10 +350,18 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             )
             .collect();
 
-        let (stored_cursor_len, stored_cursor_next_index, cursor_alphabet) = progress_by_target
+        let (mut stored_cursor_len, mut stored_cursor_next_index, mut cursor_alphabet, start_len) = progress_by_target
             .get(&id)
             .cloned()
             .ok_or_else(|| AppError::Internal(format!("missing target_progress row for target {id}")))?;
+        // Mirrors ranges::claim_range: a cursor below start_len (raised by a
+        // patch since carving last ran) jumps to the start of start_len, in
+        // the target's current alphabet, on its next carve.
+        if stored_cursor_len < start_len {
+            stored_cursor_len = start_len;
+            stored_cursor_next_index = bound_indices_at_len(&alphabet, &lower_bound, &upper_bound, start_len).0;
+            cursor_alphabet = alphabet.clone();
+        }
         let gaps = gaps_between(&ranges, &lower_bound, &upper_bound);
 
         let priority_range_rows = priority_ranges_by_target.remove(&id).unwrap_or_default();
@@ -386,6 +405,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             skip_regex,
             alphabet_name,
             alphabet,
+            start_len,
             cursor_candidate_len,
             cursor_next_index,
             cursor_candidate,

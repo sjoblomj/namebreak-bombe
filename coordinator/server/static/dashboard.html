@@ -1382,6 +1382,13 @@
       card.appendChild(skip);
     }
 
+    if (t.start_len > 1) {
+      const startLen = document.createElement('div');
+      startLen.className = 'target-skip';
+      startLen.textContent = `Skipping candidates shorter than ${t.start_len} characters`;
+      card.appendChild(startLen);
+    }
+
     if (t.status === 'solved') {
       const banner = document.createElement('div');
       banner.className = 'found-banner';
