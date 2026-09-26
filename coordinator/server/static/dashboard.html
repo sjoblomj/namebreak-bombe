@@ -963,8 +963,8 @@
   // tab's table) that were split off a given priority range - each still
   // has its own independent status/progress, since a priority range is
   // carved and claimed piecemeal, same as ordinary sweep work (see
-  // ranges::claim_priority_range_chunk). A four-column condensed cousin of
-  // rangeRow() rather than a reuse of it: the priority table only has four
+  // ranges::claim_priority_range_chunk). A five-column condensed cousin of
+  // rangeRow() rather than a reuse of it: the priority table only has five
   // columns, and rangeRow()'s eight would misalign against its header. No
   // worker/hostname shown here (or anywhere in this table) - unlike the
   // main Progress tab, this table is about the priority range's own address
@@ -973,8 +973,9 @@
     const tr = document.createElement('tr');
     tr.className = 'priority-carved-row';
 
-    // Blank Priority cell - a carved chunk doesn't have its own priority,
-    // only the priority range it came from does (shown on the row above).
+    // Blank Id and Priority cells - those belong to the priority range this
+    // chunk came from (shown on the row above), not to the chunk itself.
+    tr.appendChild(document.createElement('td'));
     tr.appendChild(document.createElement('td'));
 
     const tdRange = document.createElement('td');
@@ -1030,7 +1031,7 @@
     const table = document.createElement('table');
     table.className = 'priority-table';
     const thead = document.createElement('thead');
-    thead.innerHTML = '<tr><th>Prio</th><th>Pattern</th><th>Len</th><th>Progress</th></tr>';
+    thead.innerHTML = '<tr><th>Id</th><th>Prio</th><th>Pattern</th><th>Len</th><th>Progress</th></tr>';
     table.appendChild(thead);
 
     // Every actual carved chunk any priority range has produced so far,
@@ -1071,13 +1072,19 @@
         const sep = document.createElement('tr');
         sep.className = 'priority-done-sep';
         const sepTd = document.createElement('td');
-        sepTd.colSpan = 4;
+        sepTd.colSpan = 5;
         sepTd.textContent = 'Done';
         sep.appendChild(sepTd);
         tbody.appendChild(sep);
       }
 
       const tr = document.createElement('tr');
+
+      // The id the admin API takes (DELETE /api/v1/admin/priority-ranges/{id}).
+      const tdId = document.createElement('td');
+      tdId.className = 'mono';
+      tdId.textContent = String(pr.id);
+      tr.appendChild(tdId);
 
       const tdPriority = document.createElement('td');
       tdPriority.className = 'mono';
