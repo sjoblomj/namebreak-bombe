@@ -167,6 +167,8 @@
   .badge.status-in_progress { background: var(--in-progress); }
   .badge.status-completed { background: var(--completed); }
   .badge.status-skipped { background: var(--skipped); }
+  /* Black in both themes; the border keeps it visible on the dark card. */
+  .badge.status-gap { background: #000; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18); }
   .priority-chip {
     color: var(--muted);
     font-size: 11px;
@@ -417,6 +419,17 @@
   tr.collapsed-row td {
     background: var(--detail-bg);
     white-space: normal;
+  }
+  tr.gap-row td { color: var(--muted); }
+  /* The main sweep's position: a rule across the table, labelled. */
+  tr.sweep-row td {
+    padding: 4px 8px;
+    border-top: 2px solid var(--accent);
+    border-bottom: 0;
+    white-space: normal;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 600;
   }
   .collapsed-wrap {
     display: flex;
@@ -777,6 +790,53 @@
     return [tr, detailRow];
   }
 
+  // Candidates between two ranges that no range covers - see
+  // dashboard.rs's gaps_between. Laid out on the same columns as a range row.
+  function gapRow(g) {
+    const tr = document.createElement('tr');
+    tr.className = 'gap-row';
+
+    const tdId = document.createElement('td');
+    tdId.className = 'col-range';
+    tr.appendChild(tdId);
+
+    const tdStatus = document.createElement('td');
+    tdStatus.appendChild(statusBadge('gap', 'Gap'));
+    tr.appendChild(tdStatus);
+
+    const tdLen = document.createElement('td');
+    tdLen.className = 'mono';
+    tdLen.textContent = g.first_len === g.last_len ? String(g.first_len) : `${g.first_len}–${g.last_len}`;
+    tr.appendChild(tdLen);
+
+    const tdRange = document.createElement('td');
+    tdRange.append(candidateChip(g.first_candidate), ' – ', candidateChip(g.last_candidate));
+    tr.appendChild(tdRange);
+
+    const tdCount = document.createElement('td');
+    tdCount.className = 'mono col-count';
+    tdCount.textContent = fmtNum(g.count);
+    tr.appendChild(tdCount);
+
+    for (const cls of ['col-worker', 'col-assigned', 'col-completed']) {
+      const td = document.createElement('td');
+      td.className = cls;
+      tr.appendChild(td);
+    }
+    return tr;
+  }
+
+  // Where the target's main sweep is: it carves its next range from here.
+  function sweepRow(t) {
+    const tr = document.createElement('tr');
+    tr.className = 'sweep-row';
+    const td = document.createElement('td');
+    td.colSpan = DETAIL_COLSPAN;
+    td.append('▶ Main sweep is here - next: ', candidateChip(t.cursor_candidate), ` (length ${t.cursor_candidate_len})`);
+    tr.appendChild(td);
+    return tr;
+  }
+
   function detailField(label, value, mono, title) {
     const wrap = document.createElement('div');
     const labelEl = document.createElement('span');
@@ -809,21 +869,28 @@
     }
   }
 
-  // Walks `sortedRanges` (already ordered by candidate_len then start_index)
-  // and folds any run of more than COLLAPSE_THRESHOLD consecutive ranges
-  // sharing the same status and length down to {first, collapsed-middle,
-  // last}. Only consecutive runs are folded - a status that briefly
-  // interrupts an otherwise-long run (e.g. a reclaimed split) starts a run
-  // of its own rather than being absorbed into a neighboring one.
-  function groupRanges(sortedRanges) {
+  // Walks `items` (ranges in table order, with gap and sweep-marker items
+  // between them - see rangesContent) and folds any run of more than
+  // COLLAPSE_THRESHOLD consecutive ranges sharing the same status and length
+  // down to {first, collapsed-middle, last}. Only consecutive runs are
+  // folded - a status that briefly interrupts an otherwise-long run (e.g. a
+  // reclaimed split), a gap or the sweep marker ends the run, so neither of
+  // the latter two is ever hidden inside a collapsed one.
+  function groupRanges(items) {
     const groups = [];
     let i = 0;
-    while (i < sortedRanges.length) {
+    while (i < items.length) {
+      if (items[i].kind !== 'range') {
+        groups.push(items[i]);
+        i++;
+        continue;
+      }
+      const first = items[i].range;
       let j = i + 1;
-      while (j < sortedRanges.length && sortedRanges[j].status === sortedRanges[i].status && sortedRanges[j].candidate_len === sortedRanges[i].candidate_len) {
+      while (j < items.length && items[j].kind === 'range' && items[j].range.status === first.status && items[j].range.candidate_len === first.candidate_len) {
         j++;
       }
-      const run = sortedRanges.slice(i, j);
+      const run = items.slice(i, j).map((item) => item.range);
       if (run.length > COLLAPSE_THRESHOLD) {
         groups.push({ kind: 'range', range: run[0] });
         groups.push({ kind: 'collapsed', status: run[0].status, candidateLen: run[0].candidate_len, hidden: run.slice(1, -1) });
@@ -1198,16 +1265,31 @@
       '<th class="col-assigned">Assigned</th><th class="col-completed">Completed</th></tr>';
     table.appendChild(thead);
 
-    // Shorter candidates (fewer characters) before longer ones, since a
-    // target's search always works through lengths in that order.
-    const sortedRanges = t.ranges.slice().sort((a, b) => a.candidate_len - b.candidate_len || a.start_index - b.start_index);
+    // t.ranges comes ordered by length, then position (see dashboard.rs) -
+    // not re-sorted here, since indices can exceed what a JS number holds
+    // exactly. Gaps and the main sweep's position are placed by the range
+    // they come right after, as the server worked them out.
+    const gapAfter = new Map(t.gaps.map((g) => [g.after_range_id, g]));
+    const showSweep = t.status !== 'solved';
+    const items = [];
+    if (showSweep && t.sweep_after_range_id == null) items.push({ kind: 'sweep' });
+    for (const r of t.ranges) {
+      items.push({ kind: 'range', range: r });
+      if (showSweep && t.sweep_after_range_id === r.id) items.push({ kind: 'sweep' });
+      const gap = gapAfter.get(r.id);
+      if (gap) items.push({ kind: 'gap', gap });
+    }
 
     const tbody = document.createElement('tbody');
-    for (const group of groupRanges(sortedRanges)) {
+    for (const group of groupRanges(items)) {
       if (group.kind === 'range') {
         const [row, detailRow] = rangeRow(group.range);
         tbody.appendChild(row);
         tbody.appendChild(detailRow);
+      } else if (group.kind === 'gap') {
+        tbody.appendChild(gapRow(group.gap));
+      } else if (group.kind === 'sweep') {
+        tbody.appendChild(sweepRow(t));
       } else {
         tbody.appendChild(collapsedRow(group));
       }

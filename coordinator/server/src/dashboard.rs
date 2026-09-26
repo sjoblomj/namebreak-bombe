@@ -9,7 +9,7 @@ use axum::response::Html;
 use axum::Json;
 use serde::Serialize;
 
-use crate::alphabet::index_to_candidate;
+use crate::alphabet::{bound_indices_at_len, index_to_candidate};
 use crate::error::AppError;
 use crate::models::i64_to_u32;
 use crate::state::AppState;
@@ -64,8 +64,83 @@ pub struct DashboardTarget {
     pub cursor_candidate_len: i64,
     pub cursor_next_index: i64,
     pub cursor_candidate: String,
+    /// Where the main sweep's position falls among `ranges`: right after
+    /// this range, or before all of them if `None`.
+    pub sweep_after_range_id: Option<i64>,
     pub priority_ranges: Vec<DashboardPriorityRange>,
+    /// Ordered by candidate length, then position - the order the dashboard
+    /// lists them in, and the order `gaps` refers to.
     pub ranges: Vec<DashboardRange>,
+    /// Candidates not covered by any range, between two consecutive
+    /// `ranges` - see `gaps_between`.
+    pub gaps: Vec<DashboardGap>,
+}
+
+/// A stretch of candidates between two consecutive ranges (in `ranges`'
+/// order) that no range covers. May run across candidate lengths.
+#[derive(Serialize)]
+pub struct DashboardGap {
+    /// The range this gap comes right after.
+    pub after_range_id: i64,
+    pub first_len: i64,
+    pub first_candidate: String,
+    pub last_len: i64,
+    pub last_candidate: String,
+    /// How many candidates it covers (saturating, for display).
+    pub count: i64,
+}
+
+/// The gaps between consecutive ranges in `ranges` (already ordered by
+/// length, then start). Within a length, a gap is simply the space between
+/// one range's end and the next one's start; across lengths, it's the rest
+/// of the earlier length, any whole lengths in between, and the start of
+/// the later length, each limited to what the target's bounds cover at that
+/// length. Two ranges carved under different alphabets aren't comparable
+/// (an alphabet patch happened in between), so no gap is reported there.
+fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str) -> Vec<DashboardGap> {
+    let mut gaps = Vec::new();
+    for pair in ranges.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a.alphabet != b.alphabet {
+            continue;
+        }
+        // (length, first index, end index exclusive), one per length.
+        let mut pieces: Vec<(i64, i64, i64)> = Vec::new();
+        if a.candidate_len == b.candidate_len {
+            pieces.push((a.candidate_len, a.end_index, b.start_index));
+        } else {
+            for len in a.candidate_len..=b.candidate_len {
+                let (lo, hi) = bound_indices_at_len(&a.alphabet, lower_bound, upper_bound, len);
+                let from = if len == a.candidate_len { a.end_index } else { lo };
+                let to = if len == b.candidate_len { b.start_index } else { hi + 1 };
+                pieces.push((len, from, to));
+            }
+        }
+        pieces.retain(|&(_, from, to)| from < to);
+        let (Some(&(first_len, first, _)), Some(&(last_len, _, last_end))) = (pieces.first(), pieces.last()) else {
+            continue;
+        };
+        gaps.push(DashboardGap {
+            after_range_id: a.id,
+            first_len,
+            first_candidate: index_to_candidate(&a.alphabet, first, first_len),
+            last_len,
+            last_candidate: index_to_candidate(&a.alphabet, last_end - 1, last_len),
+            count: pieces.iter().fold(0i64, |sum, &(_, from, to)| sum.saturating_add(to - from)),
+        });
+    }
+    gaps
+}
+
+/// The last range in `ranges` (ordered by length, then start) that starts
+/// before the main sweep's position - so the sweep marker goes right after
+/// it. `None` if the sweep is before every range.
+fn sweep_after_range_id(ranges: &[DashboardRange], cursor_len: i64, cursor_next_index: i64) -> Option<i64> {
+    ranges
+        .iter()
+        .take_while(|r| (r.candidate_len, r.start_index) < (cursor_len, cursor_next_index))
+        .last()
+        .map(|r| r.id)
 }
 
 #[derive(Serialize)]
@@ -162,7 +237,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                 ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
                 ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id \
          FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
-         ORDER BY ranges.created_at DESC",
+         ORDER BY ranges.candidate_len, ranges.start_index",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -194,7 +269,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_by, found_by_backend, found_at, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
 
-        let ranges = range_rows
+        let ranges: Vec<DashboardRange> = range_rows
             .into_iter()
             .map(
                 |(_target_id, range_id, r_status, candidate_len, start_index, end_index, progress_index, worker, worker_backend, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet, priority_range_id)| {
@@ -234,6 +309,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             .cloned()
             .ok_or_else(|| AppError::Internal(format!("missing target_progress row for target {id}")))?;
         let cursor_candidate = index_to_candidate(&cursor_alphabet, cursor_next_index, cursor_candidate_len);
+        let gaps = gaps_between(&ranges, &lower_bound, &upper_bound);
+        let sweep_after_range_id = sweep_after_range_id(&ranges, cursor_candidate_len, cursor_next_index);
 
         let priority_range_rows = priority_ranges_by_target.remove(&id).unwrap_or_default();
         let priority_ranges = priority_range_rows
@@ -274,8 +351,10 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             cursor_candidate_len,
             cursor_next_index,
             cursor_candidate,
+            sweep_after_range_id,
             priority_ranges,
             ranges,
+            gaps,
         });
     }
 
@@ -284,4 +363,68 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
 
 pub async fn dashboard_page() -> Html<&'static str> {
     Html(include_str!("../static/dashboard.html"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    fn range(id: i64, candidate_len: i64, start_index: i64, end_index: i64) -> DashboardRange {
+        DashboardRange {
+            id,
+            status: "completed".into(),
+            candidate_len,
+            start_index,
+            end_index,
+            first_candidate: String::new(),
+            last_candidate: String::new(),
+            progress_candidate: None,
+            progress_percent: None,
+            worker: None,
+            worker_backend: None,
+            assigned_at: None,
+            lease_expires_at: None,
+            completed_at: None,
+            created_at: 0,
+            alphabet_name: "letters".into(),
+            alphabet: LETTERS.into(),
+            priority_range_id: None,
+        }
+    }
+
+    fn summary(g: &DashboardGap) -> (i64, i64, &str, i64, &str, i64) {
+        (g.after_range_id, g.first_len, g.first_candidate.as_str(), g.last_len, g.last_candidate.as_str(), g.count)
+    }
+
+    #[test]
+    fn gaps_between_finds_gaps_within_a_length_but_not_between_adjacent_ranges() {
+        // Length 2 (26*26 = 676): 0..10 and 10..20 back to back, then 30..40.
+        let ranges = vec![range(1, 2, 0, 10), range(2, 2, 10, 20), range(3, 2, 30, 40)];
+        let gaps = gaps_between(&ranges, "AA", "ZZ");
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(summary(&gaps[0]), (2, 2, "AU", 2, "BD", 10));
+    }
+
+    #[test]
+    fn gaps_between_runs_across_lengths_within_the_targets_bounds() {
+        // Length 1 covered up to "X" (0..24), then length 3 starting at "AAC" (index 2):
+        // the gap is Y-Z, all of length 2, then AAA-AAB.
+        let ranges = vec![range(1, 1, 0, 24), range(2, 3, 2, 10)];
+        let gaps = gaps_between(&ranges, "A", "Z");
+        assert_eq!(summary(&gaps[0]), (1, 1, "Y", 3, "AAB", 2 + 676 + 2));
+
+        // Back to back across a length boundary: no gap.
+        let ranges = vec![range(1, 1, 0, 26), range(2, 2, 0, 5)];
+        assert!(gaps_between(&ranges, "A", "Z").is_empty());
+    }
+
+    #[test]
+    fn sweep_after_range_id_is_the_last_range_starting_before_the_sweep() {
+        let ranges = vec![range(1, 2, 0, 10), range(2, 2, 10, 20), range(3, 3, 5, 9)];
+        assert_eq!(sweep_after_range_id(&ranges, 2, 20), Some(2));
+        assert_eq!(sweep_after_range_id(&ranges, 2, 0), None);
+        assert_eq!(sweep_after_range_id(&ranges, 4, 0), Some(3));
+    }
 }
