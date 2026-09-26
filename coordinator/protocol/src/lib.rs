@@ -342,11 +342,12 @@ pub struct AdminDeletePriorityRangeResponse {
     /// True if the priority range is gone entirely: nothing was ever carved
     /// from it and nothing had to be kept.
     pub deleted: bool,
-    /// Candidates handed back to the main sweep.
-    pub returned_to_main_sweep: i64,
+    /// Candidates handed back to the main sweep. 128-bit, since a priority
+    /// range at a long candidate length can span more than an i64 holds.
+    pub returned_to_main_sweep: i128,
     /// Candidates kept as priority work because the main sweep is already
     /// past them.
-    pub kept: i64,
+    pub kept: i128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

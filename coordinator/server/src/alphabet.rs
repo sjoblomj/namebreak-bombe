@@ -70,16 +70,40 @@ fn alphabet_chars(alphabet: &str) -> Vec<char> {
     alphabet.chars().collect()
 }
 
-/// The largest candidate length whose full space (`alphabet_size(alphabet)^len`)
-/// still fits in an `i64`, so a range can be represented as a flat
-/// `[start_index, end_index)` pair without overflow. `namebreak.cu` sidesteps this
-/// same limit (there, for u64) by splitting long candidates into a CPU-enumerated
-/// leading part and a GPU-indexed trailing part; the server doesn't replicate that
-/// split, so a target's search is capped at this length (see `bound_indices_at_len`
-/// and `ranges::claim_range`, which stop carving once it's reached). In practice
-/// this is a non-issue: exhaustively searching anywhere near this length is
-/// already computationally infeasible. A smaller alphabet permits a larger cap.
+/// A candidate's position within its own length's space, in
+/// `index_to_candidate`'s order. An `i128` rather than an `i64`, since
+/// `alphabet_size^len` passes `i64::MAX` beyond length 11 for every predefined
+/// alphabet. The database has no 128-bit integers, so every stored position
+/// is split into a `(block, index)` pair of `i64`s - see `split_pos`.
+pub type Pos = i128;
+
+/// The longest candidate the server carves, whatever the alphabet: the
+/// client's own `MAX_CANDIDATE_LEN` (client/src/engine/limits.h), which
+/// refuses to search anything longer. Keep the two in sync.
+pub const MAX_CANDIDATE_LEN: i64 = 16;
+
+/// The longest candidate length the server carves for `alphabet`:
+/// `MAX_CANDIDATE_LEN`, unless the alphabet is so large that the whole space
+/// at that length wouldn't fit a `Pos` (not the case for any predefined one).
 pub fn max_supported_len(alphabet: &str) -> i64 {
+    let size = alphabet_size(alphabet) as i128;
+    let mut len = 0i64;
+    let mut space: i128 = 1;
+    while len < MAX_CANDIDATE_LEN {
+        let Some(next) = space.checked_mul(size) else { break };
+        space = next;
+        len += 1;
+    }
+    len
+}
+
+/// How many trailing characters a stored `i64` index covers: the longest
+/// length whose whole space still fits an `i64` (11 for every predefined
+/// alphabet). A longer candidate's characters before those - its leading
+/// prefix - are numbered separately, as a block - see `split_pos`. The same
+/// split the client makes between its CPU-enumerated leading part and its
+/// natively indexed trailing part (client/src/engine/search.cpp).
+pub fn index_width(alphabet: &str) -> i64 {
     let size = alphabet_size(alphabet) as i128;
     let mut len = 0i64;
     let mut space: i128 = 1;
@@ -90,26 +114,62 @@ pub fn max_supported_len(alphabet: &str) -> i64 {
     len
 }
 
+/// How many candidates share one leading prefix (one block) at `len`. The
+/// whole length's space for a length no longer than `index_width` - there's
+/// only ever block 0 there.
+pub fn block_size(alphabet: &str, len: i64) -> Pos {
+    space_size(alphabet, len.min(index_width(alphabet)))
+}
+
+/// Splits `pos` into the `(block, index)` pair the database stores it as:
+/// which leading prefix it falls under (numbered in `index_to_candidate`'s
+/// order), and its index among that prefix's candidates. For a length no
+/// longer than `index_width` the block is always 0 and the index is `pos`
+/// itself, so rows from before 128-bit positions read back unchanged.
+pub fn split_pos(alphabet: &str, len: i64, pos: Pos) -> (i64, i64) {
+    let size = block_size(alphabet, len);
+    ((pos / size) as i64, (pos % size) as i64)
+}
+
+/// Like `split_pos`, but for an exclusive end or a cursor: a `pos` right at
+/// the start of a block is stored against the block before it, as an index
+/// equal to `block_size`. Such a position is where something *stops* rather
+/// than a candidate in its own right, so it belongs with the candidate
+/// before it - and the end of a length no longer than `index_width` then
+/// reads back as the plain index (the length's size) it always was.
+pub fn split_end(alphabet: &str, len: i64, pos: Pos) -> (i64, i64) {
+    if pos == 0 {
+        return (0, 0);
+    }
+    let (block, index) = split_pos(alphabet, len, pos - 1);
+    (block, index + 1)
+}
+
+/// Inverse of `split_pos` and `split_end`.
+pub fn join_pos(alphabet: &str, len: i64, block: i64, index: i64) -> Pos {
+    block as Pos * block_size(alphabet, len) + index as Pos
+}
+
 /// Total number of distinct candidates of the given length. Caller must
 /// ensure `len <= max_supported_len(alphabet)`. Used by
 /// `transition_alphabet_cursor` as a sentinel "past this length's entire
 /// space, in any alphabet" value when nothing at all is left to translate a
 /// cursor to; otherwise a natural, directly-tested primitive also heavily
 /// used by the test suite to compute expected values independently.
-pub fn space_size(alphabet: &str, len: i64) -> i64 {
-    let size = alphabet_size(alphabet) as i128;
-    let mut space: i128 = 1;
+pub fn space_size(alphabet: &str, len: i64) -> Pos {
+    let size = alphabet_size(alphabet) as Pos;
+    let mut space: Pos = 1;
     for _ in 0..len {
         space *= size;
     }
-    space as i64
+    space
 }
 
-/// Same enumeration order as `namebreak.cu`'s `indexToCandidate`: most-significant
+/// Same enumeration order as the client's `indexToCandidate`: most-significant
 /// character first, base-`alphabet_size(alphabet)` positional encoding.
-pub fn index_to_candidate(alphabet: &str, mut index: i64, len: i64) -> String {
+pub fn index_to_candidate(alphabet: &str, mut index: Pos, len: i64) -> String {
     let chars = alphabet_chars(alphabet);
-    let size = alphabet_size(alphabet);
+    let size = alphabet_size(alphabet) as Pos;
     let mut buf = vec![' '; len as usize];
     for i in (0..len as usize).rev() {
         let digit = (index % size) as usize;
@@ -121,12 +181,12 @@ pub fn index_to_candidate(alphabet: &str, mut index: i64, len: i64) -> String {
 
 /// Inverse of `index_to_candidate`. Returns `None` if `candidate` contains a
 /// character outside the alphabet (or is implausibly long enough to overflow).
-pub fn candidate_to_index(alphabet: &str, candidate: &str) -> Option<i64> {
+pub fn candidate_to_index(alphabet: &str, candidate: &str) -> Option<Pos> {
     let chars = alphabet_chars(alphabet);
-    let size = alphabet_size(alphabet);
-    let mut index: i64 = 0;
+    let size = alphabet_size(alphabet) as Pos;
+    let mut index: Pos = 0;
     for ch in candidate.chars() {
-        let digit = chars.iter().position(|&c| c == ch)? as i64;
+        let digit = chars.iter().position(|&c| c == ch)? as Pos;
         index = index.checked_mul(size)?.checked_add(digit)?;
     }
     Some(index)
@@ -136,7 +196,7 @@ pub fn candidate_to_index(alphabet: &str, candidate: &str) -> Option<i64> {
 /// candidate that's shorter than the length currently being searched. The
 /// lower bound pads with the minimum character (permissive on the low side:
 /// "this, or anything continuing from it"); the upper bound pads with the
-/// maximum character (permissive on the high side). Mirrors `namebreak.cu`'s
+/// maximum character (permissive on the high side). Mirrors the client's
 /// `getLowerBound`/`getUpperBound` convention.
 fn min_max_chars(alphabet: &str) -> (char, char) {
     let mut chars = alphabet.chars();
@@ -154,7 +214,7 @@ fn min_max_chars(alphabet: &str) -> (char, char) {
 /// as a string, only as these two indices, so it's always safe from overflow
 /// as long as `len <= max_supported_len(alphabet)` (the only case it's ever
 /// called with).
-pub fn bound_indices_at_len(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64) -> (i64, i64) {
+pub fn bound_indices_at_len(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64) -> (Pos, Pos) {
     let (min_char, max_char) = min_max_chars(alphabet);
     let len = len as usize;
 
@@ -259,14 +319,14 @@ pub fn skip_char_mask(alphabet: &str, skip_regex: &regex::Regex) -> Vec<bool> {
 /// orders candidates by leading character first - so this only ever has to
 /// walk the (at most `alphabet_size`, typically under 50) characters, never
 /// individual candidates within a block.
-pub fn find_skip_run(alphabet_size: i64, skip_chars: &[bool], candidate_len: i64, lo_index: i64, hi_index_exclusive: i64) -> Option<(i64, i64)> {
+pub fn find_skip_run(alphabet_size: i64, skip_chars: &[bool], candidate_len: i64, lo_index: Pos, hi_index_exclusive: Pos) -> Option<(Pos, Pos)> {
     if lo_index >= hi_index_exclusive {
         return None;
     }
-    let block_size = pow_i64(alphabet_size, candidate_len - 1);
+    let block_size = pow_pos(alphabet_size, candidate_len - 1);
     let mut char_idx = (lo_index / block_size) as usize;
     while char_idx < skip_chars.len() {
-        let block_start = char_idx as i64 * block_size;
+        let block_start = char_idx as Pos * block_size;
         if block_start >= hi_index_exclusive {
             break;
         }
@@ -276,7 +336,7 @@ pub fn find_skip_run(alphabet_size: i64, skip_chars: &[bool], candidate_len: i64
             while end_char_idx + 1 < skip_chars.len() && skip_chars[end_char_idx + 1] {
                 end_char_idx += 1;
             }
-            let skip_end = ((end_char_idx as i64 + 1) * block_size).min(hi_index_exclusive);
+            let skip_end = ((end_char_idx as Pos + 1) * block_size).min(hi_index_exclusive);
             return Some((skip_start, skip_end));
         }
         char_idx += 1;
@@ -284,15 +344,14 @@ pub fn find_skip_run(alphabet_size: i64, skip_chars: &[bool], candidate_len: i64
     None
 }
 
-/// `base^exp` via `i128` so it can't silently wrap before the final cast -
-/// callers only ever pass an `exp` (`candidate_len - 1`) small enough that the
-/// true result already fits `i64` (see `max_supported_len`).
-fn pow_i64(base: i64, exp: i64) -> i64 {
-    let mut result: i128 = 1;
+/// `base^exp` - callers only ever pass an `exp` (`candidate_len - 1`) small
+/// enough that the result fits a `Pos` (see `max_supported_len`).
+fn pow_pos(base: i64, exp: i64) -> Pos {
+    let mut result: Pos = 1;
     for _ in 0..exp {
-        result *= base as i128;
+        result *= base as Pos;
     }
-    result as i64
+    result
 }
 
 /// Cap on how many concrete prefixes a single priority-range pattern (see
@@ -468,7 +527,7 @@ pub struct AlphabetTransition {
     /// (nothing smaller than `new_next_index` qualifies, by construction).
     /// `None` when the old cursor's candidate is already fully expressible
     /// in the new alphabet, so nothing needs skipping.
-    pub skip: Option<(i64, i64)>,
+    pub skip: Option<(Pos, Pos)>,
     /// Where carving should resume, under `new_alphabet`, at the same
     /// `candidate_len` as the old cursor - or an index already known to be
     /// past this length's own space entirely (see `alphabet::space_size`),
@@ -476,7 +535,7 @@ pub struct AlphabetTransition {
     /// The caller is still responsible for bumping past this length in that
     /// case - exactly as it already does for ordinary carving, via
     /// `bump_length_if_exhausted`.
-    pub new_next_index: i64,
+    pub new_next_index: Pos,
 }
 
 /// Computes an `AlphabetTransition` for a cursor currently at
@@ -490,7 +549,7 @@ pub fn transition_alphabet_cursor(
     lower_bound: &str,
     upper_bound: &str,
     candidate_len: i64,
-    old_next_index: i64,
+    old_next_index: Pos,
 ) -> AlphabetTransition {
     let old_candidate: Vec<char> = index_to_candidate(old_alphabet, old_next_index, candidate_len).chars().collect();
     let len = old_candidate.len();
@@ -583,8 +642,8 @@ pub fn range_bound_filenames(
     prefix: &str,
     suffix: &str,
     len: i64,
-    start_index: i64,
-    end_index: i64,
+    start_index: Pos,
+    end_index: Pos,
 ) -> (String, String) {
     let lower = index_to_candidate(alphabet, start_index, len);
     let upper = index_to_candidate(alphabet, end_index - 1, len);
@@ -654,22 +713,38 @@ mod tests {
     }
 
     #[test]
-    fn max_supported_len_space_fits_i64_but_next_length_does_not() {
-        let len = max_supported_len(DEFAULT);
-        assert!(space_size(DEFAULT, len) > 0);
-        // One length further should overflow i64 - confirmed via i128 math directly,
-        // since space_size() itself assumes no overflow.
-        let size = alphabet_size(DEFAULT) as i128;
-        let mut space: i128 = 1;
-        for _ in 0..(len + 1) {
-            space *= size;
-        }
-        assert!(space > i64::MAX as i128);
+    fn index_width_space_fits_i64_but_next_length_does_not() {
+        let len = index_width(DEFAULT);
+        assert_eq!(len, 11);
+        assert!(space_size(DEFAULT, len) <= i64::MAX as Pos);
+        assert!(space_size(DEFAULT, len + 1) > i64::MAX as Pos);
     }
 
     #[test]
-    fn max_supported_len_grows_as_alphabet_shrinks() {
-        assert!(max_supported_len(TINY) > max_supported_len(DEFAULT));
+    fn index_width_grows_as_alphabet_shrinks() {
+        assert!(index_width(TINY) > index_width(DEFAULT));
+    }
+
+    #[test]
+    fn max_supported_len_is_the_clients_limit_for_every_predefined_alphabet() {
+        for &(name, chars, _since) in PREDEFINED_ALPHABETS {
+            assert_eq!(max_supported_len(chars), MAX_CANDIDATE_LEN, "{name}");
+        }
+    }
+
+    #[test]
+    fn split_pos_leaves_short_lengths_in_block_0_and_round_trips_long_ones() {
+        assert_eq!(split_pos(DEFAULT, 11, space_size(DEFAULT, 11) - 1), (0, (space_size(DEFAULT, 11) - 1) as i64));
+        let block = space_size(DEFAULT, 11);
+        // "!" followed by fourteen spaces: block 1 of length 15 (leading "!   "), index 0.
+        let pos = candidate_to_index(DEFAULT, &format!("!{}", " ".repeat(14))).unwrap();
+        assert_eq!(split_pos(DEFAULT, 15, pos), (49 * 49 * 49, 0));
+        for &p in &[0, 1, block - 1, block, block + 7, space_size(DEFAULT, 16) - 1] {
+            let (b, i) = split_pos(DEFAULT, 16, p);
+            assert_eq!(join_pos(DEFAULT, 16, b, i), p);
+        }
+        // An exclusive end at the very end of a block may be stored against that block.
+        assert_eq!(join_pos(DEFAULT, 16, 0, block as i64), block);
     }
 
     #[test]
@@ -721,7 +796,7 @@ mod tests {
         assert_eq!(hi11, candidate_to_index(DEFAULT, &format!("{upper}___")).unwrap());
 
         // Growing into an already-padded length is exactly a base shift.
-        assert_eq!(lo11, lo * alphabet_size(DEFAULT));
+        assert_eq!(lo11, lo * alphabet_size(DEFAULT) as Pos);
     }
 
     #[test]

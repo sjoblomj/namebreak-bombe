@@ -177,14 +177,16 @@ truncated into relevance.
 
 `start_len` (default 1) is the shortest candidate length the server carves -
 every shorter candidate is left out entirely. It must be between 1 and the
-alphabet's max supported length. There's no `max_len`: the server always searches up to as long as the chosen alphabet supports (capped at
-whatever length still fits a flat 64-bit range index, `alphabet_size^len <=
-i64::MAX` - 11 for every alphabet currently in `PREDEFINED_ALPHABETS`, since
-they're all close enough in size to land on the same cap; a genuinely smaller
-alphabet, e.g. a hex-only one, would push it noticeably higher) - tightened at
-every length in between by `lower_bound`/`upper_bound`. `alphabet_name`
-defaults to `"size49"` if omitted; see `GET /api/v1/alphabets` for the full
-list.
+max supported length. There's no `max_len`: the server always searches up to
+length 16, the longest candidate the client will search (`MAX_CANDIDATE_LEN`
+in `client/src/engine/limits.h`, mirrored by `alphabet::MAX_CANDIDATE_LEN`) -
+tightened at every length in between by `lower_bound`/`upper_bound`, which is
+what keeps the longer lengths searchable at all. Past length 11 a length has
+more candidates than a 64-bit integer holds, so the server stores each
+position per leading prefix - which prefix (a block number) plus an index
+among that prefix's candidates - the same leading/trailing split the client
+makes. `alphabet_name` defaults to `"size49"` if omitted; see
+`GET /api/v1/alphabets` for the full list.
 
 `priority` (default 0, omit for normal priority) decides which target's work
 gets claimed first when more than one is active: a worker's `/claim` always

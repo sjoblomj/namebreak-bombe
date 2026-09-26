@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 
 use crate::alphabet::{
     alphabet_available_to, alphabet_size, bound_indices_at_len, candidate_to_index, compile_skip_regex, find_skip_run, index_to_candidate,
-    max_supported_len, range_bound_filenames, skip_char_mask, strip_prefix_suffix, transition_alphabet_cursor,
+    max_supported_len, range_bound_filenames, skip_char_mask, split_end, split_pos, strip_prefix_suffix, transition_alphabet_cursor, Pos,
 };
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Range, Target, TargetProgress, User};
@@ -21,7 +21,7 @@ fn effective_rate(config: &RangeConfig, user: &User) -> f64 {
 /// necessarily `target.alphabet` - a range carved before the target's
 /// alphabet was last patched must still be served (and decoded) with
 /// whatever alphabet it was actually carved under.
-fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_index: i64, end_index: i64, lease_seconds: i64, alphabet: &str) -> ClaimResponse {
+fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_index: Pos, end_index: Pos, lease_seconds: i64, alphabet: &str) -> ClaimResponse {
     let (lower_bound_filename, upper_bound_filename) = range_bound_filenames(alphabet, &target.prefix, &target.suffix, candidate_len, start_index, end_index);
     ClaimResponse {
         range_id,
@@ -37,7 +37,9 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
         lower_bound_filename,
         upper_bound_filename,
         alphabet: alphabet.to_string(),
-        candidate_count: end_index - start_index,
+        // Only ever a chunk carved to at most max_chunk_candidates (or the
+        // remainder of one), so this can't actually saturate.
+        candidate_count: i64::try_from(end_index - start_index).unwrap_or(i64::MAX),
         lease_seconds,
     }
 }
@@ -47,7 +49,7 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
 /// carving logic, just pulled out so both the "skip swallows the whole
 /// cursor" and "skip trims a handed-out chunk" branches in `claim_range` can
 /// share it). A no-op once `len` has already reached `max_supported_len`.
-fn bump_length_if_exhausted(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64, next_index: i64, upper_at_len: i64) -> (i64, i64) {
+fn bump_length_if_exhausted(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64, next_index: Pos, upper_at_len: Pos) -> (i64, Pos) {
     if next_index > upper_at_len && len < max_supported_len(alphabet) {
         let new_len = len + 1;
         let new_next_index = bound_indices_at_len(alphabet, lower_bound, upper_bound, new_len).0;
@@ -61,12 +63,14 @@ async fn persist_progress(
     tx: &mut sqlx::SqliteConnection,
     target_id: i64,
     candidate_len: i64,
-    next_index: i64,
+    next_index: Pos,
     alphabet_name: &str,
     alphabet: &str,
 ) -> Result<(), AppError> {
-    sqlx::query("UPDATE target_progress SET candidate_len = ?, next_index = ?, alphabet_name = ?, alphabet = ? WHERE target_id = ?")
+    let (next_block, next_index) = split_end(alphabet, candidate_len, next_index);
+    sqlx::query("UPDATE target_progress SET candidate_len = ?, next_block = ?, next_index = ?, alphabet_name = ?, alphabet = ? WHERE target_id = ?")
         .bind(candidate_len)
+        .bind(next_block)
         .bind(next_index)
         .bind(alphabet_name)
         .bind(alphabet)
@@ -89,20 +93,24 @@ async fn insert_skip_range(
     tx: &mut sqlx::SqliteConnection,
     target_id: i64,
     candidate_len: i64,
-    start_index: i64,
-    end_index: i64,
+    start_index: Pos,
+    end_index: Pos,
     alphabet_name: &str,
     alphabet: &str,
     priority_range_id: Option<i64>,
     now: i64,
 ) -> Result<(), AppError> {
+    let (start_block, start_index) = split_pos(alphabet, candidate_len, start_index);
+    let (end_block, end_index) = split_end(alphabet, candidate_len, end_index);
     sqlx::query(
-        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, created_at, alphabet_name, alphabet, priority_range_id) \
-         VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?, ?)",
+        "INSERT INTO ranges (target_id, candidate_len, start_block, start_index, end_block, end_index, status, created_at, alphabet_name, alphabet, priority_range_id) \
+         VALUES (?, ?, ?, ?, ?, ?, 'skipped', ?, ?, ?, ?)",
     )
     .bind(target_id)
     .bind(candidate_len)
+    .bind(start_block)
     .bind(start_index)
+    .bind(end_block)
     .bind(end_index)
     .bind(now)
     .bind(alphabet_name)
@@ -110,6 +118,56 @@ async fn insert_skip_range(
     .bind(priority_range_id)
     .execute(tx)
     .await?;
+    Ok(())
+}
+
+/// Inserts a freshly carved range, already claimed by `user`, returning its id.
+#[allow(clippy::too_many_arguments)]
+async fn insert_claimed_range(
+    tx: &mut sqlx::SqliteConnection,
+    target_id: i64,
+    candidate_len: i64,
+    start_index: Pos,
+    end_index: Pos,
+    alphabet_name: &str,
+    alphabet: &str,
+    priority_range_id: Option<i64>,
+    user: &User,
+    lease_seconds: i64,
+    now: i64,
+) -> Result<i64, AppError> {
+    let (start_block, start_index) = split_pos(alphabet, candidate_len, start_index);
+    let (end_block, end_index) = split_end(alphabet, candidate_len, end_index);
+    let range_id = sqlx::query_scalar(
+        "INSERT INTO ranges (target_id, candidate_len, start_block, start_index, end_block, end_index, status, \
+         assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id, last_progress_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(target_id)
+    .bind(candidate_len)
+    .bind(start_block)
+    .bind(start_index)
+    .bind(end_block)
+    .bind(end_index)
+    .bind(user.id)
+    .bind(user.id)
+    .bind(now)
+    .bind(lease_seconds)
+    .bind(now + lease_seconds)
+    .bind(now)
+    .bind(alphabet_name)
+    .bind(alphabet)
+    .bind(priority_range_id)
+    .bind(now)
+    .fetch_one(tx)
+    .await?;
+    Ok(range_id)
+}
+
+/// Sets a priority range's own cursor (`next_index` and its block).
+async fn set_priority_range_next(tx: &mut sqlx::SqliteConnection, pr: &PriorityRange, next_index: Pos) -> Result<(), AppError> {
+    let (next_block, next_index) = split_end(&pr.alphabet, pr.candidate_len, next_index);
+    sqlx::query("UPDATE priority_ranges SET next_block = ?, next_index = ? WHERE id = ?").bind(next_block).bind(next_index).bind(pr.id).execute(tx).await?;
     Ok(())
 }
 
@@ -130,9 +188,9 @@ async fn find_priority_boundary(
     target_id: i64,
     candidate_len: i64,
     alphabet_name: &str,
-    lo_index: i64,
-    hi_index_exclusive: i64,
-) -> Result<Option<(i64, i64)>, AppError> {
+    lo_index: Pos,
+    hi_index_exclusive: Pos,
+) -> Result<Option<(Pos, Pos)>, AppError> {
     let priority_ranges = sqlx::query_as::<_, PriorityRange>(
         "SELECT * FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ?",
     )
@@ -145,8 +203,8 @@ async fn find_priority_boundary(
     Ok(priority_ranges
         .into_iter()
         .filter_map(|pr| {
-            let lo = pr.start_index.max(lo_index);
-            let hi = pr.end_index.min(hi_index_exclusive);
+            let lo = pr.start().max(lo_index);
+            let hi = pr.end().min(hi_index_exclusive);
             if lo < hi {
                 Some((lo, hi))
             } else {
@@ -184,16 +242,19 @@ async fn claim_priority_range_chunk(
     now: i64,
 ) -> Result<Option<ClaimResponse>, AppError> {
     loop {
-        let pr = sqlx::query_as::<_, PriorityRange>(
-            "SELECT * FROM priority_ranges WHERE target_id = ? AND next_index < end_index ORDER BY priority DESC, created_at ASC LIMIT 1",
-        )
-        .bind(target.id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        // Filtered here rather than in SQL, since a position is only
+        // comparable once its block and index are joined.
+        let pr = sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE target_id = ? ORDER BY priority DESC, created_at ASC")
+            .bind(target.id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .find(|pr| pr.next() < pr.end());
 
         let Some(pr) = pr else {
             return Ok(None);
         };
+        let (pr_next, pr_end) = (pr.next(), pr.end());
 
         // skip_regex still applies within a priority range's own space: a
         // candidate being uninteresting doesn't stop being true just because
@@ -205,20 +266,20 @@ async fn claim_priority_range_chunk(
             .and_then(compile_skip_regex)
             .map(|re| skip_char_mask(&pr.alphabet, &re));
         let skip_run =
-            skip_chars.as_ref().and_then(|chars| find_skip_run(alphabet_size(&pr.alphabet), chars, pr.candidate_len, pr.next_index, pr.end_index));
+            skip_chars.as_ref().and_then(|chars| find_skip_run(alphabet_size(&pr.alphabet), chars, pr.candidate_len, pr_next, pr_end));
 
         if let Some((skip_start, skip_end)) = skip_run {
-            if skip_start == pr.next_index {
+            if skip_start == pr_next {
                 insert_skip_range(&mut *tx, target.id, pr.candidate_len, skip_start, skip_end, &pr.alphabet_name, &pr.alphabet, Some(pr.id), now).await?;
-                sqlx::query("UPDATE priority_ranges SET next_index = ? WHERE id = ?").bind(skip_end).bind(pr.id).execute(&mut *tx).await?;
+                set_priority_range_next(&mut *tx, &pr, skip_end).await?;
                 continue; // this priority range may have room left after the skip, or may now be exhausted - reconsider from the top either way
             }
         }
 
-        let remaining = pr.end_index - pr.next_index;
+        let remaining = pr_end - pr_next;
         let desired = (rate * config.target_chunk_seconds).round() as i64;
-        let natural_chunk = desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates).min(remaining);
-        let start_index = pr.next_index;
+        let natural_chunk = (desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates) as Pos).min(remaining);
+        let start_index = pr_next;
         let natural_end = start_index + natural_chunk;
 
         let (end_index, skip_to_insert) = match skip_run {
@@ -233,29 +294,22 @@ async fn claim_priority_range_chunk(
             }
             None => end_index,
         };
-        sqlx::query("UPDATE priority_ranges SET next_index = ? WHERE id = ?").bind(next_index).bind(pr.id).execute(&mut *tx).await?;
+        set_priority_range_next(&mut *tx, &pr, next_index).await?;
 
         let lease_seconds = config.lease_seconds;
-        let range_id: i64 = sqlx::query_scalar(
-            "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-             assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id, last_progress_at) \
-             VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        let range_id = insert_claimed_range(
+            &mut *tx,
+            target.id,
+            pr.candidate_len,
+            start_index,
+            end_index,
+            &pr.alphabet_name,
+            &pr.alphabet,
+            Some(pr.id),
+            user,
+            lease_seconds,
+            now,
         )
-        .bind(target.id)
-        .bind(pr.candidate_len)
-        .bind(start_index)
-        .bind(end_index)
-        .bind(user.id)
-        .bind(user.id)
-        .bind(now)
-        .bind(lease_seconds)
-        .bind(now + lease_seconds)
-        .bind(now)
-        .bind(&pr.alphabet_name)
-        .bind(&pr.alphabet)
-        .bind(pr.id)
-        .bind(now)
-        .fetch_one(&mut *tx)
         .await?;
 
         return Ok(Some(to_claim_response(target, range_id, pr.candidate_len, start_index, end_index, lease_seconds, &pr.alphabet)));
@@ -339,7 +393,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .await?;
 
             tx.commit().await?;
-            return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start_index, range.end_index, lease_seconds, &range.alphabet)));
+            return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start(), range.end(), lease_seconds, &range.alphabet)));
         }
 
         // 2) Otherwise, try this target's priority ranges (see
@@ -390,8 +444,9 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                 continue 'carve;
             }
 
+            let next_index = progress.next();
             let (_, upper_at_len) = bound_indices_at_len(active_alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len);
-            let remaining = upper_at_len - progress.next_index + 1; // inclusive upper bound
+            let remaining = upper_at_len - next_index + 1; // inclusive upper bound
             if remaining <= 0 {
                 break 'carve; // this target's bounds are fully carved out at this length (and, if this is its last length, entirely) - try the next target
             }
@@ -409,7 +464,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
 
             let skip_run = skip_chars
                 .as_ref()
-                .and_then(|chars| find_skip_run(alphabet_size(active_alphabet), chars, progress.candidate_len, progress.next_index, upper_at_len + 1));
+                .and_then(|chars| find_skip_run(alphabet_size(active_alphabet), chars, progress.candidate_len, next_index, upper_at_len + 1));
 
             // A priority range (see `models::PriorityRange`) permanently
             // excludes its own declared span from the main sweep at its
@@ -420,7 +475,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             // moved away from is no longer index-comparable to the cursor,
             // so it's (harmlessly, if rarely) left for a future pass to sort
             // out rather than risking a wrong comparison here.
-            let priority_boundary = find_priority_boundary(&mut tx, target.id, progress.candidate_len, active_alphabet_name, progress.next_index, upper_at_len + 1).await?;
+            let priority_boundary = find_priority_boundary(&mut tx, target.id, progress.candidate_len, active_alphabet_name, next_index, upper_at_len + 1).await?;
 
             // Whichever of the two starts first is this iteration's boundary
             // - `is_skip` says which, since only a skip run gets persisted
@@ -437,7 +492,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             // skip if that's what it is - without handing anything out this
             // iteration.
             if let Some((b_start, b_end, is_skip)) = boundary {
-                if b_start == progress.next_index {
+                if b_start == next_index {
                     if is_skip {
                         insert_skip_range(&mut tx, target.id, progress.candidate_len, b_start, b_end, active_alphabet_name, active_alphabet, None, now).await?;
                     }
@@ -472,7 +527,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                     &target.lower_bound,
                     &target.upper_bound,
                     progress.candidate_len,
-                    progress.next_index,
+                    next_index,
                 );
                 if let Some((skip_start, skip_end)) = transition.skip {
                     insert_skip_range(&mut tx, target.id, progress.candidate_len, skip_start, skip_end, active_alphabet_name, active_alphabet, None, now).await?;
@@ -491,8 +546,8 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             }
 
             let desired = (rate * config.target_chunk_seconds).round() as i64;
-            let natural_chunk = desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates).min(remaining);
-            let start_index = progress.next_index;
+            let natural_chunk = (desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates) as Pos).min(remaining);
+            let start_index = next_index;
             let natural_end = start_index + natural_chunk;
 
             // Only truncate at the boundary if the chunk that would
@@ -526,25 +581,19 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             persist_progress(&mut tx, target.id, new_len, new_next_index, &target.alphabet_name, &target.alphabet).await?;
 
             let lease_seconds = config.lease_seconds;
-            let range_id: i64 = sqlx::query_scalar(
-                "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
-                 assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, last_progress_at) \
-                 VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            let range_id = insert_claimed_range(
+                &mut tx,
+                target.id,
+                progress.candidate_len,
+                start_index,
+                end_index,
+                &target.alphabet_name,
+                &target.alphabet,
+                None,
+                user,
+                lease_seconds,
+                now,
             )
-            .bind(target.id)
-            .bind(progress.candidate_len)
-            .bind(start_index)
-            .bind(end_index)
-            .bind(user.id)
-            .bind(user.id)
-            .bind(now)
-            .bind(lease_seconds)
-            .bind(now + lease_seconds)
-            .bind(now)
-            .bind(&target.alphabet_name)
-            .bind(&target.alphabet)
-            .bind(now)
-            .fetch_one(&mut *tx)
             .await?;
 
             tx.commit().await?;
@@ -616,11 +665,13 @@ pub async fn heartbeat_range(
     if let Some(filename) = last_hash_a_match_filename {
         if let Some(new_progress) = resolve_progress_index(&mut tx, &range, &filename).await? {
             // Monotonic: never let a late/out-of-order heartbeat move progress backwards.
-            let floor = range.progress_index.unwrap_or(range.start_index - 1);
+            let floor = range.progress().unwrap_or(range.start() - 1);
             let new_progress = new_progress.max(floor);
             made_progress = new_progress > floor;
-            sqlx::query("UPDATE ranges SET progress_index = ? WHERE id = ?")
-                .bind(new_progress)
+            let (progress_block, progress_index) = split_pos(&range.alphabet, range.candidate_len, new_progress);
+            sqlx::query("UPDATE ranges SET progress_block = ?, progress_index = ? WHERE id = ?")
+                .bind(progress_block)
+                .bind(progress_index)
                 .bind(range_id)
                 .execute(&mut *tx)
                 .await?;
@@ -678,7 +729,7 @@ async fn resolve_progress_index(
     tx: &mut sqlx::SqliteConnection,
     range: &Range,
     filename: &str,
-) -> Result<Option<i64>, AppError> {
+) -> Result<Option<Pos>, AppError> {
     let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
         .bind(range.target_id)
         .fetch_one(&mut *tx)
@@ -698,7 +749,7 @@ async fn resolve_progress_index(
         tracing::warn!(range_id = range.id, filename, "heartbeat match candidate has out-of-alphabet characters, ignoring");
         return Ok(None);
     };
-    if index < range.start_index || index >= range.end_index {
+    if index < range.start() || index >= range.end() {
         tracing::warn!(range_id = range.id, filename, index, "heartbeat match index falls outside the range, ignoring");
         return Ok(None);
     }
@@ -856,7 +907,7 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
 /// thing to this range: whoever holds it isn't making progress, so hand
 /// whatever's left back to the pool.
 async fn release_range(tx: &mut sqlx::SqliteConnection, range: &Range, now: i64) -> Result<(), sqlx::Error> {
-    let fully_searched = matches!(range.progress_index, Some(p) if p + 1 >= range.end_index);
+    let fully_searched = matches!(range.progress(), Some(p) if p + 1 >= range.end());
 
     if fully_searched {
         sqlx::query(
@@ -893,15 +944,18 @@ async fn release_range(tx: &mut sqlx::SqliteConnection, range: &Range, now: i64)
 /// `pending` row for just the unsearched remainder. A row without a
 /// checkpoint is returned unchanged.
 async fn split_off_searched_portion(tx: &mut sqlx::SqliteConnection, range: Range, now: i64) -> Result<Range, sqlx::Error> {
-    let effective_start = match range.progress_index {
-        Some(p) if p + 1 > range.start_index => p + 1,
+    let effective_start = match range.progress() {
+        Some(p) if p + 1 > range.start() => p + 1,
         _ => return Ok(range),
     };
+    let (completed_end_block, completed_end) = split_end(&range.alphabet, range.candidate_len, effective_start);
+    let (effective_start_block, effective_start) = split_pos(&range.alphabet, range.candidate_len, effective_start);
 
     sqlx::query(
-        "UPDATE ranges SET end_index = ?, status = 'completed', completed_at = ?, progress_index = NULL WHERE id = ?",
+        "UPDATE ranges SET end_block = ?, end_index = ?, status = 'completed', completed_at = ?, progress_block = 0, progress_index = NULL WHERE id = ?",
     )
-    .bind(effective_start)
+    .bind(completed_end_block)
+    .bind(completed_end)
     .bind(now)
     .bind(range.id)
     .execute(&mut *tx)
@@ -914,13 +968,15 @@ async fn split_off_searched_portion(tx: &mut sqlx::SqliteConnection, range: Rang
     // priority range's work if the original was (see
     // `models::Range::priority_range_id`).
     let remainder = sqlx::query_as::<_, Range>(
-        "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, \
+        "INSERT INTO ranges (target_id, candidate_len, start_block, start_index, end_block, end_index, status, \
          assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id) \
-         VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?) RETURNING *",
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?) RETURNING *",
     )
     .bind(range.target_id)
     .bind(range.candidate_len)
+    .bind(effective_start_block)
     .bind(effective_start)
+    .bind(range.end_block)
     .bind(range.end_index)
     .bind(now)
     .bind(&range.alphabet_name)
@@ -967,41 +1023,43 @@ pub async fn priority_range_start(
     target_id: i64,
     candidate_len: i64,
     alphabet_name: &str,
-    start_index: i64,
-    end_index: i64,
-    mut next_index: i64,
-) -> Result<i64, AppError> {
-    let overlapping = sqlx::query_as::<_, PriorityRange>(
-        "SELECT * FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ? AND start_index < ? AND end_index > ? \
-         ORDER BY start_index",
-    )
-    .bind(target_id)
-    .bind(candidate_len)
-    .bind(alphabet_name)
-    .bind(end_index)
-    .bind(start_index)
-    .fetch_all(&mut *tx)
-    .await?;
+    start_index: Pos,
+    end_index: Pos,
+    mut next_index: Pos,
+) -> Result<Pos, AppError> {
+    // Overlap is checked here rather than in SQL, since a position is only
+    // comparable once its block and index are joined.
+    let mut overlapping: Vec<PriorityRange> =
+        sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ?")
+            .bind(target_id)
+            .bind(candidate_len)
+            .bind(alphabet_name)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .filter(|pr| pr.start() < end_index && pr.end() > start_index)
+            .collect();
+    overlapping.sort_by_key(|pr| pr.start());
 
     for pr in overlapping {
-        let first = index_to_candidate(&pr.alphabet, pr.start_index, pr.candidate_len);
-        let last = index_to_candidate(&pr.alphabet, pr.end_index - 1, pr.candidate_len);
-        if pr.next_index < pr.end_index {
+        let first = index_to_candidate(&pr.alphabet, pr.start(), pr.candidate_len);
+        let last = index_to_candidate(&pr.alphabet, pr.end() - 1, pr.candidate_len);
+        if pr.next() < pr.end() {
             return Err(AppError::BadRequest(format!(
                 "overlaps priority range #{} ('{first}' to '{last}'), which is still handing out work",
                 pr.id
             )));
         }
-        if pr.end_index <= next_index {
+        if pr.end() <= next_index {
             continue; // already behind where this one starts
         }
-        if pr.start_index > next_index {
+        if pr.start() > next_index {
             return Err(AppError::BadRequest(format!(
                 "overlaps work priority range #{} already handed out ('{first}' to '{last}') - a new priority range can only skip such work at its start",
                 pr.id
             )));
         }
-        next_index = pr.end_index;
+        next_index = pr.end();
     }
 
     if next_index >= end_index {
@@ -1017,11 +1075,11 @@ pub struct PriorityRangeRemoval {
     pub deleted: bool,
     /// Candidates handed back to the target's main sweep, which will search
     /// them when it gets there.
-    pub returned_to_main_sweep: i64,
+    pub returned_to_main_sweep: Pos,
     /// Candidates the main sweep has already jumped past (it never goes
     /// back), so they stay with this priority range - still handed out
     /// ahead of the main sweep - rather than never being searched at all.
-    pub kept: i64,
+    pub kept: Pos,
 }
 
 /// How far into `pr`'s span the target's main sweep has already gone past.
@@ -1033,14 +1091,14 @@ pub struct PriorityRangeRemoval {
 /// different alphabet isn't index-comparable to `pr`, so it's treated as
 /// having passed all of it - keeping work prioritized is always safe,
 /// giving it back is only safe when the sweep will really reach it.
-fn main_sweep_passed_to(progress: &TargetProgress, pr: &PriorityRange) -> i64 {
-    let carved_to = pr.next_index.min(pr.end_index);
+fn main_sweep_passed_to(progress: &TargetProgress, pr: &PriorityRange) -> Pos {
+    let carved_to = pr.next().min(pr.end());
     if progress.alphabet_name != pr.alphabet_name || progress.candidate_len > pr.candidate_len {
-        pr.end_index
+        pr.end()
     } else if progress.candidate_len < pr.candidate_len {
         carved_to
     } else {
-        progress.next_index.clamp(carved_to, pr.end_index)
+        progress.next().clamp(carved_to, pr.end())
     }
 }
 
@@ -1082,8 +1140,8 @@ pub async fn remove_priority_range(pool: &SqlitePool, priority_range_id: i64) ->
     let new_end = main_sweep_passed_to(&progress, &pr);
     let removal = PriorityRangeRemoval {
         deleted: false,
-        returned_to_main_sweep: pr.end_index - new_end,
-        kept: new_end - pr.next_index.min(pr.end_index),
+        returned_to_main_sweep: pr.end() - new_end,
+        kept: new_end - pr.next().min(pr.end()),
     };
 
     let ever_carved: Option<(i64,)> =
@@ -1093,7 +1151,13 @@ pub async fn remove_priority_range(pool: &SqlitePool, priority_range_id: i64) ->
         sqlx::query("DELETE FROM priority_ranges WHERE id = ?").bind(priority_range_id).execute(&mut *tx).await?;
         PriorityRangeRemoval { deleted: true, ..removal }
     } else {
-        sqlx::query("UPDATE priority_ranges SET end_index = ? WHERE id = ?").bind(new_end).bind(priority_range_id).execute(&mut *tx).await?;
+        let (end_block, end_index) = split_end(&pr.alphabet, pr.candidate_len, new_end);
+        sqlx::query("UPDATE priority_ranges SET end_block = ?, end_index = ? WHERE id = ?")
+            .bind(end_block)
+            .bind(end_index)
+            .bind(priority_range_id)
+            .execute(&mut *tx)
+            .await?;
         removal
     };
 
@@ -1144,14 +1208,14 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
         let representable =
             pr.candidate_len <= max_supported_len(new_alphabet) && prefix.chars().all(|c| candidate_to_index(new_alphabet, &c.to_string()).is_some());
         if !representable {
-            sqlx::query("UPDATE priority_ranges SET next_index = end_index WHERE id = ?").bind(pr.id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE priority_ranges SET next_block = end_block, next_index = end_index WHERE id = ?").bind(pr.id).execute(&mut *tx).await?;
             continue;
         }
 
         let (new_start, new_end_inclusive) = bound_indices_at_len(new_alphabet, prefix, prefix, pr.candidate_len);
         let new_end = new_end_inclusive + 1;
 
-        let new_next_index = if pr.next_index >= pr.end_index {
+        let new_next_index = if pr.next() >= pr.end() {
             // Already fully exhausted under the old alphabet - nothing to
             // resume, just carry the "done" state over to the new bounds.
             new_end
@@ -1161,7 +1225,7 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
             // this can produce is clipped to this row's own block, not the
             // whole target's space - see transition_alphabet_cursor's own
             // doc comment for the general algorithm.
-            let transition = transition_alphabet_cursor(&pr.alphabet, new_alphabet, prefix, prefix, pr.candidate_len, pr.next_index);
+            let transition = transition_alphabet_cursor(&pr.alphabet, new_alphabet, prefix, prefix, pr.candidate_len, pr.next());
             if let Some((skip_start, skip_end)) = transition.skip {
                 insert_skip_range(&mut *tx, target_id, pr.candidate_len, skip_start, skip_end, &pr.alphabet_name, &pr.alphabet, Some(pr.id), now).await?;
             }
@@ -1173,9 +1237,18 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
             transition.new_next_index.min(new_end)
         };
 
-        sqlx::query("UPDATE priority_ranges SET start_index = ?, end_index = ?, next_index = ?, alphabet_name = ?, alphabet = ? WHERE id = ?")
+        let (start_block, new_start) = split_pos(new_alphabet, pr.candidate_len, new_start);
+        let (end_block, new_end) = split_end(new_alphabet, pr.candidate_len, new_end);
+        let (next_block, new_next_index) = split_end(new_alphabet, pr.candidate_len, new_next_index);
+        sqlx::query(
+            "UPDATE priority_ranges SET start_block = ?, start_index = ?, end_block = ?, end_index = ?, next_block = ?, next_index = ?, \
+             alphabet_name = ?, alphabet = ? WHERE id = ?",
+        )
+            .bind(start_block)
             .bind(new_start)
+            .bind(end_block)
             .bind(new_end)
+            .bind(next_block)
             .bind(new_next_index)
             .bind(new_alphabet_name)
             .bind(new_alphabet)
@@ -1190,7 +1263,32 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alphabet::{index_to_candidate, max_supported_len, range_bound_filenames, space_size};
+    use crate::alphabet::{index_width, max_supported_len, Pos};
+
+    // `i64` versions of the alphabet's position functions, which is what the
+    // tests below work in: they stay at lengths up to `index_width`, where a
+    // position is block 0 and so equal to its stored index. Tests of longer
+    // lengths use `crate::alphabet`'s own functions directly.
+    fn space_size(alphabet: &str, len: i64) -> i64 {
+        i64::try_from(crate::alphabet::space_size(alphabet, len)).expect("tests here stay within index_width")
+    }
+
+    fn candidate_to_index(alphabet: &str, candidate: &str) -> Option<i64> {
+        crate::alphabet::candidate_to_index(alphabet, candidate).map(|p| i64::try_from(p).expect("tests here stay within index_width"))
+    }
+
+    fn index_to_candidate(alphabet: &str, index: i64, len: i64) -> String {
+        crate::alphabet::index_to_candidate(alphabet, index as Pos, len)
+    }
+
+    fn range_bound_filenames(alphabet: &str, prefix: &str, suffix: &str, len: i64, start_index: i64, end_index: i64) -> (String, String) {
+        crate::alphabet::range_bound_filenames(alphabet, prefix, suffix, len, start_index as Pos, end_index as Pos)
+    }
+
+    fn bound_indices_at_len(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64) -> (i64, i64) {
+        let (lo, hi) = crate::alphabet::bound_indices_at_len(alphabet, lower_bound, upper_bound, len);
+        (i64::try_from(lo).expect("tests here stay within index_width"), i64::try_from(hi).expect("tests here stay within index_width"))
+    }
 
     const DEFAULT: &str = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
     const SIZE42: &str = " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
@@ -1305,11 +1403,15 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        // Through crate::alphabet directly (not this module's i64 shims),
+        // so a bound longer than index_width works here too.
         let start_len = lower_bound.chars().count() as i64;
-        let start_index = crate::alphabet::candidate_to_index(alphabet, lower_bound).unwrap();
-        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, ?, ?)")
+        let start = crate::alphabet::candidate_to_index(alphabet, lower_bound).unwrap();
+        let (start_block, start_index) = crate::alphabet::split_pos(alphabet, start_len, start);
+        sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(target_id)
             .bind(start_len)
+            .bind(start_block)
             .bind(start_index)
             .bind(alphabet_name)
             .bind(alphabet)
@@ -1338,7 +1440,7 @@ mod tests {
         .await
         .unwrap();
         let start_len = lower_bound.chars().count() as i64;
-        let start_index = crate::alphabet::candidate_to_index(DEFAULT, lower_bound).unwrap();
+        let start_index = candidate_to_index(DEFAULT, lower_bound).unwrap();
         sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, 'size49', ?)")
             .bind(target_id)
             .bind(start_len)
@@ -1365,7 +1467,7 @@ mod tests {
         .await
         .unwrap();
         let start_len = lower_bound.chars().count() as i64;
-        let start_index = crate::alphabet::candidate_to_index(alphabet, lower_bound).unwrap();
+        let start_index = candidate_to_index(alphabet, lower_bound).unwrap();
         sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, 'custom', ?)")
             .bind(target_id)
             .bind(start_len)
@@ -1386,7 +1488,7 @@ mod tests {
     /// prefix. Passing `""` as `prefix` covers the entire `candidate_len`
     /// space, which is handy for tests that don't care about narrowing it.
     async fn insert_priority_range(pool: &SqlitePool, target_id: i64, alphabet: &str, alphabet_name: &str, priority: i64, prefix: &str, candidate_len: i64) -> i64 {
-        let (start_index, end_index_inclusive) = crate::alphabet::bound_indices_at_len(alphabet, prefix, prefix, candidate_len);
+        let (start_index, end_index_inclusive) = bound_indices_at_len(alphabet, prefix, prefix, candidate_len);
         let end_index = end_index_inclusive + 1;
         let now = now_unix();
         sqlx::query_scalar(
@@ -1527,42 +1629,104 @@ mod tests {
         assert_eq!(claim2.candidate_count, space_size(DEFAULT, 2), "second range should cover the whole (and only the) length-2 space");
     }
 
-    /// There's no admin-supplied max_len anymore ("always go as long as
-    /// possible") - the only real ceiling is `max_supported_len`, the largest
-    /// length whose index still fits an i64. Starts the target's bounds one
-    /// length below that ceiling (full space at both lengths) so only two
-    /// claims are needed to reach it and confirm claiming genuinely stops
-    /// there rather than inventing a length beyond what the server can index.
+    /// There's no admin-supplied max_len ("always go as long as possible") -
+    /// carving goes past index_width (where a position no longer fits one
+    /// stored i64) and only stops at max_supported_len, the client's own
+    /// limit. Long bounds that differ only near the end keep lengths 15 and
+    /// 16 tiny, so two claims reach the ceiling.
     #[tokio::test]
-    async fn range_carving_stops_at_the_true_max_supported_length() {
+    async fn range_carving_goes_past_index_width_and_stops_at_max_supported_len() {
         let pool = test_pool().await;
         let user = insert_user(&pool, "tester").await;
         let cap = max_supported_len(DEFAULT);
-        let (lower, upper) = full_bounds(DEFAULT, cap - 1);
+        assert!(cap > index_width(DEFAULT) + 1);
+        // Length 15: just these two. Length 16: each followed by any of the 49 characters.
+        let lower = format!("Y{}", "_".repeat(cap as usize - 2));
+        let upper = format!("Z{}", " ".repeat(cap as usize - 2));
         insert_target(&pool, &lower, &upper).await;
 
-        // Not test_config(): chunks this large need a rate to match, or the
-        // chunk-size calculation (rate * target_chunk_seconds) couldn't reach them.
-        let huge = space_size(DEFAULT, cap);
-        let config = RangeConfig {
-            target_chunk_seconds: 1.0,
-            default_rate_per_sec: huge as f64,
-            min_chunk_candidates: huge,
-            max_chunk_candidates: huge,
-            lease_seconds: 6 * 60 * 60,
-            reclaim_interval_secs: 30,
-            ema_alpha: 0.3,
-            stall_release_seconds: 24 * 60 * 60,
-        };
-
+        let config = test_config(1_000);
         let claim1 = claim_range(&pool, &config, &user).await.unwrap().expect(&format!("length {} should have work", cap - 1));
-        assert_eq!(claim1.candidate_count, space_size(DEFAULT, cap - 1));
+        assert_eq!(claim1.candidate_count, 2);
+        assert_eq!(claim1.lower_bound_filename, format!("PRE{lower}.SUF"));
+        assert_eq!(claim1.upper_bound_filename, format!("PRE{upper}.SUF"));
 
         let claim2 = claim_range(&pool, &config, &user).await.unwrap().expect(&format!("length {cap} (the ceiling) should have work"));
-        assert_eq!(claim2.candidate_count, space_size(DEFAULT, cap));
+        assert_eq!(claim2.candidate_count, 2 * 49);
+        assert_eq!(claim2.lower_bound_filename, format!("PRE{lower} .SUF"));
+        assert_eq!(claim2.upper_bound_filename, format!("PRE{upper}_.SUF"));
+
+        // Stored per leading prefix: its start is the last candidate under
+        // one prefix ("Y____"), its end just past the first under the next ("Z    ").
+        let range: Range = sqlx::query_as("SELECT * FROM ranges WHERE id = ?").bind(claim2.range_id).fetch_one(&pool).await.unwrap();
+        assert!(range.start_block > 0 && range.end_block == range.start_block + 1);
+        assert_eq!(range.start(), crate::alphabet::candidate_to_index(DEFAULT, &format!("{lower} ")).unwrap());
+        assert_eq!(range.end(), crate::alphabet::candidate_to_index(DEFAULT, &format!("{upper}_")).unwrap() + 1);
 
         let claim3 = claim_range(&pool, &config, &user).await.unwrap();
         assert!(claim3.is_none(), "max_supported_len is now fully carved - there must be no work beyond the true ceiling");
+    }
+
+    /// A heartbeat checkpoint and the split on reassignment work across a
+    /// leading-prefix boundary too, not just within one block.
+    #[tokio::test]
+    async fn heartbeat_progress_splits_a_range_straddling_two_leading_prefixes() {
+        let pool = test_pool().await;
+        let first_user = insert_user(&pool, "first").await;
+        let second_user = insert_user(&pool, "second").await;
+        // Length 12: the last candidate under leading "Y", then the first under "Z".
+        let (lower, upper) = (format!("Y{}", "_".repeat(11)), format!("Z{}", " ".repeat(11)));
+        insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(1_000);
+        let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
+        assert_eq!(claim.candidate_count, 2);
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(format!("PRE{lower}.SUF"))).await.unwrap();
+
+        sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
+        reclaim_expired(&pool).await.unwrap();
+        let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("the unsearched remainder");
+        assert_eq!(resumed.candidate_count, 1);
+        assert_eq!(resumed.lower_bound_filename, format!("PRE{upper}.SUF"));
+
+        let done: Range = sqlx::query_as("SELECT * FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.end(), crate::alphabet::candidate_to_index(DEFAULT, &upper).unwrap());
+    }
+
+    /// A priority range at a long length can span many leading prefixes -
+    /// here a whole one ("A" at length 12) - and is carved across them.
+    #[tokio::test]
+    async fn priority_range_spanning_leading_prefixes_is_carved_from_its_stored_blocks() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let target_id = insert_target(&pool, &format!(" {}", " ".repeat(11)), "_").await;
+        let (start, end_inclusive) = crate::alphabet::bound_indices_at_len(DEFAULT, "A", "A", 12);
+        let end = end_inclusive + 1;
+        assert!(end > i64::MAX as Pos, "must not fit a single i64");
+        let (start_block, start_index) = crate::alphabet::split_pos(DEFAULT, 12, start);
+        let (end_block, end_index) = crate::alphabet::split_end(DEFAULT, 12, end);
+        sqlx::query(
+            "INSERT INTO priority_ranges (target_id, priority, pattern, prefix, candidate_len, start_block, start_index, end_block, end_index, \
+             next_block, next_index, alphabet_name, alphabet, created_at) VALUES (?, 1, 'A', 'A', 12, ?, ?, ?, ?, ?, ?, 'size49', ?, 0)",
+        )
+        .bind(target_id)
+        .bind(start_block)
+        .bind(start_index)
+        .bind(end_block)
+        .bind(end_index)
+        .bind(start_block)
+        .bind(start_index)
+        .bind(DEFAULT)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let claim = claim_range(&pool, &test_config(1_000), &user).await.unwrap().expect("priority work");
+        assert_eq!(claim.lower_bound_filename, format!("PREA{}.SUF", " ".repeat(11)));
+        assert_eq!(claim.candidate_count, 1_000);
+        let pr: PriorityRange = sqlx::query_as("SELECT * FROM priority_ranges WHERE target_id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!((pr.start(), pr.next(), pr.end()), (start, start + 1_000, end));
     }
 
     /// The scenario this whole feature exists for: a client heartbeats a partial
@@ -1928,7 +2092,7 @@ mod tests {
         let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAAAAA", "ZZZZZZ").await;
 
         // Simulate carving having already reached "ABC001" under the old alphabet.
-        let cursor_index = crate::alphabet::candidate_to_index(old_alphabet, "ABC001").unwrap();
+        let cursor_index = candidate_to_index(old_alphabet, "ABC001").unwrap();
         sqlx::query("UPDATE target_progress SET candidate_len = 6, next_index = ? WHERE target_id = ?")
             .bind(cursor_index)
             .bind(target_id)
@@ -1960,7 +2124,7 @@ mod tests {
                 .expect("the old-alphabet remainder of the ABC block must be persisted as a skipped range");
         assert_eq!(skip_status, "skipped");
         assert_eq!(skip_start, cursor_index);
-        assert_eq!(skip_end, crate::alphabet::candidate_to_index(old_alphabet, "ABCAAA").unwrap(), "skip runs exactly up to the resume point, not the whole shared prefix block");
+        assert_eq!(skip_end, candidate_to_index(old_alphabet, "ABCAAA").unwrap(), "skip runs exactly up to the resume point, not the whole shared prefix block");
         assert_eq!(skip_alphabet, old_alphabet, "the skip range is denominated in the OLD alphabet, not the target's current one");
 
         let (progress_alphabet_name, progress_alphabet): (String, String) =
@@ -2010,7 +2174,7 @@ mod tests {
         let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAAAAA", "ZZZZZZ").await;
-        let cursor_index = crate::alphabet::candidate_to_index(old_alphabet, "ABC001").unwrap();
+        let cursor_index = candidate_to_index(old_alphabet, "ABC001").unwrap();
         sqlx::query("UPDATE target_progress SET next_index = ? WHERE target_id = ?").bind(cursor_index).bind(target_id).execute(&pool).await.unwrap();
         sqlx::query("UPDATE targets SET alphabet_name = 'letters_only', alphabet = ?, start_len = 7 WHERE id = ?")
             .bind(new_alphabet)
@@ -2294,7 +2458,7 @@ mod tests {
 
     async fn start_for(pool: &SqlitePool, target_id: i64, start_index: i64, end_index: i64, next_index: i64) -> Result<i64, AppError> {
         let mut conn = pool.acquire().await.unwrap();
-        priority_range_start(&mut conn, target_id, 2, "letters", start_index, end_index, next_index).await
+        priority_range_start(&mut conn, target_id, 2, "letters", start_index.into(), end_index.into(), next_index.into()).await.map(|p| p as i64)
     }
 
     /// The case this exists for: a finished priority range (here "M", MA-MZ
@@ -2416,7 +2580,7 @@ mod tests {
         // The cursor is 5 candidates into length 2, and this row's span (AA-AZ)
         // starts there - so its first 5 are already searched by the sweep.
         sqlx::query("UPDATE target_progress SET candidate_len = 2, next_index = 5 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
-        let (start_index, end_index_inclusive) = crate::alphabet::bound_indices_at_len(letters, "A", "A", 2);
+        let (start_index, end_index_inclusive) = bound_indices_at_len(letters, "A", "A", 2);
         let clamped_next_index = start_index + 5;
         let priority_range_id: i64 = sqlx::query_scalar(
             "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
@@ -2455,7 +2619,7 @@ mod tests {
         let priority_range_id = insert_priority_range(&pool, target_id, old_alphabet, "digits_and_letters", 10, "ABC", 6).await;
 
         // Simulate this priority range having already carved partway through its own block.
-        let cursor_index = crate::alphabet::candidate_to_index(old_alphabet, "ABC001").unwrap();
+        let cursor_index = candidate_to_index(old_alphabet, "ABC001").unwrap();
         sqlx::query("UPDATE priority_ranges SET next_index = ? WHERE id = ?").bind(cursor_index).bind(priority_range_id).execute(&pool).await.unwrap();
 
         let mut tx = pool.begin().await.unwrap();
@@ -2470,10 +2634,10 @@ mod tests {
                 .unwrap();
         assert_eq!(alphabet_name, "letters_only");
         assert_eq!(alphabet, new_alphabet);
-        let (exp_start, exp_end_inclusive) = crate::alphabet::bound_indices_at_len(new_alphabet, "ABC", "ABC", 6);
+        let (exp_start, exp_end_inclusive) = bound_indices_at_len(new_alphabet, "ABC", "ABC", 6);
         assert_eq!(start_index, exp_start, "bounds must be recomputed for the same prefix under the new alphabet");
         assert_eq!(end_index, exp_end_inclusive + 1);
-        assert_eq!(next_index, crate::alphabet::candidate_to_index(new_alphabet, "ABCAAA").unwrap(), "resumes at the first candidate expressible in the new alphabet");
+        assert_eq!(next_index, candidate_to_index(new_alphabet, "ABCAAA").unwrap(), "resumes at the first candidate expressible in the new alphabet");
 
         let (skip_status, skip_alphabet, skip_priority_range_id): (String, String, Option<i64>) =
             sqlx::query_as("SELECT status, alphabet, priority_range_id FROM ranges WHERE target_id = ? AND status = 'skipped'")
@@ -2537,7 +2701,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(alphabet_name, "letters_only");
-        let (exp_start, exp_end_inclusive) = crate::alphabet::bound_indices_at_len(new_alphabet, "ABC", "ABC", 3);
+        let (exp_start, exp_end_inclusive) = bound_indices_at_len(new_alphabet, "ABC", "ABC", 3);
         assert_eq!(start_index, exp_start);
         assert_eq!(end_index, exp_end_inclusive + 1);
         assert_eq!(next_index, end_index, "stays exhausted under the new bounds too");

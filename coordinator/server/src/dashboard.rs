@@ -9,9 +9,9 @@ use axum::response::Html;
 use axum::Json;
 use serde::Serialize;
 
-use crate::alphabet::{bound_indices_at_len, index_to_candidate, max_supported_len};
+use crate::alphabet::{bound_indices_at_len, index_to_candidate, join_pos, max_supported_len, Pos};
 use crate::error::AppError;
-use crate::models::i64_to_u32;
+use crate::models::{i64_to_u32, PriorityRange};
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -66,7 +66,7 @@ pub struct DashboardTarget {
     /// each `DashboardPriorityRange` so the dashboard can show the (never
     /// persisted - see `ranges::find_priority_boundary`) gap between them.
     pub cursor_candidate_len: i64,
-    pub cursor_next_index: i64,
+    pub cursor_next_index: Pos,
     pub cursor_candidate: String,
     /// Where the main sweep's position falls among `ranges`: right after
     /// this range, or before all of them if `None`.
@@ -90,8 +90,8 @@ pub struct DashboardGap {
     pub first_candidate: String,
     pub last_len: i64,
     pub last_candidate: String,
-    /// How many candidates it covers (saturating, for display).
-    pub count: i64,
+    /// How many candidates it covers.
+    pub count: Pos,
 }
 
 /// The gaps between consecutive ranges in `ranges` (already ordered by
@@ -109,7 +109,7 @@ fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str)
             continue;
         }
         // (length, first index, end index exclusive), one per length.
-        let mut pieces: Vec<(i64, i64, i64)> = Vec::new();
+        let mut pieces: Vec<(i64, Pos, Pos)> = Vec::new();
         if a.candidate_len == b.candidate_len {
             pieces.push((a.candidate_len, a.end_index, b.start_index));
         } else {
@@ -130,7 +130,7 @@ fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str)
             first_candidate: index_to_candidate(&a.alphabet, first, first_len),
             last_len,
             last_candidate: index_to_candidate(&a.alphabet, last_end - 1, last_len),
-            count: pieces.iter().fold(0i64, |sum, &(_, from, to)| sum.saturating_add(to - from)),
+            count: pieces.iter().map(|&(_, from, to)| to - from).sum(),
         });
     }
     gaps
@@ -146,12 +146,12 @@ fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str)
 /// end, just as the sweep itself will.
 fn effective_sweep_position(
     mut len: i64,
-    mut index: i64,
+    mut index: Pos,
     alphabet: &str,
     priority_ranges: &[DashboardPriorityRange],
     lower_bound: &str,
     upper_bound: &str,
-) -> (i64, i64) {
+) -> (i64, Pos) {
     let max_len = max_supported_len(alphabet);
     loop {
         let covering = priority_ranges
@@ -173,7 +173,7 @@ fn effective_sweep_position(
 /// The last range in `ranges` (ordered by length, then start) that starts
 /// before the main sweep's position - so the sweep marker goes right after
 /// it. `None` if the sweep is before every range.
-fn sweep_after_range_id(ranges: &[DashboardRange], cursor_len: i64, cursor_next_index: i64) -> Option<i64> {
+fn sweep_after_range_id(ranges: &[DashboardRange], cursor_len: i64, cursor_next_index: Pos) -> Option<i64> {
     ranges
         .iter()
         .take_while(|r| (r.candidate_len, r.start_index) < (cursor_len, cursor_next_index))
@@ -187,9 +187,9 @@ pub struct DashboardPriorityRange {
     pub priority: i64,
     pub pattern: String,
     pub candidate_len: i64,
-    pub start_index: i64,
-    pub end_index: i64,
-    pub next_index: i64,
+    pub start_index: Pos,
+    pub end_index: Pos,
+    pub next_index: Pos,
     pub first_candidate: String,
     pub last_candidate: String,
     /// `None` once this priority range is exhausted (`next_index == end_index`)
@@ -199,13 +199,38 @@ pub struct DashboardPriorityRange {
     pub alphabet: String,
 }
 
+/// One row of the dashboard's range query - positions still split into
+/// block and index, as stored (see `alphabet::split_pos`).
+#[derive(sqlx::FromRow)]
+struct RangeRow {
+    target_id: i64,
+    id: i64,
+    status: String,
+    candidate_len: i64,
+    start_block: i64,
+    start_index: i64,
+    end_block: i64,
+    end_index: i64,
+    progress_block: i64,
+    progress_index: Option<i64>,
+    worker: Option<String>,
+    worker_backend: Option<String>,
+    assigned_at: Option<i64>,
+    lease_expires_at: Option<i64>,
+    completed_at: Option<i64>,
+    created_at: i64,
+    alphabet_name: String,
+    alphabet: String,
+    priority_range_id: Option<i64>,
+}
+
 #[derive(Serialize)]
 pub struct DashboardRange {
     pub id: i64,
     pub status: String,
     pub candidate_len: i64,
-    pub start_index: i64,
-    pub end_index: i64,
+    pub start_index: Pos,
+    pub end_index: Pos,
     /// The actual first/last candidate strings this range covers - `end_index`
     /// itself is exclusive (see `range_bound_filenames`), so the last candidate
     /// is decoded from `end_index - 1`.
@@ -268,47 +293,44 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     // how many targets exist) and group by target_id in memory instead.
     // Each table's own ORDER BY is preserved per-group because HashMap's
     // `entry().or_default().push()` keeps insertion order within a bucket.
-    #[allow(clippy::type_complexity)]
-    let all_ranges: Vec<(i64, i64, String, i64, i64, i64, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, i64, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT ranges.target_id, ranges.id, ranges.status, ranges.candidate_len, ranges.start_index, ranges.end_index, \
-                ranges.progress_index, worker.username || '@' || worker.hostname, NULLIF(worker.backend, ''), \
+    let all_ranges: Vec<RangeRow> = sqlx::query_as(
+        "SELECT ranges.target_id, ranges.id, ranges.status, ranges.candidate_len, ranges.start_block, ranges.start_index, \
+                ranges.end_block, ranges.end_index, ranges.progress_block, ranges.progress_index, \
+                worker.username || '@' || worker.hostname AS worker, NULLIF(worker.backend, '') AS worker_backend, \
                 ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
                 ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id \
          FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
-         ORDER BY ranges.candidate_len, ranges.start_index",
+         ORDER BY ranges.candidate_len, ranges.start_block, ranges.start_index",
     )
     .fetch_all(&state.pool)
     .await?;
-    let mut ranges_by_target: HashMap<i64, Vec<_>> = HashMap::new();
+    let mut ranges_by_target: HashMap<i64, Vec<RangeRow>> = HashMap::new();
     for row in all_ranges {
-        let target_id = row.0;
-        ranges_by_target.entry(target_id).or_default().push(row);
+        ranges_by_target.entry(row.target_id).or_default().push(row);
     }
 
     // start_len rides along here rather than in target_rows above, which is
     // already at sqlx's 16-column tuple limit.
-    let all_progress: Vec<(i64, i64, i64, String, i64)> = sqlx::query_as(
-        "SELECT target_progress.target_id, target_progress.candidate_len, target_progress.next_index, target_progress.alphabet, targets.start_len \
+    let all_progress: Vec<(i64, i64, i64, i64, String, i64)> = sqlx::query_as(
+        "SELECT target_progress.target_id, target_progress.candidate_len, target_progress.next_block, target_progress.next_index, \
+                target_progress.alphabet, targets.start_len \
          FROM target_progress JOIN targets ON targets.id = target_progress.target_id",
     )
     .fetch_all(&state.pool)
     .await?;
-    let progress_by_target: HashMap<i64, (i64, i64, String, i64)> = all_progress
+    let progress_by_target: HashMap<i64, (i64, Pos, String, i64)> = all_progress
         .into_iter()
-        .map(|(target_id, candidate_len, next_index, alphabet, start_len)| (target_id, (candidate_len, next_index, alphabet, start_len)))
+        .map(|(target_id, candidate_len, next_block, next_index, alphabet, start_len)| {
+            let next = join_pos(&alphabet, candidate_len, next_block, next_index);
+            (target_id, (candidate_len, next, alphabet, start_len))
+        })
         .collect();
 
-    #[allow(clippy::type_complexity)]
-    let all_priority_ranges: Vec<(i64, i64, i64, String, i64, i64, i64, i64, String, String)> = sqlx::query_as(
-        "SELECT target_id, id, priority, pattern, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet \
-         FROM priority_ranges ORDER BY priority DESC, created_at ASC",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let mut priority_ranges_by_target: HashMap<i64, Vec<_>> = HashMap::new();
-    for row in all_priority_ranges {
-        let target_id = row.0;
-        priority_ranges_by_target.entry(target_id).or_default().push(row);
+    let all_priority_ranges: Vec<PriorityRange> =
+        sqlx::query_as("SELECT * FROM priority_ranges ORDER BY priority DESC, created_at ASC").fetch_all(&state.pool).await?;
+    let mut priority_ranges_by_target: HashMap<i64, Vec<PriorityRange>> = HashMap::new();
+    for pr in all_priority_ranges {
+        priority_ranges_by_target.entry(pr.target_id).or_default().push(pr);
     }
 
     let mut targets = Vec::with_capacity(target_rows.len());
@@ -317,37 +339,37 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
 
         let ranges: Vec<DashboardRange> = range_rows
             .into_iter()
-            .map(
-                |(_target_id, range_id, r_status, candidate_len, start_index, end_index, progress_index, worker, worker_backend, assigned_at, lease_expires_at, completed_at, created_at, range_alphabet_name, range_alphabet, priority_range_id)| {
-                    // Each range is decoded with its OWN alphabet, not the
-                    // target's current one - a range carved before the
-                    // target's alphabet was last patched (see
-                    // handlers::admin_patch_target) must still be shown with
-                    // the alphabet it actually holds candidates in.
-                    DashboardRange {
-                        id: range_id,
-                        status: r_status,
-                        candidate_len,
-                        start_index,
-                        end_index,
-                        first_candidate: index_to_candidate(&range_alphabet, start_index, candidate_len),
-                        last_candidate: index_to_candidate(&range_alphabet, end_index - 1, candidate_len),
-                        progress_candidate: progress_index.map(|p| index_to_candidate(&range_alphabet, p, candidate_len)),
-                        progress_percent: progress_index.map(|p| {
-                            (p - start_index + 1) as f64 / (end_index - start_index) as f64 * 100.0
-                        }),
-                        worker,
-                        worker_backend,
-                        assigned_at,
-                        lease_expires_at,
-                        completed_at,
-                        created_at,
-                        alphabet_name: range_alphabet_name,
-                        alphabet: range_alphabet,
-                        priority_range_id,
-                    }
-                },
-            )
+            .map(|row| {
+                // Each range is decoded with its OWN alphabet, not the
+                // target's current one - a range carved before the
+                // target's alphabet was last patched (see
+                // handlers::admin_patch_target) must still be shown with
+                // the alphabet it actually holds candidates in.
+                let len = row.candidate_len;
+                let start_index = join_pos(&row.alphabet, len, row.start_block, row.start_index);
+                let end_index = join_pos(&row.alphabet, len, row.end_block, row.end_index);
+                let progress_index = row.progress_index.map(|p| join_pos(&row.alphabet, len, row.progress_block, p));
+                DashboardRange {
+                    id: row.id,
+                    status: row.status,
+                    candidate_len: len,
+                    start_index,
+                    end_index,
+                    first_candidate: index_to_candidate(&row.alphabet, start_index, len),
+                    last_candidate: index_to_candidate(&row.alphabet, end_index - 1, len),
+                    progress_candidate: progress_index.map(|p| index_to_candidate(&row.alphabet, p, len)),
+                    progress_percent: progress_index.map(|p| (p - start_index + 1) as f64 / (end_index - start_index) as f64 * 100.0),
+                    worker: row.worker,
+                    worker_backend: row.worker_backend,
+                    assigned_at: row.assigned_at,
+                    lease_expires_at: row.lease_expires_at,
+                    completed_at: row.completed_at,
+                    created_at: row.created_at,
+                    alphabet_name: row.alphabet_name,
+                    alphabet: row.alphabet,
+                    priority_range_id: row.priority_range_id,
+                }
+            })
             .collect();
 
         let (mut stored_cursor_len, mut stored_cursor_next_index, mut cursor_alphabet, start_len) = progress_by_target
@@ -367,19 +389,22 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         let priority_range_rows = priority_ranges_by_target.remove(&id).unwrap_or_default();
         let priority_ranges = priority_range_rows
             .into_iter()
-            .map(|(_target_id, pr_id, pr_priority, pattern, candidate_len, start_index, end_index, next_index, pr_alphabet_name, pr_alphabet)| DashboardPriorityRange {
-                id: pr_id,
-                priority: pr_priority,
-                pattern,
-                candidate_len,
-                start_index,
-                end_index,
-                next_index,
-                first_candidate: index_to_candidate(&pr_alphabet, start_index, candidate_len),
-                last_candidate: index_to_candidate(&pr_alphabet, end_index - 1, candidate_len),
-                next_candidate: (next_index < end_index).then(|| index_to_candidate(&pr_alphabet, next_index, candidate_len)),
-                alphabet_name: pr_alphabet_name,
-                alphabet: pr_alphabet,
+            .map(|pr| {
+                let (start_index, end_index, next_index) = (pr.start(), pr.end(), pr.next());
+                DashboardPriorityRange {
+                    id: pr.id,
+                    priority: pr.priority,
+                    candidate_len: pr.candidate_len,
+                    start_index,
+                    end_index,
+                    next_index,
+                    first_candidate: index_to_candidate(&pr.alphabet, start_index, pr.candidate_len),
+                    last_candidate: index_to_candidate(&pr.alphabet, end_index - 1, pr.candidate_len),
+                    next_candidate: (next_index < end_index).then(|| index_to_candidate(&pr.alphabet, next_index, pr.candidate_len)),
+                    pattern: pr.pattern,
+                    alphabet_name: pr.alphabet_name,
+                    alphabet: pr.alphabet,
+                }
             })
             .collect::<Vec<_>>();
 
@@ -429,7 +454,7 @@ mod tests {
 
     const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-    fn range(id: i64, candidate_len: i64, start_index: i64, end_index: i64) -> DashboardRange {
+    fn range(id: i64, candidate_len: i64, start_index: Pos, end_index: Pos) -> DashboardRange {
         DashboardRange {
             id,
             status: "completed".into(),
@@ -452,7 +477,7 @@ mod tests {
         }
     }
 
-    fn summary(g: &DashboardGap) -> (i64, i64, &str, i64, &str, i64) {
+    fn summary(g: &DashboardGap) -> (i64, i64, &str, i64, &str, Pos) {
         (g.after_range_id, g.first_len, g.first_candidate.as_str(), g.last_len, g.last_candidate.as_str(), g.count)
     }
 
@@ -478,7 +503,7 @@ mod tests {
         assert!(gaps_between(&ranges, "A", "Z").is_empty());
     }
 
-    fn priority_range(candidate_len: i64, start_index: i64, end_index: i64) -> DashboardPriorityRange {
+    fn priority_range(candidate_len: i64, start_index: Pos, end_index: Pos) -> DashboardPriorityRange {
         DashboardPriorityRange {
             id: 0,
             priority: 0,

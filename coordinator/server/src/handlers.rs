@@ -11,7 +11,7 @@ use namebreak_protocol::{
 
 use crate::alphabet::{
     alphabet_size, bound_indices_at_len, bounds_are_valid, bounds_diverge_immediately, candidate_to_index, compile_skip_regex, expand_priority_pattern,
-    lookup_predefined_alphabet, max_supported_len, PREDEFINED_ALPHABETS,
+    lookup_predefined_alphabet, max_supported_len, split_end, split_pos, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
@@ -262,9 +262,11 @@ pub async fn admin_create_target(
     // character, which is exactly the right constraint there too).
     let start_len = req.start_len;
     let start_index = bound_indices_at_len(alphabet, lower_bound, upper_bound, start_len).0;
-    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, ?, ?)")
+    let (start_block, start_index) = split_end(alphabet, start_len, start_index);
+    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(target_id)
         .bind(start_len)
+        .bind(start_block)
         .bind(start_index)
         .bind(alphabet_name)
         .bind(alphabet)
@@ -485,7 +487,7 @@ pub async fn admin_create_priority_range(
     for prefix in &prefixes {
         let (start_index, end_index_inclusive) = bound_indices_at_len(&target.alphabet, prefix, prefix, req.length);
         let end_index = end_index_inclusive + 1;
-        let next_index = if clamp_to_cursor { start_index.max(progress.next_index) } else { start_index };
+        let next_index = if clamp_to_cursor { start_index.max(progress.next()) } else { start_index };
         if next_index >= end_index {
             return Err(AppError::BadRequest(format!(
                 "prefix '{prefix}' at length {} has already been fully searched by the main sweep - nothing left to prioritize",
@@ -507,17 +509,24 @@ pub async fn admin_create_priority_range(
                 other => other,
             })?;
 
+        let (start_block, start_index) = split_pos(&target.alphabet, req.length, start_index);
+        let (end_block, end_index) = split_end(&target.alphabet, req.length, end_index);
+        let (next_block, next_index) = split_end(&target.alphabet, req.length, next_index);
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO priority_ranges (target_id, priority, pattern, prefix, candidate_len, start_index, end_index, next_index, alphabet_name, alphabet, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO priority_ranges (target_id, priority, pattern, prefix, candidate_len, start_block, start_index, end_block, end_index, \
+             next_block, next_index, alphabet_name, alphabet, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(target_id)
         .bind(req.priority)
         .bind(&req.pattern)
         .bind(prefix)
         .bind(req.length)
+        .bind(start_block)
         .bind(start_index)
+        .bind(end_block)
         .bind(end_index)
+        .bind(next_block)
         .bind(next_index)
         .bind(&target.alphabet_name)
         .bind(&target.alphabet)

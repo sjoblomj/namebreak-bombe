@@ -1,3 +1,5 @@
+use crate::alphabet::{join_pos, Pos};
+
 // Several fields on these row types round-trip DB columns via `SELECT *` /
 // sqlx::FromRow without every field being read back in application code -
 // they're still needed for the row shape to match the table.
@@ -68,6 +70,15 @@ pub struct TargetProgress {
     /// which lazily reconciles the two the next time it carves.
     pub alphabet_name: String,
     pub alphabet: String,
+    /// `next_index`'s block - see `alphabet::split_pos`. Always read the
+    /// cursor's position through `next()`, which joins the two.
+    pub next_block: i64,
+}
+
+impl TargetProgress {
+    pub fn next(&self) -> Pos {
+        join_pos(&self.alphabet, self.candidate_len, self.next_block, self.next_index)
+    }
 }
 
 #[allow(dead_code)]
@@ -104,6 +115,26 @@ pub struct Range {
     /// advance - `None` while it isn't currently claimed. See
     /// `ranges::heartbeat_range` and `STALL_RELEASE_SECONDS`.
     pub last_progress_at: Option<i64>,
+    /// The blocks of `start_index`/`end_index`/`progress_index` - see
+    /// `alphabet::split_pos`. Always read positions through `start()`,
+    /// `end()` and `progress()`, which join the two.
+    pub start_block: i64,
+    pub end_block: i64,
+    pub progress_block: i64,
+}
+
+impl Range {
+    pub fn start(&self) -> Pos {
+        join_pos(&self.alphabet, self.candidate_len, self.start_block, self.start_index)
+    }
+
+    pub fn end(&self) -> Pos {
+        join_pos(&self.alphabet, self.candidate_len, self.end_block, self.end_index)
+    }
+
+    pub fn progress(&self) -> Option<Pos> {
+        self.progress_index.map(|index| join_pos(&self.alphabet, self.candidate_len, self.progress_block, index))
+    }
 }
 
 #[allow(dead_code)]
@@ -141,6 +172,26 @@ pub struct PriorityRange {
     pub alphabet_name: String,
     pub alphabet: String,
     pub created_at: i64,
+    /// The blocks of `start_index`/`end_index`/`next_index` - see
+    /// `alphabet::split_pos`. Always read positions through `start()`,
+    /// `end()` and `next()`, which join the two.
+    pub start_block: i64,
+    pub end_block: i64,
+    pub next_block: i64,
+}
+
+impl PriorityRange {
+    pub fn start(&self) -> Pos {
+        join_pos(&self.alphabet, self.candidate_len, self.start_block, self.start_index)
+    }
+
+    pub fn end(&self) -> Pos {
+        join_pos(&self.alphabet, self.candidate_len, self.end_block, self.end_index)
+    }
+
+    pub fn next(&self) -> Pos {
+        join_pos(&self.alphabet, self.candidate_len, self.next_block, self.next_index)
+    }
 }
 
 /// Stores a `u32` hash in an `i64` column without sign issues (always non-negative,
