@@ -9,7 +9,7 @@ use axum::response::Html;
 use axum::Json;
 use serde::Serialize;
 
-use crate::alphabet::{bound_indices_at_len, index_to_candidate};
+use crate::alphabet::{bound_indices_at_len, index_to_candidate, max_supported_len};
 use crate::error::AppError;
 use crate::models::i64_to_u32;
 use crate::state::AppState;
@@ -57,10 +57,11 @@ pub struct DashboardTarget {
     /// The resolved characters behind `alphabet_name`, for the dashboard's
     /// hover tooltip.
     pub alphabet: String,
-    /// Where the target's own main sweep currently is - see
-    /// `models::TargetProgress`. Compared against each `DashboardPriorityRange`
-    /// so the dashboard can show the (never persisted - see
-    /// `ranges::find_priority_boundary`) gap between them.
+    /// Where the target's own main sweep will carve next - its stored
+    /// position, moved past any priority range span it would jump over on
+    /// its next carve (see `effective_sweep_position`). Compared against
+    /// each `DashboardPriorityRange` so the dashboard can show the (never
+    /// persisted - see `ranges::find_priority_boundary`) gap between them.
     pub cursor_candidate_len: i64,
     pub cursor_next_index: i64,
     pub cursor_candidate: String,
@@ -130,6 +131,40 @@ fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str)
         });
     }
     gaps
+}
+
+/// Where the main sweep will carve next. Its stored position only moves
+/// when it carves, and it jumps over a priority range's span only then (see
+/// `ranges::claim_range`) - so until it next carves, the stored position can
+/// sit at the start of work a priority range has already handed out, for
+/// instance when that priority range was created while the sweep was
+/// partway into its span. This moves past any such span, continuing at the
+/// next length (within the target's bounds) when one runs to a length's
+/// end, just as the sweep itself will.
+fn effective_sweep_position(
+    mut len: i64,
+    mut index: i64,
+    alphabet: &str,
+    priority_ranges: &[DashboardPriorityRange],
+    lower_bound: &str,
+    upper_bound: &str,
+) -> (i64, i64) {
+    let max_len = max_supported_len(alphabet);
+    loop {
+        let covering = priority_ranges
+            .iter()
+            .find(|pr| pr.alphabet == alphabet && pr.candidate_len == len && pr.start_index <= index && index < pr.end_index);
+        if let Some(pr) = covering {
+            index = pr.end_index;
+            continue;
+        }
+        let (_, upper) = bound_indices_at_len(alphabet, lower_bound, upper_bound, len);
+        if index <= upper || len >= max_len {
+            return (len, index);
+        }
+        len += 1;
+        index = bound_indices_at_len(alphabet, lower_bound, upper_bound, len).0;
+    }
 }
 
 /// The last range in `ranges` (ordered by length, then start) that starts
@@ -304,13 +339,11 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             )
             .collect();
 
-        let (cursor_candidate_len, cursor_next_index, cursor_alphabet) = progress_by_target
+        let (stored_cursor_len, stored_cursor_next_index, cursor_alphabet) = progress_by_target
             .get(&id)
             .cloned()
             .ok_or_else(|| AppError::Internal(format!("missing target_progress row for target {id}")))?;
-        let cursor_candidate = index_to_candidate(&cursor_alphabet, cursor_next_index, cursor_candidate_len);
         let gaps = gaps_between(&ranges, &lower_bound, &upper_bound);
-        let sweep_after_range_id = sweep_after_range_id(&ranges, cursor_candidate_len, cursor_next_index);
 
         let priority_range_rows = priority_ranges_by_target.remove(&id).unwrap_or_default();
         let priority_ranges = priority_range_rows
@@ -329,7 +362,12 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                 alphabet_name: pr_alphabet_name,
                 alphabet: pr_alphabet,
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        let (cursor_candidate_len, cursor_next_index) =
+            effective_sweep_position(stored_cursor_len, stored_cursor_next_index, &cursor_alphabet, &priority_ranges, &lower_bound, &upper_bound);
+        let cursor_candidate = index_to_candidate(&cursor_alphabet, cursor_next_index, cursor_candidate_len);
+        let sweep_after_range_id = sweep_after_range_id(&ranges, cursor_candidate_len, cursor_next_index);
 
         targets.push(DashboardTarget {
             id,
@@ -418,6 +456,44 @@ mod tests {
         // Back to back across a length boundary: no gap.
         let ranges = vec![range(1, 1, 0, 26), range(2, 2, 0, 5)];
         assert!(gaps_between(&ranges, "A", "Z").is_empty());
+    }
+
+    fn priority_range(candidate_len: i64, start_index: i64, end_index: i64) -> DashboardPriorityRange {
+        DashboardPriorityRange {
+            id: 0,
+            priority: 0,
+            pattern: String::new(),
+            candidate_len,
+            start_index,
+            end_index,
+            next_index: end_index,
+            first_candidate: String::new(),
+            last_candidate: String::new(),
+            next_candidate: None,
+            alphabet_name: "letters".into(),
+            alphabet: LETTERS.into(),
+        }
+    }
+
+    #[test]
+    fn effective_sweep_position_moves_past_priority_ranges_at_the_stored_position() {
+        // A priority range created while the sweep was partway into its span
+        // (MA-MZ = 312..338, sweep at 320): the sweep will jump to its end.
+        let prs = vec![priority_range(2, 312, 338)];
+        assert_eq!(effective_sweep_position(2, 320, LETTERS, &prs, "AA", "ZZ"), (2, 338));
+        // Back-to-back spans are all skipped.
+        let prs = vec![priority_range(2, 312, 338), priority_range(2, 338, 364)];
+        assert_eq!(effective_sweep_position(2, 312, LETTERS, &prs, "AA", "ZZ"), (2, 364));
+        // Nothing at the stored position: it stays.
+        assert_eq!(effective_sweep_position(2, 300, LETTERS, &prs, "AA", "ZZ"), (2, 300));
+    }
+
+    #[test]
+    fn effective_sweep_position_continues_at_the_next_length() {
+        // A span running to the end of length 2 (ZA-ZZ = 650..676) moves the
+        // sweep to the start of length 3.
+        let prs = vec![priority_range(2, 650, 676)];
+        assert_eq!(effective_sweep_position(2, 650, LETTERS, &prs, "AA", "ZZZ"), (3, 0));
     }
 
     #[test]
