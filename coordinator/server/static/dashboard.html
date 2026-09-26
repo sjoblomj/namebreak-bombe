@@ -85,6 +85,23 @@
     margin-right: 6px;
   }
   .subhead.stale #status-dot { background: var(--pending); }
+  .notify {
+    margin-left: 14px;
+  }
+  .notify-btn {
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    cursor: pointer;
+  }
+  .notify-btn:hover { border-color: var(--accent); }
+  .notify-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .notify-btn.on { color: #fff; background: var(--accent); border-color: var(--accent); }
   .targets {
     display: flex;
     flex-direction: column;
@@ -540,7 +557,7 @@
 </head>
 <body>
   <h1>namebreak coordinator</h1>
-  <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span></div>
+  <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span></div>
   <div id="targets" class="targets"></div>
 
 <script>
@@ -1442,6 +1459,101 @@
       statusEl.textContent = 'update failed (' + err.message + ') - reload to retry';
       statusEl.removeAttribute('title');
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // Desktop notifications when a target is found. The page itself loads
+  // its data once, so this polls the small /api/v1/status endpoint in the
+  // background instead of redrawing everything (which would close expanded
+  // rows and reset tabs); a new find also redraws the page once. Whether
+  // it's on, and which finds were already announced, are remembered per
+  // browser - so a find that happened while the page was closed is still
+  // announced next time it's opened, and no find is announced twice.
+  // ---------------------------------------------------------------------
+  const NOTIFY_POLL_MS = 60 * 1000;
+  const NOTIFY_ENABLED_KEY = 'namebreak-notify-enabled';
+  const NOTIFY_SEEN_KEY = 'namebreak-notify-seen-solved';
+  const notifyEl = document.getElementById('notify');
+  let notifyTimer = null;
+
+  function storageGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function storageSet(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) { /* not remembered, that's all */ }
+  }
+
+  function notificationsOn() {
+    return storageGet(NOTIFY_ENABLED_KEY) === 'true' && Notification.permission === 'granted';
+  }
+
+  async function checkForFinds() {
+    let data;
+    try {
+      const resp = await fetch('/api/v1/status', { cache: 'no-store' });
+      if (!resp.ok) return;
+      data = await resp.json();
+    } catch (e) {
+      return; // try again next time
+    }
+    const solved = data.targets.filter((t) => t.status === 'solved');
+    const stored = storageGet(NOTIFY_SEEN_KEY);
+    const seen = new Set(stored ? JSON.parse(stored) : solved.map((t) => t.id));
+    const fresh = solved.filter((t) => !seen.has(t.id));
+    for (const t of fresh) {
+      const n = new Notification('Target found: ' + t.name, {
+        body: t.found_filename || '(filename not recorded)',
+        tag: 'namebreak-target-' + t.id,
+      });
+      n.onclick = () => { window.focus(); n.close(); };
+      seen.add(t.id);
+    }
+    storageSet(NOTIFY_SEEN_KEY, JSON.stringify([...seen]));
+    if (fresh.length > 0) refresh();
+  }
+
+  function scheduleFindChecks() {
+    clearInterval(notifyTimer);
+    notifyTimer = null;
+    if (!notificationsOn()) return;
+    checkForFinds();
+    notifyTimer = setInterval(checkForFinds, NOTIFY_POLL_MS);
+  }
+
+  function renderNotifyControl() {
+    notifyEl.replaceChildren();
+    if (Notification.permission === 'denied') {
+      notifyEl.textContent = 'Notifications are blocked for this site in your browser settings';
+      return;
+    }
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'notify-toggle';
+    const on = notificationsOn();
+    btn.className = 'notify-btn' + (on ? ' on' : '');
+    btn.textContent = on ? 'Notifications on' : 'Notify me when a target is found';
+    btn.title = on ? 'Click to stop desktop notifications for finds' : 'Get a desktop notification while this page is open';
+    btn.addEventListener('click', async () => {
+      if (notificationsOn()) {
+        storageSet(NOTIFY_ENABLED_KEY, 'false');
+      } else {
+        const permission = await Notification.requestPermission();
+        storageSet(NOTIFY_ENABLED_KEY, permission === 'granted' ? 'true' : 'false');
+        // Start from the finds there are now, rather than announcing every
+        // one made while notifications were off.
+        try { localStorage.removeItem(NOTIFY_SEEN_KEY); } catch (e) { /* nothing remembered anyway */ }
+      }
+      renderNotifyControl();
+      scheduleFindChecks();
+    });
+    notifyEl.appendChild(btn);
+  }
+
+  // Needs a secure context (https, or localhost) and a browser that has it.
+  if ('Notification' in window && window.isSecureContext) {
+    notifyEl.hidden = false;
+    renderNotifyControl();
+    scheduleFindChecks();
   }
 
   refresh();
