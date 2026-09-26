@@ -24,14 +24,6 @@ For more info on what name-breaking is, see [here](http://zezula.net/en/mpq/name
   candidate space into time-boxed ranges, and hands them out to
   `client` clients over HTTP, with a live dashboard showing
   progress and who found what.
-- `namechecker/` - a small standalone CPU tool for checking whether a given
-  name (or every name in a wordlist file), once prefixed/suffixed, matches a
-  target hash pair - useful for verifying a candidate by hand, or scoring a
-  wordlist offline, without spinning up the GPU search.
-- `portrait-cuda/` - an earlier, single-file prototype of the GPU search (no
-  config file, no coordinator support, no CPU/GPU candidate split).
-  Superseded by `client`; kept around for reference, not actively
-  maintained.
 
 ## Getting started
 
