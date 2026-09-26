@@ -31,8 +31,11 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#ifndef _WIN32
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <sys/stat.h>
+#else
 #include <unistd.h>
 #endif
 #include "engine/search.h"
@@ -54,25 +57,32 @@ static uint32_t hashWithTable(const std::string& s, int off) {
 static uint32_t hashA(const std::string& s) { return hashWithTable(s, 0x100); }
 static uint32_t hashB(const std::string& s) { return hashWithTable(s, 0x200); }
 
-static std::string runCaptured(const SearchRequest& req, SearchResult& result, std::vector<std::string>& reported) {
-#ifndef _WIN32
-    fflush(stdout); fflush(stderr);
-    int fd = open(".capture.tmp", O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    int savedOut = dup(1), savedErr = dup(2);
-    dup2(fd, 1); dup2(fd, 2);
+// Redirects stdout and stderr to a file for the duration of one runSearch() call.
+#ifdef _WIN32
+static int openCaptureFile() { return _open(".capture.tmp", _O_CREAT | _O_TRUNC | _O_WRONLY, _S_IREAD | _S_IWRITE); }
+static int dupFd(int fd) { return _dup(fd); }
+static int dup2Fd(int from, int to) { return _dup2(from, to); }
+static int closeFd(int fd) { return _close(fd); }
+#else
+static int openCaptureFile() { return open(".capture.tmp", O_CREAT | O_TRUNC | O_WRONLY, 0644); }
+static int dupFd(int fd) { return dup(fd); }
+static int dup2Fd(int from, int to) { return dup2(from, to); }
+static int closeFd(int fd) { return close(fd); }
 #endif
-    result = runSearch(*g_backend, req, nullptr, [&](const std::string& f) { reported.push_back(removePrefixAndSuffix(f, req.prefix, req.suffix)); });
-#ifndef _WIN32
+
+static std::string runCaptured(const SearchRequest& req, SearchResult& result, std::vector<std::string>& reported) {
     fflush(stdout); fflush(stderr);
-    dup2(savedOut, 1); dup2(savedErr, 2);
-    close(savedOut); close(savedErr); close(fd);
+    int fd = openCaptureFile();
+    int savedOut = dupFd(1), savedErr = dupFd(2);
+    dup2Fd(fd, 1); dup2Fd(fd, 2);
+    result = runSearch(*g_backend, req, nullptr, [&](const std::string& f) { reported.push_back(removePrefixAndSuffix(f, req.prefix, req.suffix)); });
+    fflush(stdout); fflush(stderr);
+    dup2Fd(savedOut, 1); dup2Fd(savedErr, 2);
+    closeFd(savedOut); closeFd(savedErr); closeFd(fd);
     std::ifstream in(".capture.tmp");
     std::stringstream ss;
     ss << in.rdbuf();
     return ss.str();
-#else
-    return "";
-#endif
 }
 
 static int g_failures = 0;
