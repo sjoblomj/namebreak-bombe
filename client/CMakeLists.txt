@@ -37,6 +37,13 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# windows.h defines min/max macros that break std::min/std::max - and it gets
+# pulled in indirectly (curl/curl.h includes winsock2.h), not just by the
+# files that include it themselves, so define NOMINMAX for every target.
+if(WIN32)
+    add_compile_definitions(NOMINMAX)
+endif()
+
 if(NAMEBREAK_GPU STREQUAL "cuda")
     # The GPU architecture to compile for, as a compute capability without the
     # dot (see `nvidia-smi --query-gpu=compute_cap --format=csv`). 86 is this

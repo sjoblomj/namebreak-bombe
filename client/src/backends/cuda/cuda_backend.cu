@@ -422,10 +422,13 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
     const unsigned blocks = (unsigned) ((rowCount + kThreadsPerBlock - 1) / kThreadsPerBlock);
 
     bool supported = dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
-        constexpr int AlphabetSize = decltype(alphabetC)::value;
+        // A type alias rather than a constexpr local: MSVC treats a constexpr
+        // local of this lambda read from the nested [&] lambda below as a
+        // capture, so it's no longer a constant expression there (C2672).
+        using AlphabetC = decltype(alphabetC);
         dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
             constexpr int SuffixLen = decltype(suffixC)::value;
-            bruteForceKernel<AlphabetSize, SuffixLen><<<blocks, kThreadsPerBlock>>>(
+            bruteForceKernel<AlphabetC::value, SuffixLen><<<blocks, kThreadsPerBlock>>>(
                     trailingLen, (uint32_t) firstRow, (uint32_t) rowCount, firstRowStartK, lastRowEndK, targetA_, params, bufs_);
         });
     });
