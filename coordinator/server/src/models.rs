@@ -16,8 +16,8 @@ pub struct User {
     /// This client's declared protocol version (`"X.Y.Z"`), captured at
     /// `/register` time - see `namebreak_protocol::PROTOCOL_VERSION` and
     /// `handlers::register`. Consulted by `ranges::claim_range` so it never
-    /// hands this client a target using an alphabet introduced after the
-    /// version it declared - see `alphabet::alphabet_available_to`.
+    /// hands this client an alphabet introduced after the version it
+    /// declared - see `alphabet::client_alphabet_for`.
     pub protocol_version: String,
     /// The backend this client searches with (e.g. "cuda"), as declared at
     /// `/register` time - informational only.

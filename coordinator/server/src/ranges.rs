@@ -8,8 +8,8 @@ use namebreak_protocol::{ClaimResponse, Version};
 use sqlx::SqlitePool;
 
 use crate::alphabet::{
-    alphabet_available_to, bound_indices_at_len, candidate_to_index, index_to_candidate, max_supported_len, pattern_spans, range_bound_filenames,
-    split_end, split_pos, strip_prefix_suffix, transition_alphabet_cursor, Pos,
+    alphabet_size, bound_indices_at_len, candidate_to_index, client_alphabet_for, floor_index, index_to_candidate, max_supported_len, pattern_spans,
+    range_bound_filenames, split_end, split_pos, strip_prefix_suffix, transition_alphabet_cursor, Pos, PREDEFINED_ALPHABETS,
 };
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Range, Segment, SkipRange, Target, TargetProgress, User};
@@ -19,12 +19,46 @@ fn effective_rate(config: &RangeConfig, user: &User) -> f64 {
     user.ema_rate_per_sec.unwrap_or(config.default_rate_per_sec)
 }
 
+/// How many of `alphabet`'s candidates at `candidate_len` to carve for a
+/// client searching at `rate` in `client_alphabet` (see
+/// `alphabet::client_alphabet_for`), so it takes about
+/// `target_chunk_seconds`. A client searching in a bigger alphabet searches
+/// about `(its size / alphabet's size) ^ candidate_len` candidates per
+/// candidate of the range, so it gets that many times fewer.
+fn chunk_size(config: &RangeConfig, rate: f64, alphabet: &str, client_alphabet: &str, candidate_len: i64) -> Pos {
+    let desired = (rate * config.target_chunk_seconds).round() as i64;
+    let chunk = desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates) as f64;
+    let ratio = (alphabet_size(alphabet) as f64 / alphabet_size(client_alphabet) as f64).powi(candidate_len as i32);
+    ((chunk * ratio).round() as Pos).max(1)
+}
+
 /// `alphabet` is the range's own alphabet (`Range::alphabet`), not
 /// necessarily `target.alphabet` - a range carved before the target's
 /// alphabet was last patched must still be served (and decoded) with
-/// whatever alphabet it was actually carved under.
-fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_index: Pos, end_index: Pos, lease_seconds: i64, alphabet: &str) -> ClaimResponse {
+/// whatever alphabet it was actually carved under. `client_alphabet` is what
+/// the client searches it with (see `alphabet::client_alphabet_for`): with a
+/// bigger one, the same first and last candidate bound every candidate of
+/// the range, plus the ones only the bigger alphabet has.
+#[allow(clippy::too_many_arguments)]
+fn to_claim_response(
+    target: &Target,
+    range_id: i64,
+    candidate_len: i64,
+    start_index: Pos,
+    end_index: Pos,
+    lease_seconds: i64,
+    alphabet: &str,
+    client_alphabet: &str,
+) -> ClaimResponse {
     let (lower_bound_filename, upper_bound_filename) = range_bound_filenames(alphabet, &target.prefix, &target.suffix, candidate_len, start_index, end_index);
+    let candidate_count = if client_alphabet == alphabet {
+        end_index - start_index
+    } else {
+        let first = index_to_candidate(alphabet, start_index, candidate_len);
+        let last = index_to_candidate(alphabet, end_index - 1, candidate_len);
+        let at = |candidate: &str| candidate_to_index(client_alphabet, candidate).expect("client_alphabet contains every character of alphabet");
+        at(&last) - at(&first) + 1
+    };
     ClaimResponse {
         range_id,
         target_id: target.id,
@@ -38,10 +72,11 @@ fn to_claim_response(target: &Target, range_id: i64, candidate_len: i64, start_i
         max_backslash_count: target.max_backslash_count,
         lower_bound_filename,
         upper_bound_filename,
-        alphabet: alphabet.to_string(),
+        alphabet: client_alphabet.to_string(),
         // Only ever a chunk carved to at most max_chunk_candidates (or the
-        // remainder of one), so this can't actually saturate.
-        candidate_count: i64::try_from(end_index - start_index).unwrap_or(i64::MAX),
+        // remainder of one, or that chunk in a slightly bigger alphabet - see
+        // chunk_size), so this can't actually saturate.
+        candidate_count: i64::try_from(candidate_count).unwrap_or(i64::MAX),
         lease_seconds,
     }
 }
@@ -358,6 +393,7 @@ async fn claim_priority_range_chunk(
     config: &RangeConfig,
     target: &Target,
     user: &User,
+    client_version: Version,
     rate: f64,
     now: i64,
 ) -> Result<Option<ClaimResponse>, AppError> {
@@ -368,13 +404,13 @@ async fn claim_priority_range_chunk(
             .await?;
         let segments = priority_segments_by_range(tx, target.id).await?;
 
-        // The first priority range with anything left, where its next chunk
-        // starts and where the segment that's in ends. Filtered here rather
-        // than in SQL, since a position is only comparable once its block
-        // and index are joined.
+        // The first priority range with anything left that this client can
+        // search, where its next chunk starts and where the segment that's
+        // in ends. Filtered here rather than in SQL, since a position is
+        // only comparable once its block and index are joined.
         let mut found = None;
         for pr in priority_ranges {
-            if pr.next() >= pr.end() {
+            if pr.next() >= pr.end() || client_alphabet_for(&pr.alphabet_name, &pr.alphabet, client_version).is_none() {
                 continue;
             }
             match owned_spans(&pr, segments.get(&pr.id)).into_iter().find(|&(_, end)| end > pr.next()) {
@@ -389,6 +425,7 @@ async fn claim_priority_range_chunk(
         let Some((pr_next, pr_end, pr)) = found else {
             return Ok(None);
         };
+        let client_alphabet = client_alphabet_for(&pr.alphabet_name, &pr.alphabet, client_version).expect("checked above");
 
         // Skip ranges still apply within a priority range's own space: a
         // candidate being uninteresting doesn't stop being true just because
@@ -417,8 +454,7 @@ async fn claim_priority_range_chunk(
         }
 
         let remaining = pr_end - pr_next;
-        let desired = (rate * config.target_chunk_seconds).round() as i64;
-        let natural_chunk = (desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates) as Pos).min(remaining);
+        let natural_chunk = chunk_size(config, rate, &pr.alphabet, client_alphabet, pr.candidate_len).min(remaining);
         let start_index = pr_next;
         let natural_end = start_index + natural_chunk;
 
@@ -464,7 +500,7 @@ async fn claim_priority_range_chunk(
         )
         .await?;
 
-        return Ok(Some(to_claim_response(target, range_id, pr.candidate_len, start_index, end_index, lease_seconds, &pr.alphabet)));
+        return Ok(Some(to_claim_response(target, range_id, pr.candidate_len, start_index, end_index, lease_seconds, &pr.alphabet, client_alphabet)));
     }
 }
 
@@ -497,36 +533,34 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         .await?;
 
     for target in targets {
-        // A target using an alphabet introduced after this client's own
-        // declared protocol version is entirely invisible to it - not just
-        // for fresh carving, but for reusing any of its pending ranges too,
-        // even ones that happen to be carved in an older, compatible
-        // alphabet from before a later admin_patch_target moved it forward.
-        // That's a deliberate simplification (see
-        // alphabet::alphabet_available_to's doc comment for the general
-        // idea): an old client simply doesn't get *new* work from this
-        // target until it's upgraded, rather than the server trying to
+        // A client that can't search the target's alphabet - it knows
+        // neither that alphabet nor any bigger one containing it (see
+        // alphabet::client_alphabet_for) - gets no work from this target at
+        // all, not even a pending range left over in an older alphabet it
+        // could search. An old client simply doesn't get *new* work from
+        // this target until it's upgraded, rather than the server trying to
         // thread the needle on every individual leftover range.
-        if !alphabet_available_to(&target.alphabet_name, client_version) {
+        let Some(target_client_alphabet) = client_alphabet_for(&target.alphabet_name, &target.alphabet, client_version) else {
             continue;
-        }
+        };
 
-        // 1) Reuse this target's own oldest pending range, if it has one -
-        // either a fresh chunk nobody's claimed yet, or the unsearched
-        // remainder of a range whose previous claimant's lease expired.
-        // A released range keeps its checkpointed progress_index while it
-        // sits pending (see `release_range`), so its previous claimant can
-        // still re-adopt it as-is - only now that it's actually being handed
-        // out is its already-searched portion split off as its own completed
-        // row, leaving just the unsearched remainder to assign here.
-        let pending = sqlx::query_as::<_, Range>(
-            "SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1",
-        )
-        .bind(target.id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        // 1) Reuse this target's own oldest pending range this client can
+        // search, if it has one - either a fresh chunk nobody's claimed yet,
+        // or the unsearched remainder of a range whose previous claimant's
+        // lease expired. A released range keeps its checkpointed
+        // progress_index while it sits pending (see `release_range`), so its
+        // previous claimant can still re-adopt it as-is - only now that it's
+        // actually being handed out is its already-searched portion split
+        // off as its own completed row, leaving just the unsearched
+        // remainder to assign here.
+        let pending = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC")
+            .bind(target.id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .find_map(|range| client_alphabet_for(&range.alphabet_name, &range.alphabet, client_version).map(str::to_string).map(|a| (range, a)));
 
-        if let Some(range) = pending {
+        if let Some((range, client_alphabet)) = pending {
             let range = split_off_searched_portion(&mut tx, range, now).await?;
             let lease_seconds = config.lease_seconds;
 
@@ -545,13 +579,22 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .await?;
 
             tx.commit().await?;
-            return Ok(Some(to_claim_response(&target, range.id, range.candidate_len, range.start(), range.end(), lease_seconds, &range.alphabet)));
+            return Ok(Some(to_claim_response(
+                &target,
+                range.id,
+                range.candidate_len,
+                range.start(),
+                range.end(),
+                lease_seconds,
+                &range.alphabet,
+                &client_alphabet,
+            )));
         }
 
         // 2) Otherwise, try this target's priority ranges (see
         // `models::PriorityRange`) before its own main sweep, highest
         // priority first - see `claim_priority_range_chunk`.
-        if let Some(claim) = claim_priority_range_chunk(&mut tx, config, &target, user, rate, now).await? {
+        if let Some(claim) = claim_priority_range_chunk(&mut tx, config, &target, user, client_version, rate, now).await? {
             tx.commit().await?;
             return Ok(Some(claim));
         }
@@ -701,8 +744,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
                 continue 'carve;
             }
 
-            let desired = (rate * config.target_chunk_seconds).round() as i64;
-            let natural_chunk = (desired.clamp(config.min_chunk_candidates, config.max_chunk_candidates) as Pos).min(remaining);
+            let natural_chunk = chunk_size(config, rate, &target.alphabet, target_client_alphabet, progress.candidate_len).min(remaining);
             let start_index = next_index;
             let natural_end = start_index + natural_chunk;
 
@@ -765,7 +807,16 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             .await?;
 
             tx.commit().await?;
-            return Ok(Some(to_claim_response(&target, range_id, progress.candidate_len, start_index, end_index, lease_seconds, &target.alphabet)));
+            return Ok(Some(to_claim_response(
+                &target,
+                range_id,
+                progress.candidate_len,
+                start_index,
+                end_index,
+                lease_seconds,
+                &target.alphabet,
+                target_client_alphabet,
+            )));
         }
     }
 
@@ -911,10 +962,19 @@ async fn resolve_progress_index(
         tracing::warn!(range_id = range.id, filename, "heartbeat match candidate length doesn't match range, ignoring");
         return Ok(None);
     }
+    // A client searching the range in a bigger alphabet (see
+    // alphabet::client_alphabet_for) can report a candidate with characters
+    // the range's alphabet doesn't have.
+    let known = |c: char| range.alphabet.contains(c) || PREDEFINED_ALPHABETS.iter().any(|(_, chars, _)| chars.contains(c));
+    if !candidate.chars().all(known) {
+        tracing::warn!(range_id = range.id, filename, "heartbeat match candidate has characters from no known alphabet, ignoring");
+        return Ok(None);
+    }
     // The range's own alphabet, not the target's current one - see
-    // `models::Range::alphabet`.
-    let Some(index) = candidate_to_index(&range.alphabet, candidate) else {
-        tracing::warn!(range_id = range.id, filename, "heartbeat match candidate has out-of-alphabet characters, ignoring");
+    // `models::Range::alphabet`. Rounded down, so everything up to it has
+    // been searched even when the candidate itself isn't in that alphabet.
+    let Some(index) = floor_index(&range.alphabet, candidate) else {
+        tracing::warn!(range_id = range.id, filename, "heartbeat match candidate comes before every candidate of the range's alphabet, ignoring");
         return Ok(None);
     };
     if index < range.start() || index >= range.end() {
@@ -2349,6 +2409,62 @@ mod tests {
         assert!(claim_range(&pool, &config, &old_client).await.unwrap().is_none(), "the only target uses an alphabet this client predates");
     }
 
+    /// A client searching a range in a bigger alphabet gets the same first
+    /// and last candidate as bounds, the bigger alphabet, and the number of
+    /// candidates it will actually search.
+    #[tokio::test]
+    async fn to_claim_response_hands_out_a_range_in_a_bigger_alphabet() {
+        let pool = test_pool().await;
+        let (lower, upper) = full_bounds(SIZE42, 2);
+        let target_id = insert_target_with_alphabet(&pool, "size42", SIZE42, &lower, &upper).await;
+        let target: Target = sqlx::query_as("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        let (start, end) = (candidate_to_index(SIZE42, "A ").unwrap(), candidate_to_index(SIZE42, "B ").unwrap());
+
+        let claim = to_claim_response(&target, 1, 2, start.into(), end.into(), 60, SIZE42, DEFAULT);
+        assert_eq!((claim.lower_bound_filename.as_str(), claim.upper_bound_filename.as_str()), ("PREA .SUF", "PREA_.SUF"));
+        assert_eq!(claim.alphabet, DEFAULT);
+        assert_eq!(claim.candidate_count, 49, "every size49 candidate from 'A ' to 'A_'");
+
+        let own = to_claim_response(&target, 1, 2, start.into(), end.into(), 60, SIZE42, SIZE42);
+        assert_eq!((own.alphabet.as_str(), own.candidate_count), (SIZE42, 42));
+    }
+
+    /// A chunk for a client searching in a bigger alphabet shrinks by how
+    /// many more candidates it searches per candidate of the range.
+    #[test]
+    fn chunk_size_shrinks_for_a_bigger_client_alphabet() {
+        let config = test_config(49 * 49);
+        assert_eq!(chunk_size(&config, 1.0, SIZE42, SIZE42, 2), 49 * 49);
+        assert_eq!(chunk_size(&config, 1.0, SIZE42, DEFAULT, 2), 42 * 42);
+    }
+
+    /// Progress reported by a client searching in a bigger alphabet can be a
+    /// candidate the range's alphabet doesn't have: it's rounded down to the
+    /// last one the range has at or before it, so nothing is skipped.
+    #[tokio::test]
+    async fn heartbeat_rounds_progress_from_a_bigger_alphabet_down() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(SIZE42, 2);
+        insert_target_with_alphabet(&pool, "size42", SIZE42, &lower, &upper).await;
+        let config = test_config(42); // the whole ' ?' block: "  " to " _"
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work");
+
+        let progress = |pool: SqlitePool| async move {
+            let range: Range = sqlx::query_as("SELECT * FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+            range.progress().map(|p| crate::alphabet::index_to_candidate(SIZE42, p, 2))
+        };
+        // '!' isn't in size42 and comes right after ' ': only "  " is certainly searched.
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE !.SUF".into())).await.unwrap();
+        assert_eq!(progress(pool.clone()).await.as_deref(), Some("  "));
+        // '[' comes between 'Z' and '_'.
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE [.SUF".into())).await.unwrap();
+        assert_eq!(progress(pool.clone()).await.as_deref(), Some(" Z"));
+        // '~' is in no alphabet at all: ignored.
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE ~.SUF".into())).await.unwrap();
+        assert_eq!(progress(pool.clone()).await.as_deref(), Some(" Z"));
+    }
+
     /// The other side of the same gate: once a target's alphabet is one the
     /// client's declared version does understand, it's claimable as normal.
     #[tokio::test]
@@ -2369,7 +2485,7 @@ mod tests {
     /// outright. Every *real* predefined alphabet happens to be tagged
     /// `(1, 0)` as of this writing, so there's no actual alphabet a 0.9.0
     /// client could understand - the "compatible" target here uses a
-    /// synthetic alphabet name instead, relying on `alphabet_available_to`'s
+    /// synthetic alphabet name instead, relying on `client_alphabet_for`'s
     /// fail-open behavior for unrecognized names (see its own doc comment).
     /// That's still a faithful test of the *mechanism* (skip one target,
     /// fall through to the next), just not of a same-day real-world alphabet.

@@ -63,10 +63,12 @@ impl std::str::FromStr for Version {
 ///   assumed across that boundary, so there's no point letting it proceed.
 /// - MINOR: something purely additive was introduced - a new optional
 ///   field, or a new entry in `alphabet::PREDEFINED_ALPHABETS`. An older
-///   client keeps working exactly as before; `ranges::claim_range` just
-///   never hands it a target whose alphabet was introduced in a MINOR
-///   version newer than what that client declared (see
-///   `alphabet::alphabet_available_to`) - so the server can keep an old,
+///   client keeps working exactly as before; `ranges::claim_range` never
+///   hands it an alphabet introduced in a MINOR version newer than what
+///   that client declared. It searches such a target in the smallest
+///   alphabet it does know that contains every character of the target's,
+///   or gets no work from it if there's none (see
+///   `alphabet::client_alphabet_for`) - so the server can keep an old,
 ///   un-upgraded client fed with work it can actually make sense of, rather
 ///   than crashing it with a target it has no idea how to search.
 /// - PATCH: anything else (bug fixes, doc changes) - never gates anything.
@@ -372,8 +374,8 @@ pub struct AlphabetInfo {
     pub size: i64,
     /// The protocol version this alphabet was introduced in (`"X.Y"`, minor
     /// version only - see `PROTOCOL_VERSION`). A client whose own declared
-    /// version is older than this will never be offered a target using this
-    /// alphabet - see `alphabet::alphabet_available_to`.
+    /// version is older than this will never be given this alphabet - see
+    /// `alphabet::client_alphabet_for`.
     pub since: String,
 }
 

@@ -40,11 +40,17 @@ See the top-level plan/design notes for the full rationale; the short version:
   (`X.Y.Z`) at `/register`; the server rejects registration outright on a
   MAJOR version mismatch against its own `PROTOCOL_VERSION`
   (`coordinator/protocol/src/lib.rs`), asking for an upgrade. A client's
-  MINOR version also gates which `PREDEFINED_ALPHABETS` it's offered -
-  `GET /api/v1/alphabets` and range-claiming both hide an alphabet from a
-  client whose declared version predates that alphabet's own
-  `introduced_in` version (`server/src/alphabet.rs`), so an old client never
-  gets handed a range in a newer alphabet it doesn't understand.
+  MINOR version also gates which `PREDEFINED_ALPHABETS` it's given: an old
+  client is never handed a range in an alphabet newer than its declared
+  version. It searches such a range in the smallest alphabet it does know
+  that contains every character of the range's (`client_alphabet_for` in
+  `server/src/alphabet.rs`), with the same first and last candidate as
+  bounds - so it covers the whole range, plus some candidates only the
+  bigger alphabet has, and its chunks are shrunk to match. The range itself
+  stays in its own alphabet; a progress checkpoint the client reports is
+  rounded down to the last candidate of that alphabet at or before it
+  (`floor_index`), so nothing gets skipped. A client that knows no such
+  alphabet gets no work from that target at all.
 - **Ranges**: a target's candidate space is carved into contiguous chunks sized
   from each user's observed candidates/sec, so a chunk takes roughly
   `TARGET_CHUNK_SECONDS` regardless of GPU speed. A range that isn't completed

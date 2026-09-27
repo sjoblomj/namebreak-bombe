@@ -23,9 +23,10 @@
 /// Every alphabet below predates protocol versioning itself, so they're all
 /// tagged `(1, 0)` - the version this feature shipped in. A newly added
 /// alphabet should be tagged with whatever the *next* MINOR version will be,
-/// so `alphabet_available_to` keeps it hidden from clients that declared an
-/// older one (see `ranges::claim_range`) - the entire reason this table
-/// carries a version per row instead of just name+characters.
+/// so `client_alphabet_for` keeps it from clients that declared an older one
+/// (they get a bigger alphabet they do know, if any - see
+/// `ranges::claim_range`) - the entire reason this table carries a version
+/// per row instead of just name+characters.
 pub const PREDEFINED_ALPHABETS: &[(&str, &str, (u64, u64))] = &[
     ("size50", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]_", (1, 0)),
     ("size49", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_", (1, 0)),
@@ -39,27 +40,71 @@ pub fn lookup_predefined_alphabet(name: &str) -> Option<&'static str> {
     PREDEFINED_ALPHABETS.iter().find(|(n, _, _)| *n == name).map(|(_, chars, _)| *chars)
 }
 
-/// The `(major, minor)` protocol version a predefined alphabet was
-/// introduced in, or `None` if `name` isn't a known alphabet at all.
-pub fn alphabet_introduced_in(name: &str) -> Option<(u64, u64)> {
-    PREDEFINED_ALPHABETS.iter().find(|(n, _, _)| *n == name).map(|&(_, _, since)| since)
+/// The alphabet a client that declared `client_version` should search a
+/// range carved in `alphabet` (named `alphabet_name`) with: that alphabet
+/// itself when the client knows it, or else the smallest alphabet it knows
+/// that contains every one of its characters. Searching in a bigger
+/// alphabet covers every candidate of the range, plus some the range
+/// doesn't have - extra work, but nothing missed; see `floor_index` for
+/// reading the client's progress back. `None` if the client knows no such
+/// alphabet, and so can't be given the range at all.
+///
+/// A client knows an alphabet from the MINOR version it was introduced in
+/// onward - see `namebreak_protocol::PROTOCOL_VERSION`'s doc comment. An
+/// unknown alphabet name is always usable as it is (there's nothing to gate
+/// it *by*) - this shouldn't come up in practice, since a real target's
+/// `alphabet_name` is always one of `PREDEFINED_ALPHABETS` by construction
+/// (see `handlers::admin_create_target`); it's mainly what lets this
+/// codebase's own tests freely use synthetic alphabets outside that table.
+pub fn client_alphabet_for<'a>(alphabet_name: &str, alphabet: &'a str, client_version: namebreak_protocol::Version) -> Option<&'a str> {
+    client_alphabet_among(PREDEFINED_ALPHABETS, alphabet_name, alphabet, client_version)
 }
 
-/// Whether a client that declared `client_version` can be trusted to make
-/// sense of a target using alphabet `name` - see
-/// `namebreak_protocol::PROTOCOL_VERSION`'s doc comment on how MINOR
-/// versions gate this. An unknown alphabet name is always available (there's
-/// nothing to gate it *by* - no version has ever introduced it) - this
-/// shouldn't come up in practice, since a real target's `alphabet_name` is
-/// always one of `PREDEFINED_ALPHABETS` by construction (see
-/// `handlers::admin_create_target`); it's mainly what lets this codebase's
-/// own tests freely use synthetic alphabets outside that table without
-/// tripping this gate.
-pub fn alphabet_available_to(name: &str, client_version: namebreak_protocol::Version) -> bool {
-    match alphabet_introduced_in(name) {
-        Some((since_major, since_minor)) => (since_major, since_minor) <= (client_version.major, client_version.minor),
-        None => true,
+/// `client_alphabet_for`, choosing among `known` rather than
+/// `PREDEFINED_ALPHABETS`.
+fn client_alphabet_among<'a>(
+    known: &'static [(&'static str, &'static str, (u64, u64))],
+    alphabet_name: &str,
+    alphabet: &'a str,
+    client_version: namebreak_protocol::Version,
+) -> Option<&'a str> {
+    let available = |since: (u64, u64)| since <= (client_version.major, client_version.minor);
+    match known.iter().find(|(name, _, _)| *name == alphabet_name) {
+        None => return Some(alphabet),
+        Some(&(_, _, since)) if available(since) => return Some(alphabet),
+        Some(_) => {}
     }
+    known
+        .iter()
+        .filter(|&&(_, chars, since)| available(since) && alphabet.chars().all(|c| chars.contains(c)))
+        .map(|&(_, chars, _)| chars)
+        .min_by_key(|chars| alphabet_size(chars))
+}
+
+/// The position in `alphabet` of the last of its candidates at or before
+/// `candidate` - which may have characters `alphabet` doesn't, when a client
+/// searched `alphabet`'s range in a bigger one (see `client_alphabet_for`).
+/// Everything up to `candidate` has been searched, so everything up to the
+/// returned position has been too: rounding down never skips a candidate.
+/// `None` if `alphabet` has no candidate that early.
+///
+/// Compares characters by their code, which is only the alphabets' own
+/// order because every predefined alphabet lists its characters in
+/// ascending order (see the test pinning that down).
+pub fn floor_index(alphabet: &str, candidate: &str) -> Option<Pos> {
+    let chars = alphabet_chars(alphabet);
+    let (_, max_char) = min_max_chars(alphabet);
+    let candidate: Vec<char> = candidate.chars().collect();
+    let Some(first_foreign) = candidate.iter().position(|c| !chars.contains(c)) else {
+        return candidate_to_index(alphabet, &candidate.iter().collect::<String>());
+    };
+    // Lower the rightmost position that can go lower, no further right than
+    // the first foreign character, and max out everything after it.
+    (0..=first_foreign).rev().find_map(|i| {
+        let lower = chars.iter().copied().filter(|&c| c < candidate[i]).max()?;
+        let rounded: String = candidate[..i].iter().copied().chain([lower]).chain(std::iter::repeat_n(max_char, candidate.len() - i - 1)).collect();
+        candidate_to_index(alphabet, &rounded)
+    })
 }
 
 pub fn alphabet_size(alphabet: &str) -> i64 {
@@ -614,6 +659,7 @@ pub fn range_bound_filenames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use namebreak_protocol::Version;
 
     const DEFAULT: &str = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
     const SIZE42: &str = " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
@@ -641,31 +687,13 @@ mod tests {
     }
 
     #[test]
-    fn alphabet_introduced_in_looks_up_a_known_alphabets_version_but_not_an_unknown_ones() {
-        assert_eq!(alphabet_introduced_in("size49"), Some((1, 0)));
-        assert_eq!(alphabet_introduced_in("no-such-alphabet"), None);
-    }
-
-    #[test]
-    fn alphabet_available_to_gates_on_minor_version_but_not_patch() {
-        use namebreak_protocol::Version;
+    fn client_alphabet_for_gates_on_minor_version_but_not_patch() {
         // Every real predefined alphabet is tagged (1, 0) - available to
         // anything from 1.0.0 onward, patch version doesn't matter.
-        assert!(alphabet_available_to("size49", Version::new(1, 0, 0)));
-        assert!(alphabet_available_to("size49", Version::new(1, 0, 99)));
-        assert!(alphabet_available_to("size49", Version::new(1, 5, 0)));
-        assert!(alphabet_available_to("size49", Version::new(2, 0, 0)), "a newer major version can still use an old alphabet");
-        assert!(!alphabet_available_to("size49", Version::new(0, 9, 0)), "a client older than this alphabet's own introduced-in version is refused");
-    }
-
-    #[test]
-    fn alphabet_available_to_fails_open_for_an_unrecognized_name() {
-        use namebreak_protocol::Version;
-        // Not a real code path (a target's alphabet_name is always validated
-        // against PREDEFINED_ALPHABETS elsewhere) - but this codebase's own
-        // tests rely on it to freely use synthetic alphabets without tripping
-        // this gate, so it's worth pinning down explicitly.
-        assert!(alphabet_available_to("totally-made-up", Version::new(0, 0, 1)));
+        for version in [Version::new(1, 0, 0), Version::new(1, 0, 99), Version::new(1, 5, 0), Version::new(2, 0, 0)] {
+            assert_eq!(client_alphabet_for("size49", DEFAULT, version), Some(DEFAULT), "{version}");
+        }
+        assert_eq!(client_alphabet_for("size49", DEFAULT, Version::new(0, 9, 0)), None, "a client older than every alphabet gets nothing");
     }
 
     #[test]
@@ -959,6 +987,82 @@ mod tests {
         assert_eq!(skip_start, old_index);
         assert_eq!(skip_end, candidate_to_index(old, "Z").unwrap() + 1, "skips to this length's own upper bound");
         assert_eq!(transition.new_next_index, space_size(new, 1), "signals bump_length_if_exhausted the same way ordinary exhaustion does");
+    }
+
+    /// floor_index and the search bounds handed to a client in a bigger
+    /// alphabet (see client_alphabet_for) compare characters by their code.
+    #[test]
+    fn predefined_alphabets_list_their_characters_in_ascending_order() {
+        for &(name, chars, _) in PREDEFINED_ALPHABETS {
+            let chars: Vec<char> = chars.chars().collect();
+            assert!(chars.windows(2).all(|w| w[0] < w[1]), "{name}");
+        }
+    }
+
+    const KNOWN: &[(&str, &str, (u64, u64))] =
+        &[("x", "ACE", (1, 5)), ("c", "ABCDEFG", (1, 0)), ("b", "ABCDE", (1, 0)), ("a", "ABD", (1, 0)), ("d", "CEFG", (1, 0))];
+
+    #[test]
+    fn client_alphabet_for_uses_the_alphabet_itself_when_the_client_knows_it() {
+        assert_eq!(client_alphabet_among(KNOWN, "x", "ACE", Version::new(1, 5, 0)), Some("ACE"));
+        assert_eq!(client_alphabet_among(KNOWN, "unknown", "ACE", Version::new(0, 1, 0)), Some("ACE"), "an unknown name fails open");
+    }
+
+    #[test]
+    fn client_alphabet_for_picks_the_smallest_superset_the_client_knows() {
+        assert_eq!(client_alphabet_among(KNOWN, "x", "ACE", Version::new(1, 4, 0)), Some("ABCDE"));
+        const WITHOUT_B: &[(&str, &str, (u64, u64))] = &[("x", "ACE", (1, 5)), ("c", "ABCDEFG", (1, 0)), ("b", "ABCDE", (1, 3))];
+        assert_eq!(client_alphabet_among(WITHOUT_B, "x", "ACE", Version::new(1, 2, 0)), Some("ABCDEFG"));
+    }
+
+    #[test]
+    fn client_alphabet_for_finds_nothing_without_a_known_superset() {
+        const NO_SUPERSET: &[(&str, &str, (u64, u64))] = &[("x", "ACE", (1, 5)), ("a", "ABD", (1, 0)), ("d", "CEFG", (1, 0))];
+        assert_eq!(client_alphabet_among(NO_SUPERSET, "x", "ACE", Version::new(1, 0, 0)), None);
+    }
+
+    #[test]
+    fn client_alphabet_for_steps_up_from_size42_to_size43() {
+        // Every predefined alphabet contains size42, and size43 is the smallest.
+        let size43 = lookup_predefined_alphabet("size43").unwrap();
+        assert_eq!(client_alphabet_among(PREDEFINED_ALPHABETS, "size42", SIZE42, Version::new(1, 0, 0)), Some(SIZE42));
+        let hidden: &'static [(&str, &str, (u64, u64))] = Box::leak(
+            PREDEFINED_ALPHABETS.iter().map(|&(n, c, v)| (n, c, if n == "size42" { (1, 9) } else { v })).collect::<Vec<_>>().into_boxed_slice(),
+        );
+        assert_eq!(client_alphabet_among(hidden, "size42", SIZE42, Version::new(1, 0, 0)), Some(size43));
+    }
+
+    #[test]
+    fn floor_index_rounds_a_foreign_candidate_down_to_the_last_one_before_it() {
+        let x = "ACE";
+        let at = |s: &str| candidate_to_index(x, s);
+        assert_eq!(floor_index(x, "CC"), at("CC"), "a candidate of the alphabet itself");
+        assert_eq!(floor_index(x, "CD"), at("CC"));
+        assert_eq!(floor_index(x, "CB"), at("CA"));
+        assert_eq!(floor_index(x, "BA"), at("AE"), "everything after a lowered position is maxed out");
+        assert_eq!(floor_index(x, "C "), at("AE"), "nothing is lower than ' ' in the alphabet, so an earlier position is lowered");
+        assert_eq!(floor_index(x, "A "), None, "earlier than every candidate of the alphabet");
+        assert_eq!(floor_index(x, "EF"), at("EE"));
+    }
+
+    #[test]
+    fn floor_index_never_passes_the_candidate_it_was_given() {
+        // Every size49 candidate at length 3, floored into size42: the result
+        // is never after it, and nothing of size42 lies between the two.
+        let size49 = lookup_predefined_alphabet("size49").unwrap();
+        for i in (0..space_size(size49, 3)).step_by(7) {
+            let candidate = index_to_candidate(size49, i, 3);
+            match floor_index(SIZE42, &candidate) {
+                Some(floor) => {
+                    let floored = index_to_candidate(SIZE42, floor, 3);
+                    assert!(floored <= candidate, "{floored:?} > {candidate:?}");
+                    if floor + 1 < space_size(SIZE42, 3) {
+                        assert!(index_to_candidate(SIZE42, floor + 1, 3) > candidate, "{candidate:?} floored too far, to {floored:?}");
+                    }
+                }
+                None => assert!(index_to_candidate(SIZE42, 0, 3) > candidate),
+            }
+        }
     }
 
     /// `pattern`'s spans at `len`, as candidate strings (first, last inclusive) for readability.
