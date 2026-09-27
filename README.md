@@ -10,7 +10,40 @@ means finding a candidate string that hashes to both target values - that's
 what the programs here do, by trying every combination of characters in a
 given alphabet.
 
-For more info on what name-breaking is, see [here](http://zezula.net/en/mpq/namebreak.html).
+## What is namebreaking?
+
+Blizzard's classic games keep their files in MPQ archives, which don't store
+file names. Each file is found by hashes of its name instead: one hash picks
+its slot in the archive's hash table, and two more 32-bit hashes, *Hash A* and
+*Hash B*, confirm that the slot holds the right file. Hashes only work one way,
+so a name can't be read back out of them. Some names can be caught by watching
+which files a game opens, but archives are full of files the game never opens
+at all, but that might still be of interest to understand how the games were
+developed.
+
+Later archives ship a list of their own file names, the `(listfile)` -
+complete in Diablo II and Warcraft III, but missing or covering only a small
+part of the files in Diablo, StarCraft, Brood War and Warcraft II Battle.net
+Edition. For those, the only way to get a name back is to guess it: generate
+candidate names, hash each one, and compare against the stored *Hash A* and
+*Hash B*. That's namebreaking.
+
+Guessing blind is tough, but the archives give plenty of clues. Files were
+usually packed in batches, so neighbours in an archive tend to share a
+directory and a file type; a file's decrypted contents give away its type, and
+so its extension; and many names come in numbered series or share a leading
+part. That can sometimes pin down everything but a few characters in the
+middle - a directory like `REZ\` and an extension like `.WAV` are known, and
+only the part in between is searched.
+
+That's what the [coordinator](coordinator/README.md) is for. It splits each
+*target*, one unknown name, into ranges of candidates and hands them out to
+volunteers running the `namebreak` [client](client/README.md) on their GPUs.
+The coordinator's dashboard shows how far each target has come, who searched
+what, and the name, once it's found.
+
+For more background, see Ladislav Zezula's
+[writeup on name breaking](http://zezula.net/en/mpq/namebreak.html).
 
 ## Layout
 
