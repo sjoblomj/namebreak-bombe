@@ -18,6 +18,92 @@ use crate::state::AppState;
 #[derive(Serialize)]
 pub struct DashboardResponse {
     pub targets: Vec<DashboardTarget>,
+    /// Everyone who has claimed work or found a name, most candidates
+    /// searched first - see `volunteers`.
+    pub volunteers: Vec<DashboardVolunteer>,
+}
+
+/// One username's contribution, across every hostname it has registered
+/// from (each (username, hostname) pair is its own `users` row).
+#[derive(Serialize)]
+pub struct DashboardVolunteer {
+    pub username: String,
+    /// How many hostnames this username has registered from.
+    pub hostnames: i64,
+    /// Candidates in the completed ranges credited to it
+    /// (`last_assigned_user_id`). A little generous: a range closed because
+    /// its target was solved elsewhere, or because a match was found in it,
+    /// counts in full even though the search stopped partway.
+    pub candidates: Pos,
+    pub ranges_completed: i64,
+    /// Distinct names found: targets sharing a Hash A/Hash B pair are the
+    /// same file, solved together by one find, so they count once.
+    pub found: i64,
+}
+
+/// Every username that has claimed work or found a name, sorted by
+/// candidates searched, then names found, then username.
+async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardVolunteer>, AppError> {
+    #[derive(sqlx::FromRow)]
+    struct CompletedRow {
+        username: String,
+        candidate_len: i64,
+        start_block: i64,
+        start_index: i64,
+        end_block: i64,
+        end_index: i64,
+        alphabet: String,
+    }
+    let completed: Vec<CompletedRow> = sqlx::query_as(
+        "SELECT u.username, r.candidate_len, r.start_block, r.start_index, r.end_block, r.end_index, r.alphabet \
+         FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id WHERE r.status = 'completed'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let contributors: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT u.username FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id \
+         UNION SELECT u.username FROM targets t JOIN users u ON u.id = t.found_by_user_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let hostnames: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>("SELECT username, COUNT(*) FROM users GROUP BY username")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect();
+    let found: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT u.username, COUNT(DISTINCT t.hash_a || ':' || t.hash_b) FROM targets t JOIN users u ON u.id = t.found_by_user_id \
+         WHERE t.found_filename IS NOT NULL GROUP BY u.username",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
+
+    let mut by_username: HashMap<String, DashboardVolunteer> = contributors
+        .into_iter()
+        .map(|(username,)| {
+            let volunteer = DashboardVolunteer {
+                hostnames: hostnames.get(&username).copied().unwrap_or(0),
+                found: found.get(&username).copied().unwrap_or(0),
+                candidates: 0,
+                ranges_completed: 0,
+                username: username.clone(),
+            };
+            (username, volunteer)
+        })
+        .collect();
+    for row in completed {
+        let Some(volunteer) = by_username.get_mut(&row.username) else { continue };
+        let start = join_pos(&row.alphabet, row.candidate_len, row.start_block, row.start_index);
+        let end = join_pos(&row.alphabet, row.candidate_len, row.end_block, row.end_index);
+        volunteer.candidates += end - start;
+        volunteer.ranges_completed += 1;
+    }
+
+    let mut volunteers: Vec<DashboardVolunteer> = by_username.into_values().collect();
+    volunteers.sort_by(|a, b| b.candidates.cmp(&a.candidates).then(b.found.cmp(&a.found)).then_with(|| a.username.cmp(&b.username)));
+    Ok(volunteers)
 }
 
 #[derive(Serialize)]
@@ -511,7 +597,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         });
     }
 
-    Ok(Json(DashboardResponse { targets }))
+    Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await? }))
 }
 
 /// Every row `sql` selects (as `models::Segment`s), grouped by owner.
@@ -609,6 +695,69 @@ mod tests {
         // sweep to the start of length 3.
         let jumps = vec![jump(2, 650, 676)];
         assert_eq!(effective_sweep_position(2, 650, LETTERS, &jumps, "AA", "ZZZ"), (3, 0));
+    }
+
+    /// A username's hostnames are counted together; only completed ranges
+    /// count; and two targets solved by one find (same Hash A/Hash B) count
+    /// as one name found.
+    #[tokio::test]
+    async fn volunteers_are_tallied_per_username_and_ranked_by_candidates() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let mut users = HashMap::new();
+        for (username, hostname) in [("alice", "a"), ("alice", "b"), ("bob", "c"), ("carol", "d")] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend) VALUES (?, ?, ?, 0, 0, '1.0.0', 'cuda') RETURNING id",
+            )
+            .bind(username)
+            .bind(hostname)
+            .bind(format!("{username}-{hostname}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            users.insert(hostname, id);
+        }
+        let mut targets = Vec::new();
+        for name in ["t1", "t2", "t3"] {
+            let hash_b = if name == "t3" { 3 } else { 2 };
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, alphabet_name, alphabet, status, created_at) \
+                 VALUES (?, '', '', 1, ?, 'A', 'Z', 0, 'letters', ?, 'active', 0) RETURNING id",
+            )
+            .bind(name)
+            .bind(hash_b)
+            .bind(LETTERS)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            targets.push(id);
+        }
+        // t1 and t2 share their hashes: one find by bob solves both.
+        sqlx::query("UPDATE targets SET status = 'solved', found_filename = 'X', found_by_user_id = ? WHERE id IN (?, ?)")
+            .bind(users["c"])
+            .bind(targets[0])
+            .bind(targets[1])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (hostname, start, end, status) in [("a", 0, 100, "completed"), ("b", 100, 250, "completed"), ("a", 250, 1000, "in_progress"), ("c", 0, 50, "completed")] {
+            sqlx::query(
+                "INSERT INTO ranges (target_id, candidate_len, start_index, end_index, status, last_assigned_user_id, created_at, alphabet_name, alphabet) \
+                 VALUES (?, 3, ?, ?, ?, ?, 0, 'letters', ?)",
+            )
+            .bind(targets[2])
+            .bind(start)
+            .bind(end)
+            .bind(status)
+            .bind(users[hostname])
+            .bind(LETTERS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let tally: Vec<(String, i64, Pos, i64, i64)> =
+            volunteers(&pool).await.unwrap().into_iter().map(|v| (v.username, v.hostnames, v.candidates, v.ranges_completed, v.found)).collect();
+        assert_eq!(tally, vec![("alice".into(), 2, 250, 2, 0), ("bob".into(), 1, 50, 1, 1)], "carol never claimed anything");
     }
 
     #[test]

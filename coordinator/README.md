@@ -25,6 +25,13 @@ reclaim), and a solved target's find called out with a prominent banner. If a
 range was reassigned partway through (see progress checkpointing below), each
 finished portion shows up as its own row credited to whoever actually searched
 it, rather than the whole thing appearing under just the most recent claimer.
+That's the **Targets** tab. The **Volunteers** tab ranks every username that
+has claimed work or found a name by candidates searched (the sizes of its
+completed ranges, across all its hostnames - a little generous, since a range
+closed early by a find still counts in full), alongside its completed ranges,
+hostnames and names found (targets sharing a Hash A/Hash B pair are one find).
+The **Introduction** tab explains what namebreaking is. The open tab is kept
+in the URL's `#fragment`, so `/#volunteers` links straight to it.
 Plain HTML/CSS/JS (`server/static/dashboard.html`, embedded into the binary at
 compile time), polling `GET /api/v1/dashboard` every 8s - no build step, no
 framework. `GET /api/v1/dashboard` and `GET /` are both public (no auth),

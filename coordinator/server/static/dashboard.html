@@ -108,34 +108,41 @@
     gap: 16px;
     max-width: 1800px;
   }
-  .about {
+  /* The page's own Targets / Volunteers / Introduction tabs - the same look
+     as a target card's tabs (.tab-bar/.tab-btn below), a little larger. */
+  .page-tabs {
     max-width: 1800px;
     margin-bottom: 16px;
+  }
+  .page-tabs .tab-btn { font-size: 14px; padding: 8px 16px; }
+  .page-panel[hidden] { display: none; }
+  .panel-card {
+    max-width: 1800px;
     background: var(--card-bg);
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 1ex 1.5ex;
-    font-size: 13px;
-    line-height: 1.5;
+  }
+  .about {
+    max-width: 900px;
+    font-size: 14px;
+    line-height: 1.55;
   }
   .about h2 {
-    font-size: 14px;
-    margin: 0 0 4px;
+    font-size: 16px;
+    margin: 0 0 8px;
   }
-  .about-body p { margin: 0 0 8px; }
-  .about-body p:last-child { margin-bottom: 0; }
-  .about-body code { font-family: var(--mono); font-size: 12px; }
-  .about-body a { color: var(--accent); }
-  /* Collapsed: about three lines, fading out towards the bottom. A mask
-     rather than a gradient overlay, so it fades into whatever is behind
-     it in either theme. */
-  .about:not(.open) .about-body {
-    max-height: 4.5em;
-    overflow: hidden;
-    -webkit-mask-image: linear-gradient(to bottom, #000 30%, transparent);
-    mask-image: linear-gradient(to bottom, #000 30%, transparent);
+  .about p { margin: 0 0 10px; }
+  .about p:last-child { margin-bottom: 0; }
+  .about code { font-family: var(--mono); font-size: 13px; }
+  .about a { color: var(--accent); }
+  .volunteers-intro {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 0 0 8px;
   }
-  .about-toggle { margin-top: 6px; }
+  .volunteers-table td.num, .volunteers-table th.num { text-align: right; }
+  .volunteers-table td.rank { color: var(--muted); }
   .target-card {
     background: var(--card-bg);
     border: 1px solid var(--border);
@@ -587,9 +594,34 @@
 <body>
   <h1>namebreak coordinator</h1>
   <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span></div>
-  <section class="about" id="about">
+  <nav class="page-tabs tab-bar" id="page-tabs" role="tablist">
+    <button type="button" class="tab-btn" role="tab" data-page="targets">Targets</button>
+    <button type="button" class="tab-btn" role="tab" data-page="volunteers">Volunteers</button>
+    <button type="button" class="tab-btn" role="tab" data-page="introduction">Introduction</button>
+  </nav>
+
+  <div class="page-panel" id="page-targets" role="tabpanel">
+    <div id="targets" class="targets"></div>
+  </div>
+
+  <div class="page-panel" id="page-volunteers" role="tabpanel" hidden>
+    <div class="panel-card">
+      <p class="volunteers-intro">Everyone who has searched a range or found a name, by how many candidates they've searched
+        - counting completed ranges only, across all their machines.</p>
+      <div class="table-scroll">
+        <table class="volunteers-table">
+          <thead><tr><th>#</th><th>Volunteer</th><th class="num">Candidates searched</th><th class="num">Ranges</th>
+            <th class="num">Hostnames</th><th class="num">Names found</th></tr></thead>
+          <tbody id="volunteers"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="page-panel" id="page-introduction" role="tabpanel" hidden>
+  <section class="panel-card about">
     <h2>What is namebreaking?</h2>
-    <div class="about-body" id="about-body">
+    <div>
       <p>Blizzard's classic games keep their files in MPQ archives, which don't store file names. Each file is found by hashes of
         its name instead: one hash picks its slot in the archive's hash table, and two more 32-bit hashes, <em>Hash A</em> and
         <em>Hash B</em>, confirm that the slot holds the right file. Hashes only work one way, so a name can't be read back out
@@ -605,35 +637,71 @@
         few characters in the middle - a directory like <code>REZ\</code> and an extension like <code>.WAV</code> are known,
         and only the part in between is searched.</p>
       <p>That's what this coordinator is for. It splits each <em>target</em>, one unknown name, into ranges of candidates and
-        hands them out to volunteers running <code>namebreak</code> on their GPUs. The cards below show how far each target has
-        come, who searched what, and the name, once it's found.</p>
+        hands them out to volunteers running <code>namebreak</code> on their GPUs. The Targets tab shows how far each target has
+        come, who searched what, and the name, once it's found; the Volunteers tab shows who has put in the most work.</p>
     </div>
-    <button type="button" class="notify-btn about-toggle" id="about-toggle" aria-expanded="false" aria-controls="about-body">Expand</button>
   </section>
-  <div id="targets" class="targets"></div>
+  </div>
 
 <script>
 (function () {
-  // The "What is namebreaking?" box: collapsed to a few faded lines until
-  // expanded. Whether it was left open is remembered per viewer - a
-  // convenience only, so a browser without storage just starts collapsed.
+  // The page's Targets / Volunteers / Introduction tabs. The open one is
+  // kept in the URL's #fragment, so a link (or a reload) opens the same tab.
   (function () {
-    const about = document.getElementById('about');
-    const toggle = document.getElementById('about-toggle');
-    function setOpen(open) {
-      about.classList.toggle('open', open);
-      toggle.textContent = open ? 'Collapse' : 'Expand';
-      toggle.setAttribute('aria-expanded', String(open));
+    const buttons = document.querySelectorAll('#page-tabs .tab-btn');
+    const pages = Array.from(buttons, (b) => b.dataset.page);
+    function show(page) {
+      if (!pages.includes(page)) page = 'targets';
+      for (const b of buttons) {
+        const active = b.dataset.page === page;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-selected', String(active));
+      }
+      for (const p of pages) document.getElementById('page-' + p).hidden = p !== page;
     }
-    let open = false;
-    try { open = localStorage.getItem('aboutOpen') === '1'; } catch (e) { /* no storage */ }
-    setOpen(open);
-    toggle.addEventListener('click', () => {
-      const nowOpen = !about.classList.contains('open');
-      setOpen(nowOpen);
-      try { localStorage.setItem('aboutOpen', nowOpen ? '1' : '0'); } catch (e) { /* no storage */ }
-    });
+    for (const b of buttons) {
+      b.addEventListener('click', () => {
+        history.replaceState(null, '', b.dataset.page === 'targets' ? location.pathname : '#' + b.dataset.page);
+        show(b.dataset.page);
+      });
+    }
+    window.addEventListener('hashchange', () => show(location.hash.slice(1)));
+    show(location.hash.slice(1));
   })();
+
+  // The Volunteers tab's table - see dashboard.rs's DashboardVolunteer.
+  function renderVolunteers(volunteers) {
+    const tbody = document.getElementById('volunteers');
+    tbody.replaceChildren();
+    if (volunteers.length === 0) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.className = 'loading';
+      td.textContent = 'No volunteers yet.';
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+    volunteers.forEach((v, i) => {
+      const tr = document.createElement('tr');
+      const cells = [
+        [String(i + 1), 'rank'],
+        [v.username, ''],
+        [fmtNum(v.candidates), 'num mono'],
+        [fmtNum(v.ranges_completed), 'num mono'],
+        [fmtNum(v.hostnames), 'num mono'],
+        [fmtNum(v.found), 'num mono'],
+      ];
+      for (const [text, className] of cells) {
+        const td = document.createElement('td');
+        td.className = className;
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    });
+  }
 
   const targetsEl = document.getElementById('targets');
   const statusEl  = document.getElementById('status-text');
@@ -1541,6 +1609,7 @@
       } else {
         for (const t of targets) targetsEl.appendChild(targetCard(t));
       }
+      renderVolunteers(data.volunteers || []);
 
       subheadEl.classList.remove('stale');
       const now = fmtTime(Math.floor(Date.now() / 1000));
