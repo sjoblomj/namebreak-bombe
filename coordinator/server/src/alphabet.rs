@@ -495,10 +495,8 @@ pub fn pattern_spans(alphabet: &str, pattern: &str, candidate_len: i64) -> Resul
 /// `new_alphabet`, needed once `handlers::admin_patch_target` changes a
 /// target's alphabet: any range already carved keeps its own stored alphabet
 /// (see `models::Range::alphabet`), but the cursor (`target_progress`) has to
-/// be translated the first time carving reaches it after the patch - lazily,
-/// the same way a skip range's `skipped` rows are only ever written once
-/// carving actually reaches them (see `ranges::claim_range`), rather than
-/// retroactively.
+/// be translated the first time carving reaches it after the patch - lazily
+/// (see `ranges::claim_range`), rather than retroactively.
 ///
 /// Finds the smallest candidate, expressible entirely in `new_alphabet`,
 /// whose position in `old_alphabet`'s own ordering is still `>= old_next_index`,

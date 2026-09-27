@@ -138,29 +138,27 @@ fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str)
 }
 
 /// Where the main sweep will carve next. Its stored position only moves
-/// when it carves, and it jumps over a priority range's span only then (see
-/// `ranges::claim_range`) - so until it next carves, the stored position can
-/// sit at the start of work a priority range has already handed out, for
-/// instance when that priority range was created while the sweep was
-/// partway into it. This moves past any such span, continuing at the
-/// next length (within the target's bounds) when one runs to a length's
+/// when it carves, and it jumps over a priority or skip range's span only
+/// then (see `ranges::claim_range`) - so until it next carves, the stored
+/// position can sit at the start of work a priority range has already
+/// handed out, or of a skip range's `skipped` row. This moves past any such
+/// span - given in `jumps` as (length, alphabet, start, end) - continuing at
+/// the next length (within the target's bounds) when one runs to a length's
 /// end, just as the sweep itself will.
 fn effective_sweep_position(
     mut len: i64,
     mut index: Pos,
     alphabet: &str,
-    priority_ranges: &[DashboardPriorityRange],
+    jumps: &[(i64, &str, Pos, Pos)],
     lower_bound: &str,
     upper_bound: &str,
 ) -> (i64, Pos) {
     let max_len = max_supported_len(alphabet);
     loop {
-        let covering = priority_ranges
-            .iter()
-            .filter(|pr| pr.alphabet == alphabet && pr.candidate_len == len)
-            .flat_map(|pr| &pr.spans)
-            .find(|&&(start, end)| start <= index && index < end);
-        if let Some(&(_, end)) = covering {
+        let covering = jumps.iter().find(|&&(jump_len, jump_alphabet, start, end)| {
+            jump_alphabet == alphabet && jump_len == len && start <= index && index < end
+        });
+        if let Some(&(_, _, _, end)) = covering {
             index = end;
             continue;
         }
@@ -373,9 +371,15 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     let skip_segments =
         segments_by_owner(&state.pool, "SELECT skip_range_id AS owner_id, start_block, start_index, end_block, end_index FROM skip_range_segments").await?;
     let mut skip_ranges_by_target: HashMap<i64, Vec<DashboardSkipRange>> = HashMap::new();
+    // (length, alphabet, start, end) of every skip range segment - see effective_sweep_position.
+    let mut skip_spans_by_target: HashMap<i64, Vec<(i64, String, Pos, Pos)>> = HashMap::new();
     for sr in all_skip_ranges {
-        let candidate_count =
-            skip_segments.get(&sr.id).into_iter().flatten().map(|s| s.span(&sr.alphabet, sr.candidate_len)).map(|(start, end)| end - start).sum();
+        let spans: Vec<(Pos, Pos)> = skip_segments.get(&sr.id).into_iter().flatten().map(|s| s.span(&sr.alphabet, sr.candidate_len)).collect();
+        let candidate_count = spans.iter().map(|&(start, end)| end - start).sum();
+        skip_spans_by_target
+            .entry(sr.target_id)
+            .or_default()
+            .extend(spans.into_iter().map(|(start, end)| (sr.candidate_len, sr.alphabet.clone(), start, end)));
         skip_ranges_by_target.entry(sr.target_id).or_default().push(DashboardSkipRange {
             id: sr.id,
             pattern: sr.pattern,
@@ -468,8 +472,14 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             })
             .collect::<Vec<_>>();
 
+        let skip_spans = skip_spans_by_target.remove(&id).unwrap_or_default();
+        let jumps: Vec<(i64, &str, Pos, Pos)> = priority_ranges
+            .iter()
+            .flat_map(|pr| pr.spans.iter().map(move |&(start, end)| (pr.candidate_len, pr.alphabet.as_str(), start, end)))
+            .chain(skip_spans.iter().map(|(len, alphabet, start, end)| (*len, alphabet.as_str(), *start, *end)))
+            .collect();
         let (cursor_candidate_len, cursor_next_index) =
-            effective_sweep_position(stored_cursor_len, stored_cursor_next_index, &cursor_alphabet, &priority_ranges, &lower_bound, &upper_bound);
+            effective_sweep_position(stored_cursor_len, stored_cursor_next_index, &cursor_alphabet, &jumps, &lower_bound, &upper_bound);
         let cursor_candidate = index_to_candidate(&cursor_alphabet, cursor_next_index, cursor_candidate_len);
         let sweep_after_range_id = sweep_after_range_id(&ranges, cursor_candidate_len, cursor_next_index);
 
@@ -573,46 +583,32 @@ mod tests {
         assert!(gaps_between(&ranges, "A", "Z").is_empty());
     }
 
-    fn priority_range(candidate_len: i64, start_index: Pos, end_index: Pos) -> DashboardPriorityRange {
-        DashboardPriorityRange {
-            id: 0,
-            priority: 0,
-            pattern: String::new(),
-            candidate_len,
-            start_index,
-            end_index,
-            next_index: end_index,
-            first_candidate: String::new(),
-            last_candidate: String::new(),
-            next_candidate: None,
-            alphabet_name: "letters".into(),
-            alphabet: LETTERS.into(),
-            candidate_count: end_index - start_index,
-            handed_out_count: end_index - start_index,
-            segment_count: 1,
-            spans: vec![(start_index, end_index)],
-        }
+    /// A priority or skip range span at `candidate_len`, in LETTERS.
+    fn jump(candidate_len: i64, start: Pos, end: Pos) -> (i64, &'static str, Pos, Pos) {
+        (candidate_len, LETTERS, start, end)
     }
 
     #[test]
-    fn effective_sweep_position_moves_past_priority_ranges_at_the_stored_position() {
+    fn effective_sweep_position_moves_past_spans_at_the_stored_position() {
         // A priority range created while the sweep was partway into its span
         // (MA-MZ = 312..338, sweep at 320): the sweep will jump to its end.
-        let prs = vec![priority_range(2, 312, 338)];
-        assert_eq!(effective_sweep_position(2, 320, LETTERS, &prs, "AA", "ZZ"), (2, 338));
-        // Back-to-back spans are all skipped.
-        let prs = vec![priority_range(2, 312, 338), priority_range(2, 338, 364)];
-        assert_eq!(effective_sweep_position(2, 312, LETTERS, &prs, "AA", "ZZ"), (2, 364));
+        let jumps = vec![jump(2, 312, 338)];
+        assert_eq!(effective_sweep_position(2, 320, LETTERS, &jumps, "AA", "ZZ"), (2, 338));
+        // Back-to-back spans (say, a priority range, then a skip range) are all jumped.
+        let jumps = vec![jump(2, 312, 338), jump(2, 338, 364)];
+        assert_eq!(effective_sweep_position(2, 312, LETTERS, &jumps, "AA", "ZZ"), (2, 364));
         // Nothing at the stored position: it stays.
-        assert_eq!(effective_sweep_position(2, 300, LETTERS, &prs, "AA", "ZZ"), (2, 300));
+        assert_eq!(effective_sweep_position(2, 300, LETTERS, &jumps, "AA", "ZZ"), (2, 300));
+        // A span in another alphabet isn't comparable.
+        assert_eq!(effective_sweep_position(2, 320, LETTERS, &[(2, "OTHER", 312, 338)], "AA", "ZZ"), (2, 320));
     }
 
     #[test]
     fn effective_sweep_position_continues_at_the_next_length() {
         // A span running to the end of length 2 (ZA-ZZ = 650..676) moves the
         // sweep to the start of length 3.
-        let prs = vec![priority_range(2, 650, 676)];
-        assert_eq!(effective_sweep_position(2, 650, LETTERS, &prs, "AA", "ZZZ"), (3, 0));
+        let jumps = vec![jump(2, 650, 676)];
+        assert_eq!(effective_sweep_position(2, 650, LETTERS, &jumps, "AA", "ZZZ"), (3, 0));
     }
 
     #[test]

@@ -321,8 +321,9 @@ pub struct AdminCreatePriorityRangeResponse {
 }
 
 /// Leaves every candidate of one length matching a pattern out of the
-/// search, recorded as `skipped` ranges once carving reaches them. Ranges
-/// already carved (even pending ones) are left as they are.
+/// search, recorded right away as `skipped` ranges for everything no range
+/// covers yet. Ranges already carved (even pending ones) are left as they
+/// are.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminCreateSkipRangeRequest {
     /// Same syntax as `AdminCreatePriorityRangeRequest::pattern`.
@@ -339,13 +340,14 @@ pub struct AdminCreateSkipRangeResponse {
 }
 
 /// What `DELETE /api/v1/admin/skip-ranges/{id}` did. Carving stops skipping
-/// what the skip range matches either way; what it already skipped stays
-/// skipped.
+/// what the skip range matches either way. Its `skipped` ranges carving
+/// hasn't reached yet are removed, so they get searched; the ones it has
+/// already passed stay skipped, since carving never goes back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminDeleteSkipRangeResponse {
-    /// True if the skip range is gone entirely. False if it had already
-    /// skipped something: it's then kept, marked removed, so the dashboard
-    /// can still show why those candidates were skipped.
+    /// True if the skip range is gone entirely. False if any of its
+    /// `skipped` ranges had to stay: it's then kept, marked removed, so the
+    /// dashboard can still show why those candidates were skipped.
     pub deleted: bool,
 }
 

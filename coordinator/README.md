@@ -84,16 +84,21 @@ See the top-level plan/design notes for the full rationale; the short version:
 - **Skip ranges**: the opposite - candidates an operator never wants handed
   out. `POST /api/v1/admin/targets/{id}/skip-ranges` takes the same kind of
   `pattern`, a `length` and a plain-text `reason` (required), and returns
-  `{"skip_range_id": 3}`. Nothing is written in advance: when carving (the
-  main sweep or a priority range) reaches a skipped stretch, it's recorded
-  as a range with `status: "skipped"` ("Skip" on the dashboard, where
-  expanding the row shows the skip range's pattern and reason) and carving
-  continues after it. Ranges already carved, even pending ones, are left
-  alone. Where a skip range overlaps a priority range, skipping wins.
-  `DELETE /api/v1/admin/skip-ranges/{id}` stops it from skipping anything
-  further; what it already skipped stays skipped. The response's `deleted`
-  is false when it had already skipped something - the skip range is then
-  kept, marked removed, so those rows keep their reason.
+  `{"skip_range_id": 3}`. Everything it matches within the target's bounds
+  that no range covers yet is recorded right away as ranges with
+  `status: "skipped"` ("Skip" on the dashboard's Progress tab, where
+  expanding the row shows the skip range's pattern and reason), and carving
+  (the main sweep or a priority range) jumps straight over them. Ranges
+  already carved, even pending ones, are left alone. Where a skip range
+  overlaps a priority range, skipping wins.
+  `DELETE /api/v1/admin/skip-ranges/{id}` stops it from skipping. Its rows
+  that carving hasn't reached yet are removed, so those candidates get
+  searched after all; the ones the main sweep (or, inside a priority range,
+  the priority range) has already passed stay skipped, since carving never
+  goes back. The response's `deleted` is false when any are left - the skip
+  range is then kept, marked removed, so those rows keep their reason. On a
+  change of the target's alphabet, the rows carving hasn't reached are
+  rewritten in the new alphabet the same way.
 - **Patterns**: a skip or priority range's `pattern` pins down a candidate's
   leading characters, one per position - `"_[A-Z]"` is every candidate of
   that length starting with an underscore and then a letter. Candidates are

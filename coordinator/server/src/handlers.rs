@@ -374,9 +374,11 @@ pub async fn admin_patch_target(
     // transaction as the alphabet change itself - see
     // ranges::migrate_priority_ranges_to_new_alphabet's doc comment for why
     // this can't be deferred the way the target's own cursor transition is.
+    // Skip ranges go first - see migrate_skip_ranges_to_new_alphabet.
     if let (Some(name), Some(chars)) = (&alphabet_name, &alphabet) {
-        ranges::migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, name, chars, now_unix()).await?;
-        ranges::migrate_skip_ranges_to_new_alphabet(&mut tx, target_id, name, chars).await?;
+        let now = now_unix();
+        ranges::migrate_skip_ranges_to_new_alphabet(&mut tx, target_id, name, chars, now).await?;
+        ranges::migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, name, chars, now).await?;
     }
 
     tx.commit().await?;

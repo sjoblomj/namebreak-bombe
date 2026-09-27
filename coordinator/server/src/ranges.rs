@@ -9,7 +9,7 @@ use sqlx::SqlitePool;
 
 use crate::alphabet::{
     alphabet_size, bound_indices_at_len, candidate_to_index, client_alphabet_for, floor_index, index_to_candidate, max_supported_len, pattern_spans,
-    range_bound_filenames, split_end, split_pos, strip_prefix_suffix, transition_alphabet_cursor, Pos, PREDEFINED_ALPHABETS,
+    range_bound_filenames, space_size, split_end, split_pos, strip_prefix_suffix, transition_alphabet_cursor, Pos, PREDEFINED_ALPHABETS,
 };
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Range, Segment, SkipRange, Target, TargetProgress, User};
@@ -293,6 +293,176 @@ fn spans_overlap(a: &[(Pos, Pos)], b: &[(Pos, Pos)]) -> bool {
     a.iter().any(|&(a0, a1)| b.iter().any(|&(b0, b1)| a0.max(b0) < a1.min(b1)))
 }
 
+/// `spans` sorted, with overlapping and touching ones merged.
+fn normalize_spans(spans: &[(Pos, Pos)]) -> Vec<(Pos, Pos)> {
+    let mut sorted: Vec<(Pos, Pos)> = spans.iter().copied().filter(|&(start, end)| start < end).collect();
+    sorted.sort();
+    let mut merged: Vec<(Pos, Pos)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// The parts of `a` that are also in `b`.
+fn intersect_spans(a: &[(Pos, Pos)], b: &[(Pos, Pos)]) -> Vec<(Pos, Pos)> {
+    let b = normalize_spans(b);
+    let mut out = Vec::new();
+    for (a0, a1) in normalize_spans(a) {
+        for &(b0, b1) in &b {
+            let (start, end) = (a0.max(b0), a1.min(b1));
+            if start < end {
+                out.push((start, end));
+            }
+        }
+    }
+    out
+}
+
+/// The parts of `a` that aren't in `b`.
+fn subtract_spans(a: &[(Pos, Pos)], b: &[(Pos, Pos)]) -> Vec<(Pos, Pos)> {
+    let b = normalize_spans(b);
+    let mut out = Vec::new();
+    for (mut start, end) in normalize_spans(a) {
+        for &(b0, b1) in &b {
+            if b1 <= start || b0 >= end {
+                continue;
+            }
+            if b0 > start {
+                out.push((start, b0));
+            }
+            start = start.max(b1);
+        }
+        if start < end {
+            out.push((start, end));
+        }
+    }
+    out
+}
+
+/// Writes `skipped` rows, tagged with `skip_range_id`, for every part of
+/// `spans` (at `candidate_len`, in `alphabet`) within `target`'s bounds that
+/// no range covers yet - so a skip range shows on the dashboard as soon as
+/// it's created. Carving then jumps straight over its segments (see
+/// `claim_range`), so nothing gets skipped twice.
+#[allow(clippy::too_many_arguments)]
+async fn write_skipped_rows(
+    tx: &mut sqlx::SqliteConnection,
+    target: &Target,
+    skip_range_id: i64,
+    candidate_len: i64,
+    alphabet_name: &str,
+    alphabet: &str,
+    spans: &[(Pos, Pos)],
+    now: i64,
+) -> Result<(), AppError> {
+    let (lo, hi) = bound_indices_at_len(alphabet, &target.lower_bound, &target.upper_bound, candidate_len);
+    let covered: Vec<(Pos, Pos)> = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ?")
+        .bind(target.id)
+        .bind(candidate_len)
+        .bind(alphabet_name)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|r| (r.start(), r.end()))
+        .collect();
+    for (start, end) in subtract_spans(&intersect_spans(spans, &[(lo, hi + 1)]), &covered) {
+        insert_skipped_range(&mut *tx, target.id, candidate_len, start, end, alphabet_name, alphabet, None, Some(skip_range_id), now).await?;
+    }
+    Ok(())
+}
+
+/// The parts of `spans` (at `candidate_len`, in `alphabet_name`) that
+/// carving will still reach if they stop being skipped: ahead of the main
+/// sweep and outside every priority range, or inside a priority range and
+/// ahead of that priority range's own cursor. Everything else has been
+/// passed, and neither the sweep nor a priority range ever goes back. A
+/// sweep walking in another alphabet (an alphabet change it hasn't caught
+/// up with yet) isn't comparable, so it counts as having passed everything:
+/// keeping something skipped is always safe, un-skipping it only when it'll
+/// really be searched.
+async fn still_to_be_reached(
+    tx: &mut sqlx::SqliteConnection,
+    target: &Target,
+    candidate_len: i64,
+    alphabet_name: &str,
+    alphabet: &str,
+    spans: &[(Pos, Pos)],
+) -> Result<Vec<(Pos, Pos)>, AppError> {
+    let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
+        .bind(target.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let whole = space_size(alphabet, candidate_len);
+    // Mirrors claim_range: a sweep below start_len jumps to the start of start_len.
+    let (sweep_len, sweep_at) = if progress.candidate_len < target.start_len {
+        (target.start_len, bound_indices_at_len(alphabet, &target.lower_bound, &target.upper_bound, target.start_len).0)
+    } else {
+        (progress.candidate_len, progress.next())
+    };
+    let sweep_ahead = if progress.alphabet_name != alphabet_name || sweep_len > candidate_len {
+        vec![]
+    } else if sweep_len < candidate_len {
+        vec![(0, whole)]
+    } else {
+        vec![(sweep_at, whole)]
+    };
+
+    let priority_ranges =
+        sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE target_id = ? AND candidate_len = ? AND alphabet_name = ?")
+            .bind(target.id)
+            .bind(candidate_len)
+            .bind(alphabet_name)
+            .fetch_all(&mut *tx)
+            .await?;
+    let segments = priority_segments_by_range(tx, target.id).await?;
+    let mut owned = Vec::new();
+    let mut priority_ahead = Vec::new();
+    for pr in &priority_ranges {
+        let spans = owned_spans(pr, segments.get(&pr.id));
+        priority_ahead.extend(intersect_spans(&spans, &[(pr.next(), whole)]));
+        owned.extend(spans);
+    }
+
+    let mut reached = subtract_spans(&sweep_ahead, &owned);
+    reached.extend(priority_ahead);
+    Ok(intersect_spans(spans, &reached))
+}
+
+/// Removes the parts of skip range `skip_range_id`'s `skipped` rows (only
+/// those in `alphabet_name`, when given) that carving will still reach (see
+/// `still_to_be_reached`), so they're searched after all - splitting a row
+/// where only part of it is reached. Returns how many of its rows are left.
+async fn unskip_unreached_rows(tx: &mut sqlx::SqliteConnection, target: &Target, skip_range_id: i64, alphabet_name: Option<&str>) -> Result<i64, AppError> {
+    let rows = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE skip_range_id = ? AND status = 'skipped'")
+        .bind(skip_range_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut left = 0;
+    for row in rows {
+        if alphabet_name.is_some_and(|name| name != row.alphabet_name) {
+            left += 1;
+            continue;
+        }
+        let span = [(row.start(), row.end())];
+        let reached = still_to_be_reached(tx, target, row.candidate_len, &row.alphabet_name, &row.alphabet, &span).await?;
+        if reached.is_empty() {
+            left += 1;
+            continue;
+        }
+        sqlx::query("DELETE FROM ranges WHERE id = ?").bind(row.id).execute(&mut *tx).await?;
+        for (start, end) in subtract_spans(&span, &reached) {
+            insert_skipped_range(&mut *tx, target.id, row.candidate_len, start, end, &row.alphabet_name, &row.alphabet, None, Some(skip_range_id), row.created_at)
+                .await?;
+            left += 1;
+        }
+    }
+    Ok(left)
+}
+
 /// The earliest of `spans` (each tagged with its owner's id) overlapping
 /// `[lo, hi)`, cut to it.
 fn first_overlap(spans: &[(Pos, Pos, i64)], lo: Pos, hi: Pos) -> Option<(Pos, Pos, i64)> {
@@ -429,25 +599,13 @@ async fn claim_priority_range_chunk(
 
         // Skip ranges still apply within a priority range's own space: a
         // candidate being uninteresting doesn't stop being true just because
-        // it's also prioritized.
+        // it's also prioritized. Their `skipped` rows were written when they
+        // were created (see `write_skipped_rows`), so they're just jumped over.
         let skip_spans = skip_spans_at(&mut *tx, target.id, pr.candidate_len, &pr.alphabet_name, &pr.alphabet).await?;
         let skip_run = first_overlap(&skip_spans, pr_next, pr_end);
 
-        if let Some((skip_start, skip_end, skip_range_id)) = skip_run {
+        if let Some((skip_start, skip_end, _)) = skip_run {
             if skip_start == pr_next {
-                insert_skipped_range(
-                    &mut *tx,
-                    target.id,
-                    pr.candidate_len,
-                    skip_start,
-                    skip_end,
-                    &pr.alphabet_name,
-                    &pr.alphabet,
-                    Some(pr.id),
-                    Some(skip_range_id),
-                    now,
-                )
-                .await?;
                 set_priority_range_next(&mut *tx, &pr, skip_end).await?;
                 continue; // this priority range may have room left after the skip, or may now be exhausted - reconsider from the top either way
             }
@@ -458,29 +616,9 @@ async fn claim_priority_range_chunk(
         let start_index = pr_next;
         let natural_end = start_index + natural_chunk;
 
-        let (end_index, skip_to_insert) = match skip_run {
-            Some((skip_start, skip_end, skip_range_id)) if natural_end >= skip_start => (skip_start, Some((skip_start, skip_end, skip_range_id))),
-            _ => (natural_end, None),
-        };
-
-        let next_index = match skip_to_insert {
-            Some((skip_start, skip_end, skip_range_id)) => {
-                insert_skipped_range(
-                    &mut *tx,
-                    target.id,
-                    pr.candidate_len,
-                    skip_start,
-                    skip_end,
-                    &pr.alphabet_name,
-                    &pr.alphabet,
-                    Some(pr.id),
-                    Some(skip_range_id),
-                    now,
-                )
-                .await?;
-                skip_end
-            }
-            None => end_index,
+        let (end_index, next_index) = match skip_run {
+            Some((skip_start, skip_end, _)) if natural_end >= skip_start => (skip_start, skip_end),
+            _ => (natural_end, natural_end),
         };
         set_priority_range_next(&mut *tx, &pr, next_index).await?;
 
@@ -658,42 +796,18 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             let priority_spans = priority_spans_at(&mut tx, target.id, progress.candidate_len, active_alphabet_name).await?;
             let priority_boundary = first_overlap(&priority_spans, next_index, upper_at_len + 1);
 
-            // Whichever of the two starts first is this iteration's boundary
-            // - the skip range's id if it's a skip run, since only a skip
-            // run gets persisted as its own row when the cursor is jumped
-            // straight over it. A skip run reaching into a priority range
-            // stops where the priority range starts: the rest is the
-            // priority range's to skip when it carves there, and skipping it
-            // here too would record it twice.
-            let boundary = match (skip_run, priority_boundary) {
-                (Some((s0, _, _)), Some((p0, p1, _))) if p0 <= s0 => Some((p0, p1, None)),
-                (Some((s0, s1, skip_range_id)), Some((p0, _, _))) => Some((s0, s1.min(p0), Some(skip_range_id))),
-                (Some((s0, s1, skip_range_id)), None) => Some((s0, s1, Some(skip_range_id))),
-                (None, Some((p0, p1, _))) => Some((p0, p1, None)),
-                (None, None) => None,
-            };
+            // Whichever of the two starts first is this iteration's
+            // boundary. Both are jumped straight over without writing
+            // anything: a priority range carves its own, and a skip range's
+            // `skipped` rows were written when it was created (see
+            // `write_skipped_rows`).
+            let boundary = [skip_run, priority_boundary].into_iter().flatten().min_by_key(|&(start, _, _)| start).map(|(start, end, _)| (start, end));
 
             // The cursor itself sits right at the boundary: nothing
-            // claimable before it, so just step past it - recording the
-            // skip if that's what it is - without handing anything out this
-            // iteration.
-            if let Some((b_start, b_end, skip_range_id)) = boundary {
+            // claimable before it, so just step past it without handing
+            // anything out this iteration.
+            if let Some((b_start, b_end)) = boundary {
                 if b_start == next_index {
-                    if skip_range_id.is_some() {
-                        insert_skipped_range(
-                            &mut tx,
-                            target.id,
-                            progress.candidate_len,
-                            b_start,
-                            b_end,
-                            active_alphabet_name,
-                            active_alphabet,
-                            None,
-                            skip_range_id,
-                            now,
-                        )
-                        .await?;
-                    }
                     let (new_len, new_next_index) =
                         bump_length_if_exhausted(active_alphabet, &target.lower_bound, &target.upper_bound, progress.candidate_len, b_end, upper_at_len);
                     persist_progress(&mut tx, target.id, new_len, new_next_index, active_alphabet_name, active_alphabet).await?;
@@ -749,36 +863,12 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             let natural_end = start_index + natural_chunk;
 
             // Only truncate at the boundary if the chunk that would
-            // otherwise have been handed out actually reaches it - a skip
-            // run or priority range further out than what this claim would
-            // carve anyway is left for a future claim to discover, per
-            // "these should be created when they fall within a range that
-            // would otherwise be handed out; they should not be created in
-            // advance".
-            let (end_index, boundary_to_apply) = match boundary {
-                Some((b_start, b_end, skip_range_id)) if natural_end >= b_start => (b_start, Some((b_start, b_end, skip_range_id))),
-                _ => (natural_end, None),
-            };
-
-            let next_index_before_bump = match boundary_to_apply {
-                Some((b_start, b_end, Some(skip_range_id))) => {
-                    insert_skipped_range(
-                        &mut tx,
-                        target.id,
-                        progress.candidate_len,
-                        b_start,
-                        b_end,
-                        &target.alphabet_name,
-                        &target.alphabet,
-                        None,
-                        Some(skip_range_id),
-                        now,
-                    )
-                    .await?;
-                    b_end
-                }
-                Some((_, b_end, None)) => b_end, // priority range: jump straight over it, no row inserted
-                None => end_index,
+            // otherwise have been handed out actually reaches it - one
+            // further out than what this claim would carve anyway is left
+            // for a future claim to jump over.
+            let (end_index, next_index_before_bump) = match boundary {
+                Some((b_start, b_end)) if natural_end >= b_start => (b_start, b_end),
+                _ => (natural_end, natural_end),
             };
             let (new_len, new_next_index) = bump_length_if_exhausted(
                 &target.alphabet,
@@ -1544,9 +1634,9 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
 
 /// Creates a skip range on `target`: every candidate of length
 /// `candidate_len` matching `pattern` (see `alphabet::pattern_spans`) is
-/// left out of the search, recorded as `skipped` ranges once carving
-/// reaches it - see `claim_range`. Anything already carved stays as it is.
-/// Returns the new skip range's id.
+/// left out of the search, recorded right away as `skipped` ranges for
+/// every part no range covers yet (see `write_skipped_rows`). Anything
+/// already carved stays as it is. Returns the new skip range's id.
 pub async fn create_skip_range(
     tx: &mut sqlx::SqliteConnection,
     target: &Target,
@@ -1577,24 +1667,26 @@ pub async fn create_skip_range(
     .fetch_one(&mut *tx)
     .await?;
     insert_segments(tx, SegmentOwner::Skip, id, &target.alphabet, candidate_len, &spans).await?;
+    write_skipped_rows(tx, target, id, candidate_len, &target.alphabet_name, &target.alphabet, &spans, now).await?;
     Ok(id)
 }
 
-/// Removes a skip range, so carving stops skipping what it matches from
-/// here on. What it already skipped stays skipped - if there's any, the row
-/// itself is kept (marked removed, with no segments left) so those
-/// `skipped` ranges keep their reason on the dashboard. Returns whether the
-/// row itself is gone, or `None` if there's no such skip range.
+/// Removes a skip range, so carving stops skipping what it matches. Its
+/// `skipped` rows that carving will still reach are removed, so those
+/// candidates get searched after all; the ones carving has already passed
+/// stay skipped, since it never goes back (see `still_to_be_reached`). If
+/// any are left, the skip range's row is kept (marked removed, with no
+/// segments left) so they keep their reason on the dashboard. Returns
+/// whether the row itself is gone, or `None` if there's no such skip range.
 pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<Option<bool>, AppError> {
     let mut tx = pool.begin().await?;
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM skip_ranges WHERE id = ?").bind(skip_range_id).fetch_optional(&mut *tx).await?;
-    if exists.is_none() {
+    let Some(skip_range) = sqlx::query_as::<_, SkipRange>("SELECT * FROM skip_ranges WHERE id = ?").bind(skip_range_id).fetch_optional(&mut *tx).await?
+    else {
         return Ok(None);
-    }
+    };
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(skip_range.target_id).fetch_one(&mut *tx).await?;
     sqlx::query("DELETE FROM skip_range_segments WHERE skip_range_id = ?").bind(skip_range_id).execute(&mut *tx).await?;
-    let ever_skipped: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM ranges WHERE skip_range_id = ? LIMIT 1").bind(skip_range_id).fetch_optional(&mut *tx).await?;
-    let deleted = ever_skipped.is_none();
+    let deleted = unskip_unreached_rows(&mut tx, &target, skip_range_id, None).await? == 0;
     if deleted {
         sqlx::query("DELETE FROM skip_ranges WHERE id = ?").bind(skip_range_id).execute(&mut *tx).await?;
     } else {
@@ -1608,15 +1700,23 @@ pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<
 /// called by `handlers::admin_patch_target` in the same transaction as the
 /// alphabet change, for the same reason as
 /// `migrate_priority_ranges_to_new_alphabet`. A skip range has no cursor of
-/// its own, so its pattern is simply matched afresh. One whose pattern
-/// matches nothing in the new alphabet (or whose length it can't reach) is
-/// left with no segments.
+/// its own, so its pattern is simply matched afresh: its old-alphabet
+/// `skipped` rows carving won't pass any more are removed (the ones already
+/// passed stay, see `still_to_be_reached`), and new ones are written in the
+/// new alphabet. One whose pattern matches nothing in the new alphabet (or
+/// whose length it can't reach) is left with no segments.
+///
+/// Must run before `migrate_priority_ranges_to_new_alphabet`, while the
+/// priority ranges are still in the old alphabet the rows are compared
+/// against.
 pub async fn migrate_skip_ranges_to_new_alphabet(
     tx: &mut sqlx::SqliteConnection,
     target_id: i64,
     new_alphabet_name: &str,
     new_alphabet: &str,
+    now: i64,
 ) -> Result<(), AppError> {
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_one(&mut *tx).await?;
     let stale = sqlx::query_as::<_, SkipRange>("SELECT * FROM skip_ranges WHERE target_id = ? AND alphabet_name != ? AND removed_at IS NULL")
         .bind(target_id)
         .bind(new_alphabet_name)
@@ -1624,9 +1724,11 @@ pub async fn migrate_skip_ranges_to_new_alphabet(
         .await?;
     for skip_range in stale {
         sqlx::query("DELETE FROM skip_range_segments WHERE skip_range_id = ?").bind(skip_range.id).execute(&mut *tx).await?;
+        unskip_unreached_rows(tx, &target, skip_range.id, Some(&skip_range.alphabet_name)).await?;
         if skip_range.candidate_len <= max_supported_len(new_alphabet) {
             if let Ok(spans) = pattern_spans(new_alphabet, &skip_range.pattern, skip_range.candidate_len) {
                 insert_segments(tx, SegmentOwner::Skip, skip_range.id, new_alphabet, skip_range.candidate_len, &spans).await?;
+                write_skipped_rows(tx, &target, skip_range.id, skip_range.candidate_len, new_alphabet_name, new_alphabet, &spans, now).await?;
             }
         }
         sqlx::query("UPDATE skip_ranges SET alphabet_name = ?, alphabet = ? WHERE id = ?")
@@ -2703,16 +2805,15 @@ mod tests {
         assert_eq!(claim1.lower_bound_filename, "PREA.SUF");
         assert_eq!(claim1.upper_bound_filename, "PREL.SUF");
 
-        let (skip_status, skip_start, skip_end, skip_priority_range_id, skip_range_id): (String, i64, i64, Option<i64>, Option<i64>) =
-            sqlx::query_as("SELECT status, start_index, end_index, priority_range_id, skip_range_id FROM ranges WHERE target_id = ? AND status = 'skipped'")
+        let (skip_status, skip_start, skip_end, skip_range_id): (String, i64, i64, Option<i64>) =
+            sqlx::query_as("SELECT status, start_index, end_index, skip_range_id FROM ranges WHERE target_id = ? AND status = 'skipped'")
                 .bind(target_id)
                 .fetch_one(&pool)
                 .await
-                .expect("the M-Q skip must be recorded, once, even though it happened inside a priority range");
+                .expect("the M-Q skip must be recorded, once, even though it's inside a priority range");
         assert_eq!(skip_status, "skipped");
         assert_eq!((skip_start, skip_end), (12, 17));
-        assert!(skip_priority_range_id.is_some(), "the skip should be tagged with the priority range it happened in");
-        assert!(skip_range_id.is_some(), "and with the skip range it came from");
+        assert!(skip_range_id.is_some(), "tagged with the skip range it came from");
 
         let claim2 = claim_range(&pool, &config, &user).await.unwrap().expect("R-Z should be claimable next, still from the priority range");
         assert_eq!(claim2.lower_bound_filename, "PRER.SUF");
@@ -3276,9 +3377,22 @@ mod tests {
         assert_eq!(claimed, expected);
     }
 
-    /// A skip range lying partly inside a priority range: the main sweep
-    /// records only the part before the priority range, and the priority
-    /// range the part inside it - never both.
+    /// `(start, end)` of every `skipped` row of `target_id` at `len`, sorted.
+    async fn skipped_rows(pool: &SqlitePool, target_id: i64, len: i64) -> Vec<(i64, i64)> {
+        let mut rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT start_index, end_index FROM ranges WHERE target_id = ? AND candidate_len = ? AND status = 'skipped'")
+                .bind(target_id)
+                .bind(len)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// A skip range lying partly inside a priority range: its row is
+    /// written once, when it's created, and neither the main sweep nor the
+    /// priority range records any of it again - nor hands any of it out.
     #[tokio::test]
     async fn a_skip_range_reaching_into_a_priority_range_is_recorded_once() {
         let pool = test_pool().await;
@@ -3286,18 +3400,10 @@ mod tests {
         let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let target_id = insert_target_with_skip_range(&pool, letters, "A", "Z", "[C-F]").await;
         insert_priority_range(&pool, target_id, letters, "custom", 10, "[E-H]", 1).await;
+        assert_eq!(skipped_rows(&pool, target_id, 1).await, vec![(2, 6)], "written right away");
 
         claim_through_len(&pool, &test_config(30), &user, 1).await;
-
-        let mut skipped: Vec<(i64, i64, Option<i64>)> =
-            sqlx::query_as("SELECT start_index, end_index, priority_range_id FROM ranges WHERE target_id = ? AND candidate_len = 1 AND status = 'skipped'")
-                .bind(target_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        skipped.sort();
-        assert_eq!(skipped.iter().map(|&(s, e, _)| (s, e)).collect::<Vec<_>>(), vec![(2, 4), (4, 6)], "C-D by the main sweep, E-F by the priority range");
-        assert!(skipped[0].2.is_none() && skipped[1].2.is_some());
+        assert_eq!(skipped_rows(&pool, target_id, 1).await, vec![(2, 6)], "and never again");
 
         let mut spans: Vec<(i64, i64)> = sqlx::query_as("SELECT start_index, end_index FROM ranges WHERE target_id = ? AND candidate_len = 1")
             .bind(target_id)
@@ -3311,6 +3417,43 @@ mod tests {
             covered_to = hi;
         }
         assert_eq!(covered_to, 26);
+    }
+
+    /// A new skip range's rows cover only what no range covers yet, within
+    /// the target's bounds - here the pattern is C-H, C-D is already handed
+    /// out, and the target stops at G.
+    #[tokio::test]
+    async fn create_skip_range_writes_rows_only_for_uncovered_candidates_within_bounds() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "G").await;
+        claim_range(&pool, &test_config(4), &user).await.unwrap().expect("A-D");
+
+        add_skip_range(&pool, target_id, "[C-H]", 1).await;
+        assert_eq!(skipped_rows(&pool, target_id, 1).await, vec![(4, 7)], "E-G");
+
+        let claims = claim_through_len(&pool, &test_config(30), &user, 1).await;
+        assert!(claims.is_empty(), "nothing left at length 1: {:?}", claims.iter().map(|c| &c.lower_bound_filename).collect::<Vec<_>>());
+    }
+
+    /// Removing a skip range withdraws the part of its rows the main sweep
+    /// hasn't reached yet - so it gets searched - and keeps the part it has
+    /// passed, splitting a row where the sweep is inside it.
+    #[tokio::test]
+    async fn remove_skip_range_withdraws_only_what_the_sweep_has_not_reached() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+        let skip_range_id = add_skip_range(&pool, target_id, "[C-J]", 1).await;
+        // As if the sweep had got to F (it would normally jump the whole span).
+        sqlx::query("UPDATE target_progress SET next_index = 5 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
+
+        assert_eq!(remove_skip_range(&pool, skip_range_id).await.unwrap(), Some(false));
+        assert_eq!(skipped_rows(&pool, target_id, 1).await, vec![(2, 5)], "C-E stays skipped, F-J is searched");
+        let claim = claim_range(&pool, &test_config(30), &user).await.unwrap().expect("F onwards");
+        assert_eq!((claim.lower_bound_filename.as_str(), claim.upper_bound_filename.as_str()), ("PREF.SUF", "PREZ.SUF"));
     }
 
     /// Removing a skip range that never skipped anything deletes it; one
@@ -3345,7 +3488,9 @@ mod tests {
         assert!(claims.contains(&"PREAA.SUF".to_string()), "{claims:?}");
     }
 
-    /// An alphabet patch re-expands a skip range's pattern under the new alphabet.
+    /// An alphabet patch re-expands a skip range's pattern under the new
+    /// alphabet, and rewrites its `skipped` rows that the sweep hasn't
+    /// reached yet in the new alphabet.
     #[tokio::test]
     async fn migrate_skip_ranges_to_new_alphabet_re_expands_the_pattern() {
         let pool = test_pool().await;
@@ -3354,10 +3499,25 @@ mod tests {
         let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AA", "ZZ").await;
         let skip_range_id = add_skip_range(&pool, target_id, "[5B]", 2).await;
         let dead_id = add_skip_range(&pool, target_id, "0", 2).await;
+        let rows = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, i64, i64)>("SELECT alphabet, start_index, end_index FROM ranges WHERE skip_range_id = ?")
+                    .bind(id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let b = candidate_to_index(old_alphabet, "B0").unwrap();
+        assert_eq!(rows(skip_range_id).await, vec![(old_alphabet.to_string(), b, b + 36)], "only B is within the target's bounds");
 
         let mut tx = pool.begin().await.unwrap();
-        migrate_skip_ranges_to_new_alphabet(&mut tx, target_id, "letters_only", new_alphabet).await.unwrap();
+        migrate_skip_ranges_to_new_alphabet(&mut tx, target_id, "letters_only", new_alphabet, now_unix()).await.unwrap();
         tx.commit().await.unwrap();
+
+        assert_eq!(rows(skip_range_id).await, vec![(new_alphabet.to_string(), 26, 52)], "the sweep hadn't reached the old row, so it's rewritten");
+        assert!(rows(dead_id).await.is_empty());
 
         let segments = |id: i64| {
             let pool = pool.clone();
