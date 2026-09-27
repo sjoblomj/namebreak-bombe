@@ -108,6 +108,34 @@
     gap: 16px;
     max-width: 1800px;
   }
+  .about {
+    max-width: 1800px;
+    margin-bottom: 16px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1ex 1.5ex;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .about h2 {
+    font-size: 14px;
+    margin: 0 0 4px;
+  }
+  .about-body p { margin: 0 0 8px; }
+  .about-body p:last-child { margin-bottom: 0; }
+  .about-body code { font-family: var(--mono); font-size: 12px; }
+  .about-body a { color: var(--accent); }
+  /* Collapsed: about three lines, fading out towards the bottom. A mask
+     rather than a gradient overlay, so it fades into whatever is behind
+     it in either theme. */
+  .about:not(.open) .about-body {
+    max-height: 4.5em;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, #000 30%, transparent);
+    mask-image: linear-gradient(to bottom, #000 30%, transparent);
+  }
+  .about-toggle { margin-top: 6px; }
   .target-card {
     background: var(--card-bg);
     border: 1px solid var(--border);
@@ -559,10 +587,54 @@
 <body>
   <h1>namebreak coordinator</h1>
   <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span></div>
+  <section class="about" id="about">
+    <h2>What is namebreaking?</h2>
+    <div class="about-body" id="about-body">
+      <p>Blizzard's classic games keep their files in MPQ archives, which don't store file names. Each file is found by hashes of
+        its name instead: one hash picks its slot in the archive's hash table, and two more 32-bit hashes, <em>Hash A</em> and
+        <em>Hash B</em>, confirm that the slot holds the right file. Hashes only work one way, so a name can't be read back out
+        of them. Some names can be caught by watching which files a game opens, but archives are full of files the game never
+        opens at all, but that might still be of interest to understand how the games were developed.</p>
+      <p>Later archives ship a list of their own file names, the <code>(listfile)</code> - complete in Diablo II and Warcraft III,
+        but missing or covering only a small part of the files in Diablo, StarCraft, Brood War and Warcraft II Battle.net Edition.
+        For those, the only way to get a name back is to guess it: generate candidate names, hash each one, and compare against
+        the stored <em>Hash A</em> and <em>Hash B</em>. That's namebreaking.</p>
+      <p>Guessing blind is tough, but the archives give plenty of clues. Files were usually packed in batches, so neighbours in
+        an archive tend to share a directory and a file type; a file's decrypted contents give away its type, and so its
+        extension; and many names come in numbered series or share a leading part. That can sometimes pin down everything but a
+        few characters in the middle - a directory like <code>REZ\</code> and an extension like <code>.WAV</code> are known,
+        and only the part in between is searched.</p>
+      <p>That's what this coordinator is for. It splits each <em>target</em>, one unknown name, into ranges of candidates and
+        hands them out to volunteers running <code>namebreak</code> on their GPUs. The cards below show how far each target has
+        come, who searched what, and the name, once it's found.</p>
+    </div>
+    <button type="button" class="notify-btn about-toggle" id="about-toggle" aria-expanded="false" aria-controls="about-body">Expand</button>
+  </section>
   <div id="targets" class="targets"></div>
 
 <script>
 (function () {
+  // The "What is namebreaking?" box: collapsed to a few faded lines until
+  // expanded. Whether it was left open is remembered per viewer - a
+  // convenience only, so a browser without storage just starts collapsed.
+  (function () {
+    const about = document.getElementById('about');
+    const toggle = document.getElementById('about-toggle');
+    function setOpen(open) {
+      about.classList.toggle('open', open);
+      toggle.textContent = open ? 'Collapse' : 'Expand';
+      toggle.setAttribute('aria-expanded', String(open));
+    }
+    let open = false;
+    try { open = localStorage.getItem('aboutOpen') === '1'; } catch (e) { /* no storage */ }
+    setOpen(open);
+    toggle.addEventListener('click', () => {
+      const nowOpen = !about.classList.contains('open');
+      setOpen(nowOpen);
+      try { localStorage.setItem('aboutOpen', nowOpen ? '1' : '0'); } catch (e) { /* no storage */ }
+    });
+  })();
+
   const targetsEl = document.getElementById('targets');
   const statusEl  = document.getElementById('status-text');
   const subheadEl = document.querySelector('.subhead');
