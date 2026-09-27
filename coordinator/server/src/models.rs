@@ -49,9 +49,6 @@ pub struct Target {
     /// Operator note shown on the target's dashboard card, rendered as raw
     /// HTML there - see dashboard.html.
     pub description: Option<String>,
-    /// See `alphabet::compile_skip_regex`/`find_skip_run` - checked only when
-    /// carving fresh ranges, never against already-carved ones.
-    pub skip_regex: Option<String>,
     /// The shortest candidate length the main sweep carves - see
     /// `AdminCreateTargetRequest::start_len` and `ranges::claim_range`.
     pub start_len: i64,
@@ -145,30 +142,35 @@ pub struct PriorityRange {
     /// Higher claims first, same convention as `Target::priority`. Ties
     /// break by `created_at`. See `ranges::claim_range`.
     pub priority: i64,
-    /// The operator-supplied pattern this row's prefix was expanded from -
-    /// see `alphabet::expand_priority_pattern`. Display only.
+    /// The operator-supplied pattern - see `alphabet::pattern_spans`. The
+    /// candidates it matches are stored as this row's segments
+    /// (`priority_range_segments`).
     pub pattern: String,
-    /// The one concrete literal prefix (out of `pattern`'s possibly several
-    /// expansions) this specific row covers - `None` only for a row that
-    /// predates this column (see `migrations/0012_priority_range_prefix.sql`).
-    /// Needed to translate `start_index`/`end_index`/`next_index` onto a new
-    /// alphabet if the target's is ever patched - see
+    /// `None` for every row created since
+    /// `migrations/0021_skip_ranges_and_pattern_segments.sql`, which an
+    /// alphabet patch translates by re-expanding `pattern`. Before that, a
+    /// pattern became one row per concrete prefix, and this is that prefix -
+    /// or `""` for a row from before `0012_priority_range_prefix.sql`, which
+    /// can't be translated at all. See
     /// `ranges::migrate_priority_ranges_to_new_alphabet`.
     pub prefix: Option<String>,
-    /// A priority range is always scoped to exactly one candidate length -
-    /// see `alphabet::expand_priority_pattern`'s doc comment for why.
+    /// A priority range is always scoped to exactly one candidate length.
     pub candidate_len: i64,
+    /// What this row owns is its segments' candidates within
+    /// `[start_index, end_index)` - `end_index` can be pulled in below the
+    /// last segment's end when the range is removed (see
+    /// `ranges::remove_priority_range`).
     pub start_index: i64,
     pub end_index: i64,
-    /// This row's own cursor within `[start_index, end_index)`. Once it
-    /// reaches `end_index` the row is permanently exhausted - unlike
-    /// `TargetProgress`, there's no next length to bump to.
+    /// This row's own cursor within `[start_index, end_index)`, jumping over
+    /// the gaps between segments. Once it reaches `end_index` the row is
+    /// permanently exhausted - unlike `TargetProgress`, there's no next
+    /// length to bump to.
     pub next_index: i64,
     /// Frozen at creation, but not permanently: a later `admin_patch_target`
-    /// alphabet change translates `start_index`/`end_index`/`next_index`
-    /// onto the new alphabet (or permanently retires this row, if `prefix`
-    /// can no longer be expressed in it) - see
-    /// `ranges::migrate_priority_ranges_to_new_alphabet`.
+    /// alphabet change translates this row onto the new alphabet (or
+    /// permanently retires it, if nothing it matches can be expressed in
+    /// it) - see `ranges::migrate_priority_ranges_to_new_alphabet`.
     pub alphabet_name: String,
     pub alphabet: String,
     pub created_at: i64,
@@ -191,6 +193,47 @@ impl PriorityRange {
 
     pub fn next(&self) -> Pos {
         join_pos(&self.alphabet, self.candidate_len, self.next_block, self.next_index)
+    }
+}
+
+/// Candidates at one length an operator never wants handed out - see
+/// `migrations/0021_skip_ranges_and_pattern_segments.sql` and
+/// `ranges::claim_range`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SkipRange {
+    pub id: i64,
+    pub target_id: i64,
+    /// See `alphabet::pattern_spans`.
+    pub pattern: String,
+    /// Plain text explaining why, shown on the dashboard.
+    pub reason: String,
+    pub candidate_len: i64,
+    /// What the segments (`skip_range_segments`) are denominated in.
+    pub alphabet_name: String,
+    pub alphabet: String,
+    pub created_at: i64,
+    /// Set once removed after it had already skipped something - see
+    /// `ranges::remove_skip_range`. A removed skip range has no segments.
+    pub removed_at: Option<i64>,
+}
+
+/// One stored stretch of a skip or priority range's candidates - see
+/// `alphabet::pattern_spans`. `owner_id` is the skip or priority range it
+/// belongs to.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Segment {
+    pub owner_id: i64,
+    pub start_block: i64,
+    pub start_index: i64,
+    pub end_block: i64,
+    pub end_index: i64,
+}
+
+impl Segment {
+    /// The `[start, end)` positions this segment covers, at `len` in `alphabet`.
+    pub fn span(&self, alphabet: &str, len: i64) -> (Pos, Pos) {
+        (join_pos(alphabet, len, self.start_block, self.start_index), join_pos(alphabet, len, self.end_block, self.end_index))
     }
 }
 

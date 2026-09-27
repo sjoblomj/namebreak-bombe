@@ -11,7 +11,8 @@ use serde::Serialize;
 
 use crate::alphabet::{bound_indices_at_len, index_to_candidate, join_pos, max_supported_len, Pos};
 use crate::error::AppError;
-use crate::models::{i64_to_u32, PriorityRange};
+use crate::models::{i64_to_u32, PriorityRange, Segment, SkipRange};
+use crate::ranges::{count_within, owned_spans};
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -46,9 +47,6 @@ pub struct DashboardTarget {
     /// Operator note shown in the target's card header. Rendered as raw
     /// HTML by the dashboard, not escaped - see admin_create_target.
     pub description: Option<String>,
-    /// See `alphabet::compile_skip_regex` - shown on the target card so an
-    /// operator can see what's configured without a separate API call.
-    pub skip_regex: Option<String>,
     /// The target's *current* alphabet - i.e. what future ranges will be
     /// carved with (see `handlers::admin_patch_target`). Individual ranges
     /// may have been carved under a different (older) one - see
@@ -64,7 +62,7 @@ pub struct DashboardTarget {
     /// position, moved past any priority range span it would jump over on
     /// its next carve (see `effective_sweep_position`). Compared against
     /// each `DashboardPriorityRange` so the dashboard can show the (never
-    /// persisted - see `ranges::find_priority_boundary`) gap between them.
+    /// persisted - see `ranges::priority_spans_at`) gap between them.
     pub cursor_candidate_len: i64,
     pub cursor_next_index: Pos,
     pub cursor_candidate: String,
@@ -72,6 +70,9 @@ pub struct DashboardTarget {
     /// this range, or before all of them if `None`.
     pub sweep_after_range_id: Option<i64>,
     pub priority_ranges: Vec<DashboardPriorityRange>,
+    /// Including removed ones, so the `skipped` ranges they already produced
+    /// can still show their reason.
+    pub skip_ranges: Vec<DashboardSkipRange>,
     /// Ordered by candidate length, then position - the order the dashboard
     /// lists them in, and the order `gaps` refers to.
     pub ranges: Vec<DashboardRange>,
@@ -141,7 +142,7 @@ fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str)
 /// `ranges::claim_range`) - so until it next carves, the stored position can
 /// sit at the start of work a priority range has already handed out, for
 /// instance when that priority range was created while the sweep was
-/// partway into its span. This moves past any such span, continuing at the
+/// partway into it. This moves past any such span, continuing at the
 /// next length (within the target's bounds) when one runs to a length's
 /// end, just as the sweep itself will.
 fn effective_sweep_position(
@@ -156,9 +157,11 @@ fn effective_sweep_position(
     loop {
         let covering = priority_ranges
             .iter()
-            .find(|pr| pr.alphabet == alphabet && pr.candidate_len == len && pr.start_index <= index && index < pr.end_index);
-        if let Some(pr) = covering {
-            index = pr.end_index;
+            .filter(|pr| pr.alphabet == alphabet && pr.candidate_len == len)
+            .flat_map(|pr| &pr.spans)
+            .find(|&&(start, end)| start <= index && index < end);
+        if let Some(&(_, end)) = covering {
+            index = end;
             continue;
         }
         let (_, upper) = bound_indices_at_len(alphabet, lower_bound, upper_bound, len);
@@ -197,6 +200,30 @@ pub struct DashboardPriorityRange {
     pub next_candidate: Option<String>,
     pub alphabet_name: String,
     pub alphabet: String,
+    /// How many candidates it owns, and how many of those it has handed out.
+    /// Not simply `end_index - start_index`, since there can be gaps between
+    /// its segments (see `ranges::owned_spans`).
+    pub candidate_count: Pos,
+    pub handed_out_count: Pos,
+    /// How many separate stretches of candidates it owns.
+    pub segment_count: usize,
+    /// What it owns - only used here, by `effective_sweep_position`.
+    #[serde(skip)]
+    pub spans: Vec<(Pos, Pos)>,
+}
+
+#[derive(Serialize)]
+pub struct DashboardSkipRange {
+    pub id: i64,
+    pub pattern: String,
+    pub reason: String,
+    pub candidate_len: i64,
+    pub alphabet_name: String,
+    /// How many candidates it matches (0 once removed).
+    pub candidate_count: Pos,
+    /// Removed by an operator after it had already skipped something - see
+    /// `ranges::remove_skip_range`.
+    pub removed: bool,
 }
 
 /// One row of the dashboard's range query - positions still split into
@@ -222,6 +249,7 @@ struct RangeRow {
     alphabet_name: String,
     alphabet: String,
     priority_range_id: Option<i64>,
+    skip_range_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +295,9 @@ pub struct DashboardRange {
     /// Which `DashboardPriorityRange` (if any) this range was carved from -
     /// see `models::Range::priority_range_id`. Display only.
     pub priority_range_id: Option<i64>,
+    /// For a `skipped` range, which `DashboardSkipRange` it came from - `None`
+    /// for one an alphabet change left behind. Display only.
+    pub skip_range_id: Option<i64>,
 }
 
 // Both queries below build a user's "username@hostname" in SQL (`||` gives
@@ -276,11 +307,11 @@ pub struct DashboardRange {
 
 pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardResponse>, AppError> {
     #[allow(clippy::type_complexity)]
-    let target_rows: Vec<(i64, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+    let target_rows: Vec<(i64, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, String, String, i64, Option<String>)> = sqlx::query_as(
         "SELECT targets.id, targets.name, targets.status, \
                 targets.lower_bound, targets.upper_bound, targets.hash_a, targets.hash_b, targets.found_filename, \
                 found_user.username || '@' || found_user.hostname, NULLIF(found_user.backend, ''), targets.found_at, targets.alphabet_name, targets.alphabet, targets.priority, \
-                targets.description, targets.skip_regex \
+                targets.description \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
          ORDER BY targets.priority DESC, targets.created_at ASC",
     )
@@ -298,7 +329,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                 ranges.end_block, ranges.end_index, ranges.progress_block, ranges.progress_index, \
                 worker.username || '@' || worker.hostname AS worker, NULLIF(worker.backend, '') AS worker_backend, \
                 ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
-                ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id \
+                ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id, ranges.skip_range_id \
          FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
          ORDER BY ranges.candidate_len, ranges.start_block, ranges.start_index",
     )
@@ -332,9 +363,32 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     for pr in all_priority_ranges {
         priority_ranges_by_target.entry(pr.target_id).or_default().push(pr);
     }
+    let priority_segments = segments_by_owner(
+        &state.pool,
+        "SELECT priority_range_id AS owner_id, start_block, start_index, end_block, end_index FROM priority_range_segments",
+    )
+    .await?;
+
+    let all_skip_ranges: Vec<SkipRange> = sqlx::query_as("SELECT * FROM skip_ranges ORDER BY candidate_len, created_at").fetch_all(&state.pool).await?;
+    let skip_segments =
+        segments_by_owner(&state.pool, "SELECT skip_range_id AS owner_id, start_block, start_index, end_block, end_index FROM skip_range_segments").await?;
+    let mut skip_ranges_by_target: HashMap<i64, Vec<DashboardSkipRange>> = HashMap::new();
+    for sr in all_skip_ranges {
+        let candidate_count =
+            skip_segments.get(&sr.id).into_iter().flatten().map(|s| s.span(&sr.alphabet, sr.candidate_len)).map(|(start, end)| end - start).sum();
+        skip_ranges_by_target.entry(sr.target_id).or_default().push(DashboardSkipRange {
+            id: sr.id,
+            pattern: sr.pattern,
+            reason: sr.reason,
+            candidate_len: sr.candidate_len,
+            alphabet_name: sr.alphabet_name,
+            candidate_count,
+            removed: sr.removed_at.is_some(),
+        });
+    }
 
     let mut targets = Vec::with_capacity(target_rows.len());
-    for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_by, found_by_backend, found_at, alphabet_name, alphabet, priority, description, skip_regex) in target_rows {
+    for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_by, found_by_backend, found_at, alphabet_name, alphabet, priority, description) in target_rows {
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
 
         let ranges: Vec<DashboardRange> = range_rows
@@ -368,6 +422,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                     alphabet_name: row.alphabet_name,
                     alphabet: row.alphabet,
                     priority_range_id: row.priority_range_id,
+                    skip_range_id: row.skip_range_id,
                 }
             })
             .collect();
@@ -391,7 +446,12 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             .into_iter()
             .map(|pr| {
                 let (start_index, end_index, next_index) = (pr.start(), pr.end(), pr.next());
+                let spans = owned_spans(&pr, priority_segments.get(&pr.id));
                 DashboardPriorityRange {
+                    candidate_count: count_within(&spans, start_index, end_index),
+                    handed_out_count: count_within(&spans, start_index, next_index),
+                    segment_count: spans.len(),
+                    spans,
                     id: pr.id,
                     priority: pr.priority,
                     candidate_len: pr.candidate_len,
@@ -427,7 +487,6 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             found_at,
             priority,
             description,
-            skip_regex,
             alphabet_name,
             alphabet,
             start_len,
@@ -436,12 +495,22 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             cursor_candidate,
             sweep_after_range_id,
             priority_ranges,
+            skip_ranges: skip_ranges_by_target.remove(&id).unwrap_or_default(),
             ranges,
             gaps,
         });
     }
 
     Ok(Json(DashboardResponse { targets }))
+}
+
+/// Every row `sql` selects (as `models::Segment`s), grouped by owner.
+async fn segments_by_owner(pool: &sqlx::SqlitePool, sql: &'static str) -> Result<HashMap<i64, Vec<Segment>>, AppError> {
+    let mut by_owner: HashMap<i64, Vec<Segment>> = HashMap::new();
+    for segment in sqlx::query_as::<_, Segment>(sql).fetch_all(pool).await? {
+        by_owner.entry(segment.owner_id).or_default().push(segment);
+    }
+    Ok(by_owner)
 }
 
 pub async fn dashboard_page() -> Html<&'static str> {
@@ -474,6 +543,7 @@ mod tests {
             alphabet_name: "letters".into(),
             alphabet: LETTERS.into(),
             priority_range_id: None,
+            skip_range_id: None,
         }
     }
 
@@ -517,6 +587,10 @@ mod tests {
             next_candidate: None,
             alphabet_name: "letters".into(),
             alphabet: LETTERS.into(),
+            candidate_count: end_index - start_index,
+            handed_out_count: end_index - start_index,
+            segment_count: 1,
+            spans: vec![(start_index, end_index)],
         }
     }
 

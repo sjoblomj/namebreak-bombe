@@ -426,6 +426,7 @@
     flex-direction: column;
     gap: 2px;
   }
+  .detail-grid > .detail-wide { flex-basis: 100%; }
   .detail-label {
     color: var(--muted);
     font-size: 10px;
@@ -780,6 +781,13 @@
     if (r.priority_range_id) {
       grid.appendChild(detailField('Priority range', '#' + r.priority_range_id, true));
     }
+    if (r.skip_range) {
+      grid.appendChild(detailField('Skip range', '#' + r.skip_range.id + (r.skip_range.removed ? ' (removed)' : ''), true));
+      grid.appendChild(detailField('Pattern', r.skip_range.pattern, true));
+      const reason = detailField('Reason', r.skip_range.reason);
+      reason.className = 'detail-wide';
+      grid.appendChild(reason);
+    }
     if (r.status === 'in_progress') {
       const progressLabel = r.progress_candidate ? `Progress (${fmtPercent(r.progress_percent)})` : 'Progress';
       grid.appendChild(detailField(progressLabel, r.progress_candidate ? candidateChip(r.progress_candidate) : 'not started', false));
@@ -1007,7 +1015,7 @@
 
   // Whether the ordinary (non-priority) candidates leading up to a priority
   // range have been carved yet is never persisted server-side (see
-  // ranges::find_priority_boundary) - it's computed here, purely for
+  // ranges::priority_spans_at) - it's computed here, purely for
   // display, from the two cursors the dashboard API already sends. Only
   // detailed (with the main sweep's current candidate) when it's actually
   // bounded (same length as the main sweep); a priority range at a longer,
@@ -1178,7 +1186,7 @@
       const tdPattern = document.createElement('td');
       tdPattern.className = 'mono';
       tdPattern.textContent = pr.pattern;
-      tdPattern.title = `"${pr.alphabet}"`;
+      tdPattern.title = `"${pr.alphabet}"` + (pr.segment_count > 1 ? ` - ${pr.segment_count} separate stretches` : '');
       const gapNote = priorityGapNote(t, pr);
       if (gapNote) {
         const note = document.createElement('span');
@@ -1194,8 +1202,8 @@
       tr.appendChild(tdLen);
 
       const tdProgress = document.createElement('td');
-      const total = pr.end_index - pr.start_index;
-      const done = pr.next_index - pr.start_index;
+      const total = pr.candidate_count;
+      const done = pr.handed_out_count;
       if (isPriorityRangeDone(pr)) {
         tdProgress.textContent = `Done (${fmtNum(total)})`;
       } else {
@@ -1287,6 +1295,9 @@
     // exactly. Gaps and the main sweep's position are placed by the range
     // they come right after, as the server worked them out.
     const gapAfter = new Map(t.gaps.map((g) => [g.after_range_id, g]));
+    // So a skipped row's details (see rangeRow) can say why.
+    const skipRangeById = new Map(t.skip_ranges.map((s) => [s.id, s]));
+    for (const r of t.ranges) r.skip_range = skipRangeById.get(r.skip_range_id);
     const showSweep = t.status !== 'solved';
     const items = [];
     if (showSweep && t.sweep_after_range_id == null) items.push({ kind: 'sweep' });
@@ -1371,14 +1382,16 @@
     bounds.append(candidateChip(t.lower_bound), ' → ', candidateChip(t.upper_bound));
     card.appendChild(bounds);
 
-    if (t.skip_regex) {
+    for (const s of t.skip_ranges) {
+      if (s.removed) continue;
       const skip = document.createElement('div');
       skip.className = 'target-skip';
-      skip.append('Skipping candidates starting with ');
+      skip.append(`Skip range #${s.id}: skipping `);
       const pattern = document.createElement('span');
       pattern.className = 'mono';
-      pattern.textContent = t.skip_regex;
+      pattern.textContent = s.pattern;
       skip.appendChild(pattern);
+      skip.append(` at length ${s.candidate_len} (${fmtNum(s.candidate_count)}) - ${s.reason}`);
       card.appendChild(skip);
     }
 

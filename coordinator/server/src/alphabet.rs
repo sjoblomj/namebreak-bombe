@@ -285,92 +285,19 @@ pub fn strip_prefix_suffix<'a>(filename: &'a str, prefix: &str, suffix: &str) ->
     filename.strip_prefix(prefix)?.strip_suffix(suffix)
 }
 
-/// Compiles an operator-supplied "skip regex" into the form actually
-/// evaluated: forced to anchor at the very start of the candidate regardless
-/// of whether the pattern itself starts with `^`, since a skip decision is
-/// only ever made from a candidate's *leading character* - see
-/// `skip_char_mask`. Returns `None` if the pattern doesn't compile as a regex
-/// at all (callers reject target creation/patches in that case).
-pub fn compile_skip_regex(pattern: &str) -> Option<regex::Regex> {
-    regex::Regex::new(&format!("^(?:{pattern})")).ok()
-}
+/// Cap on how many separate stretches of candidates (see `pattern_spans`) a
+/// single skip- or priority-range pattern may cover. Each one is stored as
+/// its own segment row that `ranges::claim_range` looks through when it
+/// carves, so a pattern with several wide positions ahead of its last one
+/// can't quietly turn into an unmanageable number of them.
+pub const MAX_PATTERN_SPANS: usize = 1000;
 
-/// For each character of `alphabet` (in order), whether a lone candidate
-/// consisting of just that character matches `skip_regex` - i.e. whether any
-/// candidate starting with that character should be skipped. This is the only
-/// shape of skip regex the carving logic supports: a pattern like `^AB`
-/// matches the string "AB", but the mask is computed by testing "A" alone, so
-/// it's evaluated as "skip everything starting with A", not "starting with
-/// AB" - deliberately weaker than what the regex syntax itself can express,
-/// in exchange for a skip decision being a single per-character lookup rather
-/// than something that has to inspect individual candidates one at a time
-/// (`find_skip_run`'s block search relies on this).
-pub fn skip_char_mask(alphabet: &str, skip_regex: &regex::Regex) -> Vec<bool> {
-    alphabet_chars(alphabet).iter().map(|c| skip_regex.is_match(&c.to_string())).collect()
-}
-
-/// Finds the first run of consecutive skip-marked alphabet characters at or
-/// after `lo_index`, restricted to `[lo_index, hi_index_exclusive)`. Returns
-/// that run's half-open index range `[skip_start, skip_end)`, or `None` if
-/// there's no skip run in that span.
-///
-/// Every alphabet character skips (or doesn't) as a whole contiguous block of
-/// `alphabet_size^(candidate_len - 1)` indices, since `index_to_candidate`
-/// orders candidates by leading character first - so this only ever has to
-/// walk the (at most `alphabet_size`, typically under 50) characters, never
-/// individual candidates within a block.
-pub fn find_skip_run(alphabet_size: i64, skip_chars: &[bool], candidate_len: i64, lo_index: Pos, hi_index_exclusive: Pos) -> Option<(Pos, Pos)> {
-    if lo_index >= hi_index_exclusive {
-        return None;
-    }
-    let block_size = pow_pos(alphabet_size, candidate_len - 1);
-    let mut char_idx = (lo_index / block_size) as usize;
-    while char_idx < skip_chars.len() {
-        let block_start = char_idx as Pos * block_size;
-        if block_start >= hi_index_exclusive {
-            break;
-        }
-        if skip_chars[char_idx] {
-            let skip_start = block_start.max(lo_index);
-            let mut end_char_idx = char_idx;
-            while end_char_idx + 1 < skip_chars.len() && skip_chars[end_char_idx + 1] {
-                end_char_idx += 1;
-            }
-            let skip_end = ((end_char_idx as Pos + 1) * block_size).min(hi_index_exclusive);
-            return Some((skip_start, skip_end));
-        }
-        char_idx += 1;
-    }
-    None
-}
-
-/// `base^exp` - callers only ever pass an `exp` (`candidate_len - 1`) small
-/// enough that the result fits a `Pos` (see `max_supported_len`).
-fn pow_pos(base: i64, exp: i64) -> Pos {
-    let mut result: Pos = 1;
-    for _ in 0..exp {
-        result *= base as Pos;
-    }
-    result
-}
-
-/// Cap on how many concrete prefixes a single priority-range pattern (see
-/// `expand_priority_pattern`) may expand into, so a careless wide character
-/// class at several positions can't silently explode into an unmanageable
-/// number of `priority_ranges` rows - each one is its own extra cursor
-/// `ranges::claim_range` has to check on every claim.
-pub const MAX_PRIORITY_PATTERN_EXPANSIONS: usize = 200;
-
-/// Splits a priority-range pattern into its per-position atoms, each of
-/// which matches exactly one character. Unlike `compile_skip_regex` (a
-/// single regex tested only against a candidate's leading character), a
-/// priority pattern is meant to pin down *several* leading positions at
-/// once - e.g. `"[ _-]S"` means "space, underscore or hyphen, followed by
-/// S", not one combined regex tested some other way. Splitting it into
-/// atoms up front lets each position's matching characters be computed
-/// independently (via the same single-character-testing technique
-/// `skip_char_mask` already uses - see `expand_priority_pattern`) and then
-/// combined into the cross-product of concrete literal prefixes.
+/// Splits a skip- or priority-range pattern into its per-position atoms,
+/// each of which matches exactly one character. A pattern pins down a
+/// candidate's *leading* positions - e.g. `"[ _-]S"` means "space,
+/// underscore or hyphen, followed by S". Splitting it into atoms up front
+/// lets each position's matching characters be computed independently -
+/// see `pattern_spans`.
 ///
 /// Supported per position: a literal character, `.` (any character), a
 /// backslash escape (`\d`, `\.`, ...), or a full `[...]` bracket expression
@@ -379,8 +306,7 @@ pub const MAX_PRIORITY_PATTERN_EXPANSIONS: usize = 200;
 /// are deliberately rejected: they'd make a pattern's matched length
 /// ambiguous, and the whole point here is a fixed, known prefix depth -
 /// wanting several different lengths or alternative prefixes just means
-/// creating several priority ranges (which can freely share a priority
-/// value to be treated as one tier).
+/// creating several ranges.
 fn tokenize_pattern_atoms(pattern: &str) -> Result<Vec<String>, String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut atoms = Vec::new();
@@ -403,14 +329,14 @@ fn tokenize_pattern_atoms(pattern: &str) -> Result<Vec<String>, String> {
                     i += 1;
                 }
                 if i >= chars.len() {
-                    return Err("unterminated '[' in priority pattern".into());
+                    return Err("unterminated '[' in pattern".into());
                 }
                 i += 1; // consume the closing ']'
                 atoms.push(chars[start..i].iter().collect());
             }
             '\\' => {
                 if i + 1 >= chars.len() {
-                    return Err("priority pattern ends with a trailing '\\'".into());
+                    return Err("pattern ends with a trailing '\\'".into());
                 }
                 atoms.push(chars[i..i + 2].iter().collect());
                 i += 2;
@@ -421,7 +347,7 @@ fn tokenize_pattern_atoms(pattern: &str) -> Result<Vec<String>, String> {
             }
             c @ ('+' | '*' | '?' | '|' | '(' | ')' | '{' | '}' | '^' | '$') => {
                 return Err(format!(
-                    "unsupported character '{c}' in priority pattern - only literal characters, '.', backslash escapes, \
+                    "unsupported character '{c}' in pattern - only literal characters, '.', backslash escapes, \
                      and '[...]' character classes are allowed (no quantifiers, alternation, groups or anchors)"
                 ));
             }
@@ -432,58 +358,92 @@ fn tokenize_pattern_atoms(pattern: &str) -> Result<Vec<String>, String> {
         }
     }
     if atoms.is_empty() {
-        return Err("priority pattern must not be empty".into());
+        return Err("pattern must not be empty".into());
     }
     Ok(atoms)
 }
 
-/// Expands a priority-range pattern into the concrete literal prefixes it
-/// matches against `alphabet` - see `tokenize_pattern_atoms` for the
-/// supported syntax. Each atom is compiled as its own single-character
-/// regex (anchored at *both* ends, unlike `compile_skip_regex` - a priority
-/// atom must match exactly one character, not "starts with") and tested
-/// against every character of `alphabet`; the per-position matching-character
-/// lists are then combined into their cross-product. Every returned prefix
-/// has the same length (the atom count) - this is what makes a fixed,
-/// unambiguous prefix depth possible.
+/// Groups ascending alphabet indices into runs of consecutive ones, as
+/// inclusive `(first, last)` pairs.
+fn consecutive_runs(indices: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &i in indices {
+        match runs.last_mut() {
+            Some((_, last)) if *last + 1 == i => *last = i,
+            _ => runs.push((i, i)),
+        }
+    }
+    runs
+}
+
+/// The candidates of length `candidate_len` whose leading characters match
+/// `pattern` (see `tokenize_pattern_atoms` for the syntax), as sorted,
+/// disjoint and non-adjacent half-open index spans.
 ///
-/// Returns an error if any atom fails to compile, if any position matches no
-/// character in `alphabet` at all (a dead pattern), or if the cross-product
-/// would exceed `MAX_PRIORITY_PATTERN_EXPANSIONS`.
-pub fn expand_priority_pattern(alphabet: &str, pattern: &str) -> Result<Vec<String>, String> {
+/// Candidates are numbered leading character first, in alphabet order, so
+/// all candidates sharing a prefix form one contiguous block - and so do
+/// prefixes differing only in a last character that are next to each other
+/// in the alphabet. Positions after the pattern (and trailing `.`s) never
+/// split anything, the last constrained position splits only where its
+/// characters stop being consecutive, and only the positions before it
+/// multiply the count. So `"_[A-Z]"` and `"[A-Z]."` are one span each, while
+/// `"[A-Z]_"`, whose matches really are scattered, is 26.
+///
+/// Returns an error if the pattern is longer than `candidate_len`, if an
+/// atom fails to compile or matches no character in `alphabet` at all, or if
+/// it covers more than `MAX_PATTERN_SPANS` separate spans.
+pub fn pattern_spans(alphabet: &str, pattern: &str, candidate_len: i64) -> Result<Vec<(Pos, Pos)>, String> {
     let atoms = tokenize_pattern_atoms(pattern)?;
+    if atoms.len() as i64 > candidate_len {
+        return Err(format!("pattern is {} characters long, which is longer than the requested length ({candidate_len})", atoms.len()));
+    }
     let chars = alphabet_chars(alphabet);
 
-    let mut per_position: Vec<Vec<char>> = Vec::with_capacity(atoms.len());
+    // Per position, the (ascending) alphabet indices of the characters it matches.
+    let mut per_position: Vec<Vec<usize>> = Vec::with_capacity(atoms.len());
     for atom in &atoms {
         let re = regex::Regex::new(&format!("^(?:{atom})$")).map_err(|_| format!("'{atom}' is not a valid pattern"))?;
-        let matching: Vec<char> = chars.iter().copied().filter(|c| re.is_match(&c.to_string())).collect();
+        let matching: Vec<usize> = (0..chars.len()).filter(|&i| re.is_match(&chars[i].to_string())).collect();
         if matching.is_empty() {
             return Err(format!("'{atom}' doesn't match any character in the target's alphabet"));
         }
         per_position.push(matching);
     }
 
-    let total: usize = per_position.iter().map(|m| m.len()).product();
-    if total > MAX_PRIORITY_PATTERN_EXPANSIONS {
+    while per_position.last().is_some_and(|m| m.len() == chars.len()) {
+        per_position.pop();
+    }
+    let Some(last) = per_position.pop() else {
+        return Ok(vec![(0, space_size(alphabet, candidate_len))]);
+    };
+    let runs = consecutive_runs(&last);
+    let count = per_position.iter().try_fold(runs.len(), |acc, m| acc.checked_mul(m.len()));
+    if count.is_none_or(|c| c > MAX_PATTERN_SPANS) {
         return Err(format!(
-            "priority pattern expands to {total} concrete prefixes, which is more than the limit of {MAX_PRIORITY_PATTERN_EXPANSIONS} - use a narrower pattern"
+            "pattern covers more than {MAX_PATTERN_SPANS} separate stretches of candidates - use a narrower pattern, or split it into several"
         ));
     }
 
-    let mut prefixes = vec![String::new()];
+    // Every prefix ahead of the last constrained position, as a base-N number, in ascending order.
+    let size = chars.len() as Pos;
+    let mut prefixes: Vec<Pos> = vec![0];
     for matching in &per_position {
-        let mut next = Vec::with_capacity(prefixes.len() * matching.len());
-        for prefix in &prefixes {
-            for &c in matching {
-                let mut p = prefix.clone();
-                p.push(c);
-                next.push(p);
+        prefixes = prefixes.iter().flat_map(|&p| matching.iter().map(move |&c| p * size + c as Pos)).collect();
+    }
+
+    // How many candidates share one character at the last constrained position.
+    let block = space_size(alphabet, candidate_len - per_position.len() as i64 - 1);
+    let mut spans: Vec<(Pos, Pos)> = Vec::with_capacity(prefixes.len() * runs.len());
+    for prefix in prefixes {
+        for &(first, last) in &runs {
+            let (start, end) = ((prefix * size + first as Pos) * block, (prefix * size + last as Pos + 1) * block);
+            match spans.last_mut() {
+                Some((_, prev_end)) if *prev_end == start => *prev_end = end,
+                _ => spans.push((start, end)),
             }
         }
-        prefixes = next;
     }
-    Ok(prefixes)
+    Ok(spans)
 }
 
 /// The outcome of moving a target's carving cursor from `old_alphabet` to
@@ -491,8 +451,9 @@ pub fn expand_priority_pattern(alphabet: &str, pattern: &str) -> Result<Vec<Stri
 /// target's alphabet: any range already carved keeps its own stored alphabet
 /// (see `models::Range::alphabet`), but the cursor (`target_progress`) has to
 /// be translated the first time carving reaches it after the patch - lazily,
-/// the same way a skip-regex run is only ever materialized once carving
-/// actually reaches it (see `find_skip_run`), rather than retroactively.
+/// the same way a skip range's `skipped` rows are only ever written once
+/// carving actually reaches them (see `ranges::claim_range`), rather than
+/// retroactively.
 ///
 /// Finds the smallest candidate, expressible entirely in `new_alphabet`,
 /// whose position in `old_alphabet`'s own ordering is still `>= old_next_index`,
@@ -888,52 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn compile_skip_regex_rejects_invalid_patterns_but_accepts_valid_ones() {
-        assert!(compile_skip_regex("[M-Q]").is_some());
-        assert!(compile_skip_regex("[").is_none(), "unclosed character class must not compile");
-    }
-
-    #[test]
-    fn skip_char_mask_marks_exactly_the_characters_the_regex_matches() {
-        let regex = compile_skip_regex("[M-Q]").unwrap();
-        let mask = skip_char_mask(DEFAULT, &regex);
-        let chars = alphabet_chars(DEFAULT);
-        for (c, &skip) in chars.iter().zip(mask.iter()) {
-            assert_eq!(skip, ('M'..='Q').contains(c), "mismatch for {c:?}");
-        }
-    }
-
-    #[test]
-    fn find_skip_run_locates_the_first_run_at_or_after_lo_index() {
-        // 26-letter alphabet, length-1 candidates so block_size == 1 and
-        // "leading character" is just the candidate itself.
-        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        let regex = compile_skip_regex("[M-Q]").unwrap();
-        let mask = skip_char_mask(letters, &regex);
-
-        // Searching the whole space finds M(12)..Q(16) inclusive, i.e. [12, 17).
-        assert_eq!(find_skip_run(26, &mask, 1, 0, 26), Some((12, 17)));
-        // Starting already inside the run clips skip_start to lo_index.
-        assert_eq!(find_skip_run(26, &mask, 1, 14, 26), Some((14, 17)));
-        // Starting after the run finds nothing.
-        assert_eq!(find_skip_run(26, &mask, 1, 17, 26), None);
-        // A hi bound that cuts the run off is respected.
-        assert_eq!(find_skip_run(26, &mask, 1, 0, 15), Some((12, 15)));
-    }
-
-    #[test]
-    fn find_skip_run_operates_on_whole_leading_character_blocks_at_longer_lengths() {
-        // At length 2 over a 26-letter alphabet, each leading character owns a
-        // block of 26 indices - skipping "M" must skip all 26 of "MA".."MZ",
-        // not just the single index that would apply at length 1.
-        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        let regex = compile_skip_regex("^M").unwrap();
-        let mask = skip_char_mask(letters, &regex);
-        let hi = 26 * 26;
-        assert_eq!(find_skip_run(26, &mask, 2, 0, hi), Some((12 * 26, 13 * 26)));
-    }
-
-    #[test]
     fn transition_alphabet_cursor_skips_the_shared_prefix_block_when_the_cursor_diverges() {
         // The feature spec's motivating example: digits+letters -> letters-only.
         // The skip runs exactly up to "ABCAAA" (the smallest letters-only
@@ -1046,64 +961,91 @@ mod tests {
         assert_eq!(transition.new_next_index, space_size(new, 1), "signals bump_length_if_exhausted the same way ordinary exhaustion does");
     }
 
-    #[test]
-    fn expand_priority_pattern_cross_products_a_bracket_class_with_a_literal() {
-        // The feature's motivating example: "[ _-]S" over the default alphabet.
-        let mut prefixes = expand_priority_pattern(DEFAULT, "[ _-]S").unwrap();
-        prefixes.sort();
-        let mut expected = vec![" S".to_string(), "_S".to_string(), "-S".to_string()];
-        expected.sort();
-        assert_eq!(prefixes, expected);
+    /// `pattern`'s spans at `len`, as candidate strings (first, last inclusive) for readability.
+    fn spans_as_candidates(alphabet: &str, pattern: &str, len: i64) -> Vec<(String, String)> {
+        pattern_spans(alphabet, pattern, len)
+            .unwrap()
+            .into_iter()
+            .map(|(start, end)| (index_to_candidate(alphabet, start, len), index_to_candidate(alphabet, end - 1, len)))
+            .collect()
+    }
+
+    fn pair(first: &str, last: &str) -> (String, String) {
+        (first.to_string(), last.to_string())
     }
 
     #[test]
-    fn expand_priority_pattern_handles_a_single_literal_atom() {
-        assert_eq!(expand_priority_pattern(DEFAULT, "S").unwrap(), vec!["S".to_string()]);
+    fn pattern_spans_merges_consecutive_characters_at_the_last_position_into_one_span() {
+        assert_eq!(spans_as_candidates(DEFAULT, "_[A-Z]", 3), vec![pair("_A ", "_Z_")]);
     }
 
     #[test]
-    fn expand_priority_pattern_supports_dot_and_backslash_escapes() {
-        // "." matches every character in the alphabet; "\d" only the digits.
-        let dot = expand_priority_pattern(SIZE42, ".").unwrap();
-        assert_eq!(dot.len(), alphabet_size(SIZE42) as usize);
-
-        let digits = expand_priority_pattern(SIZE42, "\\d").unwrap();
-        let mut digits_sorted = digits.clone();
-        digits_sorted.sort();
-        assert_eq!(digits_sorted, vec!["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+    fn pattern_spans_ignores_trailing_wildcards() {
+        assert_eq!(pattern_spans(DEFAULT, "[A-Z].", 4).unwrap(), pattern_spans(DEFAULT, "[A-Z]", 4).unwrap());
+        assert_eq!(pattern_spans(DEFAULT, "..", 3).unwrap(), vec![(0, space_size(DEFAULT, 3))]);
     }
 
     #[test]
-    fn expand_priority_pattern_rejects_a_dead_position() {
+    fn pattern_spans_splits_only_where_characters_stop_being_consecutive() {
+        assert_eq!(spans_as_candidates(DEFAULT, "[A-CX-Z]", 1), vec![pair("A", "C"), pair("X", "Z")]);
+        // Space, hyphen and underscore aren't next to each other in the alphabet.
+        assert_eq!(spans_as_candidates(DEFAULT, "[ _-]S", 3), vec![pair(" S ", " S_"), pair("-S ", "-S_"), pair("_S ", "_S_")]);
+    }
+
+    #[test]
+    fn pattern_spans_multiplies_by_the_positions_before_the_last_constrained_one() {
+        let spans = pattern_spans(DEFAULT, "[A-Z]_", 2).unwrap();
+        assert_eq!(spans.len(), 26);
+        assert!(spans.iter().all(|&(start, end)| end - start == 1));
+        assert_eq!(index_to_candidate(DEFAULT, spans[0].0, 2), "A_");
+        assert_eq!(index_to_candidate(DEFAULT, spans[25].0, 2), "Z_");
+    }
+
+    #[test]
+    fn pattern_spans_merges_spans_that_meet_across_prefixes() {
+        // "A_" is immediately followed by "B ", the next prefix's first match.
+        assert_eq!(spans_as_candidates(DEFAULT, "[AB][ _]", 2), vec![pair("A ", "A "), pair("A_", "B "), pair("B_", "B_")]);
+    }
+
+    #[test]
+    fn pattern_spans_supports_dot_and_backslash_escapes() {
+        assert_eq!(spans_as_candidates(SIZE42, "\\d", 2), vec![pair("0 ", "9_")]);
+        assert_eq!(spans_as_candidates(SIZE42, ".A", 2).len(), alphabet_size(SIZE42) as usize);
+    }
+
+    #[test]
+    fn pattern_spans_rejects_a_pattern_longer_than_the_length() {
+        let err = pattern_spans(DEFAULT, "ABC", 2).unwrap_err();
+        assert!(err.contains("longer than the requested length"), "{err}");
+    }
+
+    #[test]
+    fn pattern_spans_rejects_a_dead_position() {
         // SIZE42 has no lowercase letters at all.
-        let err = expand_priority_pattern(SIZE42, "z").unwrap_err();
+        let err = pattern_spans(SIZE42, "z", 1).unwrap_err();
         assert!(err.contains('z'), "error should name the offending atom: {err}");
     }
 
     #[test]
-    fn expand_priority_pattern_rejects_quantifiers_and_alternation() {
-        assert!(expand_priority_pattern(DEFAULT, "A+").is_err());
-        assert!(expand_priority_pattern(DEFAULT, "A*").is_err());
-        assert!(expand_priority_pattern(DEFAULT, "A|B").is_err());
-        assert!(expand_priority_pattern(DEFAULT, "(AB)").is_err());
-        assert!(expand_priority_pattern(DEFAULT, "A{2,3}").is_err());
+    fn pattern_spans_rejects_quantifiers_and_alternation() {
+        for pattern in ["A+", "A*", "A|B", "(AB)", "A{2,3}"] {
+            assert!(pattern_spans(DEFAULT, pattern, 8).is_err(), "{pattern}");
+        }
     }
 
     #[test]
-    fn expand_priority_pattern_rejects_an_unterminated_bracket() {
-        assert!(expand_priority_pattern(DEFAULT, "[AB").is_err());
+    fn pattern_spans_rejects_an_unterminated_bracket_and_an_empty_pattern() {
+        assert!(pattern_spans(DEFAULT, "[AB", 3).is_err());
+        assert!(pattern_spans(DEFAULT, "", 3).is_err());
     }
 
     #[test]
-    fn expand_priority_pattern_rejects_an_empty_pattern() {
-        assert!(expand_priority_pattern(DEFAULT, "").is_err());
-    }
-
-    #[test]
-    fn expand_priority_pattern_rejects_an_oversized_expansion() {
-        // Every position matches broadly, so the cross-product blows well past the cap.
-        let err = expand_priority_pattern(DEFAULT, "...").unwrap_err();
-        assert!(err.contains("200"), "error should mention the limit: {err}");
+    fn pattern_spans_rejects_too_many_spans() {
+        // 49 * 49 scattered single-candidate spans.
+        let err = pattern_spans(DEFAULT, "..A", 3).unwrap_err();
+        assert!(err.contains("1000"), "error should mention the limit: {err}");
+        // Just under the limit is fine: 26 * 26 * 1.
+        assert_eq!(pattern_spans(DEFAULT, "[A-Z][A-Z]A", 3).unwrap().len(), 676);
     }
 
     #[test]

@@ -224,13 +224,6 @@ pub struct AdminCreateTargetRequest {
     /// only ever set this from trusted, operator-supplied text.
     #[serde(default)]
     pub description: Option<String>,
-    /// Optional regex excluding part of the search space from ever being
-    /// carved out and handed to a worker. Matched only against a candidate's
-    /// *leading character* (independent of candidate length) - e.g. "[M-Q]"
-    /// skips every candidate starting with M through Q. Must compile as a
-    /// regex or target creation is rejected; empty/omitted means no skipping.
-    #[serde(default)]
-    pub skip_regex: Option<String>,
     /// The shortest candidate length the main sweep carves - every shorter
     /// candidate is left out entirely. Must be between 1 and the alphabet's
     /// max supported length. Defaults to 1, i.e. every length.
@@ -259,11 +252,6 @@ pub struct AdminPatchTargetRequest {
     /// description unchanged; pass `""` to clear it.
     #[serde(default)]
     pub description: Option<String>,
-    /// See `AdminCreateTargetRequest::skip_regex`. Leave unset to leave it
-    /// unchanged; pass `""` to clear it. A new value only takes effect for
-    /// ranges carved after the patch - see `ranges::claim_range`.
-    #[serde(default)]
-    pub skip_regex: Option<String>,
     /// See `AdminCreateTargetRequest::alphabet_name`. Leave unset to leave
     /// the alphabet unchanged. Rejected if the name is unknown, or if the
     /// target's own (immutable) bounds contain a character outside the new
@@ -300,8 +288,8 @@ pub struct AdminPatchTargetRequest {
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of
 /// its normal sequential sweep - see `ranges::claim_range`. Unlike
-/// `AdminCreateTargetRequest::skip_regex`, this never removes anything from
-/// the search, it only reorders when it happens.
+/// `AdminCreateSkipRangeRequest`, this never removes anything from the
+/// search, it only reorders when it happens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminCreatePriorityRangeRequest {
     /// A short, regex-*style* pattern describing the leading characters to
@@ -310,10 +298,10 @@ pub struct AdminCreatePriorityRangeRequest {
     /// negation both work). E.g. `"[ _-]S"` means "space, underscore or
     /// hyphen, followed by S". No quantifiers, alternation, groups or
     /// anchors - each pattern has one single, unambiguous length (its atom
-    /// count), which must not exceed `length` below. A pattern with more
-    /// than one matching character at some position (e.g. the bracket class
-    /// above) expands into that many separate priority ranges, one per
-    /// concrete prefix, all sharing this request's `priority`.
+    /// count), which must not exceed `length` below. However many separate
+    /// stretches of candidates it matches, it's one priority range - but a
+    /// pattern matching more than 1000 of them is rejected (see
+    /// `alphabet::pattern_spans` in the server).
     pub pattern: String,
     /// The exact candidate length this priority range applies to - not a
     /// range of lengths. Wanting several lengths (e.g. both 9 and 10
@@ -327,9 +315,36 @@ pub struct AdminCreatePriorityRangeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminCreatePriorityRangeResponse {
-    /// One id per concrete prefix `pattern` expanded into - see
-    /// `AdminCreatePriorityRangeRequest::pattern`.
-    pub priority_range_ids: Vec<i64>,
+    pub priority_range_id: i64,
+}
+
+/// Leaves every candidate of one length matching a pattern out of the
+/// search, recorded as `skipped` ranges once carving reaches them. Ranges
+/// already carved (even pending ones) are left as they are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminCreateSkipRangeRequest {
+    /// Same syntax as `AdminCreatePriorityRangeRequest::pattern`.
+    pub pattern: String,
+    /// The exact candidate length to skip at.
+    pub length: i64,
+    /// Plain text explaining why, shown on the dashboard. Required.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminCreateSkipRangeResponse {
+    pub skip_range_id: i64,
+}
+
+/// What `DELETE /api/v1/admin/skip-ranges/{id}` did. Carving stops skipping
+/// what the skip range matches either way; what it already skipped stays
+/// skipped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminDeleteSkipRangeResponse {
+    /// True if the skip range is gone entirely. False if it had already
+    /// skipped something: it's then kept, marked removed, so the dashboard
+    /// can still show why those candidates were skipped.
+    pub deleted: bool,
 }
 
 /// What `DELETE /api/v1/admin/priority-ranges/{id}` did. Work already

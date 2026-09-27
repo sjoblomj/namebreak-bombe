@@ -3,20 +3,20 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use namebreak_protocol::{
-    AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateTargetRequest, AdminCreateTargetResponse, AdminDeletePriorityRangeResponse,
-    AdminPatchTargetRequest,
+    AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
+    AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
     AlphabetInfo, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
     Version, PROTOCOL_VERSION,
 };
 
 use crate::alphabet::{
-    alphabet_size, bound_indices_at_len, bounds_are_valid, bounds_diverge_immediately, candidate_to_index, compile_skip_regex, expand_priority_pattern,
-    lookup_predefined_alphabet, max_supported_len, split_end, split_pos, PREDEFINED_ALPHABETS,
+    alphabet_size, bound_indices_at_len, bounds_are_valid, bounds_diverge_immediately, candidate_to_index, lookup_predefined_alphabet, max_supported_len,
+    pattern_spans, split_end, split_pos, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::error::AppError;
 use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User};
-use crate::ranges;
+use crate::ranges::{self, SegmentOwner};
 use crate::state::{generate_token, now_unix, AppState};
 
 /// Parses `req.protocol_version` and rejects a MAJOR-version mismatch
@@ -162,18 +162,6 @@ fn validate_start_len(start_len: i64, alphabet: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Rejects a skip_regex that doesn't compile as a regex (see
-/// `alphabet::compile_skip_regex`). `None` or an empty/blank string is valid -
-/// both mean "no skipping".
-fn validate_skip_regex(skip_regex: &Option<String>) -> Result<(), AppError> {
-    if let Some(pattern) = skip_regex {
-        if !pattern.trim().is_empty() && compile_skip_regex(pattern).is_none() {
-            return Err(AppError::BadRequest("skip_regex is not a valid regex".into()));
-        }
-    }
-    Ok(())
-}
-
 pub async fn admin_create_target(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -228,13 +216,12 @@ pub async fn admin_create_target(
     }
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
-    validate_skip_regex(&req.skip_regex)?;
 
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, max_backslash_count, alphabet_name, alphabet, status, priority, description, skip_regex, start_len, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, max_backslash_count, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -250,7 +237,6 @@ pub async fn admin_create_target(
     .bind(alphabet)
     .bind(req.priority)
     .bind(&req.description)
-    .bind(&req.skip_regex)
     .bind(req.start_len)
     .bind(now)
     .fetch_one(&mut *tx)
@@ -319,7 +305,6 @@ pub async fn admin_patch_target(
     if req.status.is_none()
         && req.priority.is_none()
         && req.description.is_none()
-        && req.skip_regex.is_none()
         && req.alphabet_name.is_none()
         && req.prune_symbol_runs.is_none()
         && req.prune_unopened_brackets.is_none()
@@ -327,7 +312,7 @@ pub async fn admin_patch_target(
         && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
-            "at least one of status, priority, description, skip_regex, alphabet_name, prune_symbol_runs, prune_unopened_brackets, \
+            "at least one of status, priority, description, alphabet_name, prune_symbol_runs, prune_unopened_brackets, \
              max_backslash_count or start_len must be provided"
                 .into(),
         ));
@@ -335,7 +320,6 @@ pub async fn admin_patch_target(
     if req.max_backslash_count.is_some_and(|n| n < 0) {
         return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
     }
-    validate_skip_regex(&req.skip_regex)?;
 
     let (alphabet_name, alphabet) = match &req.alphabet_name {
         Some(name) => {
@@ -366,7 +350,7 @@ pub async fn admin_patch_target(
 
     let result = sqlx::query(
         "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority), \
-         description = COALESCE(?, description), skip_regex = COALESCE(?, skip_regex), \
+         description = COALESCE(?, description), \
          alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet), \
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
          max_backslash_count = COALESCE(?, max_backslash_count), start_len = COALESCE(?, start_len) \
@@ -375,7 +359,6 @@ pub async fn admin_patch_target(
     .bind(&req.status)
     .bind(req.priority)
     .bind(&req.description)
-    .bind(&req.skip_regex)
     .bind(&alphabet_name)
     .bind(&alphabet)
     .bind(req.prune_symbol_runs.map(i64::from))
@@ -387,12 +370,13 @@ pub async fn admin_patch_target(
     .await?;
     debug_assert!(result.rows_affected() > 0, "target existed and wasn't solved per the check above");
 
-    // Priority ranges are translated eagerly, in the same transaction as
-    // the alphabet change itself - see
+    // Priority and skip ranges are translated eagerly, in the same
+    // transaction as the alphabet change itself - see
     // ranges::migrate_priority_ranges_to_new_alphabet's doc comment for why
     // this can't be deferred the way the target's own cursor transition is.
     if let (Some(name), Some(chars)) = (&alphabet_name, &alphabet) {
         ranges::migrate_priority_ranges_to_new_alphabet(&mut tx, target_id, name, chars, now_unix()).await?;
+        ranges::migrate_skip_ranges_to_new_alphabet(&mut tx, target_id, name, chars).await?;
     }
 
     tx.commit().await?;
@@ -413,10 +397,9 @@ pub async fn admin_delete_target(
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of
 /// its normal sequential sweep - see `ranges::claim_range`,
-/// `ranges::claim_priority_range_chunk`. `req.pattern` may expand (via
-/// `alphabet::expand_priority_pattern`) into several concrete prefixes, each
-/// becoming its own `priority_ranges` row sharing `req.priority` and
-/// `req.length`.
+/// `ranges::claim_priority_range_chunk`. However many separate stretches of
+/// candidates `req.pattern` covers (see `alphabet::pattern_spans`), it
+/// becomes one `priority_ranges` row, with one segment per stretch.
 pub async fn admin_create_priority_range(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -445,21 +428,12 @@ pub async fn admin_create_priority_range(
         return Err(AppError::BadRequest(format!("length {} exceeds this target's alphabet's max supported length ({cap})", req.length)));
     }
 
-    let prefixes = expand_priority_pattern(&target.alphabet, &req.pattern).map_err(AppError::BadRequest)?;
-    // Every expansion shares the same atom count (see expand_priority_pattern), so any one of them tells us the pattern's length.
-    let pattern_len = prefixes[0].chars().count() as i64;
-    if pattern_len > req.length {
-        return Err(AppError::BadRequest(format!(
-            "priority pattern is {pattern_len} characters long, which is longer than the requested length ({})",
-            req.length
-        )));
-    }
+    let spans = pattern_spans(&target.alphabet, &req.pattern, req.length).map_err(AppError::BadRequest)?;
 
     // A priority range only makes sense ahead of where the target's own
-    // cursor already reached - see alphabet::expand_priority_pattern's doc
-    // comment. Everything before that has already been fully searched by
-    // the main sweep, under its own bookkeeping; there's nothing left here
-    // to fast-track.
+    // cursor already reached. Everything before that has already been fully
+    // searched by the main sweep, under its own bookkeeping; there's
+    // nothing left here to fast-track.
     let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
         .bind(target_id)
         .fetch_one(&mut *tx)
@@ -481,63 +455,50 @@ pub async fn admin_create_priority_range(
     // whenever req.length is ahead of the cursor's length.
     let clamp_to_cursor = req.length == progress.candidate_len && progress.alphabet_name == target.alphabet_name;
 
-    let now = now_unix();
-    let mut priority_range_ids = Vec::with_capacity(prefixes.len());
-
-    for prefix in &prefixes {
-        let (start_index, end_index_inclusive) = bound_indices_at_len(&target.alphabet, prefix, prefix, req.length);
-        let end_index = end_index_inclusive + 1;
-        let next_index = if clamp_to_cursor { start_index.max(progress.next()) } else { start_index };
-        if next_index >= end_index {
-            return Err(AppError::BadRequest(format!(
-                "prefix '{prefix}' at length {} has already been fully searched by the main sweep - nothing left to prioritize",
-                req.length
-            )));
-        }
-
-        // Each priority range permanently owns its declared span (see
-        // ranges::find_priority_boundary), so this one mustn't double-book
-        // another's - beyond starting after work a finished one already
-        // handed out, see ranges::priority_range_start. One frozen under a
-        // different alphabet isn't index-comparable at all (same reasoning
-        // as find_priority_boundary), so it's excluded rather than risking
-        // a wrong comparison.
-        let next_index = ranges::priority_range_start(&mut tx, target_id, req.length, &target.alphabet_name, start_index, end_index, next_index)
-            .await
-            .map_err(|err| match err {
-                AppError::BadRequest(msg) => AppError::BadRequest(format!("prefix '{prefix}' at length {}: {msg}", req.length)),
-                other => other,
-            })?;
-
-        let (start_block, start_index) = split_pos(&target.alphabet, req.length, start_index);
-        let (end_block, end_index) = split_end(&target.alphabet, req.length, end_index);
-        let (next_block, next_index) = split_end(&target.alphabet, req.length, next_index);
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO priority_ranges (target_id, priority, pattern, prefix, candidate_len, start_block, start_index, end_block, end_index, \
-             next_block, next_index, alphabet_name, alphabet, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
-        .bind(target_id)
-        .bind(req.priority)
-        .bind(&req.pattern)
-        .bind(prefix)
-        .bind(req.length)
-        .bind(start_block)
-        .bind(start_index)
-        .bind(end_block)
-        .bind(end_index)
-        .bind(next_block)
-        .bind(next_index)
-        .bind(&target.alphabet_name)
-        .bind(&target.alphabet)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-        priority_range_ids.push(id);
+    let (start_index, end_index) = (spans[0].0, spans[spans.len() - 1].1);
+    let next_index = if clamp_to_cursor { start_index.max(progress.next()) } else { start_index };
+    if !spans.iter().any(|&(_, end)| end > next_index) {
+        return Err(AppError::BadRequest(format!(
+            "'{}' at length {} has already been fully searched by the main sweep - nothing left to prioritize",
+            req.pattern, req.length
+        )));
     }
 
+    // Each priority range permanently owns its segments (see
+    // ranges::priority_spans_at), so this one mustn't double-book another's
+    // - beyond starting after work a finished one already handed out, see
+    // ranges::priority_range_start. One frozen under a different alphabet
+    // isn't index-comparable at all (same reasoning as priority_spans_at),
+    // so it's excluded rather than risking a wrong comparison.
+    let next_index = ranges::priority_range_start(&mut tx, target_id, req.length, &target.alphabet_name, &spans, next_index).await?;
+
+    let (start_block, start_index) = split_pos(&target.alphabet, req.length, start_index);
+    let (end_block, end_index) = split_end(&target.alphabet, req.length, end_index);
+    let (next_block, next_index) = split_end(&target.alphabet, req.length, next_index);
+    let priority_range_id: i64 = sqlx::query_scalar(
+        "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_block, start_index, end_block, end_index, \
+         next_block, next_index, alphabet_name, alphabet, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(target_id)
+    .bind(req.priority)
+    .bind(&req.pattern)
+    .bind(req.length)
+    .bind(start_block)
+    .bind(start_index)
+    .bind(end_block)
+    .bind(end_index)
+    .bind(next_block)
+    .bind(next_index)
+    .bind(&target.alphabet_name)
+    .bind(&target.alphabet)
+    .bind(now_unix())
+    .fetch_one(&mut *tx)
+    .await?;
+    ranges::insert_segments(&mut tx, SegmentOwner::Priority, priority_range_id, &target.alphabet, req.length, &spans).await?;
+
     tx.commit().await?;
-    Ok(Json(AdminCreatePriorityRangeResponse { priority_range_ids }))
+    Ok(Json(AdminCreatePriorityRangeResponse { priority_range_id }))
 }
 
 pub async fn admin_delete_priority_range(
@@ -551,6 +512,34 @@ pub async fn admin_delete_priority_range(
         returned_to_main_sweep: removal.returned_to_main_sweep,
         kept: removal.kept,
     }))
+}
+
+/// Leaves the candidates matching `req.pattern` at `req.length` out of the
+/// search - see `ranges::create_skip_range`.
+pub async fn admin_create_skip_range(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(target_id): Path<i64>,
+    Json(req): Json<AdminCreateSkipRangeRequest>,
+) -> Result<Json<AdminCreateSkipRangeResponse>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?")
+        .bind(target_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let skip_range_id = ranges::create_skip_range(&mut tx, &target, &req.pattern, req.length, &req.reason, now_unix()).await?;
+    tx.commit().await?;
+    Ok(Json(AdminCreateSkipRangeResponse { skip_range_id }))
+}
+
+pub async fn admin_delete_skip_range(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(skip_range_id): Path<i64>,
+) -> Result<Json<AdminDeleteSkipRangeResponse>, AppError> {
+    let deleted = ranges::remove_skip_range(&state.pool, skip_range_id).await?.ok_or(AppError::NotFound)?;
+    Ok(Json(AdminDeleteSkipRangeResponse { deleted }))
 }
 
 #[cfg(test)]

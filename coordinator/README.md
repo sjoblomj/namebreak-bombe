@@ -62,10 +62,8 @@ See the top-level plan/design notes for the full rationale; the short version:
   carving to reach it. `POST /api/v1/admin/targets/{id}/priority-ranges`
   takes a small regex-*style* `pattern` (literal characters, `.`, backslash
   escapes, and `[...]` bracket classes - no quantifiers, alternation, groups
-  or anchors), a `length`, and a `priority`; a pattern matching more than one
-  character at some position expands into one priority range per concrete
-  prefix (capped at `MAX_PRIORITY_PATTERN_EXPANSIONS`, 200, in
-  `server/src/alphabet.rs`), each claimed the same way an ordinary range is.
+  or anchors), a `length`, and a `priority`, and creates one priority range
+  (see **Patterns** below), carved and claimed the same way ordinary work is.
   A new priority range may not overlap one that's still handing out work.
   It may start inside work a finished (or deleted) one already handed out,
   and then simply starts right after that work - handy for narrowing in on
@@ -77,6 +75,32 @@ See the top-level plan/design notes for the full rationale; the short version:
   searched. The response says how much went each way
   (`{"deleted": false, "returned_to_main_sweep": 21, "kept": 0}`); `deleted`
   is true only when nothing was ever handed out and nothing had to be kept.
+- **Skip ranges**: the opposite - candidates an operator never wants handed
+  out. `POST /api/v1/admin/targets/{id}/skip-ranges` takes the same kind of
+  `pattern`, a `length` and a plain-text `reason` (required), and returns
+  `{"skip_range_id": 3}`. Nothing is written in advance: when carving (the
+  main sweep or a priority range) reaches a skipped stretch, it's recorded
+  as a range with `status: "skipped"` ("Skip" on the dashboard, where
+  expanding the row shows the skip range's pattern and reason) and carving
+  continues after it. Ranges already carved, even pending ones, are left
+  alone. Where a skip range overlaps a priority range, skipping wins.
+  `DELETE /api/v1/admin/skip-ranges/{id}` stops it from skipping anything
+  further; what it already skipped stays skipped. The response's `deleted`
+  is false when it had already skipped something - the skip range is then
+  kept, marked removed, so those rows keep their reason.
+- **Patterns**: a skip or priority range's `pattern` pins down a candidate's
+  leading characters, one per position - `"_[A-Z]"` is every candidate of
+  that length starting with an underscore and then a letter. Candidates are
+  numbered in alphabet order, leading character first, so everything a
+  pattern matches is a few contiguous stretches of positions, and the
+  pattern is stored as one range with one segment per stretch. Characters
+  that sit next to each other in the alphabet at the pattern's last
+  constrained position form one stretch, and anything after that position
+  (including trailing `.`s) never splits one - so `"_[A-Z]"` and `"[A-Z]."`
+  are one stretch each, while `"[A-Z]_"` is 26. A pattern needing more than
+  1000 stretches (`MAX_PATTERN_SPANS` in `server/src/alphabet.rs`) is
+  rejected. On an alphabet change, the pattern is matched afresh against the
+  new alphabet.
 - **Alphabets**: each target picks one of a small set of predefined alphabets
   (`server/src/alphabet.rs`'s `PREDEFINED_ALPHABETS`, also listable via
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
@@ -153,7 +177,6 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "max_backslash_count": 0,
     "priority": 0,
     "description": "From the <b>1998</b> demo listing",
-    "skip_regex": "[M-Q]",
     "start_len": 1
   }'
 ```
@@ -202,16 +225,17 @@ header on the dashboard. It's rendered there as raw HTML, not escaped - tags
 like `<b>` come out formatted - so only ever set it from text you trust,
 since it's never sanitized.
 
-`skip_regex` (optional) excludes part of the search space from ever being
-carved out and handed to a worker. It's matched only against a candidate's
-*leading character*, independent of candidate length - `"[M-Q]"` skips every
-candidate starting with `M` through `Q`, at every length the target searches.
-It must compile as a regex or the request is rejected; it can't match
-anything deeper than the first character (e.g. `"^AB"` behaves exactly like
-`"^A"` - only the leading character is ever tested). A skipped stretch is
-carved as its own range with `status: "skipped"` (shown as "Skip" on the
-dashboard) the moment carving actually reaches it - never in advance, and
-never retroactively against ranges carved before the regex was set.
+Skip part of a target's search space (see **Skip ranges** above), or
+prioritize part of it:
+
+```sh
+curl -X POST localhost:8080/api/v1/admin/targets/1/skip-ranges \
+  -H 'X-Admin-Token: devsecret' -H 'Content-Type: application/json' \
+  -d '{"pattern": "[M-Q]", "length": 8, "reason": "Searched offline in 2024"}'
+curl -X POST localhost:8080/api/v1/admin/targets/1/priority-ranges \
+  -H 'X-Admin-Token: devsecret' -H 'Content-Type: application/json' \
+  -d '{"pattern": "_[A-Z]", "length": 9, "priority": 10}'
+```
 
 Check progress:
 
@@ -219,7 +243,7 @@ Check progress:
 curl localhost:8080/api/v1/status
 ```
 
-Pause/resume a target, and/or change its priority, description, skip_regex,
+Pause/resume a target, and/or change its priority, description,
 alphabet_name, prune_symbol_runs, prune_unopened_brackets, max_backslash_count
 or start_len:
 
@@ -229,9 +253,8 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
   -d '{"status": "paused", "priority": 5, "description": "<b>Bumped</b> for the weekend"}'
 ```
 
-Any field can be omitted to leave it unchanged (pass `"description": ""` or
-`"skip_regex": ""` to clear an existing one), but at least one must be given.
-A changed `skip_regex` only affects ranges carved after the patch. A changed
+Any field can be omitted to leave it unchanged (pass `"description": ""` to
+clear an existing one), but at least one must be given. A changed
 `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
 progress finish with the old setting. Raising `start_len` past where carving
