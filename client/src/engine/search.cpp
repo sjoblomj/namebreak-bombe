@@ -79,13 +79,14 @@ int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint
                            outFoundFilename, pauseRequested);
     }
     for (const std::string& hit : outcome.hits) {
-        printf("Hash A matches: %s\n", hit.c_str());
+        printf("%s\n", hit.c_str());
         fprintf(fout, "%s\n", hit.c_str());
         fflush(fout);
         if (onPartialMatch)
             onPartialMatch(hit);
     }
     if (outcome.found) {
+        printf("%s\n", outcome.foundFilename.c_str());
         printf("BOTH HASHES MATCH: %s\n", outcome.foundFilename.c_str());
         outFoundFilename = outcome.foundFilename;
         return 1;
