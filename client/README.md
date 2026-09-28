@@ -116,7 +116,7 @@ resume_from_last_candidate = true
 
 | Key | Required | Meaning |
 |---|---|---|
-| `alphabet` | yes | Every character a candidate may contain. Size must be one of `42, 43, 47, 48, 49, 50` (see [Compiling](#compiling) for why) and at most `MAX_ALPHABET_SIZE` (50). |
+| `alphabet` | yes | Every character a candidate may contain. Size must be one of `29, 30, 40, 41, 42, 43, 47, 48, 49, 50` (see [Compiling](#compiling) for why) and at most `MAX_ALPHABET_SIZE` (50). |
 | `max_backslash_count` | yes | Max `\` occurrences allowed in a candidate before it's skipped; `0` means unlimited. To forbid `\` entirely, leave it out of `alphabet` instead - `0` is "no limit", not "zero allowed". |
 | `prefix` / `suffix` | yes | The fixed parts of the filename around the candidate. |
 | `start_candidate` | no | Full filename (prefix+candidate+suffix) to begin searching from. Without it, the search starts from the beginning: in `continuous` mode the shortest candidates (as if it were just prefix+suffix - that filename itself isn't checked), in `bounded` mode, which searches only one candidate length, `lower_bound`. |
@@ -172,7 +172,7 @@ MinGW-w64, and its tests pass under Wine.
 
 The alphabet's *size* (not its exact characters) is baked into the binary as
 a compile-time template instantiation per size, for performance - the fixed
-set of sizes this build supports (`42, 43, 47, 48, 49, 50`) is checked early
+set of sizes this build supports (`29, 30, 40, 41, 42, 43, 47, 48, 49, 50`) is checked early
 and fails fast with a clear message if `config.conf`'s alphabet doesn't
 match one of them. Supporting a new size means adding it to
 `SupportedAlphabetSizes` in `src/backends/cuda/cuda_backend.cu` and

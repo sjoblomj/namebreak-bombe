@@ -134,8 +134,9 @@ See the top-level plan/design notes for the full rationale; the short version:
   (`server/src/alphabet.rs`'s `PREDEFINED_ALPHABETS`, also listable via
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
   without brackets/backslash and with a reduced punctuation set, currently
-  `size50`, `size49`, `size48`, `size47`, `size43` and `size42`. The set of
-  distinct *sizes* (42/43/47/48/49/50) is compiled into namebreak's CUDA backend as
+  `size50`, `size49`, `size48`, `size47`, `size43`, `size42`, `size41`,
+  `size40`, `size30` and `size29`. The set of distinct *sizes*
+  (29/30/40/41/42/43/47/48/49/50) is compiled into namebreak's CUDA backend as
   separate template instantiations (the same zero-cost trick already used for
   `--prune-symbol-runs`), so picking a different alphabet costs no performance -
   but it does mean a genuinely new *size* (not just a new named profile at an

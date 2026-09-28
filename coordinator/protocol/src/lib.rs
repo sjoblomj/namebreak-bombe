@@ -77,7 +77,8 @@ impl std::str::FromStr for Version {
 /// - 1.0.0 - initial versioned release; every alphabet in
 ///   `PREDEFINED_ALPHABETS` as of this version is tagged `since: (1, 0)`.
 /// - 1.1.0 - `RegisterRequest::client_release` (see `ClientReleases`).
-pub const PROTOCOL_VERSION: Version = Version::new(1, 1, 0);
+/// - 1.2.0 - the `size41`, `size40`, `size30` and `size29` alphabets.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 2, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {

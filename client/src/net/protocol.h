@@ -18,7 +18,7 @@
 // simply never gets handed to it - see ranges::claim_range on the server).
 // Bump this whenever this client starts depending on something the protocol
 // only guarantees from a newer version onward.
-constexpr const char* kProtocolVersion = "1.1.0";
+constexpr const char* kProtocolVersion = "1.2.0";
 
 struct RegisterRequest {
     std::string username;

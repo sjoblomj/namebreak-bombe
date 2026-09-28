@@ -271,7 +271,7 @@ __global__ void verifyMatchesKernel(
 // Must all be <= MAX_ALPHABET_SIZE.
 template<int... Sizes>
 struct AlphabetSizeList {};
-using SupportedAlphabetSizes = AlphabetSizeList<42, 43, 47, 48, 49, 50>;
+using SupportedAlphabetSizes = AlphabetSizeList<29, 30, 40, 41, 42, 43, 47, 48, 49, 50>;
 
 template<typename F, int... Sizes>
 bool dispatchAlphabetSizeIn(AlphabetSizeList<Sizes...>, int alphabetSize, F&& f) {

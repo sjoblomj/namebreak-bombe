@@ -85,7 +85,7 @@
 // The backend under test, and its window size (set in main()).
 static std::unique_ptr<SearchBackend> g_backend;
 static int g_window = 0;
-static const int kAlphabetSizes[] = {42, 43, 47, 48, 49, 50};
+static const int kAlphabetSizes[] = {29, 30, 40, 41, 42, 43, 47, 48, 49, 50};
 
 static uint32_t g_cryptTable[0x500];
 static int g_cases = 0;
@@ -716,8 +716,8 @@ static bool scenarioPrefixSuffixLengths() {
     ok &= expectError("P: prefix 52 + suffix 60 (would overflow MAX_FILENAME_LEN)", std::string(52, 'x'), std::string(60, 'y'), alphabet);
     ok &= expectError("P: prefix of 53 characters", std::string(53, 'x'), ".DAT", alphabet);
     std::vector<int> supportedSizes = g_backend->supportedAlphabetSizes();
-    if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), 41) == supportedSizes.end())
-        ok &= expectError("P: alphabet of an unsupported size (41)", "TEST_", ".DAT", alphabetOfSize(42).substr(0, 41));
+    if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), 39) == supportedSizes.end())
+        ok &= expectError("P: alphabet of an unsupported size (39)", "TEST_", ".DAT", alphabetOfSize(42).substr(0, 39));
     {
         // An empty start candidate means "from the beginning": the shortest
         // candidates, one character long - here a bounded search, so only those.
@@ -880,7 +880,7 @@ static bool fuzz(int iterations, uint64_t seed) {
 
     for (int it = 0; it < iterations; ++it) {
         CaseSpec c;
-        const int as = kAlphabetSizes[uni(6)];
+        const int as = kAlphabetSizes[uni(std::size(kAlphabetSizes))];
         const bool highBytes = uni(2) == 0;
         std::vector<char> pool;
         for (int b = 0x20; b <= 0x7E; ++b) pool.push_back((char) b);
@@ -893,6 +893,11 @@ static bool fuzz(int iterations, uint64_t seed) {
         static const int suffixLens[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 25, 60};
         int pl = prefixLens[uni(7)];
         int sl = suffixLens[uni(13)];
+        // runSearch reserves room after the prefix for as many leading
+        // characters as fit a uint64_t index - 11 for sizes 41-50, 12 for 40, 13 for 29-30.
+        int maxSafeIndexLen = 0;
+        for (uint64_t product = 1; maxSafeIndexLen < MAX_CANDIDATE_LEN && product <= UINT64_MAX / as; product *= as) maxSafeIndexLen++;
+        pl = std::min(pl, kMaxPrefixSize - 1 - maxSafeIndexLen);
         if (pl + sl + MAX_CANDIDATE_LEN >= MAX_FILENAME_LEN) sl = MAX_FILENAME_LEN - MAX_CANDIDATE_LEN - 1 - pl;
         auto randomBytes = [&](int n) {
             std::string s;
