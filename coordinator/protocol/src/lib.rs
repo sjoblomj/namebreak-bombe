@@ -73,9 +73,11 @@ impl std::str::FromStr for Version {
 ///   than crashing it with a target it has no idea how to search.
 /// - PATCH: anything else (bug fixes, doc changes) - never gates anything.
 ///
-/// Changelog: 1.0.0 - initial versioned release; every alphabet in
-/// `PREDEFINED_ALPHABETS` as of this version is tagged `since: (1, 0)`.
-pub const PROTOCOL_VERSION: Version = Version::new(1, 0, 0);
+/// Changelog:
+/// - 1.0.0 - initial versioned release; every alphabet in
+///   `PREDEFINED_ALPHABETS` as of this version is tagged `since: (1, 0)`.
+/// - 1.1.0 - `RegisterRequest::client_release` (see `ClientReleases`).
+pub const PROTOCOL_VERSION: Version = Version::new(1, 1, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -88,6 +90,12 @@ pub struct RegisterRequest {
     pub backend: String,
     /// This client's own protocol version (`"X.Y.Z"`, see `PROTOCOL_VERSION`).
     pub protocol_version: String,
+    /// The client release this is (`"vYYYY-MM-DD"`, optionally `.N`, as
+    /// tagged on GitHub; `"dev"` for a build that isn't a release) - see
+    /// `ClientReleases`. Missing from clients older than protocol 1.1.0,
+    /// which then count as older than any release.
+    #[serde(default)]
+    pub client_release: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +108,19 @@ pub struct RegisterResponse {
     /// decision left to make from this - it's just useful to log if it
     /// differs from what the client expected.
     pub server_protocol_version: String,
+}
+
+/// The client releases this server accepts, set with
+/// `PUT /api/v1/admin/client-releases` (and read back with GET).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientReleases {
+    /// A release tag (`"vYYYY-MM-DD"`, optionally `.N`), or null for none.
+    /// Clients older than this are refused, at `/register` and `/claim`,
+    /// with HTTP 426 Upgrade Required and a message saying what to get -
+    /// the client shows it and quits. A range already in hand can still be
+    /// heartbeated and completed.
+    #[serde(default)]
+    pub minimum: Option<String>,
 }
 
 /// A contiguous, ready-to-run slice of one target's search space, handed to a client.

@@ -1,5 +1,6 @@
 mod alphabet;
 mod auth;
+mod client_release;
 mod dashboard;
 mod db;
 mod error;
@@ -46,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/admin/priority-ranges/{id}", axum::routing::delete(handlers::admin_delete_priority_range))
         .route("/api/v1/admin/targets/{id}/skip-ranges", post(handlers::admin_create_skip_range))
         .route("/api/v1/admin/skip-ranges/{id}", axum::routing::delete(handlers::admin_delete_skip_range))
+        .route("/api/v1/admin/client-releases", get(handlers::admin_get_client_releases).put(handlers::admin_set_client_releases))
         .with_state(state);
 
     tracing::info!(%bind_addr, "starting namebreak coordinator server");

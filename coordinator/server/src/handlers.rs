@@ -5,7 +5,7 @@ use axum::Json;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
     AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
-    AlphabetInfo, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
+    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
     Version, PROTOCOL_VERSION,
 };
 
@@ -14,6 +14,7 @@ use crate::alphabet::{
     pattern_spans, split_end, split_pos, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
+use crate::client_release;
 use crate::error::AppError;
 use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User};
 use crate::ranges::{self, SegmentOwner};
@@ -45,6 +46,9 @@ pub async fn register(
     }
     let client_version = resolve_client_protocol_version(&req)?.to_string();
     let backend = req.backend.trim();
+    let client_release = req.client_release.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    let releases = client_release::load_client_releases(&state.pool).await?;
+    client_release::check_minimum(&releases, client_release)?;
 
     let now = now_unix();
 
@@ -57,19 +61,25 @@ pub async fn register(
         // Refreshed on every registration, not just created once: a
         // returning client may have been upgraded (or downgraded) since it
         // last registered, and claim_range always wants the current picture.
-        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ?, client_release = ? WHERE id = ?")
             .bind(now)
             .bind(&client_version)
             .bind(backend)
+            .bind(client_release)
             .bind(existing.id)
             .execute(&state.pool)
             .await?;
-        return Ok(Json(RegisterResponse { user_id: existing.id, token: existing.token, server_protocol_version: PROTOCOL_VERSION.to_string() }));
+        return Ok(Json(RegisterResponse {
+            user_id: existing.id,
+            token: existing.token,
+            server_protocol_version: PROTOCOL_VERSION.to_string(),
+        }));
     }
 
     let token = generate_token();
     let user_id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend, client_release) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(username)
     .bind(hostname)
@@ -78,6 +88,7 @@ pub async fn register(
     .bind(now)
     .bind(&client_version)
     .bind(backend)
+    .bind(client_release)
     .fetch_one(&state.pool)
     .await?;
 
@@ -88,6 +99,11 @@ pub async fn claim(
     State(state): State<AppState>,
     AuthedUser(user): AuthedUser,
 ) -> Result<Response, AppError> {
+    // Checked here too, not only at /register: a client that registered
+    // before the minimum was raised is turned away once it finishes the
+    // range it has, rather than carrying on for as long as it runs.
+    let releases = client_release::load_client_releases(&state.pool).await?;
+    client_release::check_minimum(&releases, user.client_release.as_deref())?;
     match ranges::claim_range(&state.pool, &state.config, &user).await? {
         Some(resp) => Ok((StatusCode::OK, Json(resp)).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
@@ -102,6 +118,21 @@ pub async fn heartbeat(
 ) -> Result<Json<HeartbeatResponse>, AppError> {
     let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename).await?;
     Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, range_released: outcome.range_released }))
+}
+
+pub async fn admin_get_client_releases(State(state): State<AppState>, _admin: AdminAuth) -> Result<Json<ClientReleases>, AppError> {
+    Ok(Json(client_release::load_client_releases(&state.pool).await?))
+}
+
+/// Replaces the minimum client release - see `ClientReleases`. Left out (or
+/// null), it's cleared.
+pub async fn admin_set_client_releases(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Json(req): Json<ClientReleases>,
+) -> Result<Json<ClientReleases>, AppError> {
+    client_release::set_client_releases(&state.pool, &req).await?;
+    Ok(Json(client_release::load_client_releases(&state.pool).await?))
 }
 
 pub async fn complete(
@@ -549,7 +580,7 @@ mod tests {
     use super::*;
 
     fn register_request(protocol_version: &str) -> RegisterRequest {
-        RegisterRequest { username: "u".into(), hostname: "h".into(), backend: "cuda".into(), protocol_version: protocol_version.to_string() }
+        RegisterRequest { username: "u".into(), hostname: "h".into(), backend: "cuda".into(), protocol_version: protocol_version.to_string(), client_release: None }
     }
 
     #[test]

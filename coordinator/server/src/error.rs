@@ -10,6 +10,10 @@ pub enum AppError {
     Forbidden,
     NotFound,
     Conflict(String),
+    /// The client is older than the server accepts - see
+    /// `client_release::check_minimum`. HTTP 426 Upgrade Required, which the
+    /// client takes as its cue to show the message and quit.
+    UpgradeRequired(String),
     Internal(String),
 }
 
@@ -21,6 +25,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            AppError::UpgradeRequired(msg) => (StatusCode::UPGRADE_REQUIRED, msg),
             AppError::Internal(msg) => {
                 tracing::error!(error = %msg, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())

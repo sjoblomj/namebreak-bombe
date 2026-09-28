@@ -58,6 +58,17 @@ See the top-level plan/design notes for the full rationale; the short version:
   rounded down to the last candidate of that alphabet at or before it
   (`floor_index`), so nothing gets skipped. A client that knows no such
   alphabet gets no work from that target at all.
+- **Client releases**: clients from protocol 1.1.0 on also send which
+  release they are (`client_release`, the GitHub tag they were built for,
+  e.g. `v2026-09-26`, or `dev`). `PUT /api/v1/admin/client-releases` sets
+  `{"minimum": "v2026-09-26"}` (null or left out clears it; `GET` reads it
+  back). A client older than `minimum` is refused at `/register` and
+  `/claim` with HTTP 426 and a message saying what to get, which the client
+  shows before quitting - a range it already has can still be finished. That
+  includes clients from before 1.1.0, which don't say what release they are,
+  and already show the server's error message when registration fails. `dev`
+  builds are never refused. The setting lives in the database, so changing
+  it needs no restart.
 - **Ranges**: a target's candidate space is carved into contiguous chunks sized
   from each user's observed candidates/sec, so a chunk takes roughly
   `TARGET_CHUNK_SECONDS` regardless of GPU speed. A range that isn't completed

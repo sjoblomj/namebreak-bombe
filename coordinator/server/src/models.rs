@@ -22,6 +22,9 @@ pub struct User {
     /// The backend this client searches with (e.g. "cuda"), as declared at
     /// `/register` time - informational only.
     pub backend: String,
+    /// The client release it last registered with - see `client_release`.
+    /// `None` for a client from before protocol 1.1.0.
+    pub client_release: Option<String>,
 }
 
 #[allow(dead_code)]

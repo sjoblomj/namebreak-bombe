@@ -1821,6 +1821,7 @@ mod tests {
             last_seen_at: now,
             protocol_version: "1.0.0".to_string(),
             backend: String::new(),
+            client_release: None,
         }
     }
 
@@ -1852,6 +1853,7 @@ mod tests {
             last_seen_at: now,
             protocol_version: protocol_version.to_string(),
             backend: String::new(),
+            client_release: None,
         }
     }
 
