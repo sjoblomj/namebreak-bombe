@@ -163,6 +163,42 @@ async fn insert_skipped_range(
     Ok(())
 }
 
+/// Inserts an unclaimed range, for `claim_range` to hand out ahead of fresh
+/// carving - see `remove_skip_range` and `split_off_chunk`.
+#[allow(clippy::too_many_arguments)]
+async fn insert_pending_range(
+    tx: &mut sqlx::SqliteConnection,
+    target_id: i64,
+    candidate_len: i64,
+    start_index: Pos,
+    end_index: Pos,
+    alphabet_name: &str,
+    alphabet: &str,
+    priority_range_id: Option<i64>,
+    created_at: i64,
+) -> Result<(), sqlx::Error> {
+    let (start_block, start_index) = split_pos(alphabet, candidate_len, start_index);
+    let (end_block, end_index) = split_end(alphabet, candidate_len, end_index);
+    sqlx::query(
+        "INSERT INTO ranges (target_id, candidate_len, start_block, start_index, end_block, end_index, status, created_at, alphabet_name, alphabet, \
+         priority_range_id) \
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+    )
+    .bind(target_id)
+    .bind(candidate_len)
+    .bind(start_block)
+    .bind(start_index)
+    .bind(end_block)
+    .bind(end_index)
+    .bind(created_at)
+    .bind(alphabet_name)
+    .bind(alphabet)
+    .bind(priority_range_id)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
 /// Inserts a freshly carved range, already claimed by `user`, returning its id.
 #[allow(clippy::too_many_arguments)]
 async fn insert_claimed_range(
@@ -710,6 +746,8 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
 
         if let Some((range, client_alphabet)) = pending {
             let range = split_off_searched_portion(&mut tx, range, now).await?;
+            let chunk = chunk_size(config, rate, &range.alphabet, &client_alphabet, range.candidate_len);
+            let range = split_off_chunk(&mut tx, range, chunk).await?;
             let lease_seconds = config.lease_seconds;
 
             sqlx::query(
@@ -1316,6 +1354,26 @@ async fn split_off_searched_portion(tx: &mut sqlx::SqliteConnection, range: Rang
     Ok(remainder)
 }
 
+/// Called by `claim_range` on the pending row it's about to hand out, after
+/// `split_off_searched_portion`. A row of more than `chunk` candidates - such
+/// as one a removed skip range requeued, see `remove_skip_range` - is shrunk
+/// to its first `chunk`, and the rest stays pending as a row of its own,
+/// keeping its place in the queue. So a client gets about as much work as a
+/// freshly carved chunk, not the whole row at once.
+async fn split_off_chunk(tx: &mut sqlx::SqliteConnection, mut range: Range, chunk: Pos) -> Result<Range, sqlx::Error> {
+    let split = range.start() + chunk;
+    if split >= range.end() {
+        return Ok(range);
+    }
+    insert_pending_range(&mut *tx, range.target_id, range.candidate_len, split, range.end(), &range.alphabet_name, &range.alphabet, range.priority_range_id, range.created_at)
+        .await?;
+    let (end_block, end_index) = split_end(&range.alphabet, range.candidate_len, split);
+    sqlx::query("UPDATE ranges SET end_block = ?, end_index = ? WHERE id = ?").bind(end_block).bind(end_index).bind(range.id).execute(&mut *tx).await?;
+    range.end_block = end_block;
+    range.end_index = end_index;
+    Ok(range)
+}
+
 /// Permanently removes a target and everything carved for it (its ranges and
 /// carving cursor). SQLite doesn't enforce the `REFERENCES` foreign keys here
 /// (no `PRAGMA foreign_keys = ON` is set), so children have to be deleted
@@ -1687,14 +1745,16 @@ pub async fn create_skip_range(
     Ok(id)
 }
 
-/// Removes a skip range, so carving stops skipping what it matches. Its
-/// `skipped` rows that carving will still reach are removed, so those
-/// candidates get searched after all; the ones carving has already passed
-/// stay skipped, since it never goes back (see `still_to_be_reached`). If
-/// any are left, the skip range's row is kept (marked removed, with no
-/// segments left) so they keep their reason on the dashboard. Returns
-/// whether the row itself is gone, or `None` if there's no such skip range.
-pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<Option<bool>, AppError> {
+/// Removes a skip range, so nothing it matches stays skipped. Its `skipped`
+/// rows that carving will still reach are removed, so carving searches
+/// them. The ones carving has already passed (see `still_to_be_reached`),
+/// which it never goes back to, become `pending` rows instead, which
+/// `claim_range` hands out ahead of fresh carving - in chunks, see
+/// `split_off_chunk`. The skip range itself is deleted - also one removed
+/// before this worked this way, whose passed rows then get searched too.
+/// Returns how many candidates were requeued as pending, or `None` if
+/// there's no such skip range.
+pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<Option<Pos>, AppError> {
     let mut tx = pool.begin().await?;
     let Some(skip_range) = sqlx::query_as::<_, SkipRange>("SELECT * FROM skip_ranges WHERE id = ?").bind(skip_range_id).fetch_optional(&mut *tx).await?
     else {
@@ -1702,14 +1762,26 @@ pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<
     };
     let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(skip_range.target_id).fetch_one(&mut *tx).await?;
     sqlx::query("DELETE FROM skip_range_segments WHERE skip_range_id = ?").bind(skip_range_id).execute(&mut *tx).await?;
-    let deleted = unskip_unreached_rows(&mut tx, &target, skip_range_id, None).await? == 0;
-    if deleted {
-        sqlx::query("DELETE FROM skip_ranges WHERE id = ?").bind(skip_range_id).execute(&mut *tx).await?;
-    } else {
-        sqlx::query("UPDATE skip_ranges SET removed_at = COALESCE(removed_at, ?) WHERE id = ?").bind(now_unix()).bind(skip_range_id).execute(&mut *tx).await?;
+
+    let rows = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE skip_range_id = ? AND status = 'skipped'")
+        .bind(skip_range_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let now = now_unix();
+    let mut requeued: Pos = 0;
+    for row in rows {
+        let span = [(row.start(), row.end())];
+        let reached = still_to_be_reached(&mut tx, &target, row.candidate_len, &row.alphabet_name, &row.alphabet, &span).await?;
+        sqlx::query("DELETE FROM ranges WHERE id = ?").bind(row.id).execute(&mut *tx).await?;
+        for (start, end) in subtract_spans(&span, &reached) {
+            insert_pending_range(&mut tx, target.id, row.candidate_len, start, end, &row.alphabet_name, &row.alphabet, row.priority_range_id, now).await?;
+            requeued += end - start;
+        }
     }
+
+    sqlx::query("DELETE FROM skip_ranges WHERE id = ?").bind(skip_range_id).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Some(deleted))
+    Ok(Some(requeued))
 }
 
 /// Re-expands every one of `target_id`'s skip ranges onto a new alphabet -
@@ -3472,10 +3544,11 @@ mod tests {
     }
 
     /// Removing a skip range withdraws the part of its rows the main sweep
-    /// hasn't reached yet - so it gets searched - and keeps the part it has
-    /// passed, splitting a row where the sweep is inside it.
+    /// hasn't reached yet - so the sweep searches it - and requeues the
+    /// part it has passed as pending, splitting a row where the sweep is
+    /// inside it. The pending part is handed out before the sweep goes on.
     #[tokio::test]
-    async fn remove_skip_range_withdraws_only_what_the_sweep_has_not_reached() {
+    async fn remove_skip_range_withdraws_what_the_sweep_has_not_reached_and_requeues_the_rest() {
         let pool = test_pool().await;
         let user = insert_user(&pool, "tester").await;
         let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -3484,16 +3557,18 @@ mod tests {
         // As if the sweep had got to F (it would normally jump the whole span).
         sqlx::query("UPDATE target_progress SET next_index = 5 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
 
-        assert_eq!(remove_skip_range(&pool, skip_range_id).await.unwrap(), Some(false));
-        assert_eq!(skipped_rows(&pool, target_id, 1).await, vec![(2, 5)], "C-E stays skipped, F-J is searched");
+        assert_eq!(remove_skip_range(&pool, skip_range_id).await.unwrap(), Some(3), "C-E is requeued");
+        assert_eq!(skipped_rows(&pool, target_id, 1).await, vec![], "nothing stays skipped");
+        let claim = claim_range(&pool, &test_config(30), &user).await.unwrap().expect("the requeued C-E");
+        assert_eq!((claim.lower_bound_filename.as_str(), claim.upper_bound_filename.as_str()), ("PREC.SUF", "PREE.SUF"));
         let claim = claim_range(&pool, &test_config(30), &user).await.unwrap().expect("F onwards");
         assert_eq!((claim.lower_bound_filename.as_str(), claim.upper_bound_filename.as_str()), ("PREF.SUF", "PREZ.SUF"));
     }
 
-    /// Removing a skip range that never skipped anything deletes it; one
-    /// that did is kept for its reason but stops skipping.
+    /// Removing a skip range deletes it whether or not it skipped anything,
+    /// and it stops skipping.
     #[tokio::test]
-    async fn remove_skip_range_deletes_an_unused_one_and_keeps_a_used_one() {
+    async fn remove_skip_range_deletes_both_an_unused_and_a_used_one() {
         let pool = test_pool().await;
         let user = insert_user(&pool, "tester").await;
         let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -3503,23 +3578,38 @@ mod tests {
 
         claim_range(&pool, &test_config(30), &user).await.unwrap().expect("A-B");
 
-        assert_eq!(remove_skip_range(&pool, unused).await.unwrap(), Some(true));
-        assert_eq!(remove_skip_range(&pool, used).await.unwrap(), Some(false));
+        assert_eq!(remove_skip_range(&pool, unused).await.unwrap(), Some(0));
+        assert_eq!(remove_skip_range(&pool, used).await.unwrap(), Some(2), "the sweep had jumped C-D");
         assert_eq!(remove_skip_range(&pool, 999_999).await.unwrap(), None);
 
-        let (removed_at, segments): (Option<i64>, i64) = sqlx::query_as(
-            "SELECT removed_at, (SELECT COUNT(*) FROM skip_range_segments WHERE skip_range_id = skip_ranges.id) FROM skip_ranges WHERE id = ?",
-        )
-        .bind(used)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(removed_at.is_some());
-        assert_eq!(segments, 0);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skip_ranges WHERE target_id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0);
 
-        // Length 2 is no longer skipped at "A".
+        // C-D is searched after all, and length 2 is no longer skipped at "A".
         let claims: Vec<String> = claim_through_len(&pool, &test_config(1000), &user, 2).await.into_iter().map(|c| c.lower_bound_filename).collect();
+        assert!(claims.contains(&"PREC.SUF".to_string()), "{claims:?}");
         assert!(claims.contains(&"PREAA.SUF".to_string()), "{claims:?}");
+    }
+
+    /// A pending row bigger than a chunk - what a removed skip range can
+    /// requeue - is handed out a chunk at a time, the rest staying pending.
+    #[tokio::test]
+    async fn claim_range_hands_out_a_big_pending_row_a_chunk_at_a_time() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+        let skip_range_id = add_skip_range(&pool, target_id, "[C-J]", 1).await;
+        sqlx::query("UPDATE target_progress SET next_index = 10 WHERE target_id = ?").bind(target_id).execute(&pool).await.unwrap();
+        assert_eq!(remove_skip_range(&pool, skip_range_id).await.unwrap(), Some(8), "all of C-J");
+
+        let mut claimed = Vec::new();
+        for _ in 0..3 {
+            let claim = claim_range(&pool, &test_config(3), &user).await.unwrap().expect("a chunk of C-J");
+            claimed.push((claim.lower_bound_filename, claim.upper_bound_filename));
+        }
+        let expected = [("PREC.SUF", "PREE.SUF"), ("PREF.SUF", "PREH.SUF"), ("PREI.SUF", "PREJ.SUF")];
+        assert_eq!(claimed, expected.map(|(lo, hi)| (lo.to_string(), hi.to_string())));
     }
 
     /// An alphabet patch re-expands a skip range's pattern under the new

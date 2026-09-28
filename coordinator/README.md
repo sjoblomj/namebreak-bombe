@@ -109,14 +109,17 @@ See the top-level plan/design notes for the full rationale; the short version:
   (the main sweep or a priority range) jumps straight over them. Ranges
   already carved, even pending ones, are left alone. Where a skip range
   overlaps a priority range, skipping wins.
-  `DELETE /api/v1/admin/skip-ranges/{id}` stops it from skipping. Its rows
-  that carving hasn't reached yet are removed, so those candidates get
-  searched after all; the ones the main sweep (or, inside a priority range,
-  the priority range) has already passed stay skipped, since carving never
-  goes back. The response's `deleted` is false when any are left - the skip
-  range is then kept, marked removed, so those rows keep their reason. On a
-  change of the target's alphabet, the rows carving hasn't reached are
-  rewritten in the new alphabet the same way.
+  `DELETE /api/v1/admin/skip-ranges/{id}` deletes it, and nothing it
+  matched stays skipped. Its rows that carving hasn't reached yet are
+  removed, so carving searches those candidates as it gets there. The ones
+  the main sweep (or, inside a priority range, the priority range) has
+  already passed - carving never goes back - are requeued as pending
+  ranges, which are handed out a chunk at a time before any fresh carving.
+  The response says how many candidates were requeued
+  (`{"requeued": 1250}`). A priority range can't be used for this instead:
+  one never starts behind the main sweep. On a change of the target's
+  alphabet, the rows carving hasn't reached are rewritten in the new
+  alphabet the same way.
 - **Patterns**: a skip or priority range's `pattern` pins down a candidate's
   leading characters, one per position - `"_[A-Z]"` is every candidate of
   that length starting with an underscore and then a letter. Candidates are

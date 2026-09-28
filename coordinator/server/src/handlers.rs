@@ -480,7 +480,8 @@ pub async fn admin_create_priority_range(
         .await?;
     if req.length < progress.candidate_len {
         return Err(AppError::BadRequest(format!(
-            "the target has already fully searched every {}-character candidate - nothing left to prioritize there",
+            "the main sweep has already passed every {}-character candidate - nothing left to prioritize there \
+             (to get candidates a skip range left out searched, remove the skip range instead)",
             req.length
         )));
     }
@@ -499,7 +500,8 @@ pub async fn admin_create_priority_range(
     let next_index = if clamp_to_cursor { start_index.max(progress.next()) } else { start_index };
     if !spans.iter().any(|&(_, end)| end > next_index) {
         return Err(AppError::BadRequest(format!(
-            "'{}' at length {} has already been fully searched by the main sweep - nothing left to prioritize",
+            "'{}' at length {} has already been passed by the main sweep - nothing left to prioritize \
+             (to get candidates a skip range left out searched, remove the skip range instead)",
             req.pattern, req.length
         )));
     }
@@ -578,8 +580,8 @@ pub async fn admin_delete_skip_range(
     _admin: AdminAuth,
     Path(skip_range_id): Path<i64>,
 ) -> Result<Json<AdminDeleteSkipRangeResponse>, AppError> {
-    let deleted = ranges::remove_skip_range(&state.pool, skip_range_id).await?.ok_or(AppError::NotFound)?;
-    Ok(Json(AdminDeleteSkipRangeResponse { deleted }))
+    let requeued = ranges::remove_skip_range(&state.pool, skip_range_id).await?.ok_or(AppError::NotFound)?;
+    Ok(Json(AdminDeleteSkipRangeResponse { requeued }))
 }
 
 #[cfg(test)]

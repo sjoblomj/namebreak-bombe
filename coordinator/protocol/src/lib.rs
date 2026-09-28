@@ -361,16 +361,17 @@ pub struct AdminCreateSkipRangeResponse {
     pub skip_range_id: i64,
 }
 
-/// What `DELETE /api/v1/admin/skip-ranges/{id}` did. Carving stops skipping
-/// what the skip range matches either way. Its `skipped` ranges carving
-/// hasn't reached yet are removed, so they get searched; the ones it has
-/// already passed stay skipped, since carving never goes back.
+/// What `DELETE /api/v1/admin/skip-ranges/{id}` did. The skip range is
+/// deleted and nothing it matched stays skipped: its `skipped` ranges
+/// carving hasn't reached yet are removed, so carving searches them, and
+/// the ones carving has already passed (it never goes back) are requeued
+/// as pending ranges instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminDeleteSkipRangeResponse {
-    /// True if the skip range is gone entirely. False if any of its
-    /// `skipped` ranges had to stay: it's then kept, marked removed, so the
-    /// dashboard can still show why those candidates were skipped.
-    pub deleted: bool,
+    /// Candidates requeued as pending because carving had already passed
+    /// them. 128-bit, since a skip range at a long candidate length can span
+    /// more than an i64 holds.
+    pub requeued: i128,
 }
 
 /// What `DELETE /api/v1/admin/priority-ranges/{id}` did. Work already
