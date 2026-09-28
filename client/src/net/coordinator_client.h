@@ -18,13 +18,14 @@ public:
 
     // Registers with the server, sending this client's own protocolVersion
     // (see protocol.h's kProtocolVersion) so the server can gate what it
-    // offers to only what this client understands, and the name of the
-    // backend it searches with. On success, stores the
-    // returned token for subsequent calls (also retrievable via token())
-    // and returns true, with outServerProtocolVersion set to the server's
-    // own protocol version - purely informational, worth logging.
-    bool registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t& outUserId,
-                        std::string& outServerProtocolVersion, std::string& error);
+    // offers to only what this client understands, its release (see
+    // common/version.h) and the name of the backend it searches with. On
+    // success, stores the returned token for subsequent calls (also
+    // retrievable via token()) and returns true, with `out` holding the
+    // server's response - notably its protocol version (purely
+    // informational, worth logging).
+    bool registerClient(const std::string& username, const std::string& hostname, const std::string& backend, RegisterResponse& out,
+                        std::string& error);
 
     void setToken(std::string token) { token_ = std::move(token); }
     const std::string& token() const { return token_; }
@@ -32,6 +33,12 @@ public:
     // std::nullopt means "no work available" (server returned 204 No
     // Content) - not an error.
     bool claim(std::optional<ClaimResponse>& out, std::string& error);
+
+    // Whether the last registerClient() or claim() failed because the
+    // server refuses this release as too old (HTTP 426 Upgrade Required) -
+    // retrying can't help, so the caller should show `error` (the server's
+    // message, saying what to get) and quit.
+    bool upgradeRequired() const { return upgradeRequired_; }
 
     // Distinguishes a 409 (this range's ownership already moved on - e.g. a
     // network or sleep/hibernate outage during heartbeating outlasted the
@@ -55,6 +62,7 @@ public:
 private:
     std::string baseUrl_;
     std::string token_;
+    bool upgradeRequired_ = false;
     HttpClient http_;
 };
 

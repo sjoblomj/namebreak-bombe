@@ -181,15 +181,23 @@ namebreak_search_library(namebreak_search)
 add_library(namebreak_common STATIC
     src/common/config.cpp
     src/common/matches_file.cpp
-    src/common/platform.cpp)
+    src/common/platform.cpp
+    src/common/version.cpp)
 target_link_libraries(namebreak_common PUBLIC namebreak_search)
+
+# This build's release (see src/common/version.h) - the release workflow sets
+# it to the tag it's building (-DNAMEBREAK_VERSION=v2026-09-26). Only
+# version.cpp sees it, so changing it rebuilds just that file.
+set(NAMEBREAK_VERSION "dev" CACHE STRING "Release this build is, e.g. v2026-09-26 ('dev' for none)")
+set_source_files_properties(src/common/version.cpp PROPERTIES COMPILE_DEFINITIONS "NAMEBREAK_VERSION=\"${NAMEBREAK_VERSION}\"")
 
 if(NAMEBREAK_NETWORK)
     add_library(namebreak_net STATIC
         src/net/coordinator_runner.cpp
         src/net/coordinator_client.cpp
         src/net/http_client.cpp
-        src/net/protocol.cpp)
+        src/net/protocol.cpp
+        src/net/update_check.cpp)
     target_link_libraries(namebreak_net PUBLIC namebreak_common CURL::libcurl)
 endif()
 
@@ -247,6 +255,16 @@ namebreak_test(prefix_hasher_test prefix_hasher_test)
 # start_candidate and resume_from_last_candidate. CPU only.
 namebreak_test_executable(config_test tests/config_test.cpp namebreak_common)
 namebreak_test(config_test config_test)
+
+# Release versions (src/common/version.h) and, with networking, the pure
+# parts of the startup update check. No network access.
+if(NAMEBREAK_NETWORK)
+    namebreak_test_executable(version_test tests/version_test.cpp namebreak_net)
+    target_compile_definitions(version_test PRIVATE NAMEBREAK_WITH_NETWORK)
+else()
+    namebreak_test_executable(version_test tests/version_test.cpp namebreak_common)
+endif()
+namebreak_test(version_test version_test)
 
 # The backends this build has (backends/backends.cpp); every one is tested.
 # Every backend except `reference` searches in rows (the same batch geometry

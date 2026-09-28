@@ -223,9 +223,16 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 out.matchesDir = value;
             } else if (key == "backend") {
                 out.backend = value;
+            } else if (key == "check_for_updates") {
+                if (value != "true" && value != "false") {
+                    error = path + ":" + std::to_string(lineNo) + ": check_for_updates must be true or false, got '" + value + "'";
+                    return false;
+                }
+                out.checkForUpdates = value == "true";
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search] or [coordinator] section (only 'mode', 'matches_dir' and 'backend' are allowed before any section)";
+                        "' must be inside a [search] or [coordinator] section (only 'mode', 'matches_dir', 'backend' and "
+                        "'check_for_updates' are allowed before any section)";
                 return false;
             }
         } else {

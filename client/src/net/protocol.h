@@ -18,7 +18,7 @@
 // simply never gets handed to it - see ranges::claim_range on the server).
 // Bump this whenever this client starts depending on something the protocol
 // only guarantees from a newer version onward.
-constexpr const char* kProtocolVersion = "1.0.0";
+constexpr const char* kProtocolVersion = "1.1.0";
 
 struct RegisterRequest {
     std::string username;
@@ -27,6 +27,9 @@ struct RegisterRequest {
     // "cuda") - informational only; the server just records it.
     std::string backend;
     std::string protocolVersion = kProtocolVersion;
+    // This build's release (namebreakVersion() - see common/version.h), so
+    // the server can refuse a client that's too old.
+    std::string clientRelease;
 };
 
 struct RegisterResponse {

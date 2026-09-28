@@ -10,14 +10,17 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include "backends/backends.h"
 #include "common/config.h"
 #include "common/platform.h"
+#include "common/version.h"
 #include "engine/search.h"
 #ifdef NAMEBREAK_WITH_NETWORK
 #include "net/coordinator_runner.h"
+#include "net/update_check.h"
 #endif
 
 // Toggled by pauseKeyListener below, polled by runSearch (via its
@@ -122,11 +125,12 @@ void printUsage(const char* argv0) {
     for (const std::string& name : backendNames())
         backends += (backends.empty() ? "" : "|") + name;
     fprintf(stderr, "Usage: %s [--mode continuous|bounded|coordinator] [--config <file>] [--backend %s]\n"
+                     "       %s -v|--version\n"
                      "Reads the given --config file (default: %s, in the current directory) for\n"
                      "everything else; --mode and --backend, if given, override that file's own\n"
                      "'mode = ...'/'backend = ...'. Without either, the first backend listed that\n"
-                     "can run on this machine is used.\n",
-            argv0, backends.c_str(), kDefaultConfigPath);
+                     "can run on this machine is used. -v/--version prints this build's version.\n",
+            argv0, backends.c_str(), argv0, kDefaultConfigPath);
 }
 
 // For a first run: where the config file was looked for, and the smallest
@@ -162,6 +166,10 @@ int main(int argc, char* argv[]) {
     std::string configPath = kDefaultConfigPath;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        if (arg == "-v" || arg == "--version") {
+            printf("namebreak %s\n", namebreakVersion());
+            return 0;
+        }
         if (arg == "--config") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--config requires a file path argument\n");
@@ -215,6 +223,14 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef NAMEBREAK_WITH_NETWORK
+    // Only ever a notice - nothing is downloaded, and nothing is said if
+    // the lookup fails. Done before any work starts, so it isn't lost in
+    // the search's output.
+    if (config.checkForUpdates) {
+        if (std::optional<std::string> notice = checkForNewerRelease())
+            printf("%s\n", notice->c_str());
+    }
+
     CoordinatorArgs cargs;
     if (mode == "coordinator") {
         if (!buildCoordinatorArgs(config, cargs, error)) {

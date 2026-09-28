@@ -25,11 +25,13 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 //   [search]      - bounded/continuous parameters (mode picks which of the
 //                   two actually runs; both take the same parameters)
 //   [coordinator] - coordinator-mode parameters (see coordinator_runner.h)
-// plus three keys allowed before any section: `mode = continuous|bounded|
+// plus four keys allowed before any section: `mode = continuous|bounded|
 // coordinator` (overridable by passing --mode <mode> - see main()),
-// `matches_dir = <directory>` (optional - see matches_file.h), and
+// `matches_dir = <directory>` (optional - see matches_file.h),
 // `backend = <name>` (optional, overridable by --backend <name> - see
-// backends/backends.h; unset, the first one that can run here). '#'-led lines
+// backends/backends.h; unset, the first one that can run here), and
+// `check_for_updates = true|false` (optional, default true - whether to look
+// for a newer release at startup; see net/update_check.h). '#'-led lines
 // and blank lines are ignored; a value may optionally be wrapped in "..." if
 // it needs meaningful leading/trailing whitespace (no other escaping - a
 // candidate/prefix/suffix containing a literal backslash needs none).
@@ -37,6 +39,7 @@ struct ConfigFile {
     std::string mode;
     std::string matchesDir = kDefaultMatchesDir;
     std::string backend;
+    bool checkForUpdates = true;
     std::map<std::string, std::string> search;
     std::map<std::string, std::string> coordinator;
 };

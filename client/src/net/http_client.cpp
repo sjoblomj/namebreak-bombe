@@ -70,3 +70,34 @@ HttpResponse HttpClient::post(const std::string& url, const std::vector<std::str
     resp.status = httpStatus;
     return resp;
 }
+
+HttpResponse HttpClient::head(const std::string& url, long timeoutSeconds) {
+    HttpResponse resp;
+    auto* curl = static_cast<CURL*>(curl_);
+    if (!curl) {
+        resp.error = "failed to initialize libcurl";
+        return resp;
+    }
+
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "namebreak");
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L); // see post()
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        resp.error = curl_easy_strerror(rc);
+        return resp;
+    }
+
+    long httpStatus = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpStatus);
+    resp.status = httpStatus;
+    char* effective = nullptr;
+    if (curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective) == CURLE_OK && effective)
+        resp.effectiveUrl = effective;
+    return resp;
+}

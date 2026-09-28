@@ -15,6 +15,9 @@ struct HttpResponse {
     std::string body;
     // libcurl's error string, only set when status == 0.
     std::string error;
+    // The URL the response actually came from, after following redirects -
+    // only set by head().
+    std::string effectiveUrl;
 
     bool ok() const { return status >= 200 && status < 300; }
 };
@@ -32,6 +35,10 @@ public:
     static constexpr long kDefaultTimeoutSeconds = 20;
 
     HttpResponse post(const std::string& url, const std::vector<std::string>& headers, const std::string& jsonBody);
+
+    // A body-less GET, following redirects - for where a URL redirects to
+    // (see HttpResponse::effectiveUrl), as update_check.cpp needs.
+    HttpResponse head(const std::string& url, long timeoutSeconds = kDefaultTimeoutSeconds);
 
 private:
     void* curl_; // CURL*, opaque here so this header doesn't need <curl/curl.h>

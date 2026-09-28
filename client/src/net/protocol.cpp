@@ -204,7 +204,8 @@ bool getOptionalBool(const std::map<std::string, JsonValue>& obj, const std::str
 
 std::string toJson(const RegisterRequest& req) {
     return "{\"username\":" + escapeJsonString(req.username) + ",\"hostname\":" + escapeJsonString(req.hostname) +
-           ",\"backend\":" + escapeJsonString(req.backend) + ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) + "}";
+           ",\"backend\":" + escapeJsonString(req.backend) + ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) +
+           ",\"client_release\":" + escapeJsonString(req.clientRelease) + "}";
 }
 
 std::string toJson(const HeartbeatRequest& req) {

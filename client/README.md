@@ -39,6 +39,22 @@ unknown name lists the ones the build has.
 Exit code is `0` if both hashes matched, `2` if the search space was
 exhausted without a match, `1` on any setup/config error.
 
+## Version and updates
+
+`namebreak -v` (or `--version`) prints which release this is - the GitHub
+release tag it was built for, like `v2026-09-26`, or `dev` for a build that
+isn't a release (see `NAMEBREAK_VERSION` under [Compiling](#compiling)).
+
+At startup, a release build looks up the latest release on
+[GitHub](https://github.com/sjoblomj/namebreak-bombe/releases) and, if
+there's a newer one, says so and where to get it. It never downloads
+anything, and says nothing if the lookup fails. A top-level
+`check_for_updates = false` line in `config.conf` turns this off. A build
+without networking (`NAMEBREAK_NETWORK=OFF`) never looks.
+
+In `coordinator` mode, the server can refuse a release it considers too old.
+namebreak then shows the server's message, saying what to get, and quits.
+
 ## Pausing
 
 Press `p` (or `P`) at any point while `namebreak` is running interactively
@@ -140,7 +156,8 @@ Options, passed to the first command as `-D<option>=<value>`:
 | Option | Default | Meaning |
 |---|---|---|
 | `CMAKE_CUDA_ARCHITECTURES` | `86` | The GPU's compute capability, without the dot (`nvidia-smi --query-gpu=compute_cap --format=csv`), or `native` |
-| `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode and the libcurl dependency |
+| `NAMEBREAK_NETWORK` | `ON` | `OFF` leaves out coordinator mode, the update check and the libcurl dependency |
+| `NAMEBREAK_VERSION` | `dev` | The release this build is, e.g. `v2026-09-26` - what `--version` prints, and what the update check and the coordinator compare. The release workflow sets it to the tag it builds |
 | `NAMEBREAK_GPU` | `cuda` | `hip` builds the HIP backend for AMD GPUs instead (needs ROCm or the HIP SDK; the `hip` preset, into `build-hip/`, with `CMAKE_HIP_ARCHITECTURES` e.g. `gfx1100` - unset, CMake asks ROCm). `none` builds without either, leaving the CPU backends and OpenCL - or use the `portable` preset, which builds into `build-portable/` |
 | `NAMEBREAK_METAL` | `AUTO` | The Metal backend: `AUTO` builds it on macOS (Xcode's command line tools are all it needs), `OFF` leaves it out |
 | `NAMEBREAK_OPENCL` | `AUTO` | The OpenCL backend: `AUTO` builds it if OpenCL's headers and loader library are found (on Debian/Ubuntu: `opencl-headers ocl-icd-opencl-dev`; on Windows e.g. vcpkg's `opencl`), `ON` insists, `OFF` leaves it out |
@@ -175,14 +192,17 @@ deleting it is the clean build.
 
 ## Releases
 
-Pushing a version tag (`git tag v1.2.3 && git push origin v1.2.3`) runs
-`.github/workflows/client-release.yml`, which builds the client for Linux
+Pushing a version tag (`git tag v2026-09-26 && git push origin v2026-09-26`)
+runs `.github/workflows/client-release.yml`, which builds the client for Linux
 (CUDA + OpenCL + CPU, and a separate AMD/HIP build), Windows (CUDA + OpenCL +
 CPU, and the GUI) and macOS on Apple Silicon (Metal + OpenCL + CPU), runs the
 tests on each, and attaches the archives to a GitHub release for the tag. A
 build that fails is left out and the release is created as a draft instead.
-The workflow can also be started by hand from the Actions tab, to get the
-same builds without a release. The runners have no GPUs, so only the CPU
+Tags must be the release date, `vYYYY-MM-DD`, with `.1`, `.2`, ... added for
+a later release the same day: that's how releases are ordered, both by the
+client's update check and by the coordinator's minimum release. Each build is made with `NAMEBREAK_VERSION` set to the tag. The
+workflow can also be started by hand from the Actions tab, to get the same
+builds (as `dev`) without a release. The runners have no GPUs, so only the CPU
 backends' tests actually run there.
 
 ## Source layout

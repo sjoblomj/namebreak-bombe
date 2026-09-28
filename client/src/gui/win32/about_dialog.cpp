@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "common/version.h"
 #include "gui/win32/app_icons.h"
 #include "net/protocol.h"
 
@@ -82,7 +83,8 @@ void showAboutDialog(HWND owner) {
     HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 16, 16, 192, 128, hwnd, nullptr, hInstance, nullptr);
     SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
 
-    std::string protocolLine = std::string("Coordinator protocol v") + kProtocolVersion;
+    // Short enough for the 210px label: "v2026-09-26 (protocol 1.1.0)".
+    std::string protocolLine = std::string(namebreakVersion()) + " (protocol " + kProtocolVersion + ")";
     HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 226, 16, 210, 28, hwnd, nullptr, hInstance, nullptr);
     // Wide-character API for this one label: the byline has a non-ASCII
     // letter, which the ANSI API would only show correctly on codepages that

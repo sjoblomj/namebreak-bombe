@@ -1,6 +1,7 @@
 # Builds the namebreak client (client/) for every platform it ships
-# on, runs its tests there, and - for a pushed version tag (v1.2.3) - attaches
-# the builds to a GitHub release for that tag. Run it by hand (Actions tab ->
+# on, runs its tests there, and - for a pushed version tag (v2026-09-26, see
+# client/README.md's "Releases") - attaches the builds to a GitHub release for
+# that tag. Every build gets the tag as its NAMEBREAK_VERSION. Run it by hand (Actions tab ->
 # "Run workflow") to get the same builds as workflow artifacts, without a
 # release.
 #
@@ -43,7 +44,7 @@ jobs:
       - name: Configure
         run: >
           cmake -S client -B build -DCMAKE_BUILD_TYPE=Release
-          -DNAMEBREAK_GPU=cuda -DNAMEBREAK_OPENCL=ON -DNAMEBREAK_TEST_VARIANTS=OFF
+          -DNAMEBREAK_GPU=cuda -DNAMEBREAK_OPENCL=ON -DNAMEBREAK_TEST_VARIANTS=OFF "-DNAMEBREAK_VERSION=$VERSION"
           "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES" -DCMAKE_CUDA_FLAGS=-Wno-deprecated-gpu-targets
       - name: Build
         run: cmake --build build -j "$(nproc)"
@@ -75,7 +76,7 @@ jobs:
       - name: Configure
         run: >
           cmake -S client -B build -DCMAKE_BUILD_TYPE=Release
-          -DNAMEBREAK_GPU=hip -DNAMEBREAK_OPENCL=OFF -DNAMEBREAK_TEST_VARIANTS=OFF
+          -DNAMEBREAK_GPU=hip -DNAMEBREAK_OPENCL=OFF -DNAMEBREAK_TEST_VARIANTS=OFF "-DNAMEBREAK_VERSION=$VERSION"
           -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm
           "-DCMAKE_HIP_ARCHITECTURES=$HIP_ARCHITECTURES"
       - name: Build
@@ -113,7 +114,7 @@ jobs:
       - name: Configure
         run: >
           cmake -S client -B build -G "Visual Studio 17 2022" -A x64 -T "cuda=$env:CUDA_PATH"
-          -DNAMEBREAK_GPU=cuda -DNAMEBREAK_OPENCL=ON -DNAMEBREAK_TEST_VARIANTS=OFF
+          -DNAMEBREAK_GPU=cuda -DNAMEBREAK_OPENCL=ON -DNAMEBREAK_TEST_VARIANTS=OFF "-DNAMEBREAK_VERSION=$env:VERSION"
           "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES" -DCMAKE_CUDA_FLAGS=-Wno-deprecated-gpu-targets
           "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
       - name: Build
@@ -138,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Configure
-        run: cmake --preset portable
+        run: cmake --preset portable "-DNAMEBREAK_VERSION=$VERSION"
         working-directory: client
       - name: Build
         run: cmake --build --preset portable

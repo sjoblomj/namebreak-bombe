@@ -1,20 +1,28 @@
 #include "net/coordinator_client.h"
 
+#include "common/version.h"
+
 namespace {
 std::string authHeader(const std::string& token) {
     return "Authorization: Bearer " + token;
 }
 } // namespace
 
-bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t& outUserId,
-                                       std::string& outServerProtocolVersion, std::string& error) {
+bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, const std::string& backend, RegisterResponse& out,
+                                       std::string& error) {
     RegisterRequest req;
     req.username = username;
     req.hostname = hostname;
     req.backend = backend;
+    req.clientRelease = namebreakVersion();
     HttpResponse resp = http_.post(baseUrl_ + "/api/v1/register", {}, toJson(req));
+    upgradeRequired_ = resp.status == 426;
     if (resp.status == 0) {
         error = "request failed: " + resp.error;
+        return false;
+    }
+    if (upgradeRequired_) {
+        error = parseErrorMessage(resp.body);
         return false;
     }
     if (!resp.ok()) {
@@ -24,21 +32,23 @@ bool CoordinatorClient::registerClient(const std::string& username, const std::s
         error = "register failed (HTTP " + std::to_string(resp.status) + "): " + parseErrorMessage(resp.body);
         return false;
     }
-    RegisterResponse out;
     if (!parseRegisterResponse(resp.body, out)) {
         error = "malformed register response: " + resp.body;
         return false;
     }
     token_ = out.token;
-    outUserId = out.userId;
-    outServerProtocolVersion = out.serverProtocolVersion;
     return true;
 }
 
 bool CoordinatorClient::claim(std::optional<ClaimResponse>& out, std::string& error) {
     HttpResponse resp = http_.post(baseUrl_ + "/api/v1/claim", {authHeader(token_)}, "");
+    upgradeRequired_ = resp.status == 426;
     if (resp.status == 0) {
         error = "request failed: " + resp.error;
+        return false;
+    }
+    if (upgradeRequired_) {
+        error = parseErrorMessage(resp.body);
         return false;
     }
     if (resp.status == 204) {

@@ -19,6 +19,7 @@
 #include "backends/backends.h"
 #include "common/config.h"
 #include "common/matches_file.h"
+#include "common/version.h"
 #include "net/coordinator_client.h"
 #include "common/string_util.h"
 #include "engine/candidate.h"
@@ -485,20 +486,21 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
     }
 
     CoordinatorClient client(args.serverUrl);
-    int64_t userId = 0;
-    std::string serverProtocolVersion;
+    RegisterResponse registration;
     std::string error;
-    if (!client.registerClient(args.username, args.hostname, backend->name(), userId, serverProtocolVersion, error)) {
-        std::string msg = "failed to register with coordinator: " + error;
+    if (!client.registerClient(args.username, args.hostname, backend->name(), registration, error)) {
+        // Too old for the server (see CoordinatorClient::upgradeRequired):
+        // its message says what to get.
+        std::string msg = client.upgradeRequired() ? error : "failed to register with coordinator: " + error;
         fprintf(stderr, "%s\n", msg.c_str());
         if (callbacks && callbacks->onStatus)
             callbacks->onStatus(msg);
         return 1;
     }
     {
-        std::string msg = "[coordinator] registered with coordinator as user " + std::to_string(userId) + " (" + args.username + "@" +
-                           args.hostname + ", " + backend->name() + " backend) - client protocol v" + kProtocolVersion + ", server protocol v" +
-                           serverProtocolVersion;
+        std::string msg = "[coordinator] registered with coordinator as user " + std::to_string(registration.userId) + " (" + args.username +
+                           "@" + args.hostname + ", " + backend->name() + " backend) - namebreak " + namebreakVersion() + ", client protocol v" +
+                           kProtocolVersion + ", server protocol v" + registration.serverProtocolVersion;
         printf("%s\n", msg.c_str());
         if (callbacks && callbacks->onStatus)
             callbacks->onStatus(msg);
@@ -542,6 +544,14 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
 
         std::optional<ClaimResponse> claim;
         if (!client.claim(claim, error)) {
+            if (client.upgradeRequired()) {
+                // The server has stopped accepting this release since it
+                // registered - retrying won't change that.
+                fprintf(stderr, "%s\n", error.c_str());
+                if (callbacks && callbacks->onStatus)
+                    callbacks->onStatus(error);
+                return 1;
+            }
             auto cap = claimBackoff.cap();
             auto sleepFor = claimBackoff.nextSleep();
             std::string msg = "[coordinator] claim failed, retrying in " + std::to_string(sleepFor.count()) + "s (backoff cap " +
