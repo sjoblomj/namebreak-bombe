@@ -462,6 +462,13 @@ pub async fn admin_create_priority_range(
     }
 
     let spans = pattern_spans(&target.alphabet, &req.pattern, req.length).map_err(AppError::BadRequest)?;
+    let spans = ranges::clip_spans_to_bounds(&target.alphabet, &target.lower_bound, &target.upper_bound, req.length, &spans);
+    if spans.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "'{}' at length {} matches nothing within the target's bounds ('{}' to '{}')",
+            req.pattern, req.length, target.lower_bound, target.upper_bound
+        )));
+    }
 
     // A priority range only makes sense ahead of where the target's own
     // cursor already reached. Everything before that has already been fully

@@ -322,6 +322,16 @@ fn intersect_spans(a: &[(Pos, Pos)], b: &[(Pos, Pos)]) -> Vec<(Pos, Pos)> {
     out
 }
 
+/// The parts of `spans` (see `alphabet::pattern_spans`) at `candidate_len`
+/// that fall within `[lower_bound, upper_bound]` - a pattern knows nothing of
+/// the target it's applied to, so e.g. `"GA"` on a target bounded above by
+/// `GAMEMENU.BIN` would otherwise cover all of `GA_________` too. Empty if
+/// none of it does.
+pub fn clip_spans_to_bounds(alphabet: &str, lower_bound: &str, upper_bound: &str, candidate_len: i64, spans: &[(Pos, Pos)]) -> Vec<(Pos, Pos)> {
+    let (lo, hi) = bound_indices_at_len(alphabet, lower_bound, upper_bound, candidate_len);
+    intersect_spans(spans, &[(lo, hi + 1)])
+}
+
 /// The parts of `a` that aren't in `b`.
 fn subtract_spans(a: &[(Pos, Pos)], b: &[(Pos, Pos)]) -> Vec<(Pos, Pos)> {
     let b = normalize_spans(b);
@@ -1538,6 +1548,8 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
         .fetch_all(&mut *tx)
         .await?;
     let segments = priority_segments_by_range(tx, target_id).await?;
+    let (lower_bound, upper_bound): (String, String) =
+        sqlx::query_as("SELECT lower_bound, upper_bound FROM targets WHERE id = ?").bind(target_id).fetch_one(&mut *tx).await?;
 
     for pr in stale {
         if pr.prefix.as_deref() == Some("") {
@@ -1554,6 +1566,9 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
         } else {
             pattern_spans(new_alphabet, &pr.pattern, pr.candidate_len).ok()
         };
+        let new_spans = new_spans
+            .map(|spans| clip_spans_to_bounds(new_alphabet, &lower_bound, &upper_bound, pr.candidate_len, &spans))
+            .filter(|spans| !spans.is_empty());
 
         // Nothing it matches can ever be produced by the new alphabet's own
         // walk - the length itself no longer fits, or the pattern needs a
@@ -1562,7 +1577,8 @@ pub async fn migrate_priority_ranges_to_new_alphabet(
         // fresh work and leave its bounds as a historical record under the
         // alphabet it actually holds candidates in. (Also when the pattern
         // would now take too many spans - the main sweep then searches
-        // those candidates itself.)
+        // those candidates itself - and when none of what it matches lies
+        // within the target's bounds.)
         let Some(new_spans) = new_spans else {
             sqlx::query("UPDATE priority_ranges SET next_block = end_block, next_index = end_index WHERE id = ?").bind(pr.id).execute(&mut *tx).await?;
             continue;
@@ -2536,6 +2552,22 @@ mod tests {
     /// A chunk for a client searching in a bigger alphabet shrinks by how
     /// many more candidates it searches per candidate of the range.
     #[test]
+    fn clip_spans_to_bounds_drops_what_lies_outside_the_targets_bounds() {
+        let (lower, upper) = ("FINZ09BX.TXT", "GAMEMENU.BIN");
+        let at = |candidate: &str| crate::alphabet::candidate_to_index(DEFAULT, candidate).unwrap();
+        let clip = |pattern: &str| clip_spans_to_bounds(DEFAULT, lower, upper, 12, &pattern_spans(DEFAULT, pattern, 12).unwrap());
+
+        // Straddles the upper bound: cut off right after it.
+        assert_eq!(clip("GA"), vec![(at("GA          "), at(upper) + 1)]);
+        // Straddles the lower bound: starts right at it.
+        assert_eq!(clip("FI"), vec![(at(lower), at("FI__________") + 1)]);
+        // Entirely inside: untouched.
+        assert_eq!(clip("FL"), pattern_spans(DEFAULT, "FL", 12).unwrap());
+        // Entirely outside: nothing left.
+        assert!(clip("GB").is_empty());
+    }
+
+    #[test]
     fn chunk_size_shrinks_for_a_bigger_client_alphabet() {
         let config = test_config(49 * 49);
         assert_eq!(chunk_size(&config, 1.0, SIZE42, SIZE42, 2), 49 * 49);
@@ -3174,7 +3206,7 @@ mod tests {
         let pool = test_pool().await;
         let old_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let new_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAA000", "ZZZZZZ").await;
+        let target_id = insert_target_with_alphabet(&pool, "digits_and_letters", old_alphabet, "AAAAAA", "ZZZZZZ").await;
         let priority_range_id = insert_priority_range(&pool, target_id, old_alphabet, "digits_and_letters", 10, "ABC", 6).await;
 
         // Simulate this priority range having already carved partway through its own block.
