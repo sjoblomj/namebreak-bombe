@@ -81,6 +81,22 @@ will have grown (not measured again).
 - [ ] **HIP.** Gets the filter with the CUDA code, but has never run on an
   AMD GPU. The self-test now runs there before every use, which lowers the
   risk - but measuring it on real AMD hardware is still to do.
+  - [x] **Tested through HIP's NVIDIA platform**, filter and row groups
+    and all: built against ROCm 6.1.2's own HIP headers (compiled by nvcc)
+    and run as `--backend hip` on the RTX 3080 Ti, every test passes - the
+    integration test in its four geometries, the stress test in its five
+    configurations and the overflow test. That tests the HIP API mapping,
+    not AMD's compiler, and the NVIDIA platform would even compile a CUDA
+    runtime call `gpu_runtime.h` doesn't map, so two more things were
+    checked by hand: every `cuda*` name the backend uses is mapped, and the
+    device functions it uses beyond CUDA's syntax exist in AMD's HIP
+    headers with the same meaning - `__syncthreads`, `__ldg`, which has a
+    `const unsigned long*` overload for the table, and `__ffsll`, whose two
+    AMD overloads the `(long long)` cast chooses between.
+  - [ ] **Run it on an AMD GPU**: `ctest`, `search_bench --scale 20` and
+    `tests/mutation_test.py --backend hip`. Until then, the release
+    workflow's `linux-hip` job (run it by hand from the Actions tab) at
+    least compiles it with ROCm's own compiler for RDNA2-4.
   - [ ] **Tune the chunk size on AMD.** HIP has the CUDA kernel's
     incremental row decoding already, but its 25 rows per thread was tuned
     on an NVIDIA GPU. Many AMD GPUs run 64 threads in lockstep rather than

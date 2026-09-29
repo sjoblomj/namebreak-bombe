@@ -249,9 +249,11 @@ so a GPU build still works on a machine without that GPU:
   hot it is.
 - `hip` - AMD GPUs: `cuda/`'s code compiled with ROCm's HIP instead, which
   accepts CUDA's kernel syntax as is; `gpu_runtime.h` maps the handful of
-  CUDA runtime calls onto HIP's. Not built by default, and not yet tested on
-  an AMD GPU: it has only been run through HIP's NVIDIA mapping, on an
-  NVIDIA GPU, where its tests pass.
+  CUDA runtime calls onto HIP's. So it has everything the CUDA backend has,
+  lookup filter and row groups included. Not built by default, and not yet
+  tested on an AMD GPU: it has only been run through HIP's NVIDIA mapping,
+  on an NVIDIA GPU, where every test passes, stress tests included (see
+  [PERFORMANCE.md](PERFORMANCE.md) for what that does and doesn't cover).
 - `metal/` - the Mac's GPU (Apple Silicon, or an Intel Mac's), through
   Metal: the OpenCL kernel, lookup filter, row groups and all, in Metal's
   shading language (`search.metal`), compiled by Metal at runtime the same way; the
