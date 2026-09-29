@@ -51,6 +51,13 @@ time in a 0.5 s search: 2,044 launches of 233 us each).
   `filteredRowsKernel<49, 4>`). Consecutive rows differ only in their last
   shared character 48 times out of 49, so a thread walking several rows in
   a row would pay one hash step per row instead. *Estimated* +20-30%.
+  The HIP backend is this same code, so it gets the change for free. The
+  OpenCL and Metal kernels decode rows the same way, but without the filter
+  a row there still hashes all its candidates, and decoding is only about 5%
+  of that (*estimated* from the unfiltered CUDA kernel they were ported
+  from) - so for them it's worth doing after the filter is ported, not
+  before. The CPU backend already walks rows incrementally
+  (`searchRowsWith`).
 - [ ] **Less divergence in the verify loop.** A warp repeats the loop over
   flagged candidates as many times as its busiest lane needs: about 1.4
   times at 8 bits (*estimated* from the statistics). Options: a 9-bit table
