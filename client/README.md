@@ -194,7 +194,10 @@ filter), each with its own
 compile of the CUDA backend - the build runs them in parallel.
 `cmake --build --preset default --target run_search_bench` times the real
 search over a fixed range (`build/tests/search_bench --scale <n>` for a
-longer one). Everything is built into `build/`; deleting it is the clean
+longer one), and `--target run_mutation_test` checks that the tests catch
+deliberately broken kernels - see [The lookup
+filter](#the-lookup-filter-most-candidates-are-never-hashed) - which takes
+about seven minutes, so it isn't part of `ctest`. Everything is built into `build/`; deleting it is the clean
 build.
 
 ## Releases
@@ -222,7 +225,7 @@ backends' tests actually run there.
 | `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `NAMEBREAK_NETWORK=OFF`) |
 | `src/cli/` | The console program's `main()` |
 | `src/gui/win32/` | The Windows GUI (Windows only) |
-| `tests/` | Correctness tests and benchmarks (`ctest`, `run_search_bench`) |
+| `tests/` | Correctness tests and benchmarks (`ctest`, `run_search_bench`), and the mutation experiment (`mutation_test.py`, `run_mutation_test`) |
 | `scripts/` | The generator for the GUI's embedded icon |
 
 Includes are written relative to `src/` (e.g. `#include "engine/search.h"`).
@@ -654,10 +657,17 @@ In detail:
   held to.
 
 To check that these checks would actually catch a broken kernel, broken
-ones were built on purpose - each a bug that silently misses (or invents)
+ones are built on purpose - each a bug that silently misses (or invents)
 candidates - and run against each check on its own (the integration and
-stress tests with the self-test switched off). Against the kernel as it is
-now, with row groups split into chunks, eighteen of them: rows' masks cut to
+stress tests with the self-test switched off). `tests/mutation_test.py`
+does it: `cmake --build --preset default --target run_mutation_test`, about
+seven minutes on the RTX 3080 Ti Laptop. Run it after any change to the kernel - and when it
+says a mutation no longer applies, because the code it breaks has changed,
+update the mutation rather than drop it. It first checks that the unchanged
+code passes all three checks, and that a change which mustn't matter (one
+thread too few launched) passes them too, so that it can't pass by always
+saying "caught". Against the kernel as it is
+now, with row groups split into chunks, eighteen mutations: rows' masks cut to
 32 bits; seed1 and seed2 swapped in the lookup; a launch's last row, or
 first row, one candidate short; the edges of the range ignored; the loop
 over a row's flagged candidates stopping one early; the suffix hashed one

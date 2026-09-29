@@ -181,29 +181,19 @@ backend is self-tested before use (see the README). What's still open:
 - [ ] **Longer stress runs.** `search_stress_test --budget <candidates>`
   runs longer than ctest's default of 300 million (about 60,000-73,000 hits
   in the default geometry); worth a long run after any change to a kernel.
-- [ ] **Mutation testing as a script.** The experiment in the README
+- [x] **Mutation testing as a script.** The experiment in the README
   (deliberately broken CUDA kernels, each of which the self-test, the
   integration test and the stress test must catch on their own) was run by
-  hand, from copies of the source, in three rounds - and each round found a
-  gap in the checks, which is the best argument for running it after every
-  kernel change. A script would copy the source, apply one mutation (an
-  exact string replacement, failing loudly if the string isn't found exactly
-  once), switch off `createBackend`'s self-test in the copy, build, and
-  check that the self-test, `search_integration_test` and
-  `search_stress_test` each fail. The eighteen of the last round, in
-  `cuda_backend.cu` unless noted: `mask &= (uint64_t(1) << AlphabetSize) - 1`
-  to `mask &= 0xFFFFFFFFull`; `lowBitsFilterIndex(seed1, seed2)` to
-  `(seed2, seed1)`; `<< lastRowEndK` to `<< (lastRowEndK - 1)`;
-  `<< firstRowStartK` to `<< (firstRowStartK + 1)`; both `d == firstRowD` /
-  `d == lastRowD` to `false`; `while (mask != 0)` to
-  `while ((mask & (mask - 1)) != 0)`; the suffix loop to `i + 1 < SuffixLen`;
-  `targetHashA` to `targetHashA ^ 1` in `buildLowBitsFilterTable`
-  (`lowbits_filter.cpp`); a chunk's `dEnd` minus 1 and `dBegin` plus 1; the
-  range's clips `firstRow - groupStart` plus 1 and `lastRow + 1 - groupStart`
-  minus 1; `firstRowD` plus 1 and `lastRowD` minus 1; `hashRowDigits<..., 3>`
-  to `<..., 2>` for a trailing length of 5; `sOrd[d]` to `sOrd[dBegin]` in a
-  row's own step; `chunkCount` minus 1; and `chunkCount` without the last
-  group when there's more than one. (Launching one thread too few, host
-  side, is deliberately harmless now - keep it as the one mutation that
-  must *not* be caught.) The same for the other backends as they get the
-  filter.
+  hand in three rounds, and each round found a gap in the checks - the best
+  argument for running it after every kernel change. It's now
+  `tests/mutation_test.py` (`--target run_mutation_test`): it copies the
+  source, applies each mutation as an exact string replacement (stopping if
+  one no longer matches exactly once), switches off `createBackend`'s
+  self-test in the copy, builds, and checks that the self-test,
+  `search_integration_test` and `search_stress_test` each fail - after
+  checking that the unchanged code passes them, as does the one mutation
+  that must *not* be caught (one thread too few launched). `--list` shows the
+  mutations.
+  - [ ] **The other backends**, as they get the filter: their own mutations
+    in the script (it takes `--gpu hip` already, for the CUDA code compiled
+    as HIP).

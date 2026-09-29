@@ -396,4 +396,26 @@ else()
     set(SEARCH_BENCH_ARGS --scale 20)
 endif()
 add_custom_target(run_search_bench COMMAND search_bench ${SEARCH_BENCH_ARGS} WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench USES_TERMINAL)
+
+# Mutation testing (tests/mutation_test.py) - not a ctest test: it builds
+# about twenty copies of the client with the GPU kernel broken on purpose, and
+# checks that the self-test, the integration test and the stress test each
+# catch every one. About seven minutes on the RTX 3080 Ti Laptop: `cmake
+# --build --preset default --target run_mutation_test`, after any change to
+# the kernel.
+if(NOT NAMEBREAK_GPU STREQUAL "none")
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_FOUND)
+        set(MUTATION_TEST_ARGS --gpu ${NAMEBREAK_GPU})
+        # A single architecture is passed on; the script's copies build for
+        # CMake's default otherwise.
+        if(NAMEBREAK_GPU STREQUAL "cuda" AND CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES MATCHES ";")
+            list(APPEND MUTATION_TEST_ARGS "--cmake-arg=-DCMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
+        elseif(NAMEBREAK_GPU STREQUAL "hip" AND CMAKE_HIP_ARCHITECTURES AND NOT CMAKE_HIP_ARCHITECTURES MATCHES ";")
+            list(APPEND MUTATION_TEST_ARGS "--cmake-arg=-DCMAKE_HIP_ARCHITECTURES=${CMAKE_HIP_ARCHITECTURES}")
+        endif()
+        add_custom_target(run_mutation_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mutation_test.py ${MUTATION_TEST_ARGS}
+                          USES_TERMINAL VERBATIM)
+    endif()
+endif()
 add_custom_target(run_prefix_hasher_bench COMMAND prefix_hasher_bench USES_TERMINAL)
