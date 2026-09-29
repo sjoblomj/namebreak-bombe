@@ -18,6 +18,7 @@
 
 #include "backends/common/row_batch.h"
 #include "backends/opencl/search_kernel.h" // generated from search.cl - see CMakeLists.txt
+#include "engine/hash_match.h"
 #include "engine/limits.h"
 
 // Like CUDA_CHECK: an OpenCL call failing mid-search means a broken driver
@@ -159,7 +160,8 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen) {
     cl_program program = clCreateProgramWithSource(context_, 1, &source, nullptr, &err);
     CL_CHECK(err);
     const std::string options = "-cl-std=CL1.2 -DALPHABET_SIZE=" + std::to_string(alphabetSize_) + " -DSUFFIX_LEN=" + std::to_string(suffixLen_) +
-                                " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES);
+                                " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES) +
+                                " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u";
     if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
         size_t size = 0;
         clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);

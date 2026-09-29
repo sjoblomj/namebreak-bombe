@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "engine/hash_match.h"
+
 namespace {
 
 // Hashes every candidate from scratch (every trailing character, then the
@@ -76,7 +78,7 @@ BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_
         for (unsigned char ch : suffix_)
             step(seed1, seed2, ch, 0x100);
 
-        if (seed1 == targetA_ && ++outcome.hitCount <= MAX_MATCHES) {
+        if (hashAMatches(seed1, targetA_) && ++outcome.hitCount <= MAX_MATCHES) {
             std::string filename = prefix;
             for (int i = 0; i < trailingLen; ++i)
                 filename += alphabet_[digit[i]];

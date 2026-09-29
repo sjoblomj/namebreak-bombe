@@ -21,10 +21,12 @@ __device__ __constant__ char d_alphabet[MAX_ALPHABET_SIZE + 1];
 __device__ __constant__ char d_suffix[kMaxSuffixSize];
 __device__ __constant__ short d_suffix_size;
 
-// Per-search tables precomputed on the host so the search kernel can read them
-// at compile-time-constant indices (folded straight into ALU instructions as
-// constant-bank operands) instead of doing a data-dependent d_cryptTable lookup
-// per character, which every lane of a warp would then serialize on:
+// Per-search tables precomputed on the host, so the search kernel never does
+// a data-dependent d_cryptTable lookup per character, which every lane of a
+// warp would then serialize on (filteredRowsKernel copies the alphabet's into
+// shared memory for the row's digits, and reads the suffix's at
+// compile-time-constant indices, which fold into its instructions as
+// constant-bank operands):
 //   d_alphabetKey[k] = d_cryptTable[0x100 + alphabet[k]]   (hashA's per-char key)
 //   d_alphabetOrd[k] = (unsigned char) alphabet[k]
 //   d_suffixKey[i]   = d_cryptTable[0x100 + suffix[i]]
@@ -93,7 +95,7 @@ __device__ uint32_t mpqHashSeed2(const char* str) {
 // prefix-cache incremental path mpqHashCandidateAndSuffix uses. Only called
 // once, on the rare candidate that already matched via that incremental
 // path, as a correctness cross-check (see its call site in
-// bruteForceKernel) - not on the hot per-candidate path, so recomputing from
+// verifyMatchesKernel) - not on the hot per-candidate path, so recomputing from
 // scratch here costs nothing that matters.
 __device__ uint32_t mpqHashSeed1(const char* str) {
     uint32_t seed1 = 0x7FED7FED;
@@ -122,7 +124,7 @@ __device__ void indexToCandidate(uint64_t index, int candidateLen, char* outCand
 }
 
 // No hasForbiddenSymbolRun/countBackslashes here (deliberately - see
-// bruteForceKernel's doc comment in cuda_backend.cu and
+// filteredRowsKernel's doc comment in cuda_backend.cu and
 // hasForbiddenSymbolRun_CPU's in candidate.h): those checks only ever run on
 // the CPU now, against the leading characters, before this candidate's batch
 // is even launched.

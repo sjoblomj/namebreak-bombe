@@ -115,6 +115,8 @@ set(SEARCH_SOURCES
     src/engine/mpq_hash.cpp
     src/engine/candidate.cpp
     src/backends/backends.cpp
+    src/backends/self_test.cpp
+    src/backends/common/lowbits_filter.cpp
     src/backends/common/row_batch.cpp
     src/backends/cpu/cpu_backend.cpp
     src/backends/reference/reference_backend.cpp)
@@ -251,6 +253,18 @@ endfunction()
 namebreak_test_executable(prefix_hasher_test tests/prefix_hasher_test.cpp namebreak_search)
 namebreak_test(prefix_hasher_test prefix_hasher_test)
 
+# Pure-CPU correctness check for the lookup filter the CUDA backend searches
+# with (src/backends/common/lowbits_filter.h): the property it rests on, every
+# entry of many tables, planted matches, and that its table check catches a
+# wrong table.
+namebreak_test_executable(lowbits_filter_test tests/lowbits_filter_test.cpp namebreak_search)
+namebreak_test(lowbits_filter_test lowbits_filter_test)
+
+# That the backend self-test createBackend runs (src/backends/self_test.h)
+# catches a backend that searches wrongly - CPU backends wrapped in broken ones.
+namebreak_test_executable(self_test_test tests/self_test_test.cpp namebreak_search)
+namebreak_test(self_test_test self_test_test)
+
 # Where buildSearchRequest (src/common/config.h) starts a search -
 # start_candidate and resume_from_last_candidate. CPU only.
 namebreak_test_executable(config_test tests/config_test.cpp namebreak_common)
@@ -321,6 +335,37 @@ foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(overflow-${backend} search_overflow_test --backend ${backend})
 endforeach()
 
+# Dense-hit differential test: built so that a hashA "hit" only has to match
+# the target's low 12 bits (NAMEBREAK_HASHA_MATCH_BITS, src/engine/hash_match.h),
+# about one candidate in 4096, and compared hit for hit with a brute force
+# over hundreds of random ranges - see the file. Every backend but Metal,
+# whose kernel doesn't take the weakened match. The variants (row-based
+# backends only - `reference` ignores all of these values) mirror the
+# integration test's geometries, plus a lookup filter of a single bit
+# (NAMEBREAK_LOWBITS_FILTER_BITS=1), which lets about half of every row
+# through to be hashed in full.
+set(STRESS_BACKENDS ${ROW_BACKENDS})
+list(REMOVE_ITEM STRESS_BACKENDS metal)
+set(STRESS_DEFINITIONS NAMEBREAK_HASHA_MATCH_BITS=12)
+namebreak_search_library(namebreak_search_stress ${STRESS_DEFINITIONS})
+namebreak_test_executable(search_stress_test tests/search_stress_test.cpp namebreak_search_stress)
+foreach(backend IN LISTS STRESS_BACKENDS ITEMS reference)
+    namebreak_test(stress-${backend} search_stress_test --backend ${backend})
+endforeach()
+if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
+    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_CPU_NO_AVX2)
+    set(STRESS_window6 NAMEBREAK_GPU_WINDOW_CHARS=6 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_filter1 NAMEBREAK_LOWBITS_FILTER_BITS=1)
+    foreach(variant IN ITEMS small_launch window2 window6 filter1)
+        namebreak_search_library(namebreak_search_stress_${variant} ${STRESS_DEFINITIONS} ${STRESS_${variant}})
+        namebreak_test_executable(search_stress_test_${variant} tests/search_stress_test.cpp namebreak_search_stress_${variant})
+        foreach(backend IN LISTS STRESS_BACKENDS)
+            namebreak_test(stress-${backend}-${variant} search_stress_test_${variant} --backend ${backend})
+        endforeach()
+    endforeach()
+endif()
+
 # Benchmarks - not tests, run with `cmake --build --preset default --target
 # <name>`:
 #   run_search_bench         times the real runSearch() over a ~28.8B-candidate
@@ -340,5 +385,11 @@ else()
 endif()
 namebreak_test_executable(prefix_hasher_bench tests/prefix_hasher_bench.cpp namebreak_search)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench)
-add_custom_target(run_search_bench COMMAND search_bench WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench USES_TERMINAL)
+# A GPU covers the default range in hundredths of a second; 20 times it is long enough to time.
+if(NAMEBREAK_GPU STREQUAL "none")
+    set(SEARCH_BENCH_ARGS "")
+else()
+    set(SEARCH_BENCH_ARGS --scale 20)
+endif()
+add_custom_target(run_search_bench COMMAND search_bench ${SEARCH_BENCH_ARGS} WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench USES_TERMINAL)
 add_custom_target(run_prefix_hasher_bench COMMAND prefix_hasher_bench USES_TERMINAL)

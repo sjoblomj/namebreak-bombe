@@ -289,8 +289,9 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     //     CUDA backend: one kernel launch, plus a second, tiny one only if
     //     that launch had a hashA hit).
     //  4. Inside the backend - for the CUDA backend, one GPU thread per *row*
-    //     of the chunk, each looping over its row's alphabetSize candidates -
-    //     see bruteForceKernel's comment.
+    //     of the chunk, each hashing only the few of its row's alphabetSize
+    //     candidates its lookup filter lets through - see filteredRowsKernel's
+    //     comment.
     if (candidateLen < 1) {
         // An empty start candidate (prefix + suffix alone) means "from the
         // very beginning": the shortest candidates, starting from the lower
@@ -319,7 +320,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         if (trailingLen > backend.maxTrailingLen()) {
             // Only reachable if MAX_CANDIDATE_LEN/the alphabet sizes change so that
             // candidateLen - maxSafeIndexLen exceeds what the backend supports (for
-            // CUDA, bruteForceKernel's 32-bit row index) - refuse rather than overflow it.
+            // CUDA, filteredRowsKernel's 32-bit row index) - refuse rather than overflow it.
             fprintf(stderr, "candidateLen (%d) needs a %d-character trailing part, which exceeds the %s backend's maximum (%d) - exiting\n",
                     candidateLen, trailingLen, backend.name(), backend.maxTrailingLen());
             break;

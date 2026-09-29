@@ -10,12 +10,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "backends/common/lowbits_filter.h"
 #include "backends/cuda/hash_kernels.cuh"
 #include "backends/cuda/tuning.h"
 #include "engine/backend.h"
+#include "engine/hash_match.h"
 #include "engine/limits.h"
 
 #define CUDA_CHECK(call) do { \
@@ -51,19 +54,22 @@ struct BatchResults {
 struct DeviceBuffers {
     BatchResults* results;
     // matchIdx[i]: trailing index of the i-th hashA hit (only the first MAX_MATCHES
-    // hits of a launch are recorded). Written by bruteForceKernel, consumed by
+    // hits of a launch are recorded). Written by filteredRowsKernel, consumed by
     // verifyMatchesKernel.
     uint64_t* matchIdx;
     // matches + i * MAX_FILENAME_LEN: the i-th hit's complete filename.
     // Written by verifyMatchesKernel, consumed by the host.
     char* matches;
+    // This search's lookup filter: kLowBitsFilterEntries entries, see
+    // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
+    uint64_t* filterTable;
 };
 
-static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "bruteForceKernel needs one thread per alphabet entry to fill its shared tables");
+static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "filteredRowsKernel needs one thread per alphabet entry to fill its shared tables");
 
 // Suffix lengths 0-8 (see dispatchSuffixLen) get their own compile-time
-// instantiation of bruteForceKernel, fully unrolled - measured ~2x faster than
-// looping over a runtime length; anything longer falls back to kRuntimeSuffix.
+// instantiation of filteredRowsKernel, with the suffix loop fully unrolled;
+// anything longer falls back to kRuntimeSuffix.
 constexpr int kRuntimeSuffix = -1;
 
 // One step of the MPQ hash recurrence (hashA table, offset 0x100) for a
@@ -101,19 +107,20 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, uint32_t& seed1, uin
 // No maxBackslashCount, pruneSymbolRuns or pruneUnopenedBrackets check here -
 // all are applied only to the leading characters, on the CPU, before this kernel is
 // ever launched (see the leadingIdx loop in runSearch), not to the trailing
-// characters this kernel brute-forces. See README.md's "Design decisions"
+// characters this kernel searches. See README.md's "Design decisions"
 // section for why.
 //
 // Thread t handles row `firstRow + t` (t < rowCount): every candidate of
 // that row whose last character index k is in [kBegin, kEnd) - all of them
 // for every row but the (at most two) at the edges of the launch's range
 // (firstRowStartK / lastRowEndK). The row's shared prefix (its first
-// trailingLen - 1 characters) is hashed once, then the last character is
-// looped over the alphabet, so each candidate only costs one character step
-// plus the suffix - instead of every candidate re-decoding and re-hashing
-// all trailingLen characters itself. In that loop every table read is at a
-// compile-time-constant index (the loop is fully unrolled), so the values are
-// constant-bank operands of the ALU instructions themselves.
+// trailingLen - 1 characters) is hashed once. Then, instead of hashing every
+// candidate of the row, one lookup in this search's filter table
+// (bufs.filterTable, see backends/common/lowbits_filter.h) gives the set of
+// last characters whose hashA has the target's low bits - on average
+// alphabetSize / 2^kLowBitsFilterBits of them, and always including any
+// candidate that matches the target. Only those are hashed in full. README.md's
+// "The lookup filter" has why the lookup can never leave a match out.
 //
 // A hashA hit only records its trailing index (bufs.matchIdx): building the
 // filename and checking hashB happen in verifyMatchesKernel, launched only
@@ -123,7 +130,7 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, uint32_t& seed1, uin
 // `params` (prefix, seeds) is only ever read at constant offsets here - see
 // buildCompleteFilename (hash_kernels.cuh) for why its address must not be taken.
 template<int AlphabetSize, int SuffixLen>
-__global__ void bruteForceKernel(
+__global__ void filteredRowsKernel(
     int trailingLen,
     uint32_t firstRow,
     uint32_t rowCount,
@@ -133,6 +140,7 @@ __global__ void bruteForceKernel(
     BatchParams params,
     DeviceBuffers bufs
 ) {
+    static_assert(AlphabetSize < 64, "a row's candidates, and one past the last of them, must fit a 64-bit mask");
     __shared__ uint32_t sKey[AlphabetSize];
     __shared__ uint32_t sOrd[AlphabetSize];
     if (threadIdx.x < AlphabetSize) {
@@ -145,8 +153,6 @@ __global__ void bruteForceKernel(
     if (t >= rowCount)
         return;
     const uint32_t row = firstRow + t;
-    const int kBegin = (t == 0) ? firstRowStartK : 0;
-    const int kEnd = (t == rowCount - 1) ? lastRowEndK : AlphabetSize;
 
     uint32_t seed1 = params.seed1Start;
     uint32_t seed2 = params.seed2Start;
@@ -160,21 +166,23 @@ __global__ void bruteForceKernel(
         // trailingLen is validated against kMaxTrailingLen (== 6) by runSearch
     }
 
-    constexpr int kSuffixRegs = (SuffixLen > 0) ? SuffixLen : 1;
-    uint32_t sufKey[kSuffixRegs];
-    uint32_t sufOrd[kSuffixRegs];
-    if constexpr (SuffixLen > 0) {
-        #pragma unroll
-        for (int i = 0; i < SuffixLen; ++i) {
-            sufKey[i] = d_suffixKey[i];
-            sufOrd[i] = (unsigned char) d_suffix[i];
-        }
-    }
+    // Bit k: the candidate with last character k is worth hashing. Restricted
+    // to this thread's own candidates [kBegin, kEnd) - and to the alphabet,
+    // which the table never exceeds anyway, but a stray bit must not be able
+    // to index past sKey. The table doesn't change during a launch, so it's
+    // read through the read-only data path (__ldg).
+    uint64_t mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
+    mask &= (uint64_t(1) << AlphabetSize) - 1;
+    if (t == 0)
+        mask &= ~uint64_t(0) << firstRowStartK;          // firstRowStartK is in [0, AlphabetSize)
+    if (t == rowCount - 1)
+        mask &= (uint64_t(1) << lastRowEndK) - 1;        // lastRowEndK is in [1, AlphabetSize]
 
-    // hashA of (this row's prefix state) + one last character + the suffix.
-    auto hashCandidate = [&](uint32_t key, uint32_t ord) -> uint32_t {
+    while (mask != 0) {
+        const int k = __ffsll((long long) mask) - 1;
+        mask &= mask - 1;
         uint32_t a = seed1, b = seed2;
-        mpqStep(a, b, key, ord);
+        mpqStep(a, b, sKey[k], sOrd[k]);
         if constexpr (SuffixLen == kRuntimeSuffix) {
             const int n = d_suffix_size;
             for (int i = 0; i < n; ++i)
@@ -182,30 +190,12 @@ __global__ void bruteForceKernel(
         } else {
             #pragma unroll
             for (int i = 0; i < SuffixLen; ++i)
-                mpqStep(a, b, sufKey[i], sufOrd[i]);
+                mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
         }
-        return a;
-    };
-    auto record = [&](int k) {
-        int slot = atomicAdd(&bufs.results->matchCount, 1);
-        if (slot < MAX_MATCHES)
-            bufs.matchIdx[slot] = (uint64_t) row * AlphabetSize + k;
-    };
-
-    if (kBegin == 0 && kEnd == AlphabetSize) {
-        #pragma unroll
-        for (int k = 0; k < AlphabetSize; ++k) {
-            if (hashCandidate(d_alphabetKey[k], d_alphabetOrd[k]) == targetA)
-                record(k);
-        }
-    } else {
-        // A partial row at the edge of the launch's range - only ever the
-        // first and/or last thread, so its cost doesn't matter, only that
-        // it's exactly right.
-        #pragma unroll 1
-        for (int k = kBegin; k < kEnd; ++k) {
-            if (hashCandidate(sKey[k], sOrd[k]) == targetA)
-                record(k);
+        if (hashAMatches(a, targetA)) {
+            int slot = atomicAdd(&bufs.results->matchCount, 1);
+            if (slot < MAX_MATCHES)
+                bufs.matchIdx[slot] = (uint64_t) row * AlphabetSize + k;
         }
     }
 }
@@ -216,8 +206,8 @@ __global__ void bruteForceKernel(
 // found flag/filename. Deliberately implemented with the
 // *original*, independent hashing path (indexToCandidate +
 // mpqHashCandidateAndSuffix + from-scratch mpqHashSeed1/Seed2), not
-// bruteForceKernel's row-based one, so every hit bruteForceKernel reports is
-// cross-checked against a second implementation at runtime.
+// filteredRowsKernel's row-based one, so every hit filteredRowsKernel reports
+// is cross-checked against a second implementation at runtime.
 template<int AlphabetSize>
 __global__ void verifyMatchesKernel(
     int trailingLen,
@@ -237,12 +227,12 @@ __global__ void verifyMatchesKernel(
     buildCompleteFilename(params, candidate, trailingLen, filename);
 
     // hashA via the prefix-cache/incremental path must agree with both the
-    // target bruteForceKernel claimed to hit and hashing the complete filename
+    // target filteredRowsKernel claimed to hit and hashing the complete filename
     // from scratch. A mismatch would mean one of them is out of sync with the
     // actual filename - a real bug, not a candidate to skip.
     uint32_t hashA = mpqHashCandidateAndSuffix(candidate, trailingLen, params.seed1Start, params.seed2Start);
-    if (hashA != targetA) {
-        printf("WARNING: bruteForceKernel reported a hashA hit for '%s' but the reference hashing path gives 0x%08X, not the target 0x%08X\n",
+    if (!hashAMatches(hashA, targetA)) {
+        printf("WARNING: filteredRowsKernel reported a hashA hit for '%s' but the reference hashing path gives 0x%08X, not the target 0x%08X\n",
                filename, hashA, targetA);
     }
     uint32_t verifyHashA = mpqHashSeed1(filename);
@@ -262,7 +252,7 @@ __global__ void verifyMatchesKernel(
 
 // alphabetSize/suffix length have to be dispatched to one of a fixed set of
 // compile-time template instantiations (see indexToCandidate's and
-// bruteForceKernel's comments for why) - dispatchAlphabetSize/
+// filteredRowsKernel's comments for why) - dispatchAlphabetSize/
 // dispatchSuffixLen call `f` with a std::integral_constant of the matching
 // value.
 //
@@ -319,10 +309,9 @@ public:
     int windowChars() const override { return NAMEBREAK_GPU_WINDOW_CHARS; }
     int maxTrailingLen() const override { return kMaxTrailingLen; }
     // A whole number of rows (see the terminology comment above
-    // bruteForceKernel), NAMEBREAK_ROWS_PER_LAUNCH of them (tuning.h). Launch
+    // filteredRowsKernel), NAMEBREAK_ROWS_PER_LAUNCH of them (tuning.h). Launch
     // boundaries then always land on row boundaries (except at a range's own
-    // start/end), so almost every row a launch handles takes
-    // bruteForceKernel's fast path.
+    // start/end), so only a launch's first and last row can be partial.
     uint64_t batchSize(int alphabetSize) const override { return (uint64_t) alphabetSize * NAMEBREAK_ROWS_PER_LAUNCH; }
 
     void beginSearch(const SearchConstants& constants) override;
@@ -337,6 +326,20 @@ private:
     DeviceBuffers bufs_ = {};
 };
 
+// How many of the lookup filter's entries beginSearch checks against their
+// definition before every search (see checkLowBitsFilterTable), each with two
+// different random high bits - about a millisecond. tests/lowbits_filter_test.cpp
+// checks every entry of many tables.
+constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
+
+// A search must not start with a filter table that is wrong: it could drop a
+// match without any other sign. Like CUDA_CHECK, this ends the process - a
+// coordinator range is then reassigned when its lease runs out.
+[[noreturn]] void refuseFilterTable(const char* what, const std::string& detail) {
+    fprintf(stderr, "INTERNAL ERROR: the lookup filter table %s (%s) - refusing to search with it\n", what, detail.c_str());
+    exit(1);
+}
+
 void CudaBackend::beginSearch(const SearchConstants& constants) {
     alphabetSize_ = (int) constants.alphabet.size();
     suffixLen_ = (int) constants.suffix.size();
@@ -349,8 +352,8 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, constants.alphabet.c_str(), alphabetSize_ + 1));
     CUDA_CHECK(cudaMemcpyToSymbol(d_cryptTable, constants.cryptTable, 0x500 * sizeof(uint32_t)));
 
-    // The per-search tables bruteForceKernel reads at compile-time-constant
-    // indices - see their declaration in hash_kernels.cuh.
+    // The per-search tables filteredRowsKernel reads - see their declaration
+    // in hash_kernels.cuh.
     {
         uint32_t h_alphabetKey[MAX_ALPHABET_SIZE] = {0};
         uint32_t h_alphabetOrd[MAX_ALPHABET_SIZE] = {0};
@@ -380,12 +383,29 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     // falsely report "found" immediately. It also establishes the
     // "matchCount is 0 at launch" invariant runBatch maintains from here.
     CUDA_CHECK(cudaMemset(bufs_.results, 0, sizeof(BatchResults)));
+
+    // This search's lookup filter - it depends on the alphabet, the suffix and
+    // the target, so it's built for every search. Checked against its
+    // definition before it's used, and read back after the upload to make
+    // sure the GPU has exactly what was checked.
+    const std::vector<uint64_t> table = buildLowBitsFilterTable(constants);
+    std::string error;
+    if (!checkLowBitsFilterTable(table, constants, kFilterEntriesCheckedPerSearch, 2, std::random_device{}(), error))
+        refuseFilterTable("failed its check", error);
+    const size_t tableBytes = table.size() * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&bufs_.filterTable, tableBytes));
+    CUDA_CHECK(cudaMemcpy(bufs_.filterTable, table.data(), tableBytes, cudaMemcpyHostToDevice));
+    std::vector<uint64_t> readBack(table.size());
+    CUDA_CHECK(cudaMemcpy(readBack.data(), bufs_.filterTable, tableBytes, cudaMemcpyDeviceToHost));
+    if (readBack != table)
+        refuseFilterTable("read back from the GPU differs from the one uploaded", std::to_string(tableBytes) + " bytes");
 }
 
 void CudaBackend::endSearch() {
     CUDA_CHECK(cudaFree(bufs_.matches));
     CUDA_CHECK(cudaFree(bufs_.matchIdx));
     CUDA_CHECK(cudaFree(bufs_.results));
+    CUDA_CHECK(cudaFree(bufs_.filterTable));
     bufs_ = {};
 }
 
@@ -402,7 +422,7 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
     // between two kernels.
 
     // The range [startIdx, endIdx) covers rows firstRow..lastRow; only the
-    // first and last row can be partial (see bruteForceKernel).
+    // first and last row can be partial (see filteredRowsKernel).
     const uint64_t endIdx = startIdx + count;
     const uint64_t firstRow = startIdx / alphabetSize;
     const uint64_t lastRow = (endIdx - 1) / alphabetSize;
@@ -428,7 +448,7 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
         using AlphabetC = decltype(alphabetC);
         dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
             constexpr int SuffixLen = decltype(suffixC)::value;
-            bruteForceKernel<AlphabetC::value, SuffixLen><<<blocks, kThreadsPerBlock>>>(
+            filteredRowsKernel<AlphabetC::value, SuffixLen><<<blocks, kThreadsPerBlock>>>(
                     trailingLen, (uint32_t) firstRow, (uint32_t) rowCount, firstRowStartK, lastRowEndK, targetA_, params, bufs_);
         });
     });

@@ -98,8 +98,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::string error;
-    g_backend = createBackend(backendName, error);
+    bool selfTestFailed = false;
+    g_backend = createBackend(backendName, error, &selfTestFailed);
     if (!g_backend) {
+        if (selfTestFailed) {
+            fprintf(stderr, "FAILED: %s\n", error.c_str());
+            return 1;
+        }
         // 77: "skipped" to ctest (see SKIP_RETURN_CODE in CMakeLists.txt) - a
         // GPU backend on a machine without that kind of GPU.
         fprintf(stderr, "%s - skipping\n", error.c_str());

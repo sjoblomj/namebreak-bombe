@@ -16,7 +16,7 @@
 
 // How many *rows* one kernel launch covers at most (a row = every value of a
 // candidate's last character, for one combination of its other trailing
-// characters - see bruteForceKernel in cuda_backend.cu), so one launch covers
+// characters - see filteredRowsKernel in cuda_backend.cu), so one launch covers
 // at most NAMEBREAK_ROWS_PER_LAUNCH * alphabetSize candidates. Bounds how long
 // a single launch can run (pause/abort are only polled between launches).
 // Overridable at compile time (-DNAMEBREAK_ROWS_PER_LAUNCH=N) so tests can
@@ -29,7 +29,7 @@
 // (alphabetSize^(trailingLen-1)) must fit in 32 bits: 50^5 < 2^32 <= 50^6.
 constexpr int kMaxTrailingLen = 6;
 
-// Threads per block. Must be >= MAX_ALPHABET_SIZE: bruteForceKernel fills its
+// Threads per block. Must be >= MAX_ALPHABET_SIZE: filteredRowsKernel fills its
 // shared tables one entry per thread.
 constexpr int kThreadsPerBlock = 256;
 

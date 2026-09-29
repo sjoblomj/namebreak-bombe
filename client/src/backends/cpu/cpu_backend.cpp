@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "backends/common/row_batch.h"
+#include "engine/hash_match.h"
 #include "engine/limits.h"
 
 // The hot loop hashes kLanes candidates at once, as a few independent chains
@@ -106,9 +107,17 @@ NAMEBREAK_ALWAYS_INLINE bool hashLanes(const BatchContext& ctx, int k0, uint32_t
             a[c] = na;
         }
     }
-    Vec hit = (Vec) (a[0] == ctx.targetA);
+    // Only the bits a hit must match - all of them, and so nothing to do,
+    // outside the stress tests' builds (see engine/hash_match.h). The masked
+    // values still compare right with hashAMatches below.
+    if constexpr (kHashAMatchMask != 0xFFFFFFFFu) {
+        for (int c = 0; c < kChains; ++c)
+            a[c] &= kHashAMatchMask;
+    }
+    const uint32_t target = ctx.targetA & kHashAMatchMask;
+    Vec hit = (Vec) (a[0] == target);
     for (int c = 1; c < kChains; ++c)
-        hit |= (Vec) (a[c] == ctx.targetA);
+        hit |= (Vec) (a[c] == target);
     uint64_t words[sizeof(Vec) / sizeof(uint64_t)];
     memcpy(words, &hit, sizeof(words));
     uint64_t any = 0;
@@ -138,7 +147,7 @@ NAMEBREAK_ALWAYS_INLINE bool hashLanesScalar(const BatchContext& ctx, int k0, ui
     bool any = false;
     for (int l = 0; l < kLanes; ++l) {
         outA[l] = a[l];
-        any |= a[l] == ctx.targetA;
+        any |= hashAMatches(a[l], ctx.targetA);
     }
     return any;
 }
@@ -190,7 +199,7 @@ NAMEBREAK_ALWAYS_INLINE void searchRowsWith(const BatchContext& ctx, RowJob& job
                 uint32_t a[Group];
                 if (hash(k0, s1, s2, a)) {
                     for (int l = 0; l < Group && k0 + l < as; ++l) {
-                        if (a[l] == ctx.targetA)
+                        if (hashAMatches(a[l], ctx.targetA))
                             record(job, row * as + k0 + l);
                     }
                 }
@@ -203,7 +212,7 @@ NAMEBREAK_ALWAYS_INLINE void searchRowsWith(const BatchContext& ctx, RowJob& job
                 mpqStep(a, b, ctx.key[k], ctx.ord[k]);
                 for (int j = 0; j < ctx.suffixLen; ++j)
                     mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);
-                if (a == ctx.targetA)
+                if (hashAMatches(a, ctx.targetA))
                     record(job, row * as + k);
             }
         }

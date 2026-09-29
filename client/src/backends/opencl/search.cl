@@ -1,5 +1,6 @@
-// The OpenCL backend's search kernel - the CUDA backend's bruteForceKernel
-// (backends/cuda/cuda_backend.cu), ported. Embedded into the program at
+// The OpenCL backend's search kernel - the CUDA backend's kernel as it was
+// before it got the lookup filter (backends/common/lowbits_filter.h), ported:
+// every candidate of a row is hashed. Embedded into the program at
 // build time and compiled by the OpenCL driver at runtime, once per
 // combination of these (see opencl_backend.cpp), which makes them all
 // compile-time constants the compiler can unroll and fold:
@@ -7,6 +8,8 @@
 //   SUFFIX_LEN     the suffix's length
 //   TRAILING_LEN   the candidate's trailing (GPU-enumerated) length, >= 1
 //   MAX_MATCHES    how many hits one batch can record
+//   HASHA_MATCH_MASK  the bits of hashA a hit must match - all of them, except
+//                  in the stress tests' builds (see engine/hash_match.h)
 //
 // One work-item per *row* - every value of the candidate's last character,
 // for one combination of the other trailing characters (see the terminology
@@ -14,6 +17,11 @@
 // once, then only the last character and the suffix per candidate, and
 // records the trailing index of every hashA hit; the host rebuilds and
 // checks those.
+
+#ifndef HASHA_MATCH_MASK
+#define HASHA_MATCH_MASK 0xFFFFFFFFu
+#endif
+#define HASHA_MATCHES(a, target) (((a) & HASHA_MATCH_MASK) == ((target) & HASHA_MATCH_MASK))
 
 #define MPQ_STEP(seed1, seed2, key, ord)                        \
     do {                                                        \
@@ -73,7 +81,7 @@ __kernel void searchRows(uint firstRow, uint rowCount, int firstRowStartK, int l
 #pragma unroll
             for (int i = 0; i < SUFFIX_LEN; ++i)
                 MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);
-            if (a == targetA) {
+            if (HASHA_MATCHES(a, targetA)) {
                 const int slot = atomic_inc(matchCount);
                 if (slot < MAX_MATCHES)
                     matchIdx[slot] = (ulong) row * ALPHABET_SIZE + k;
@@ -87,7 +95,7 @@ __kernel void searchRows(uint firstRow, uint rowCount, int firstRowStartK, int l
             MPQ_STEP(a, b, sKey[k], sOrd[k]);
             for (int i = 0; i < SUFFIX_LEN; ++i)
                 MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);
-            if (a == targetA) {
+            if (HASHA_MATCHES(a, targetA)) {
                 const int slot = atomic_inc(matchCount);
                 if (slot < MAX_MATCHES)
                     matchIdx[slot] = (ulong) row * ALPHABET_SIZE + k;

@@ -20,6 +20,7 @@
 #define cudaMemset hipMemset
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 // HIP takes a __device__/__constant__ variable's address, via HIP_SYMBOL,
 // where CUDA takes the variable itself.
 #define cudaMemcpyToSymbol(symbol, ...) hipMemcpyToSymbol(HIP_SYMBOL(symbol), __VA_ARGS__)

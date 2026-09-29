@@ -178,17 +178,23 @@ match one of them. Supporting a new size means adding it to
 `SupportedAlphabetSizes` in `src/backends/cuda/cuda_backend.cu` and
 recompiling.
 
-`ctest` runs the correctness test suite: a pure-CPU unit test, plus
+`ctest` runs the correctness test suite: pure-CPU unit tests (among them
+`lowbits_filter_test`, of the CUDA backend's lookup filter), plus
 end-to-end tests of every backend that compare real search results against
 an independent brute-force reference (thousands of cases: every supported
 alphabet size, every last-character position, ranges starting/ending mid-row and
 crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
-0x80, the both-hashes-match path, and a seeded fuzzer). The CUDA backend is
+0x80, the both-hashes-match path, and a seeded fuzzer), and the dense-hit
+stress tests (`stress-*`), which make one candidate in 4096 a hit and
+compare every one of them with a brute force - see [The lookup
+filter](#the-lookup-filter-most-candidates-are-never-hashed). The search is
 built in several configurations for this (different GPU window / launch
-sizes), and each takes about a minute to compile - the build runs them in
-parallel. `cmake --build --preset default --target run_search_bench` times
-the real search over a fixed range. Everything is built into `build/`;
-deleting it is the clean build.
+sizes, the stress tests' weaker match, a one-bit filter), each with its own
+compile of the CUDA backend - the build runs them in parallel.
+`cmake --build --preset default --target run_search_bench` times the real
+search over a fixed range (`build/tests/search_bench --scale <n>` for a
+longer one). Everything is built into `build/`; deleting it is the clean
+build.
 
 ## Releases
 
@@ -231,7 +237,10 @@ backends a build has, most preferred first; unless told otherwise (see
 [Modes](#modes)) the program uses the first one that can run on the machine,
 so a GPU build still works on a machine without that GPU:
 
-- `cuda/` - the CUDA kernels and the code that launches them.
+- `cuda/` - the CUDA kernels and the code that launches them. The only
+  backend so far with [the lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
+  (`common/lowbits_filter.h`): about 1,100 G candidates/s on the RTX 3080 Ti
+  Laptop.
 - `hip` - AMD GPUs: `cuda/`'s code compiled with ROCm's HIP instead, which
   accepts CUDA's kernel syntax as is; `gpu_runtime.h` maps the handful of
   CUDA runtime calls onto HIP's. Not built by default, and not yet tested on
@@ -246,22 +255,27 @@ so a GPU build still works on a machine without that GPU:
   one GPU thread at a time, where every test configuration passes.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
-  installed. The same kernel as CUDA's, ported (`search.cl`); it's compiled
-  by the driver at runtime, once per alphabet size, suffix length and
-  trailing length, so it takes an alphabet of any size - drivers cache the
-  result, but a new combination's first search starts a moment later. On
-  the RTX 3080 Ti Laptop it runs at about 88% of the CUDA backend's speed.
+  installed. The kernel CUDA's was before the lookup filter, ported
+  (`search.cl`); it's compiled by the driver at runtime, once per alphabet
+  size, suffix length and trailing length, so it takes an alphabet of any
+  size - drivers cache the result, but a new combination's first search
+  starts a moment later. On the RTX 3080 Ti Laptop it ran at about 88% of
+  the CUDA backend's speed before that got the filter - about a sixth of it
+  now, until the filter is ported ([PERFORMANCE.md](PERFORMANCE.md)).
 - `cpu/` - every core of the CPU, with the same row trick as the CUDA
   kernel and the candidates of a row hashed several at a time with SIMD
   instructions (AVX2 on x86-64 CPUs that have it, picked at runtime; SSE2
-  or NEON otherwise). About 9 G candidates/s on a laptop i9-12900H - a
-  fifteenth of its GPU, but it lets any machine contribute. Every build has it.
+  or NEON otherwise). About 9 G candidates/s on a laptop i9-12900H - far
+  below its GPU, but it lets any machine contribute. Every build has it.
+  (A prototype of it with the lookup filter was about 4.6 times as fast -
+  see [PERFORMANCE.md](PERFORMANCE.md).)
 - `reference/` - one thread, every candidate hashed from scratch. Far too
   slow for real searches, but simple enough to be obviously right: it's what
   the others are held to. Every build has it.
 
 `ctest` runs the end-to-end tests against every backend in the build; a
-test whose backend can't run on the machine is reported as skipped. A new
+test whose backend can't run on the machine is reported as skipped (one
+whose backend fails its self-test on the machine fails). A new
 backend implements `SearchBackend`, gets a directory under `src/backends/`
 and an entry in `backends.cpp` and `CMakeLists.txt`, and is covered by the
 same tests: they take a `--backend <name>` argument.
@@ -279,11 +293,14 @@ not a full rehash) before the GPU launches for that leading value. The
 window is bounded above (`kMaxTrailingLen`, 6, in the same file) because the
 kernel indexes rows with 32-bit integers.
 
-With the current kernel the window is a launch-size knob more than a
-per-thread-cost knob (see below), and 5 measured best on the reference
-hardware (about 155 G candidates/s at a window of 4, 222 at 5, 216 at 6):
-a window of 4 makes each leading value's launch so short (~25 us) that
-per-launch overhead becomes a large fraction of the runtime. Note the window
+The window is a launch-size knob more than a per-thread-cost knob (see
+below), and 5 measured best on the reference hardware with the kernel as it
+was before [the lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
+(about 155 G candidates/s at a window of 4, 222 at 5, 216 at 6): a window
+of 4 makes each leading value's launch so short (~25 us) that per-launch
+overhead becomes a large fraction of the runtime. The filter made every
+launch about five times shorter, so this is worth measuring again - see
+[PERFORMANCE.md](PERFORMANCE.md). Note the window
 also decides how much `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count`
 can see (they only examine the leading characters, see below): a larger window means fewer
 characters are pruned on, so those settings skip slightly fewer
@@ -316,11 +333,16 @@ knob rather than only a per-thread-cost one - and it's also what bounds how
 long any single launch can run for, since pause and abort are only checked
 *between* launches, not in the middle of one.
 
-Two more things make that per-row loop fast:
+What a thread then does with its row is where the backends differ. The
+CUDA kernel (`filteredRowsKernel`) looks the row up in a table and hashes
+only the handful of its candidates that could possibly match - see [The
+lookup filter](#the-lookup-filter-most-candidates-are-never-hashed) below.
+The OpenCL and Metal kernels, and the CPU backend, don't have the filter
+yet and hash every candidate of the row, which two more things make fast:
 
-- **It's fully unrolled**, with the last character's alphabet position
-  known at compile time for every iteration of the loop. That lets the
-  compiler bake each character's hash-table value directly into the
+- **The loop over the last character is fully unrolled**, with its
+  alphabet position known at compile time for every iteration. That lets
+  the compiler bake each character's hash-table value directly into the
   generated instructions, instead of looking it up from memory at runtime.
   This matters because GPU threads execute in lockstep, 32 at a time (a
   "warp") - a runtime lookup where each of those 32 threads needs a
@@ -328,13 +350,13 @@ Two more things make that per-row loop fast:
   while a compile-time constant costs nothing extra.
 - **The suffix length is a compile-time parameter too** (for lengths 0-8;
   longer suffixes fall back to a slower runtime-length loop), for the same
-  reason.
+  reason. The CUDA kernel still does this for the candidates it does hash.
 
-Together, this row-based design measured about 16x faster than the
+Together, the row-based design measured about 16x faster than the
 previous one-thread-per-candidate kernel, while still producing
 bit-for-bit identical hashes.
 
-That fast kernel only *records where* each hashA hit is - it doesn't build
+The search kernel only *records where* each hashA hit is - it doesn't build
 the filename or check hashB, keeping its hot path as small as possible. A
 second, much smaller kernel (`verifyMatchesKernel`) runs only when a batch
 actually had a hit: it rebuilds that candidate's complete filename and
@@ -350,6 +372,137 @@ checked against hashB rather than silently lost. With a real 32-bit hash
 this essentially never happens in practice (it would take over a thousand
 collisions in a single launch), but it's handled explicitly and tested
 (`tests/search_overflow_test.cpp`).
+
+### The lookup filter: most candidates are never hashed
+
+The CUDA backend doesn't hash every candidate of a row. In the real search
+(a 49-character alphabet and `.WAV`) it hashes about one in 256 - on
+average 0.19 of a row's 49 candidates - because it can tell from a single
+table lookup that the rest can't match. That made the whole search 5.2 times
+as fast (`search_bench --scale 20` on the RTX 3080 Ti Laptop, three runs
+each: from 209-218 to 1,084-1,130 G candidates/s), without skipping
+anything a full search would find.
+
+**Why it works.** Every step of the MPQ hash is
+
+```
+seed1 = key[ch] ^ (seed1 + seed2)
+seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3
+```
+
+- only additions, an XOR, a left shift and constants; the crypt table is
+indexed by the character, never by the hash state. In each of those, bit
+*i* of the result depends only on bits 0..*i* of what goes in: an
+addition's carries only travel upward, an XOR works bit by bit, and a left
+shift only moves bits upward. So the same holds for any number of steps:
+**the lowest *n* bits of hashA depend only on the lowest *n* bits of the
+state it's computed from** (and on the characters).
+
+All of a row's candidates continue from the same state (seed1, seed2) - the
+one after the row's shared characters - with one last character, then the
+suffix. So which of them have a hashA whose lowest 8 bits are the target's
+depends only on the lowest 8 bits of seed1 and of seed2: 65,536
+possibilities. Before a search, the backend works out, for each of them,
+which last characters give the target's lowest 8 bits, as a 64-bit mask
+with one bit per alphabet character - a 512 KB table
+(`buildLowBitsFilterTable`, `src/backends/common/lowbits_filter.h`). Each
+thread looks its row up in it and hashes only the candidates in the mask,
+in full, exactly as before.
+
+**Why it can't miss a match.** A candidate that matches the target has all
+32 bits of its hashA equal to the target's - in particular the lowest 8.
+Those 8 bits are, by the property above, exactly what its row's table entry
+was computed from (with the state's higher bits set to 0, which can't change
+them), so its bit is set, and it's hashed and compared just as it was before
+there was a filter. The filter only ever leaves out candidates whose hashA
+differs from the target's in its lowest 8 bits: candidates that can't match.
+Nothing else about a candidate - its prefix, its leading characters, the
+rest of its row's state - can change that; they only reach the state's
+higher bits.
+
+**What guards the implementation.** The argument is short; the risk is code
+that doesn't follow it - a table built for the wrong target, an index with
+seed1 and seed2 swapped, a bit past the 32nd character lost - which would
+skip matches silently, with no other symptom. So, on top of the tests every
+backend already had:
+
+- `tests/lowbits_filter_test.cpp` checks the property itself on the real
+  hash step (for every *n* from 1 to 32, arbitrary characters and
+  suffixes); every bit of every entry of 27 tables (the real search's, and
+  random alphabets, suffixes of up to 63 bytes, bytes >= 0x80, random
+  targets), each from states with *random* high bits - which checks the
+  table's layout and the index function the kernel uses, not just the
+  builder; that 300 planted true matches (a random state and character,
+  with the target set to exactly their hashA) all get through; and that
+  its table check really catches a wrong table: one flipped bit, a bit past
+  the alphabet, a table for another target or another suffix, seed1 and
+  seed2 swapped.
+- `tests/search_stress_test.cpp` runs the real `runSearch()` with hits made
+  common: built with `NAMEBREAK_HASHA_MATCH_BITS=12`
+  (`src/engine/hash_match.h`), a candidate is a hashA hit when the lowest 12
+  bits match - one in 4096. Hundreds of random ranges (random alphabets,
+  prefixes, suffixes and lengths, ranges across leading values and at both
+  ends of the space) are compared hit for hit with a brute force that hashes
+  every candidate from scratch: tens of thousands of hits per run, in every
+  position of every row, where the other tests see the few they plant. Each
+  case also plants a hit where a kernel is likeliest to be wrong - a range's
+  first or last candidate, either side of a leading-value or batch
+  boundary, a row's first or last character - or just outside the range,
+  where it must not be reported. It runs in every geometry the integration
+  test does, with a one-bit filter too (`NAMEBREAK_LOWBITS_FILTER_BITS=1`:
+  about half of each row gets through), and on every backend but Metal.
+- Before every search, the CUDA backend checks 1,024 random entries of the
+  table it has just built against their definition (the test's check, from
+  random high bits), uploads it, and reads it back to compare. If either
+  fails, namebreak stops (`INTERNAL ERROR: the lookup filter table ...`)
+  rather than search with it; in coordinator mode the range is reassigned
+  once its lease expires.
+- Before any backend is used, `createBackend` runs a known-answer self-test
+  on it (`src/backends/self_test.h`), on the machine it's about to search
+  on: candidates planted in small batches - at the first and last character
+  positions, on both sides of bit 32 of the mask, in rows cut short at both
+  ends, as the very first and very last candidate of a batch, with an
+  empty, an 8-byte and a long non-ASCII suffix - must be found, and
+  candidates planted just outside a batch must not be. It takes well under
+  a second. The tests
+  only run where someone runs them (the release workflow's runners have no
+  GPU); this runs on every volunteer's GPU, driver and compiler. A backend
+  that fails isn't used: namebreak says so and falls back to the next one
+  (for a GPU backend, eventually the CPU).
+- `verifyMatchesKernel` still cross-checks every hit through the
+  independent hashing path, as before.
+- The `reference` backend never gets the filter: it's what the others are
+  held to.
+
+To check that these checks would actually catch a broken kernel, nine were
+built on purpose - each a bug that silently misses (or invents)
+candidates: rows' masks cut to 32 bits; seed1 and seed2 swapped in the
+lookup; every launch's last row, or first row, one candidate short; the
+first row's cut applied to every row; the edges of the range ignored; the
+loop over a row's flagged candidates stopping one early; the suffix hashed
+one character short; the table built for the wrong target. Every one was
+caught by the self-test, by the integration test and by the stress test,
+each on its own (the latter two with the self-test switched off) - the
+integration test failed 54-1007 of its 2,267 cases, the stress test 76-316
+of its roughly 320, and the wrong-target table stopped both at their first
+search.
+That experiment is what added the self-test's and the stress test's
+planted edge cases: before them, a launch whose last row was one short got
+past both, and only the integration test caught it.
+`tests/self_test_test.cpp` does the same for the self-test on the CPU
+backends, on every `ctest` run.
+
+If the code changes, two things must stay true for the filter to be right:
+the hash step may only combine the state with additions, subtractions,
+multiplications, AND/OR/XOR, left shifts and constants - never a right
+shift, a rotation, a division, a comparison, or a table lookup indexed by
+the state - and a hashA hit must always mean the *low* bits match
+(`hashAMatches`), which is why the stress tests' weaker match drops high
+bits and never low ones. What none of this can rule out is the hardware
+computing something wrong (consumer GPUs have no ECC memory) - as true
+before the filter as after; [PERFORMANCE.md](PERFORMANCE.md) lists a
+coordinator-side check that would catch it, along with the further speedups
+still open.
 
 ### `prune_symbol_runs`, `prune_unopened_brackets` and `max_backslash_count` only run on the CPU
 
@@ -389,3 +542,11 @@ trailing window). For `prune_unopened_brackets` that is still exact as far as
 it goes: once the leading characters have closed a bracket nobody opened,
 nothing in the trailing window can change that - it just never looks at a
 stray closer that only appears in the trailing window.
+
+Those measurements were of the kernel as it was before the lookup filter,
+when a check had to be paid on every candidate. With the filter, leaving
+out a last character the rules reject costs one AND on a row's mask, and
+applying the rules to the whole candidate would skip about a fifth more of
+it at every length (worked out exactly for the real alphabet, with both
+rules on). But that changes which candidates a search covers - so it's a
+decision rather than a speedup; see [PERFORMANCE.md](PERFORMANCE.md).
