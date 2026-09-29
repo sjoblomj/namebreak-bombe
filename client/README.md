@@ -151,6 +151,10 @@ cmake --build --preset default    # builds build/namebreak, and the tests in bui
 ctest --preset default            # runs the tests
 ```
 
+On a machine with a GPU, add `-DNAMEBREAK_REQUIRE_GPU=ON` to the first
+command, so that tests fail rather than skip if the driver loses the GPU
+(see the options below).
+
 Options, passed to the first command as `-D<option>=<value>`:
 
 | Option | Default | Meaning |
@@ -162,6 +166,7 @@ Options, passed to the first command as `-D<option>=<value>`:
 | `NAMEBREAK_METAL` | `AUTO` | The Metal backend: `AUTO` builds it on macOS (Xcode's command line tools are all it needs), `OFF` leaves it out |
 | `NAMEBREAK_OPENCL` | `AUTO` | The OpenCL backend: `AUTO` builds it if OpenCL's headers and loader library are found (on Debian/Ubuntu: `opencl-headers ocl-icd-opencl-dev`; on Windows e.g. vcpkg's `opencl`), `ON` insists, `OFF` leaves it out |
 | `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
+| `NAMEBREAK_REQUIRE_GPU` | `OFF` | `ON` makes `ctest` fail, rather than skip, the tests of a backend that can't run on the machine - for a machine with the GPUs the build is for, where that means a broken driver (see [Backends](#backends)) |
 
 On Windows, use a Visual Studio developer prompt (MSVC is the host compiler
 the CUDA Toolkit supports there) and point CMake at a libcurl, e.g. vcpkg's:
@@ -287,7 +292,11 @@ so a GPU build still works on a machine without that GPU:
 
 `ctest` runs the end-to-end tests against every backend in the build; a
 test whose backend can't run on the machine is reported as skipped (one
-whose backend fails its self-test on the machine fails). A new
+whose backend fails its self-test on the machine fails). Skipped tests
+still leave `ctest` at "100% tests passed", so a GPU the driver has lost -
+CUDA after a laptop's suspend, say - would turn every GPU test green without
+running any: on a machine with the GPUs, configure with
+`-DNAMEBREAK_REQUIRE_GPU=ON`, and those tests fail instead. A new
 backend implements `SearchBackend`, gets a directory under `src/backends/`
 and an entry in `backends.cpp` and `CMakeLists.txt`, and is covered by the
 same tests: they take a `--backend <name>` argument.

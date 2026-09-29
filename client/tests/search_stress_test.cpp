@@ -341,7 +341,9 @@ int main(int argc, char** argv) {
             fprintf(stderr, "FAILED: %s\n", error.c_str());
             return 1;
         }
-        fprintf(stderr, "%s - skipping\n", error.c_str()); // 77: "skipped" to ctest
+        // 77: "skipped" to ctest, or failed with NAMEBREAK_REQUIRE_GPU (see
+        // SKIP_RETURN_CODE in CMakeLists.txt).
+        fprintf(stderr, "%s - exit code 77: skipped, or failed where NAMEBREAK_REQUIRE_GPU is ON\n", error.c_str());
         return 77;
     }
     prepareCryptTable(g_cryptTable);

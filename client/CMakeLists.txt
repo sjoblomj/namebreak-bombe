@@ -23,6 +23,13 @@ endif()
 # machine with the GPUs to run them on. The CI release builds turn them off.
 option(NAMEBREAK_TEST_VARIANTS "Build the tests' extra tuning configurations" ON)
 
+# ON makes a test whose backend can't run on this machine fail instead of
+# being skipped. For a machine that has the GPUs this build is for: there a
+# backend that can't run is a broken driver - say, CUDA after a laptop's
+# suspend - and skipped tests would still leave ctest at "100% tests passed".
+# OFF (the default) suits machines without them, like the release workflow's.
+option(NAMEBREAK_REQUIRE_GPU "Fail, rather than skip, the tests of a backend that can't run here" OFF)
+
 # OFF builds without any networking: no coordinator client, HTTP or protocol
 # code, no libcurl dependency, and `coordinator` mode is unavailable at
 # runtime (the bounded and continuous modes are unaffected).
@@ -234,12 +241,15 @@ enable_testing()
 # build/testrun/, away from any real matches and from each other (ctest -j).
 # namebreak_test(<name> <executable> [<argument>...])
 # A test exits with 77 when its backend can't run on this machine (a GPU
-# backend without that kind of GPU), which ctest then reports as skipped.
+# backend without that kind of GPU), which ctest then reports as skipped -
+# or, with NAMEBREAK_REQUIRE_GPU, as failed.
 function(namebreak_test name executable)
     set(dir ${CMAKE_BINARY_DIR}/testrun/${name})
     file(MAKE_DIRECTORY ${dir})
     add_test(NAME ${name} COMMAND ${executable} ${ARGN} WORKING_DIRECTORY ${dir})
-    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+    if(NOT NAMEBREAK_REQUIRE_GPU)
+        set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endfunction()
 
 # namebreak_test_executable(<name> <source> <search library>)

@@ -974,8 +974,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         // 77: "skipped" to ctest (see SKIP_RETURN_CODE in CMakeLists.txt) - a
-        // GPU backend on a machine without that kind of GPU.
-        fprintf(stderr, "%s - skipping\n", error.c_str());
+        // GPU backend on a machine without that kind of GPU - unless the build
+        // requires its GPUs (NAMEBREAK_REQUIRE_GPU), where it's a failure.
+        fprintf(stderr, "%s - exit code 77: skipped, or failed where NAMEBREAK_REQUIRE_GPU is ON\n", error.c_str());
         return 77;
     }
     g_window = g_backend->windowChars();
