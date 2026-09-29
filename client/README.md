@@ -179,7 +179,7 @@ match one of them. Supporting a new size means adding it to
 recompiling.
 
 `ctest` runs the correctness test suite: pure-CPU unit tests (among them
-`lowbits_filter_test`, of the CUDA backend's lookup filter), plus
+`lowbits_filter_test`, of the lookup filter), plus
 end-to-end tests of every backend that compare real search results against
 an independent brute-force reference (thousands of cases: every supported
 alphabet size, every last-character position, ranges starting/ending mid-row and
@@ -194,10 +194,11 @@ filter), each with its own
 compile of the CUDA backend - the build runs them in parallel.
 `cmake --build --preset default --target run_search_bench` times the real
 search over a fixed range (`build/tests/search_bench --scale <n>` for a
-longer one), and `--target run_mutation_test` checks that the tests catch
-deliberately broken kernels - see [The lookup
+longer one), and `--target run_mutation_test` (and
+`run_mutation_test_opencl`) checks that the tests catch deliberately broken
+kernels - see [The lookup
 filter](#the-lookup-filter-most-candidates-are-never-hashed) - which takes
-about seven minutes, so it isn't part of `ctest`. Everything is built into `build/`; deleting it is the clean
+minutes, so it isn't part of `ctest`. Everything is built into `build/`; deleting it is the clean
 build.
 
 ## Releases
@@ -241,17 +242,18 @@ backends a build has, most preferred first; unless told otherwise (see
 [Modes](#modes)) the program uses the first one that can run on the machine,
 so a GPU build still works on a machine without that GPU:
 
-- `cuda/` - the CUDA kernels and the code that launches them. The only
-  backend so far with [the lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
-  (`common/lowbits_filter.h`): about 1,450-1,650 G candidates/s on the RTX
-  3080 Ti Laptop, depending on how hot it is.
+- `cuda/` - the CUDA kernels and the code that launches them, with [the
+  lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
+  (`common/lowbits_filter.h`) and row groups split into chunks: about
+  1,450-1,700 G candidates/s on the RTX 3080 Ti Laptop, depending on how
+  hot it is.
 - `hip` - AMD GPUs: `cuda/`'s code compiled with ROCm's HIP instead, which
   accepts CUDA's kernel syntax as is; `gpu_runtime.h` maps the handful of
   CUDA runtime calls onto HIP's. Not built by default, and not yet tested on
   an AMD GPU: it has only been run through HIP's NVIDIA mapping, on an
   NVIDIA GPU, where its tests pass.
 - `metal/` - the Mac's GPU (Apple Silicon, or an Intel Mac's), through
-  Metal: the OpenCL kernel again, in Metal's shading language
+  Metal: the OpenCL kernel as it was before the lookup filter, in Metal's shading language
   (`search.metal`), compiled by Metal at runtime the same way; the host
   side is Objective-C++ (`metal_backend.mm`). On a Mac, use the `portable`
   preset. Not yet run on a Mac: its kernel has only been tested on the CPU,
@@ -259,13 +261,14 @@ so a GPU build still works on a machine without that GPU:
   one GPU thread at a time, where every test configuration passes.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
-  installed. The kernel CUDA's was before the lookup filter, ported
-  (`search.cl`); it's compiled by the driver at runtime, once per alphabet
-  size, suffix length and trailing length, so it takes an alphabet of any
-  size - drivers cache the result, but a new combination's first search
-  starts a moment later. On the RTX 3080 Ti Laptop it ran at about 88% of
-  the CUDA backend's speed before that got the filter - about a sixth of it
-  now, until the filter is ported ([PERFORMANCE.md](PERFORMANCE.md)).
+  installed. CUDA's kernel ported (`search.cl`), lookup filter and all,
+  but with one work-item per row rather than per chunk of a row group
+  ([PERFORMANCE.md](PERFORMANCE.md)); it's compiled by the driver at
+  runtime, once per alphabet size, suffix length and trailing length, so it
+  takes an alphabet of any size - drivers cache the result, but a new
+  combination's first search starts a moment later. About 1,080 G
+  candidates/s on the RTX 3080 Ti Laptop - 5.3 times what it did before it
+  got the filter, and about 72% of the CUDA backend's speed.
 - `cpu/` - every core of the CPU, with the same row trick as the CUDA
   kernel and the candidates of a row hashed several at a time with SIMD
   instructions (AVX2 on x86-64 CPUs that have it, picked at runtime; SSE2
@@ -411,8 +414,9 @@ is shared out, never what gets searched. That made the search about a third
 faster again (1,088-1,124 to 1,434-1,467 G candidates/s, three runs each
 side by side; 1 row per thread measured 1,133, 7 rows 1,575, 25 rows 1,659
 and 49 rows 1,611 in a cooler run). The OpenCL and Metal kernels still give
-each thread one row, which costs them much less as long as they hash every
-candidate of it (see [PERFORMANCE.md](PERFORMANCE.md)).
+each thread one row - for the Metal one, which still hashes every candidate
+of it, decoding the row is a small part of the work anyway (see
+[PERFORMANCE.md](PERFORMANCE.md)).
 
 Group `X**` from above, with its 26 rows split into two chunks of 13 (26
 characters, 25 rows per thread), marked with what the lookup filter
@@ -439,11 +443,11 @@ Thread 1 hashes `X` once, then one more character for each of `XA*` to
 table lookup, and only its `#`s are hashed any further.
 
 What a thread then does with its rows is where the backends differ. The
-CUDA kernel (`filteredRowsKernel`) looks the row up in a table and hashes
-only the handful of its candidates that could possibly match - see [The
-lookup filter](#the-lookup-filter-most-candidates-are-never-hashed) below.
-The OpenCL and Metal kernels, and the CPU backend, don't have the filter
-yet and hash every candidate of the row, which two more things make fast:
+CUDA and OpenCL kernels (`filteredRowsKernel`, `search.cl`) look the row up
+in a table and hash only the handful of its candidates that could possibly
+match - see [The lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
+below. The Metal kernel and the CPU backend don't have the filter yet and
+hash every candidate of the row, which two more things make fast:
 
 - **The loop over the last character is fully unrolled**, with its
   alphabet position known at compile time for every iteration. That lets
@@ -480,12 +484,13 @@ collisions in a single launch), but it's handled explicitly and tested
 
 ### The lookup filter: most candidates are never hashed
 
-The CUDA backend doesn't hash every candidate of a row. In the real search
-(a 49-character alphabet and `.WAV`) it hashes about one in 256 - on
-average 0.19 of a row's 49 candidates - because it can tell from a single
-table lookup that the rest can't match. That made the whole search 5.2 times
-as fast (`search_bench --scale 20` on the RTX 3080 Ti Laptop, three runs
-each: from 209-218 to 1,084-1,130 G candidates/s), without skipping
+The CUDA and OpenCL backends don't hash every candidate of a row. In the
+real search (a 49-character alphabet and `.WAV`) they hash about one in
+256 - on average 0.19 of a row's 49 candidates - because they can tell from
+a single table lookup that the rest can't match. That made the whole search
+5.2 times as fast with CUDA (`search_bench --scale 20` on the RTX 3080 Ti
+Laptop, three runs each: from 209-218 to 1,084-1,130 G candidates/s) and
+5.3 times with OpenCL (from 202-205 to 1,082-1,086), without skipping
 anything a full search would find.
 
 **Why it works.** Every step of the MPQ hash is
@@ -633,9 +638,10 @@ In detail:
   where it must not be reported. It runs in every geometry the integration
   test does, with a one-bit filter too (`NAMEBREAK_LOWBITS_FILTER_BITS=1`:
   about half of each row gets through), and on every backend but Metal.
-- Before every search, the CUDA backend checks 1,024 random entries of the
-  table it has just built against their definition (the test's check, from
-  random high bits), uploads it, and reads it back to compare. If either
+- Before every search, the CUDA and OpenCL backends check 1,024 random
+  entries of the table they have just built against their definition (the
+  test's check, from random high bits), upload it, and read it back to
+  compare. If either
   fails, namebreak stops (`INTERNAL ERROR: the lookup filter table ...`)
   rather than search with it; in coordinator mode the range is reassigned
   once its lease expires.
@@ -660,14 +666,16 @@ To check that these checks would actually catch a broken kernel, broken
 ones are built on purpose - each a bug that silently misses (or invents)
 candidates - and run against each check on its own (the integration and
 stress tests with the self-test switched off). `tests/mutation_test.py`
-does it: `cmake --build --preset default --target run_mutation_test`, about
-seven minutes on the RTX 3080 Ti Laptop. Run it after any change to the kernel - and when it
+does it, a backend at a time: `cmake --build --preset default --target
+run_mutation_test` for the CUDA kernel (about seven minutes on the RTX 3080
+Ti Laptop), `run_mutation_test_opencl` for the OpenCL one (about four).
+Run it after any change to a kernel - and when it
 says a mutation no longer applies, because the code it breaks has changed,
 update the mutation rather than drop it. It first checks that the unchanged
 code passes all three checks, and that a change which mustn't matter (one
-thread too few launched) passes them too, so that it can't pass by always
-saying "caught". Against the kernel as it is
-now, with row groups split into chunks, eighteen mutations: rows' masks cut to
+thread, or one work-group, too few or too many launched) passes them too, so
+that it can't pass by always saying "caught". Against the CUDA kernel as it
+is now, with row groups split into chunks, eighteen mutations: rows' masks cut to
 32 bits; seed1 and seed2 swapped in the lookup; a launch's last row, or
 first row, one candidate short; the edges of the range ignored; the loop
 over a row's flagged candidates stopping one early; the suffix hashed one
@@ -679,7 +687,13 @@ own step; the last chunk, or the last group, of a launch never searched.
 Every one was caught by the self-test, by the integration test and by the
 stress test - the integration test failed 6-1007 of its 2,267 cases, the
 stress test 38-292 of its 321, and the wrong-target table stopped both at
-their first search.
+their first search. Against the OpenCL kernel, thirteen: the same kinds of
+bug in its mask, lookup, row edges, loop and suffix, plus a lowest-set-bit
+taken one too high, its own copy of the table index shifting one bit too
+far, the kernel compiled for a table one bit narrower, and the work size
+rounded down instead of up. Every one was caught by all three checks too
+(the integration test failed 233-1007 of its 2,266 cases, the stress test
+91-394 of its 436), the first time the script was run on it.
 
 Each round of this found something. The first one added the self-test's
 and the stress test's planted edge cases: before them, a launch whose last

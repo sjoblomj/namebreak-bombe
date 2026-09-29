@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mutation testing of the CUDA backend's search kernel.
+"""Mutation testing of the GPU backends' search kernels.
 
-Builds copies of the client in which the kernel is broken on purpose - each
-mutation a small bug that would make a search silently miss (or invent)
+Builds copies of the client in which a backend's kernel is broken on purpose -
+each mutation a small bug that would make a search silently miss (or invent)
 candidates - and checks that every one of them is caught by each of the
 three checks that guard the search, on its own:
 
@@ -18,14 +18,17 @@ unmodified code must pass all three checks (otherwise nothing here means
 anything, and the script stops), and so must the mutations marked harmless -
 changes that must *not* change what gets searched.
 
-Needs the GPU the backend runs on, a CUDA (or HIP) toolchain and CMake. It
+One backend per run (--backend): cuda (the default), hip (the same code,
+compiled with HIP) or opencl, each with its own list of mutations (--list).
+Needs the GPU the backend runs on, its toolchain or driver, and CMake. It
 copies CMakeLists.txt, src/ and tests/ as they are on disk into a work
 directory, so it tests uncommitted changes too and never touches build/.
-The whole list takes about seven minutes on a laptop i9-12900H and RTX
-3080 Ti.
+The CUDA list takes about seven minutes on a laptop i9-12900H and RTX 3080
+Ti.
 
-Run from anywhere:  python3 client/tests/mutation_test.py [options]
+Run from anywhere:  python3 client/tests/mutation_test.py [--backend opencl] [options]
 or, from a configured build:  cmake --build --preset default --target run_mutation_test
+                              (or run_mutation_test_opencl)
 
 Exit status: 0 if every mutation was caught by all three checks and every
 control passed them, 1 if not, 2 if the experiment couldn't be run.
@@ -51,6 +54,8 @@ from pathlib import Path
 CLIENT = Path(__file__).resolve().parent.parent
 KERNEL = "src/backends/cuda/cuda_backend.cu"
 FILTER = "src/backends/common/lowbits_filter.cpp"
+CL_KERNEL = "src/backends/opencl/search.cl"
+CL_HOST = "src/backends/opencl/opencl_backend.cpp"
 
 
 @dataclass
@@ -63,7 +68,12 @@ class Mutation:
     expect: str = "caught"
 
 
-MUTATIONS = [
+# The table builder is shared by every backend that has the filter.
+WRONG_TARGET = Mutation("wrongtarget", "the table built for the wrong target",
+                        [(FILTER, "if (((seed1[b] ^ constants.targetHashA) & kLowBitsFilterHashMask) == 0)",
+                          "if (((seed1[b] ^ (constants.targetHashA ^ 1)) & kLowBitsFilterHashMask) == 0)")])
+
+CUDA_MUTATIONS = [
     # The lookup filter's mask.
     Mutation("mask32", "a row's mask cut to 32 bits",
              [(KERNEL, "mask &= (uint64_t(1) << AlphabetSize) - 1;", "mask &= 0xFFFFFFFFull;")]),
@@ -80,9 +90,7 @@ MUTATIONS = [
     Mutation("suffixshort", "the suffix hashed one character short",
              [(KERNEL, "#pragma unroll\n                for (int i = 0; i < SuffixLen; ++i)",
                "#pragma unroll\n                for (int i = 0; i + 1 < SuffixLen; ++i)")]),
-    Mutation("wrongtarget", "the table built for the wrong target",
-             [(FILTER, "if (((seed1[b] ^ constants.targetHashA) & kLowBitsFilterHashMask) == 0)",
-               "if (((seed1[b] ^ (constants.targetHashA ^ 1)) & kLowBitsFilterHashMask) == 0)")]),
+    WRONG_TARGET,
     # Row groups and their chunks.
     Mutation("chunkend", "every chunk's last row skipped",
              [(KERNEL, "int dEnd = (int) ((chunk + 1) * AlphabetSize / kChunks);", "int dEnd = (int) ((chunk + 1) * AlphabetSize / kChunks) - 1;")]),
@@ -112,6 +120,50 @@ MUTATIONS = [
              edits=[(KERNEL, "const uint64_t threads = groups * kChunksPerGroup<AlphabetC::value>;",
                      "const uint64_t threads = groups * kChunksPerGroup<AlphabetC::value> - 1;")]),
 ]
+
+OPENCL_MUTATIONS = [
+    # The lookup filter's mask.
+    Mutation("mask32", "a row's mask cut to 32 bits",
+             [(CL_KERNEL, "mask &= (1UL << ALPHABET_SIZE) - 1UL;", "mask &= 0xFFFFFFFFUL;")]),
+    Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
+             [(CL_KERNEL, "ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];", "ulong mask = filterTable[FILTER_INDEX(seed2, seed1)];")]),
+    Mutation("indexshift", "the kernel's table index shifting seed2's bits one too far",
+             [(CL_KERNEL, "(((seed2) & FILTER_STATE_MASK) << FILTER_BITS))", "(((seed2) & FILTER_STATE_MASK) << (FILTER_BITS + 1)))")]),
+    Mutation("filterbits", "the kernel compiled for a table one bit narrower",
+             [(CL_HOST, '" -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits);', '" -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits - 1);')]),
+    Mutation("lastrow", "a batch's last row one candidate short",
+             [(CL_KERNEL, "mask &= (1UL << lastRowEndK) - 1UL;", "mask &= (1UL << (lastRowEndK - 1)) - 1UL;")]),
+    Mutation("firstrow", "a batch's first row one candidate short",
+             [(CL_KERNEL, "mask &= ~0UL << firstRowStartK;", "mask &= ~0UL << (firstRowStartK + 1);")]),
+    Mutation("noedges", "where the range starts and ends mid-row ignored",
+             [(CL_KERNEL, "if (t == 0)\n        mask &=", "if (false)\n        mask &="),
+              (CL_KERNEL, "if (t == rowCount - 1)\n        mask &=", "if (false)\n        mask &=")]),
+    Mutation("skiplast", "the loop over a row's flagged candidates stops one early",
+             [(CL_KERNEL, "while (mask != 0) {", "while ((mask & (mask - 1UL)) != 0) {")]),
+    Mutation("wrongbit", "a flagged bit taken for the character after it",
+             [(CL_KERNEL, "const int k = 63 - (int) clz(mask & (0UL - mask));", "const int k = 64 - (int) clz(mask & (0UL - mask));")]),
+    Mutation("suffixshort", "the suffix hashed one character short",
+             [(CL_KERNEL, "for (int i = 0; i < SUFFIX_LEN; ++i)\n            MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);",
+               "for (int i = 0; i + 1 < SUFFIX_LEN; ++i)\n            MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);")]),
+    Mutation("rowdigits", "one character too few of a row hashed",
+             [(CL_KERNEL, "for (int i = 0; i < TRAILING_LEN - 1; ++i)\n        MPQ_STEP(seed1, seed2, sKey[digit[i]], sOrd[digit[i]]);",
+               "for (int i = 0; i + 1 < TRAILING_LEN - 1; ++i)\n        MPQ_STEP(seed1, seed2, sKey[digit[i]], sOrd[digit[i]]);")]),
+    WRONG_TARGET,
+    Mutation("globalsize", "the work size rounded down, not up, to whole work-groups",
+             [(CL_HOST, "const size_t global = (rows.rowCount + local - 1) / local * local;", "const size_t global = rows.rowCount / local * local;")]),
+    # Work-items past the batch's last row return at once, so launching a
+    # whole work-group too many must not change what gets searched.
+    Mutation("extragroup", "a whole work-group too many launched", expect="harmless",
+             edits=[(CL_HOST, "const size_t global = (rows.rowCount + local - 1) / local * local;",
+                     "const size_t global = (rows.rowCount + 2 * local - 1) / local * local;")]),
+]
+
+# Per backend: how to build it, what its createBackend name is, and its mutations.
+BACKENDS = {
+    "cuda": (["-DNAMEBREAK_GPU=cuda", "-DNAMEBREAK_OPENCL=OFF"], CUDA_MUTATIONS),
+    "hip": (["-DNAMEBREAK_GPU=hip", "-DNAMEBREAK_OPENCL=OFF"], CUDA_MUTATIONS),
+    "opencl": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=ON"], OPENCL_MUTATIONS),
+}
 
 CONTROL = Mutation("none", "the code as it is", [], expect="harmless")
 
@@ -214,8 +266,8 @@ def build(work, base, mutation, args):
     for file, old, new in mutation.edits:
         replace_exactly_once(src / file, old, new, f"mutation {mutation.name}")
     build_dir = src / "build"
-    configure = ["cmake", "-S", str(src), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release", f"-DNAMEBREAK_GPU={args.gpu}",
-                 "-DNAMEBREAK_OPENCL=OFF", "-DNAMEBREAK_METAL=OFF", "-DNAMEBREAK_NETWORK=OFF", "-DNAMEBREAK_TEST_VARIANTS=OFF"]
+    configure = ["cmake", "-S", str(src), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release", "-DNAMEBREAK_METAL=OFF",
+                 "-DNAMEBREAK_NETWORK=OFF", "-DNAMEBREAK_TEST_VARIANTS=OFF"] + BACKENDS[args.backend][0]
     configure += args.cmake_arg
     compile_ = ["cmake", "--build", str(build_dir), "-j", str(args.jobs), "--target"] + TARGETS
     log = src / "build.log"
@@ -251,7 +303,7 @@ def summarize(check, log_text, capture_text, exit_code, timed_out):
 
 
 def run_checks(build_dir, mutation, args):
-    backend = "hip" if args.gpu == "hip" else "cuda"
+    backend = args.backend
     results = {}
     for check, executable in CHECKS:
         run_dir = build_dir.parent / f"run-{check}"
@@ -289,7 +341,7 @@ def describe(outcome):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog="See the module docstring for the whole story.")
-    parser.add_argument("--gpu", choices=["cuda", "hip"], default="cuda", help="the GPU backend to build and test (default cuda)")
+    parser.add_argument("--backend", choices=sorted(BACKENDS), default="cuda", help="the backend to build and test (default cuda)")
     parser.add_argument("--only", help="comma-separated mutation names to run (the unmodified code always runs first)")
     parser.add_argument("--list", action="store_true", help="list the mutations and exit")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel compile jobs per build")
@@ -300,7 +352,7 @@ def main():
     parser.add_argument("--cmake-arg", action="append", default=[], help="extra CMake argument, e.g. -DCMAKE_CUDA_ARCHITECTURES=86")
     args = parser.parse_args()
 
-    mutations = MUTATIONS
+    mutations = BACKENDS[args.backend][1]
     if args.list:
         for m in mutations:
             print(f"{m.name:<12} {m.expect:<9} {m.what}")

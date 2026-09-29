@@ -1,5 +1,6 @@
 // The Metal backend's search kernel - the same algorithm as the OpenCL one
-// (backends/opencl/search.cl, itself the CUDA kernel ported). Embedded into
+// (backends/opencl/search.cl, itself the CUDA kernel ported) as it was before
+// that got the lookup filter (backends/common/lowbits_filter.h). Embedded into
 // the program at build time and compiled by Metal at runtime, once per
 // combination of these (see metal_backend.mm), which makes them all
 // compile-time constants the compiler can unroll and fold:

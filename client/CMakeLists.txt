@@ -253,7 +253,7 @@ endfunction()
 namebreak_test_executable(prefix_hasher_test tests/prefix_hasher_test.cpp namebreak_search)
 namebreak_test(prefix_hasher_test prefix_hasher_test)
 
-# Pure-CPU correctness check for the lookup filter the CUDA backend searches
+# Pure-CPU correctness check for the lookup filter the CUDA and OpenCL backends search
 # with (src/backends/common/lowbits_filter.h): the property it rests on, every
 # entry of many tables, planted matches, and that its table check catches a
 # wrong table.
@@ -398,15 +398,19 @@ endif()
 add_custom_target(run_search_bench COMMAND search_bench ${SEARCH_BENCH_ARGS} WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench USES_TERMINAL)
 
 # Mutation testing (tests/mutation_test.py) - not a ctest test: it builds
-# about twenty copies of the client with the GPU kernel broken on purpose, and
+# a copy of the client per mutation, with a GPU kernel broken on purpose, and
 # checks that the self-test, the integration test and the stress test each
-# catch every one. About seven minutes on the RTX 3080 Ti Laptop: `cmake
-# --build --preset default --target run_mutation_test`, after any change to
-# the kernel.
+# catch every one. About seven minutes each on the RTX 3080 Ti Laptop: `cmake
+# --build --preset default --target run_mutation_test` (the CUDA or HIP
+# kernel) or run_mutation_test_opencl, after any change to the kernel.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND AND WITH_OPENCL)
+    add_custom_target(run_mutation_test_opencl COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mutation_test.py --backend opencl
+                      USES_TERMINAL VERBATIM)
+endif()
 if(NOT NAMEBREAK_GPU STREQUAL "none")
-    find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
-        set(MUTATION_TEST_ARGS --gpu ${NAMEBREAK_GPU})
+        set(MUTATION_TEST_ARGS --backend ${NAMEBREAK_GPU})
         # A single architecture is passed on; the script's copies build for
         # CMake's default otherwise.
         if(NAMEBREAK_GPU STREQUAL "cuda" AND CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES MATCHES ";")

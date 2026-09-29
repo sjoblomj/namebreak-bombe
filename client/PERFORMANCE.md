@@ -4,8 +4,8 @@ Speedups still open for the client, found while adding the lookup filter to
 the CUDA backend (see README.md's [The lookup
 filter](README.md#the-lookup-filter-most-candidates-are-never-hashed)), plus
 the safeguards that would make a missed match even less likely. Each item
-says what's known - **measured**, or **estimated** where it hasn't been tried
-- and what it would take.
+says what's known (**measured**, or **estimated** where it hasn't been
+tried) and what it would take.
 
 Numbers are from the RTX 3080 Ti Laptop GPU and i9-12900H this was developed
 on. Nothing here counts as done until it's measured with `search_bench
@@ -15,9 +15,10 @@ blur a kernel comparison) and the whole `ctest` passes - the dense-hit
 silently drop candidates.
 
 Where things stand: the CUDA backend searches 1,434-1,467 G candidates/s
-with a hot GPU, and up to about 1,650 with a cool one (**measured**), from
+with a hot GPU, and up to about 1,700 with a cool one (**measured**), from
 209-218 before the lookup filter and 1,088-1,124 with the filter but one row
-per thread. It issues about 100 instructions per row of 49 candidates
+per thread. The OpenCL backend, with the filter and one row per work-item,
+searches 1,082-1,086, from 202-205 before it. It issues about 100 instructions per row of 49 candidates
 (*estimated* from its SASS: about 30 per row, the verify loop's, and a
 share of its thread's setup), down from about 1,130 before the filter.
 Before the rows were split into chunks, Nsight Systems put about 5% of the
@@ -38,10 +39,14 @@ will have grown (not measured again).
   and their table entries gathered. The backend already walks its rows
   incrementally (`searchRowsWith`), and so did the prototype: the port must
   keep that, so there's no row decoding to add here.
-- [ ] **OpenCL.** Port `filteredRowsKernel` to `search.cl`, with the table in
-  a global buffer, and the same checks as the CUDA backend (a sample of the
-  table checked, and read back, before every search). *Estimated* about the
-  same factor as CUDA's; it ran at 88% of the unfiltered CUDA kernel.
+- [x] **OpenCL.** `filteredRowsKernel` ported to `search.cl`, with the table
+  in a global buffer and the same checks as the CUDA backend (a sample of
+  the table checked, and read back, before every search). **Measured** 5.3
+  times as fast: 1,082-1,086 G candidates/s, from 202-205 - about 72% of the
+  CUDA backend, which also has its row groups split into chunks. Its tests
+  run about four times faster too (a whole ctest of OpenCL in 45 s, from
+  about 3.5 minutes): the driver no longer compiles a fully unrolled loop
+  over every candidate of a row. `run_mutation_test_opencl` covers it.
   - [ ] **Incremental row decoding**, as the CUDA kernel's: row groups split
     into chunks of about `NAMEBREAK_ROWS_PER_THREAD` rows, one per
     work-item, walked with a loop the launch size can't cut short. After
@@ -195,5 +200,5 @@ backend is self-tested before use (see the README). What's still open:
   that must *not* be caught (one thread too few launched). `--list` shows the
   mutations.
   - [ ] **The other backends**, as they get the filter: their own mutations
-    in the script (it takes `--gpu hip` already, for the CUDA code compiled
-    as HIP).
+    in the script, as OpenCL has (`--backend opencl`). It takes
+    `--backend hip` already, for the CUDA code compiled as HIP.

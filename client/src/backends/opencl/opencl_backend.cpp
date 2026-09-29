@@ -12,10 +12,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
 #include "backends/opencl/search_kernel.h" // generated from search.cl - see CMakeLists.txt
 #include "engine/hash_match.h"
@@ -66,6 +68,8 @@ public:
             *table = clCreateBuffer(context_, CL_MEM_READ_ONLY, kMaxSuffixSize * sizeof(cl_uint), nullptr, &err);
             CL_CHECK(err);
         }
+        filterTable_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, kLowBitsFilterEntries * sizeof(cl_ulong), nullptr, &err);
+        CL_CHECK(err);
     }
 
     ~OpenClBackend() override {
@@ -73,7 +77,7 @@ public:
             clReleaseKernel(entry.second.kernel);
             clReleaseProgram(entry.second.program);
         }
-        for (cl_mem buffer : {matchCount_, matchIdx_, alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_})
+        for (cl_mem buffer : {matchCount_, matchIdx_, alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_, filterTable_})
             clReleaseMemObject(buffer);
         clReleaseCommandQueue(queue_);
         clReleaseContext(context_);
@@ -107,6 +111,9 @@ private:
     cl_mem matchIdx_ = nullptr;
     cl_mem alphabetKey_ = nullptr, alphabetOrd_ = nullptr;
     cl_mem suffixKey_ = nullptr, suffixOrd_ = nullptr;
+    // This search's lookup filter: kLowBitsFilterEntries entries, see
+    // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
+    cl_mem filterTable_ = nullptr;
     // Compiled once per (alphabet size, suffix length, trailing length) and
     // kept for the backend's lifetime - a coordinator client searches range
     // after range of the same shape, and each compile takes a moment.
@@ -118,6 +125,19 @@ private:
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
 };
+
+// How many of the lookup filter's entries beginSearch checks against their
+// definition before every search (see checkLowBitsFilterTable), each with two
+// different random high bits - about a millisecond, as in the CUDA backend.
+constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
+
+// A search must not start with a filter table that is wrong: it could drop a
+// match without any other sign. Like CL_CHECK, this ends the process - a
+// coordinator range is then reassigned when its lease runs out.
+[[noreturn]] void refuseFilterTable(const char* what, const std::string& detail) {
+    fprintf(stderr, "INTERNAL ERROR: the lookup filter table %s (%s) - refusing to search with it\n", what, detail.c_str());
+    exit(1);
+}
 
 void OpenClBackend::beginSearch(const SearchConstants& constants) {
     if (!announcedDevice_) {
@@ -147,6 +167,22 @@ void OpenClBackend::beginSearch(const SearchConstants& constants) {
     // Establishes the "matchCount is 0 at launch" invariant runBatch keeps.
     const cl_int zero = 0;
     CL_CHECK(clEnqueueWriteBuffer(queue_, matchCount_, CL_TRUE, 0, sizeof(zero), &zero, 0, nullptr, nullptr));
+
+    // This search's lookup filter - it depends on the alphabet, the suffix and
+    // the target, so it's built for every search. Checked against its
+    // definition before it's used, and read back after the upload to make
+    // sure the device has exactly what was checked.
+    const std::vector<uint64_t> table = buildLowBitsFilterTable(constants);
+    std::string error;
+    if (!checkLowBitsFilterTable(table, constants, kFilterEntriesCheckedPerSearch, 2, std::random_device{}(), error))
+        refuseFilterTable("failed its check", error);
+    static_assert(sizeof(cl_ulong) == sizeof(uint64_t), "the table's entries are 64-bit on both sides");
+    const size_t tableBytes = table.size() * sizeof(uint64_t);
+    CL_CHECK(clEnqueueWriteBuffer(queue_, filterTable_, CL_TRUE, 0, tableBytes, table.data(), 0, nullptr, nullptr));
+    std::vector<uint64_t> readBack(table.size());
+    CL_CHECK(clEnqueueReadBuffer(queue_, filterTable_, CL_TRUE, 0, tableBytes, readBack.data(), 0, nullptr, nullptr));
+    if (readBack != table)
+        refuseFilterTable("read back from the device differs from the one uploaded", std::to_string(tableBytes) + " bytes");
 }
 
 const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen) {
@@ -161,7 +197,8 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen) {
     CL_CHECK(err);
     const std::string options = "-cl-std=CL1.2 -DALPHABET_SIZE=" + std::to_string(alphabetSize_) + " -DSUFFIX_LEN=" + std::to_string(suffixLen_) +
                                 " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES) +
-                                " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u";
+                                " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
+                                " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits);
     if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
         size_t size = 0;
         clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);
@@ -209,8 +246,9 @@ BatchOutcome OpenClBackend::runBatch(int trailingLen, uint64_t start, uint64_t c
     CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_mem), &alphabetOrd_));
     CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &suffixKey_));
     CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_mem), &suffixOrd_));
-    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_mem), &matchCount_));
-    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_mem), &matchIdx_));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_mem), &filterTable_));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_mem), &matchCount_));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_mem), &matchIdx_));
 
     const size_t local = compiled.workGroupSize;
     const size_t global = (rows.rowCount + local - 1) / local * local;
