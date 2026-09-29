@@ -29,13 +29,17 @@
 // only skip candidates that cannot match.
 
 // How many low bits of each of seed1 and seed2 index the table: 2^(2n)
-// entries of 8 bytes (n = 8: 512 KB). About alphabetSize / 2^n of a row's
-// candidates get past it. Overridable at compile time
+// entries of 8 bytes (n = 7: 128 KB). About alphabetSize / 2^n of a row's
+// candidates get past it. 7 is measured, not guessed: on the RTX 3080 Ti
+// Laptop (search_bench --scale 20, interleaved runs) 6 bits did about 1,770
+// G candidates/s, 7 about 1,800, 8 about 1,550, 9 about 1,580 and 10 about
+// 390 - a smaller table caches better, and that outweighs hashing twice as
+// many candidates in full. Overridable at compile time
 // (-DNAMEBREAK_LOWBITS_FILTER_BITS=N) so the tests can run with a
 // deliberately weak filter that lets most candidates through (see
 // CMakeLists.txt).
 #ifndef NAMEBREAK_LOWBITS_FILTER_BITS
-#define NAMEBREAK_LOWBITS_FILTER_BITS 8
+#define NAMEBREAK_LOWBITS_FILTER_BITS 7
 #endif
 constexpr int kLowBitsFilterBits = NAMEBREAK_LOWBITS_FILTER_BITS;
 static_assert(kLowBitsFilterBits >= 0 && kLowBitsFilterBits <= 10, "NAMEBREAK_LOWBITS_FILTER_BITS must be 0-10 (a 2^20-entry, 8 MB table)");

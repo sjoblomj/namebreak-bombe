@@ -121,13 +121,24 @@ will have grown (not measured again).
   and decoding was only about 5% of that (*estimated* from the unfiltered
   CUDA kernel they were ported from), so it wasn't worth doing before. The
   CPU backend already walked rows incrementally (`searchRowsWith`).
-- [ ] **Less divergence in the verify loop.** A warp repeats the loop over
+- [x] **Less divergence in the verify loop.** A warp repeats the loop over
   flagged candidates as many times as its busiest lane needs: about 1.4
-  times at 8 bits (*estimated* from the statistics). Options: a 9-bit table
-  (2 MB; the GPU's L2 is 4 MB) or 10-bit, or warp-cooperative verification
-  (collect the flagged candidates of all 32 lanes with a ballot, then have
-  each lane verify one). *Estimated* +10-30%. Sweep
-  `NAMEBREAK_LOWBITS_FILTER_BITS` from 6 to 10 first.
+  times at 8 bits (*estimated* from the statistics). The sweep of
+  `NAMEBREAK_LOWBITS_FILTER_BITS` it called for first showed the opposite of
+  what was expected: wider tables are slower, narrower ones faster -
+  **measured** (`search_bench --scale 20`, interleaved, 3-4 runs each) 6
+  bits about 1,770 G candidates/s, 7 about 1,800, 8 about 1,550, 9 about
+  1,580, 10 about 390. The table's reads cost more than the divergence, so
+  the default is now 7 (a 128 KB table): **+16-18%**, in every pair of runs.
+  - [ ] **Warp-cooperative verification** (collect the flagged candidates
+    of all 32 lanes with a ballot, then have each lane verify one) is still
+    possible, but now works against a table at 7 bits, where twice as many
+    candidates are flagged: worth trying only after **Where the table
+    lives**, which the sweep shows matters more.
+  - [ ] **Re-sweep on the other backends.** 7 applies to all of them (the
+    table is shared). OpenCL on this GPU gains too - **measured** about
+    1,453 G candidates/s against 1,325 at 8 bits (+9-10%, three pairs) - but
+    Metal on a Mac and HIP on AMD may each prefer another width.
 - [ ] **Where the table lives.** 512 KB is read through the read-only cache,
   mostly from L2. A 6-bit table (32 KB) would fit in shared memory, if
   blocks were long-lived enough to load it once (a grid-stride loop).

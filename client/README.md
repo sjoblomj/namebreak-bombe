@@ -501,7 +501,7 @@ collisions in a single launch), but it's handled explicitly and tested
 
 The GPU backends - CUDA, OpenCL and Metal - don't hash every candidate of a
 row. In the real search (a 49-character alphabet and `.WAV`) they hash about one in
-256 - on average 0.19 of a row's 49 candidates - because they can tell from
+128 - on average 0.38 of a row's 49 candidates - because they can tell from
 a single table lookup that the rest can't match. That made the whole search
 5.2 times as fast with CUDA (`search_bench --scale 20` on the RTX 3080 Ti
 Laptop, three runs each: from 209-218 to 1,084-1,130 G candidates/s) and
@@ -553,6 +553,13 @@ with one bit per alphabet character - a 512 KB table
 (`buildLowBitsFilterTable`, `src/backends/common/lowbits_filter.h`). Each
 thread looks its row up in it and hashes only the candidates in the mask,
 in full, exactly as before.
+
+The examples here use 8 bits, but the backends ship with 7
+(`NAMEBREAK_LOWBITS_FILTER_BITS`): a 128 KB table, which lets twice as many
+candidates through, is still faster, because it stays in the GPU's caches.
+Measured on the RTX 3080 Ti Laptop (`search_bench --scale 20`, interleaved
+runs): 6 bits about 1,770 G candidates/s, 7 about 1,800, 8 about 1,550, 9
+about 1,580, and 10 (an 8 MB table, twice the L2 cache) about 390.
 
 The same row, looked up for the real target (every number here is computed,
 not made up):
