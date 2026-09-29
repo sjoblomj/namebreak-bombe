@@ -67,8 +67,17 @@ will have grown (not measured again).
     it by hand from the Actions tab): that compiles `metal_backend.mm` and
     runs `ctest` there, and `tests/mutation_test.py --backend metal` covers
     the host-side mutations the emulation can't.
-  - [ ] **Incremental row decoding**, as for OpenCL: after the filter port,
-    with its chunk size tuned on a Mac.
+  - [x] **Incremental row decoding**, as OpenCL's: row groups split into
+    chunks, one per thread, walked with a loop the grid's size can't cut
+    short. Tested the same way as the filter port: every configuration
+    passes, with half as many threads and with a threadgroup too many as
+    well, and each of its twenty-one kernel mutations is caught by all
+    three checks. **Not measured.** It takes CUDA's 25 rows per thread (two
+    chunks per group) rather than OpenCL's whole group, so that a batch - a
+    quarter of CUDA's - still has enough threads for the largest Apple GPUs.
+  - [ ] **Tune the chunk size on a Mac.** Sweep `NAMEBREAK_ROWS_PER_THREAD`
+    (1, 7, 25, 49 and 64, say) with `search_bench --scale 20`, as for CUDA
+    and OpenCL.
 - [ ] **HIP.** Gets the filter with the CUDA code, but has never run on an
   AMD GPU. The self-test now runs there before every use, which lowers the
   risk - but measuring it on real AMD hardware is still to do.
@@ -91,12 +100,11 @@ will have grown (not measured again).
   (1,088-1,124 to 1,434-1,467 G candidates/s), +36% in a cooler sweep, where
   1 row per thread did 1,133, 7 did 1,575, 10-16 about 1,605, 25 did 1,659
   and 49 did 1,611. The HIP backend is this same code, so it has the change
-  too. The OpenCL and Metal kernels decode rows the old way, but without the
-  filter a row there still hashes all its candidates, and decoding is only
-  about 5% of that (*estimated* from the unfiltered CUDA kernel they were
-  ported from) - so for them it's worth doing after the filter is ported,
-  not before. The CPU backend already walked rows incrementally
-  (`searchRowsWith`).
+  too. The OpenCL and Metal kernels got it after their filter ports (see
+  above): without the filter a row there still hashed all its candidates,
+  and decoding was only about 5% of that (*estimated* from the unfiltered
+  CUDA kernel they were ported from), so it wasn't worth doing before. The
+  CPU backend already walked rows incrementally (`searchRowsWith`).
 - [ ] **Less divergence in the verify loop.** A warp repeats the loop over
   flagged candidates as many times as its busiest lane needs: about 1.4
   times at 8 bits (*estimated* from the statistics). Options: a 9-bit table
@@ -210,6 +218,6 @@ backend is self-tested before use (see the README). What's still open:
   checking that the unchanged code passes them, as does the one mutation
   that must *not* be caught (one thread too few launched). `--list` shows the
   mutations.
-  - [ ] **The other backends**, as they get the filter: their own mutations
-    in the script, as OpenCL has (`--backend opencl`). It takes
-    `--backend hip` already, for the CUDA code compiled as HIP.
+  - [x] **The other backends**: OpenCL (`--backend opencl`) and Metal
+    (`--backend metal`, on a Mac) have their own mutations, and
+    `--backend hip` runs CUDA's on the CUDA code compiled as HIP.

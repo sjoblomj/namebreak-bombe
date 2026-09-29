@@ -29,10 +29,17 @@ namespace {
 // alphabet size: the kernel fills its threadgroup tables one entry per thread.
 constexpr NSUInteger kPreferredThreadgroupSize = 256;
 
+// About how many rows of a row group one thread searches (ROWS_PER_THREAD in
+// search.metal; see kChunksPerGroup in the CUDA backend). Not tuned yet: this
+// is CUDA's value, two chunks per group at the usual alphabet sizes, rather
+// than OpenCL's whole group per thread, so that a batch still has enough
+// threads for the largest Apple GPUs. See PERFORMANCE.md.
+constexpr int kRowsPerThread = rowsPerThreadOr(25);
+
 // Must match RowArgs in search.metal.
 struct RowArgs {
     uint32_t firstRow;
-    uint32_t rowCount;
+    uint32_t lastRow;
     int32_t firstRowStartK;
     int32_t lastRowEndK;
     uint32_t targetA;
@@ -169,6 +176,7 @@ id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen) {
             @"MAX_MATCHES": @(MAX_MATCHES),
             @"HASHA_MATCH_MASK": @(kHashAMatchMask),
             @"FILTER_BITS": @(kLowBitsFilterBits),
+            @"ROWS_PER_THREAD": @(kRowsPerThread),
         };
         NSError* error = nil;
         id<MTLLibrary> library = [device_ newLibraryWithSource:@(kSearchKernelSource) options:options error:&error];
@@ -204,7 +212,7 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
 
     RowArgs args;
     args.firstRow = (uint32_t) rows.firstRow;
-    args.rowCount = (uint32_t) rows.rowCount;
+    args.lastRow = (uint32_t) (rows.firstRow + rows.rowCount - 1);
     args.firstRowStartK = rows.firstRowStartK;
     args.lastRowEndK = rows.lastRowEndK;
     args.targetA = targetA_;
@@ -223,8 +231,14 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
         [encoder setBuffer:matchCount_ offset:0 atIndex:5];
         [encoder setBuffer:matchIdx_ offset:0 atIndex:6];
         [encoder setBuffer:filterTable_ offset:0 atIndex:7];
+        // A thread per chunk of every row group the batch touches (see
+        // CHUNKS_PER_GROUP in search.metal), rounded up to whole threadgroups.
+        // The kernel works out the chunks itself and covers all of them
+        // whatever the grid's size, so this only spreads the work.
         const NSUInteger threadgroupSize = std::min(kPreferredThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
-        const NSUInteger threadgroups = (rows.rowCount + threadgroupSize - 1) / threadgroupSize;
+        const NSUInteger chunksPerGroup = (NSUInteger) (alphabetSize_ + kRowsPerThread - 1) / kRowsPerThread;
+        const NSUInteger chunks = (NSUInteger) (args.lastRow / alphabetSize_ - args.firstRow / alphabetSize_ + 1) * chunksPerGroup;
+        const NSUInteger threadgroups = (chunks + threadgroupSize - 1) / threadgroupSize;
         [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupSize, 1, 1)];
         [encoder endEncoding];
         [commands commit];

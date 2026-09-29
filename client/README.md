@@ -253,8 +253,8 @@ so a GPU build still works on a machine without that GPU:
   an AMD GPU: it has only been run through HIP's NVIDIA mapping, on an
   NVIDIA GPU, where its tests pass.
 - `metal/` - the Mac's GPU (Apple Silicon, or an Intel Mac's), through
-  Metal: the OpenCL kernel, lookup filter and all, in Metal's shading
-  language (`search.metal`), compiled by Metal at runtime the same way; the
+  Metal: the OpenCL kernel, lookup filter, row groups and all, in Metal's
+  shading language (`search.metal`), compiled by Metal at runtime the same way; the
   host side is Objective-C++ (`metal_backend.mm`). On a Mac, use the
   `portable` preset. Not yet run on a Mac: its kernel has only been tested
   on the CPU, compiled as C++ against a stand-in for Metal's standard
@@ -419,8 +419,8 @@ side by side; 1 row per thread measured 1,133, 7 rows 1,575, 25 rows 1,659
 and 49 rows 1,611 in a cooler run). The OpenCL kernel does the same, but
 does best with a whole row group per work-item (1 row per work-item measured
 about 880, 7 about 1,300, 25 about 1,435, and 49 and 64 about 1,460). The
-Metal kernel still gives each thread one row (see
-[PERFORMANCE.md](PERFORMANCE.md)).
+Metal kernel does the same, with CUDA's 25 rows per thread until it has
+been measured on a Mac (see [PERFORMANCE.md](PERFORMANCE.md)).
 
 Group `X**` from above, with its 26 rows split into two chunks of 13 (26
 characters, 25 rows per thread), marked with what the lookup filter
@@ -701,7 +701,8 @@ integration test failed 6-1007 of its 2,266 cases, the stress test 48-394 of
 its 436), each time the script was run on it. The Metal kernel has its own
 list (`--backend metal`, on a Mac); with no Mac here, its kernel mutations
 were run through an emulation of Metal on the CPU (see [Backends](#backends)),
-and each was caught by all three checks there too.
+and each was caught by all three checks there too, while half as many
+threads, or a threadgroup too many, went unnoticed, as they must.
 
 Each round of this found something. The first one added the self-test's
 and the stress test's planted edge cases: before them, a launch whose last
