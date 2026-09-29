@@ -283,6 +283,54 @@ same tests: they take a `--backend <name>` argument.
 
 ## Design decisions
 
+### A search, end to end
+
+Every filename a search tries is split into parts that different pieces of
+the program deal with. Here, `REZ\FZ00ODMEA.WAV` - a 9-character
+candidate between the prefix `REZ\` and the suffix `.WAV`, with the default
+window of 5 trailing characters:
+
+```text
+  R E Z \ F Z 0 0 O D M E A . W A V
+  └──┬──┘ └──┬──┘ └─┬─┘ │ │ └──┬──┘
+     │       │      │   │ │    └───── suffix: fixed
+     │       │      │   │ └────────── the candidate's last character  ┐
+     │       │      │   └──────────── the row's last character        ├ trailing: the GPU
+     │       │      └──────────────── the row group's characters      ┘
+     │       └─────────────────────── leading: the CPU, one value at a time
+     └─────────────────────────────── prefix: fixed
+```
+
+The CPU walks through every value of the leading characters (see the next
+section), and for each one the GPU searches every combination of the
+trailing ones: in *rows* (every trailing character but the last fixed),
+which come in *row groups*, of which each GPU thread takes a *chunk* (see
+[How the GPU kernel is structured](#how-the-gpu-kernel-is-structured)). A lookup table
+then tells it which of a row's candidates could match at all, so that only
+those are hashed in full (see [The lookup
+filter](#the-lookup-filter-most-candidates-are-never-hashed)). With the real
+49-character alphabet, one leading value is 49^5 = 282,475,249 candidates:
+5,764,801 rows of 49, in 117,649 row groups of 49 rows, in 235,298 chunks of
+24 or 25 rows - one per GPU thread, in a single kernel launch.
+
+```mermaid
+flowchart TD
+    start(["runSearch()"]) --> begin["beginSearch:<br/>build the lookup table,<br/>check it, upload it"]
+    begin --> next{"next<br/>leading value"}
+    next -->|"pruned"| next
+    next -->|"none left"| done(["range exhausted"])
+    next -->|"e.g. FZ00"| seed["CPU: hash it<br/>onto the prefix"]
+    seed --> kernel
+    subgraph gpu ["GPU: one launch per leading value"]
+        kernel["filteredRowsKernel<br/>a thread per chunk of rows:<br/>a step per row, a lookup,<br/>hash only what it flags"]
+        kernel -->|"hashA hits"| verify["verifyMatchesKernel<br/>hash each hit again<br/>from scratch, check hashB"]
+    end
+    kernel -->|"no hits"| next
+    verify --> host["CPU: write the hits<br/>to the matches file"]
+    host -->|"hashB matches too"| found(["found: stop"])
+    host --> next
+```
+
 ### The GPU doesn't brute-force the whole candidate
 
 Only a small, fixed-size trailing window of each candidate
@@ -299,9 +347,9 @@ below), and 5 measured best on the reference hardware with the kernel as it
 was before [the lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
 (about 155 G candidates/s at a window of 4, 222 at 5, 216 at 6): a window
 of 4 makes each leading value's launch so short (~25 us) that per-launch
-overhead becomes a large fraction of the runtime. The filter made every
-launch about five times shorter, so this is worth measuring again - see
-[PERFORMANCE.md](PERFORMANCE.md). Note the window
+overhead becomes a large fraction of the runtime. The lookup filter and the
+row chunks made every launch about seven times shorter, so this is worth
+measuring again - see [PERFORMANCE.md](PERFORMANCE.md). Note the window
 also decides how much `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count`
 can see (they only examine the leading characters, see below): a larger window means fewer
 characters are pruned on, so those settings skip slightly fewer
@@ -334,6 +382,17 @@ knob rather than only a per-thread-cost one - and it's also what bounds how
 long any single launch can run for, since pause and abort are only checked
 *between* launches, not in the middle of one.
 
+So only a launch's first and last row can be cut short. With the
+3-character window and `A..Z` from above, a launch from `XDJ` to `YKT`:
+
+```text
+                 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+ first row  XD*  . . . . . . . . . x x x x x x x x x x x x x x x x x  <- firstRowStartK = 9 (J)
+            XE*  x x x x x x x x x x x x x x x x x x x x x x x x x x
+            ...  every row in between: all of it
+ last row   YK*  x x x x x x x x x x x x x x x x x x x x . . . . . .  <- lastRowEndK = 20 (to T)
+```
+
 The CUDA kernel takes this one step further. Consecutive rows share even
 more than their candidates do: the rows `XA*`, `XB*`, ... `XZ*` all start
 with `X`. So a *row group* - the rows that share every trailing character
@@ -351,6 +410,30 @@ side by side; 1 row per thread measured 1,133, 7 rows 1,575, 25 rows 1,659
 and 49 rows 1,611 in a cooler run). The OpenCL and Metal kernels still give
 each thread one row, which costs them much less as long as they hash every
 candidate of it (see [PERFORMANCE.md](PERFORMANCE.md)).
+
+Group `X**` from above, with its 26 rows split into two chunks of 13 (26
+characters, 25 rows per thread), marked with what the lookup filter
+described below does to each candidate - `#`: flagged, hashed in full; `·`:
+never hashed. (Where the `#`s fall here is made up; a row has
+alphabetSize / 256 of them on average.)
+
+```text
+                     last character
+                     A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+              ┌ XA*  · · · · · · # · · · · · · · · · · · · · · · · · · ·
+              │ XB*  · · · · · · · · · · · · · · · · · · · · · · · · · ·
+ thread 1:    │ ...
+ chunk 0      │ XL*  · · · · · · · · · · · · · · · · · · · · · · · · · ·
+              └ XM*  · · · · · · · · · · · · · · · · · · · # · · · · · ·
+              ┌ XN*  · · · · · · · · · · · · · · · · · · · · · · · · · ·
+ thread 2:    │ ...
+ chunk 1      │ XY*  · · · · · · · · · · · · · · · · · · · · · · · · · ·
+              └ XZ*  · # · · · · · · · · · · · · · · · · · · · · · # · ·
+```
+
+Thread 1 hashes `X` once, then one more character for each of `XA*` to
+`XM*`; thread 2 does the same for `XN*` to `XZ*`. Every row then costs one
+table lookup, and only its `#`s are hashed any further.
 
 What a thread then does with its rows is where the backends differ. The
 CUDA kernel (`filteredRowsKernel`) looks the row up in a table and hashes
@@ -409,13 +492,33 @@ seed1 = key[ch] ^ (seed1 + seed2)
 seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3
 ```
 
-- only additions, an XOR, a left shift and constants; the crypt table is
+It's only additions, an XOR, a left shift and constants; the crypt table is
 indexed by the character, never by the hash state. In each of those, bit
 *i* of the result depends only on bits 0..*i* of what goes in: an
 addition's carries only travel upward, an XOR works bit by bit, and a left
 shift only moves bits upward. So the same holds for any number of steps:
 **the lowest *n* bits of hashA depend only on the lowest *n* bits of the
 state it's computed from** (and on the characters).
+
+For example, the row `REZ\FZ00ODME*` of the real search, and its candidate
+with the last character `A`. Whatever the 24 high bits of its state are,
+the steps for `A` and then `.WAV` end with the same 8 lowest bits:
+
+```text
+   bit                31                     8   7      0
+                    ┌──────────────────────────┬──────────┐
+   seed1            │ ???????????????????????? │ 00100010 │  0x22
+   seed2            │ ???????????????????????? │ 10110011 │  0xB3
+                    └──────────────────────────┴──────────┘
+   + A, then .WAV:
+     seed1 + seed2   a carry only ever moves one bit left, to the next bit up
+     key ^ ...       every bit on its own
+     seed2 << 5      every bit moves 5 places left
+                    ┌──────────────────────────┬──────────┐
+   hashA            │ ???????????????????????? │ 10010000 │  0x90, whatever the ?s were
+                    └──────────────────────────┴──────────┘
+                      the ?s can never reach these 8 bits: bits only move <-- this way
+```
 
 All of a row's candidates continue from the same state (seed1, seed2) - the
 one after the row's shared characters - with one last character, then the
@@ -428,6 +531,33 @@ with one bit per alphabet character - a 512 KB table
 thread looks its row up in it and hashes only the candidates in the mask,
 in full, exactly as before.
 
+The same row, looked up for the real target (every number here is computed,
+not made up):
+
+```text
+  row REZ\FZ00ODME* of the real search, target hashA 0xF60F5D90
+
+  the state after REZ\FZ00ODME        seed1 = 0xA2E45422      seed2 = 0xCC16ABB3
+                                                      ──                      ──
+  their lowest 8 bits                               0x22                    0xB3
+                                                       └───────────┬───────────┘
+  the table entry (seed2's 8 bits, then seed1's)                 0xB322
+                                                                   │
+                                                                   v
+  the entry: a bit per last character, from '_' (bit 48) down to ' ' (bit 0)
+     0000000000000000000000000000100000000000000000010
+                                 │                  │
+                            bit 20: 'A'        bit 1: '!'
+                                 │                  │
+                                 v                  v
+                         REZ\FZ00ODMEA.WAV  REZ\FZ00ODME!.WAV
+                         hashA 0x94857290   hashA 0x751A4590
+
+  Both are hashed in full: their lowest 8 bits are 0x90, as the entry said,
+  but neither is 0xF60F5D90. The row's other 47 candidates are never
+  hashed at all - the entry says they can't match.
+```
+
 **Why it can't miss a match.** A candidate that matches the target has all
 32 bits of its hashA equal to the target's - in particular the lowest 8.
 Those 8 bits are, by the property above, exactly what its row's table entry
@@ -439,11 +569,41 @@ Nothing else about a candidate - its prefix, its leading characters, the
 rest of its row's state - can change that; they only reach the state's
 higher bits.
 
+```mermaid
+flowchart TD
+    a["a candidate<br/>matches the target"] --> b["all 32 bits of its hashA<br/>are the target's - so its<br/>lowest 8 bits are too"]
+    b --> c["those 8 bits depend only<br/>on the lowest 8 bits of<br/>its row's seed1 and seed2 -<br/>exactly what its table<br/>entry was built from"]
+    c --> d["so its bit in<br/>that entry is set"]
+    d --> e["so it's hashed in full,<br/>compared and reported -<br/>as without the filter"]
+```
+
 **What guards the implementation.** The argument is short; the risk is code
 that doesn't follow it - a table built for the wrong target, an index with
 seed1 and seed2 swapped, a bit past the 32nd character lost - which would
 skip matches silently, with no other symptom. So, on top of the tests every
-backend already had:
+backend already had, there are checks in development and on every run:
+
+```mermaid
+flowchart LR
+    subgraph dev ["During development"]
+        direction TB
+        t1["lowbits_filter_test<br/>the property itself,<br/>every bit of every entry,<br/>planted true matches"]
+        t2["search_stress_test<br/>1 hit in 4096, planted<br/>at edges, every hit<br/>vs. a brute force"]
+        t3["search_integration_test<br/>thousands of<br/>planted cases"]
+        t4["mutation experiment<br/>broken kernels that<br/>must each be caught"]
+        t1 ~~~ t2 ~~~ t3 ~~~ t4
+    end
+    subgraph run ["Every run, on every machine"]
+        direction TB
+        s1["at startup: the self-test<br/>planted candidates must<br/>be found, those outside<br/>the range must not"]
+        s2["every search: the table<br/>checked against its<br/>definition, read back<br/>from the GPU"]
+        s3["every hit:<br/>verifyMatchesKernel<br/>hashes it again,<br/>independently"]
+        s1 --> s2 --> s3
+    end
+    dev --> run
+```
+
+In detail:
 
 - `tests/lowbits_filter_test.cpp` checks the property itself on the real
   hash step (for every *n* from 1 to 32, arbitrary characters and
