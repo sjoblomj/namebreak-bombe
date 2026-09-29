@@ -1,6 +1,6 @@
 // The OpenCL backend's search kernel - the CUDA backend's filteredRowsKernel
-// (backends/cuda/cuda_backend.cu), ported, with one work-item per row rather
-// than per chunk of a row group. Embedded into the program at build time and
+// (backends/cuda/cuda_backend.cu), ported: one work-item per chunk of a row
+// group (see CHUNKS_PER_GROUP below). Embedded into the program at build time and
 // compiled by the OpenCL driver at runtime, once per combination of these
 // (see opencl_backend.cpp), which makes them all compile-time constants the
 // compiler can unroll and fold:
@@ -12,15 +12,17 @@
 //                  in the stress tests' builds (see engine/hash_match.h)
 //   FILTER_BITS    kLowBitsFilterBits: how many low bits of each seed index
 //                  the lookup filter's table (backends/common/lowbits_filter.h)
+//   ROWS_PER_THREAD  about how many rows one work-item searches
 //
-// One work-item per *row* - every value of the candidate's last character,
-// for one combination of the other trailing characters (see the terminology
-// in backends/common/row_batch.h). It hashes the row's shared characters
-// once, then looks the row's state up in this search's filter table, which
-// gives the set of last characters whose hashA has the target's low bits -
-// always including any that matches the target (README.md's "The lookup
-// filter" has why) - and hashes only those, in full. It records the trailing
-// index of every hashA hit; the host rebuilds and checks those.
+// Rows are every value of the candidate's last character, for one
+// combination of the other trailing characters (see the terminology in
+// backends/common/row_batch.h). A work-item hashes the characters its rows
+// share once, then one more for each row, and looks each row's state up in
+// this search's filter table, which gives the set of last characters whose
+// hashA has the target's low bits - always including any that matches the
+// target (README.md's "The lookup filter" has why) - and hashes only those,
+// in full. It records the trailing index of every hashA hit; the host
+// rebuilds and checks those.
 
 #ifndef HASHA_MATCH_MASK
 #define HASHA_MATCH_MASK 0xFFFFFFFFu
@@ -38,7 +40,16 @@
         seed2 = (ord) + seed1 + seed2 + (seed2 << 5) + 3;       \
     } while (0)
 
-__kernel void searchRows(uint firstRow, uint rowCount, int firstRowStartK, int lastRowEndK, uint targetA,
+// A row *group* is the ALPHABET_SIZE consecutive rows that share every row
+// character but the last (see kChunksPerGroup in backends/cuda/cuda_backend.cu,
+// which this follows). Each group is split into CHUNKS_PER_GROUP chunks of
+// about ROWS_PER_THREAD consecutive rows, one per work-item: chunk c is the
+// group's rows d = c * ALPHABET_SIZE / CHUNKS_PER_GROUP .. (c + 1) *
+// ALPHABET_SIZE / CHUNKS_PER_GROUP - 1, so the chunks cover every row of the
+// group exactly once and never cross into another.
+#define CHUNKS_PER_GROUP ((ALPHABET_SIZE + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD)
+
+__kernel void searchRows(uint firstRow, uint lastRow, int firstRowStartK, int lastRowEndK, uint targetA,
                          uint seed1Start, uint seed2Start,
                          __constant uint* alphabetKey,         // crypt-table key of each alphabet character
                          __constant uint* alphabetOrd,         // each alphabet character itself
@@ -47,7 +58,7 @@ __kernel void searchRows(uint firstRow, uint rowCount, int firstRowStartK, int l
                          __global const ulong* filterTable,    // this search's lookup filter
                          __global int* matchCount,             // hits this batch - may exceed MAX_MATCHES
                          __global ulong* matchIdx) {           // the first MAX_MATCHES hits' trailing indices
-    // The row's characters, and the few last characters the filter lets
+    // The rows' characters, and the few last characters the filter lets
     // through, differ between work-items, so they're looked up here rather
     // than in constant memory, where work-items reading different entries
     // would be serialized.
@@ -58,51 +69,80 @@ __kernel void searchRows(uint firstRow, uint rowCount, int firstRowStartK, int l
         sKey[lid] = alphabetKey[lid];
         sOrd[lid] = alphabetOrd[lid];
     }
-    barrier(CLK_LOCAL_MEM_FENCE); // before the bounds check, so every work-item reaches it
+    barrier(CLK_LOCAL_MEM_FENCE); // before anything returns, so every work-item reaches it
 
-    const uint t = get_global_id(0);
-    if (t >= rowCount)
-        return;
-    const uint row = firstRow + t;
+    // Every chunk of every group the batch touches, whatever the global work
+    // size: that only decides how the chunks are shared out (normally one
+    // each), never which of them get searched.
+    const uint firstGroup = firstRow / ALPHABET_SIZE;
+    const ulong chunkCount = (ulong) (lastRow / ALPHABET_SIZE - firstGroup + 1) * CHUNKS_PER_GROUP;
+    for (ulong c = get_global_id(0); c < chunkCount; c += get_global_size(0)) {
+        const uint group = firstGroup + (uint) (c / CHUNKS_PER_GROUP);
+        const uint chunk = (uint) (c % CHUNKS_PER_GROUP);
+        // The chunk's rows, as last row characters d of `group`, cut to the
+        // batch's range in its first and last group.
+        const ulong groupStart = (ulong) group * ALPHABET_SIZE;
+        int dBegin = (int) (chunk * ALPHABET_SIZE / CHUNKS_PER_GROUP);
+        int dEnd = (int) ((chunk + 1) * ALPHABET_SIZE / CHUNKS_PER_GROUP);
+        if (groupStart + dBegin < firstRow)
+            dBegin = (int) (firstRow - groupStart);
+        if (groupStart + dEnd > (ulong) lastRow + 1)
+            dEnd = (int) ((ulong) lastRow + 1 - groupStart);
+        // The d of the batch's first and last row, if they're in this group
+        // (-1 if not) - the rows firstRowStartK and lastRowEndK cut short.
+        const int firstRowD = (group == firstRow / ALPHABET_SIZE) ? (int) (firstRow % ALPHABET_SIZE) : -1;
+        const int lastRowD = (group == lastRow / ALPHABET_SIZE) ? (int) (lastRow % ALPHABET_SIZE) : -1;
 
-    uint seed1 = seed1Start, seed2 = seed2Start;
-#if TRAILING_LEN > 1
-    uint digit[TRAILING_LEN - 1];
-    uint rest = row;
+        // The group's characters: every row character but the last, i.e. the
+        // first TRAILING_LEN - 2 characters of the candidate.
+        uint group1 = seed1Start, group2 = seed2Start;
+#if TRAILING_LEN > 2
+        uint digit[TRAILING_LEN - 2];
+        uint rest = group;
 #pragma unroll
-    for (int i = TRAILING_LEN - 2; i >= 0; --i) {
-        const uint q = rest / ALPHABET_SIZE;
-        digit[i] = rest - q * ALPHABET_SIZE;
-        rest = q;
-    }
+        for (int i = TRAILING_LEN - 3; i >= 0; --i) {
+            const uint q = rest / ALPHABET_SIZE;
+            digit[i] = rest - q * ALPHABET_SIZE;
+            rest = q;
+        }
 #pragma unroll
-    for (int i = 0; i < TRAILING_LEN - 1; ++i)
-        MPQ_STEP(seed1, seed2, sKey[digit[i]], sOrd[digit[i]]);
+        for (int i = 0; i < TRAILING_LEN - 2; ++i)
+            MPQ_STEP(group1, group2, sKey[digit[i]], sOrd[digit[i]]);
 #endif
 
-    // Bit k: the candidate with last character k is worth hashing. Restricted
-    // to the batch's range in its first and last row - and to the alphabet,
-    // which the table never exceeds anyway, but a stray bit must not be able
-    // to index past sKey.
-    ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];
-    mask &= (1UL << ALPHABET_SIZE) - 1UL;                  // ALPHABET_SIZE is at most 50
-    if (t == 0)
-        mask &= ~0UL << firstRowStartK;                    // firstRowStartK is in [0, ALPHABET_SIZE)
-    if (t == rowCount - 1)
-        mask &= (1UL << lastRowEndK) - 1UL;                // lastRowEndK is in [1, ALPHABET_SIZE]
+        for (int d = dBegin; d < dEnd; ++d) {
+            uint seed1 = group1, seed2 = group2;
+#if TRAILING_LEN > 1
+            // The row's own last row character. (With TRAILING_LEN 1 a row has
+            // no characters of its own, and there's only row 0.)
+            MPQ_STEP(seed1, seed2, sKey[d], sOrd[d]);
+#endif
 
-    while (mask != 0) {
-        const int k = 63 - (int) clz(mask & (0UL - mask)); // the lowest bit set
-        mask &= mask - 1UL;
-        uint a = seed1, b = seed2;
-        MPQ_STEP(a, b, sKey[k], sOrd[k]);
+            // Bit k: the candidate with last character k is worth hashing.
+            // Restricted to the batch's range in its first and last row - and
+            // to the alphabet, which the table never exceeds anyway, but a
+            // stray bit must not be able to index past sKey.
+            ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];
+            mask &= (1UL << ALPHABET_SIZE) - 1UL;              // ALPHABET_SIZE is at most 50
+            if (d == firstRowD)
+                mask &= ~0UL << firstRowStartK;                // firstRowStartK is in [0, ALPHABET_SIZE)
+            if (d == lastRowD)
+                mask &= (1UL << lastRowEndK) - 1UL;            // lastRowEndK is in [1, ALPHABET_SIZE]
+
+            while (mask != 0) {
+                const int k = 63 - (int) clz(mask & (0UL - mask)); // the lowest bit set
+                mask &= mask - 1UL;
+                uint a = seed1, b = seed2;
+                MPQ_STEP(a, b, sKey[k], sOrd[k]);
 #pragma unroll
-        for (int i = 0; i < SUFFIX_LEN; ++i)
-            MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);
-        if (HASHA_MATCHES(a, targetA)) {
-            const int slot = atomic_inc(matchCount);
-            if (slot < MAX_MATCHES)
-                matchIdx[slot] = (ulong) row * ALPHABET_SIZE + k;
+                for (int i = 0; i < SUFFIX_LEN; ++i)
+                    MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);
+                if (HASHA_MATCHES(a, targetA)) {
+                    const int slot = atomic_inc(matchCount);
+                    if (slot < MAX_MATCHES)
+                        matchIdx[slot] = (groupStart + d) * ALPHABET_SIZE + k;
+                }
+            }
         }
     }
 }

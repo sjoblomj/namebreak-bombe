@@ -261,14 +261,14 @@ so a GPU build still works on a machine without that GPU:
   one GPU thread at a time, where every test configuration passes.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
-  installed. CUDA's kernel ported (`search.cl`), lookup filter and all,
-  but with one work-item per row rather than per chunk of a row group
-  ([PERFORMANCE.md](PERFORMANCE.md)); it's compiled by the driver at
-  runtime, once per alphabet size, suffix length and trailing length, so it
-  takes an alphabet of any size - drivers cache the result, but a new
-  combination's first search starts a moment later. About 1,080 G
-  candidates/s on the RTX 3080 Ti Laptop - 5.3 times what it did before it
-  got the filter, and about 72% of the CUDA backend's speed.
+  installed. CUDA's kernel ported (`search.cl`), lookup filter, row groups
+  and all - with a whole row group per work-item, which suits it best; it's
+  compiled by the driver at runtime, once per alphabet size, suffix length
+  and trailing length, so it takes an alphabet of any size - drivers cache
+  the result, but a new combination's first search starts a moment later.
+  About 1,300-1,460 G candidates/s on the RTX 3080 Ti Laptop, depending on
+  how hot it is - six to seven times what it did before it got the filter, and
+  close to the CUDA backend.
 - `cpu/` - every core of the CPU, with the same row trick as the CUDA
   kernel and the candidates of a row hashed several at a time with SIMD
   instructions (AVX2 on x86-64 CPUs that have it, picked at runtime; SSE2
@@ -413,9 +413,11 @@ launch itself, so how many threads are launched only decides how the work
 is shared out, never what gets searched. That made the search about a third
 faster again (1,088-1,124 to 1,434-1,467 G candidates/s, three runs each
 side by side; 1 row per thread measured 1,133, 7 rows 1,575, 25 rows 1,659
-and 49 rows 1,611 in a cooler run). The OpenCL and Metal kernels still give
-each thread one row - for the Metal one, which still hashes every candidate
-of it, decoding the row is a small part of the work anyway (see
+and 49 rows 1,611 in a cooler run). The OpenCL kernel does the same, but
+does best with a whole row group per work-item (1 row per work-item measured
+about 880, 7 about 1,300, 25 about 1,435, and 49 and 64 about 1,460). The
+Metal kernel still gives each thread one row - which, as it still hashes
+every candidate of it, is a small part of its work anyway (see
 [PERFORMANCE.md](PERFORMANCE.md)).
 
 Group `X**` from above, with its 26 rows split into two chunks of 13 (26
@@ -687,13 +689,14 @@ own step; the last chunk, or the last group, of a launch never searched.
 Every one was caught by the self-test, by the integration test and by the
 stress test - the integration test failed 6-1007 of its 2,267 cases, the
 stress test 38-292 of its 321, and the wrong-target table stopped both at
-their first search. Against the OpenCL kernel, thirteen: the same kinds of
-bug in its mask, lookup, row edges, loop and suffix, plus a lowest-set-bit
-taken one too high, its own copy of the table index shifting one bit too
-far, the kernel compiled for a table one bit narrower, and the work size
-rounded down instead of up. Every one was caught by all three checks too
-(the integration test failed 233-1007 of its 2,266 cases, the stress test
-91-394 of its 436), the first time the script was run on it.
+their first search. Against the OpenCL kernel, twenty-one: the same kinds
+of bug in its mask, lookup, row edges, loop, suffix and chunking, plus a
+lowest-set-bit taken one too high, its own copy of the table index shifting
+one bit too far, and the kernel compiled for a table one bit narrower - with
+half as many work-items, and a work-group too many, as the changes that
+mustn't matter. Every one was caught by all three checks too (the
+integration test failed 6-1007 of its 2,266 cases, the stress test 48-394 of
+its 436), each time the script was run on it.
 
 Each round of this found something. The first one added the self-test's
 and the stress test's planted edge cases: before them, a launch whose last

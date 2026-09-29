@@ -41,6 +41,14 @@ namespace {
 // work-item.
 constexpr size_t kPreferredWorkGroupSize = 256;
 
+// About how many rows of a row group one work-item searches (ROWS_PER_THREAD
+// in search.cl; see kChunksPerGroup in the CUDA backend). On the RTX 3080 Ti
+// Laptop (search_bench --scale 20, three runs each), 1 row per work-item did
+// about 880 G candidates/s, 7 about 1,300, 25 about 1,435, and 49 and 64 about
+// 1,460 - a whole row group per work-item, for any alphabet size. (CUDA's
+// kernel does best with two chunks per group; this one doesn't.)
+constexpr int kRowsPerThread = rowsPerThreadOr(64);
+
 std::string deviceInfoString(cl_device_id device, cl_device_info what) {
     size_t size = 0;
     clGetDeviceInfo(device, what, 0, nullptr, &size);
@@ -198,7 +206,8 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen) {
     const std::string options = "-cl-std=CL1.2 -DALPHABET_SIZE=" + std::to_string(alphabetSize_) + " -DSUFFIX_LEN=" + std::to_string(suffixLen_) +
                                 " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES) +
                                 " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
-                                " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits);
+                                " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits) +
+                                " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread);
     if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
         size_t size = 0;
         clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);
@@ -232,11 +241,11 @@ BatchOutcome OpenClBackend::runBatch(int trailingLen, uint64_t start, uint64_t c
     const CompiledKernel& compiled = kernelFor(trailingLen);
     cl_kernel kernel = compiled.kernel;
 
-    const cl_uint firstRow = (cl_uint) rows.firstRow, rowCount = (cl_uint) rows.rowCount;
+    const cl_uint firstRow = (cl_uint) rows.firstRow, lastRow = (cl_uint) (rows.firstRow + rows.rowCount - 1);
     const cl_int firstRowStartK = rows.firstRowStartK, lastRowEndK = rows.lastRowEndK;
     const cl_uint targetA = targetA_, seed1 = params.seed1Start, seed2 = params.seed2Start;
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(firstRow), &firstRow));
-    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(rowCount), &rowCount));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(lastRow), &lastRow));
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(firstRowStartK), &firstRowStartK));
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(lastRowEndK), &lastRowEndK));
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(targetA), &targetA));
@@ -250,8 +259,14 @@ BatchOutcome OpenClBackend::runBatch(int trailingLen, uint64_t start, uint64_t c
     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_mem), &matchCount_));
     CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_mem), &matchIdx_));
 
+    // A work-item per chunk of every row group the batch touches (see
+    // CHUNKS_PER_GROUP in search.cl), rounded up to whole work-groups. The
+    // kernel works out the chunks itself and covers all of them whatever the
+    // global size, so this only spreads the work.
     const size_t local = compiled.workGroupSize;
-    const size_t global = (rows.rowCount + local - 1) / local * local;
+    const size_t chunksPerGroup = (size_t) (alphabetSize_ + kRowsPerThread - 1) / kRowsPerThread;
+    const size_t chunks = (size_t) (lastRow / alphabetSize_ - firstRow / alphabetSize_ + 1) * chunksPerGroup;
+    const size_t global = (chunks + local - 1) / local * local;
     CL_CHECK(clEnqueueNDRangeKernel(queue_, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr));
 
     // The common batch costs exactly this one blocking read.

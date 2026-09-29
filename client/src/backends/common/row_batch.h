@@ -45,6 +45,16 @@ constexpr uint64_t rowsPerBatchOr([[maybe_unused]] uint64_t backendDefault) {
     return backendDefault;
 #endif
 }
+// Likewise how many rows of a row group one GPU thread searches (see
+// kChunksPerGroup in backends/cuda/cuda_backend.cu), for the backends that
+// split row groups into chunks (-DNAMEBREAK_ROWS_PER_THREAD=N).
+constexpr int rowsPerThreadOr([[maybe_unused]] int backendDefault) {
+#ifdef NAMEBREAK_ROWS_PER_THREAD
+    return NAMEBREAK_ROWS_PER_THREAD;
+#else
+    return backendDefault;
+#endif
+}
 
 // Turns the trailing indices of a batch's hashA hits into what runBatch
 // returns: rebuilds each hit's complete filename on the host and checks it

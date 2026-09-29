@@ -17,8 +17,9 @@ silently drop candidates.
 Where things stand: the CUDA backend searches 1,434-1,467 G candidates/s
 with a hot GPU, and up to about 1,700 with a cool one (**measured**), from
 209-218 before the lookup filter and 1,088-1,124 with the filter but one row
-per thread. The OpenCL backend, with the filter and one row per work-item,
-searches 1,082-1,086, from 202-205 before it. It issues about 100 instructions per row of 49 candidates
+per thread. The OpenCL backend, with the filter and row groups too, searches
+about 1,300-1,460, from 202-205 before the filter and 1,082-1,086 with it
+alone. The CUDA kernel issues about 100 instructions per row of 49 candidates
 (*estimated* from its SASS: about 30 per row, the verify loop's, and a
 share of its thread's setup), down from about 1,130 before the filter.
 Before the rows were split into chunks, Nsight Systems put about 5% of the
@@ -47,11 +48,12 @@ will have grown (not measured again).
   run about four times faster too (a whole ctest of OpenCL in 45 s, from
   about 3.5 minutes): the driver no longer compiles a fully unrolled loop
   over every candidate of a row. `run_mutation_test_opencl` covers it.
-  - [ ] **Incremental row decoding**, as the CUDA kernel's: row groups split
-    into chunks of about `NAMEBREAK_ROWS_PER_THREAD` rows, one per
-    work-item, walked with a loop the launch size can't cut short. After
-    the filter port, not before - until then decoding is only about 5% of a
-    row's work (*estimated*). Tune the chunk size for OpenCL separately.
+  - [x] **Incremental row decoding**, as the CUDA kernel's: row groups split
+    into chunks, one per work-item, walked with a loop the launch size
+    can't cut short. **Measured** +35%: tuned separately from CUDA, a whole
+    row group per work-item (64 rows, so one chunk whatever the alphabet)
+    did best - about 1,460 G candidates/s against 1,435 at CUDA's 25 and 880
+    at 1, in the same run; 1,082-1,086 before, with one row per work-item.
 - [ ] **Metal.** The same port. It can't be run without a Mac, so it would
   lean on the self-test, which runs on the Mac itself. Its kernel should
   take `HASHA_MATCH_MASK` the way the OpenCL one does, so that the stress
