@@ -81,10 +81,11 @@ __device__ __forceinline__ void mpqStep(uint32_t& seed1, uint32_t& seed2, uint32
     seed2 = ord + seed1 + seed2 + (seed2 << 5) + 3;
 }
 
-// Hashes the first N characters of `row` (its digits in base AlphabetSize,
-// most significant first) into (seed1, seed2), via the block's shared tables.
-// Consecutive lanes have consecutive rows, so consecutive lanes read
-// consecutive shared-memory banks here (no bank conflicts) - unlike the
+// Hashes the N characters of `row` (its digits in base AlphabetSize, most
+// significant first - filteredRowsKernel passes it a row group) into
+// (seed1, seed2), via the block's shared tables. The lanes of a warp have
+// consecutive groups (a few lanes each), so they read the same or
+// neighbouring shared-memory entries here (no bank conflicts) - unlike the
 // __constant__ d_cryptTable, where every lane needing a different entry is
 // serialized.
 template<int AlphabetSize, int N>
@@ -104,20 +105,114 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, uint32_t& seed1, uin
     }
 }
 
+// A row *group* is the AlphabetSize consecutive rows that share every row
+// character but the last: rows g * AlphabetSize .. g * AlphabetSize +
+// AlphabetSize - 1 make up group g, and row g * AlphabetSize + d is the one
+// whose last row character is d. filteredRowsKernel splits every group into
+// kChunksPerGroup<AlphabetSize> chunks of consecutive rows, of about
+// NAMEBREAK_ROWS_PER_THREAD rows each (tuning.h), and gives each chunk to a
+// thread - so its rows share everything but their last row character, and
+// only that changes from one to the next. Chunk c of a group is its rows
+// d = c * AlphabetSize / kChunks .. (c + 1) * AlphabetSize / kChunks - 1:
+// the chunks cover every row of the group exactly once, never cross into
+// another group, and differ in size by at most one row.
+template<int AlphabetSize>
+constexpr uint32_t kChunksPerGroup = (AlphabetSize + NAMEBREAK_ROWS_PER_THREAD - 1) / NAMEBREAK_ROWS_PER_THREAD;
+
+// One thread's work in filteredRowsKernel: chunk `chunk` of row group `group`.
+template<int AlphabetSize, int SuffixLen>
+__device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int trailingLen, uint32_t firstRow, uint32_t lastRow,
+                                            int firstRowStartK, int lastRowEndK, uint32_t targetA, uint32_t seed1Start,
+                                            uint32_t seed2Start, const DeviceBuffers& bufs, const uint32_t* sKey, const uint32_t* sOrd) {
+    constexpr uint32_t kChunks = kChunksPerGroup<AlphabetSize>;
+    // The chunk's rows, as last row characters d of `group`, cut to the
+    // launch's range in its first and last group.
+    const uint64_t groupStart = (uint64_t) group * AlphabetSize;
+    int dBegin = (int) (chunk * AlphabetSize / kChunks);
+    int dEnd = (int) ((chunk + 1) * AlphabetSize / kChunks);
+    if (groupStart + dBegin < firstRow)
+        dBegin = (int) (firstRow - groupStart);
+    if (groupStart + dEnd > (uint64_t) lastRow + 1)
+        dEnd = (int) ((uint64_t) lastRow + 1 - groupStart);
+    if (dBegin >= dEnd)
+        return;
+    // The d of the launch's first and last row, if they're in this group (-1
+    // if not) - the rows firstRowStartK and lastRowEndK cut short.
+    const int firstRowD = (group == firstRow / AlphabetSize) ? (int) (firstRow % AlphabetSize) : -1;
+    const int lastRowD = (group == lastRow / AlphabetSize) ? (int) (lastRow % AlphabetSize) : -1;
+
+    // The group's characters: every row character but the last, i.e. the
+    // first trailingLen - 2 characters of the candidate - none when a row has
+    // one character (trailingLen 2), and none at all with trailingLen 1, when
+    // a row has no characters of its own and there's only row 0.
+    uint32_t group1 = seed1Start;
+    uint32_t group2 = seed2Start;
+    switch (trailingLen - 2) {
+        case 1: hashRowDigits<AlphabetSize, 1>(group, group1, group2, sKey, sOrd); break;
+        case 2: hashRowDigits<AlphabetSize, 2>(group, group1, group2, sKey, sOrd); break;
+        case 3: hashRowDigits<AlphabetSize, 3>(group, group1, group2, sKey, sOrd); break;
+        case 4: hashRowDigits<AlphabetSize, 4>(group, group1, group2, sKey, sOrd); break;
+        // trailingLen is validated against kMaxTrailingLen (== 6) by runSearch
+    }
+    const bool rowsHaveCharacters = trailingLen > 1;
+
+    for (int d = dBegin; d < dEnd; ++d) {
+        uint32_t seed1 = group1;
+        uint32_t seed2 = group2;
+        if (rowsHaveCharacters)
+            mpqStep(seed1, seed2, sKey[d], sOrd[d]);
+
+        // Bit k: the candidate with last character k is worth hashing.
+        // Restricted to the launch's range in its first and last row - and to
+        // the alphabet, which the table never exceeds anyway, but a stray bit
+        // must not be able to index past sKey. The table doesn't change during
+        // a launch, so it's read through the read-only data path (__ldg).
+        uint64_t mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
+        mask &= (uint64_t(1) << AlphabetSize) - 1;
+        if (d == firstRowD)
+            mask &= ~uint64_t(0) << firstRowStartK;          // firstRowStartK is in [0, AlphabetSize)
+        if (d == lastRowD)
+            mask &= (uint64_t(1) << lastRowEndK) - 1;        // lastRowEndK is in [1, AlphabetSize]
+
+        while (mask != 0) {
+            const int k = __ffsll((long long) mask) - 1;
+            mask &= mask - 1;
+            uint32_t a = seed1, b = seed2;
+            mpqStep(a, b, sKey[k], sOrd[k]);
+            if constexpr (SuffixLen == kRuntimeSuffix) {
+                const int n = d_suffix_size;
+                for (int i = 0; i < n; ++i)
+                    mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < SuffixLen; ++i)
+                    mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
+            }
+            if (hashAMatches(a, targetA)) {
+                int slot = atomicAdd(&bufs.results->matchCount, 1);
+                if (slot < MAX_MATCHES)
+                    bufs.matchIdx[slot] = (groupStart + d) * AlphabetSize + k;
+            }
+        }
+    }
+}
+
 // No maxBackslashCount, pruneSymbolRuns or pruneUnopenedBrackets check here -
 // all are applied only to the leading characters, on the CPU, before this kernel is
 // ever launched (see the leadingIdx loop in runSearch), not to the trailing
 // characters this kernel searches. See README.md's "Design decisions"
 // section for why.
 //
-// Thread t handles row `firstRow + t` (t < rowCount): every candidate of
-// that row whose last character index k is in [kBegin, kEnd) - all of them
-// for every row but the (at most two) at the edges of the launch's range
-// (firstRowStartK / lastRowEndK). The row's shared prefix (its first
-// trailingLen - 1 characters) is hashed once. Then, instead of hashing every
-// candidate of the row, one lookup in this search's filter table
-// (bufs.filterTable, see backends/common/lowbits_filter.h) gives the set of
-// last characters whose hashA has the target's low bits - on average
+// Each thread handles one chunk (see kChunksPerGroup above - searchChunk) of
+// the rows firstRow..lastRow, and within each row every candidate whose last
+// character index k is in [kBegin, kEnd) - all of them for every row but the
+// (at most two) at the edges of the launch's range (firstRowStartK /
+// lastRowEndK). The characters its rows share - the group's - are hashed
+// once, and each row then costs one more step, for its own last row
+// character. Then, instead of
+// hashing every candidate of the row, one lookup in this search's filter
+// table (bufs.filterTable, see backends/common/lowbits_filter.h) gives the set
+// of last characters whose hashA has the target's low bits - on average
 // alphabetSize / 2^kLowBitsFilterBits of them, and always including any
 // candidate that matches the target. Only those are hashed in full. README.md's
 // "The lookup filter" has why the lookup can never leave a match out.
@@ -133,7 +228,7 @@ template<int AlphabetSize, int SuffixLen>
 __global__ void filteredRowsKernel(
     int trailingLen,
     uint32_t firstRow,
-    uint32_t rowCount,
+    uint32_t lastRow,
     int firstRowStartK,
     int lastRowEndK,
     uint32_t targetA,
@@ -141,62 +236,23 @@ __global__ void filteredRowsKernel(
     DeviceBuffers bufs
 ) {
     static_assert(AlphabetSize < 64, "a row's candidates, and one past the last of them, must fit a 64-bit mask");
+    constexpr uint32_t kChunks = kChunksPerGroup<AlphabetSize>;
     __shared__ uint32_t sKey[AlphabetSize];
     __shared__ uint32_t sOrd[AlphabetSize];
     if (threadIdx.x < AlphabetSize) {
         sKey[threadIdx.x] = d_alphabetKey[threadIdx.x];
         sOrd[threadIdx.x] = d_alphabetOrd[threadIdx.x];
     }
-    __syncthreads(); // before the bounds check below, so every thread of the block reaches it
+    __syncthreads();
 
-    uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= rowCount)
-        return;
-    const uint32_t row = firstRow + t;
-
-    uint32_t seed1 = params.seed1Start;
-    uint32_t seed2 = params.seed2Start;
-    switch (trailingLen - 1) {
-        case 0: hashRowDigits<AlphabetSize, 0>(row, seed1, seed2, sKey, sOrd); break;
-        case 1: hashRowDigits<AlphabetSize, 1>(row, seed1, seed2, sKey, sOrd); break;
-        case 2: hashRowDigits<AlphabetSize, 2>(row, seed1, seed2, sKey, sOrd); break;
-        case 3: hashRowDigits<AlphabetSize, 3>(row, seed1, seed2, sKey, sOrd); break;
-        case 4: hashRowDigits<AlphabetSize, 4>(row, seed1, seed2, sKey, sOrd); break;
-        case 5: hashRowDigits<AlphabetSize, 5>(row, seed1, seed2, sKey, sOrd); break;
-        // trailingLen is validated against kMaxTrailingLen (== 6) by runSearch
-    }
-
-    // Bit k: the candidate with last character k is worth hashing. Restricted
-    // to this thread's own candidates [kBegin, kEnd) - and to the alphabet,
-    // which the table never exceeds anyway, but a stray bit must not be able
-    // to index past sKey. The table doesn't change during a launch, so it's
-    // read through the read-only data path (__ldg).
-    uint64_t mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
-    mask &= (uint64_t(1) << AlphabetSize) - 1;
-    if (t == 0)
-        mask &= ~uint64_t(0) << firstRowStartK;          // firstRowStartK is in [0, AlphabetSize)
-    if (t == rowCount - 1)
-        mask &= (uint64_t(1) << lastRowEndK) - 1;        // lastRowEndK is in [1, AlphabetSize]
-
-    while (mask != 0) {
-        const int k = __ffsll((long long) mask) - 1;
-        mask &= mask - 1;
-        uint32_t a = seed1, b = seed2;
-        mpqStep(a, b, sKey[k], sOrd[k]);
-        if constexpr (SuffixLen == kRuntimeSuffix) {
-            const int n = d_suffix_size;
-            for (int i = 0; i < n; ++i)
-                mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
-        } else {
-            #pragma unroll
-            for (int i = 0; i < SuffixLen; ++i)
-                mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
-        }
-        if (hashAMatches(a, targetA)) {
-            int slot = atomicAdd(&bufs.results->matchCount, 1);
-            if (slot < MAX_MATCHES)
-                bufs.matchIdx[slot] = (uint64_t) row * AlphabetSize + k;
-        }
+    // Every chunk of every group the range touches, whatever the grid's size:
+    // the number of threads launched only decides how the chunks are shared
+    // out (normally one each), never which of them get searched.
+    const uint32_t firstGroup = firstRow / AlphabetSize;
+    const uint64_t chunkCount = (uint64_t) (lastRow / AlphabetSize - firstGroup + 1) * kChunks;
+    for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += (uint64_t) gridDim.x * blockDim.x) {
+        searchChunk<AlphabetSize, SuffixLen>(firstGroup + (uint32_t) (c / kChunks), (uint32_t) (c % kChunks), trailingLen, firstRow, lastRow,
+                                             firstRowStartK, lastRowEndK, targetA, params.seed1Start, params.seed2Start, bufs, sKey, sOrd);
     }
 }
 
@@ -435,21 +491,25 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
     const int firstRowStartK = (int) (startIdx - firstRow * alphabetSize);
     const int lastRowEndK = (int) (endIdx - lastRow * alphabetSize); // in [1, alphabetSize]
 
-    // This launches one GPU thread per row (up to NAMEBREAK_ROWS_PER_LAUNCH+1
-    // of them). Every 32 consecutive threads form a "warp" that the hardware
-    // runs in lockstep (SIMT) - that grouping is automatic (256 threads/block
-    // = 8 warps/block here), not something chosen at this call site.
-    const unsigned blocks = (unsigned) ((rowCount + kThreadsPerBlock - 1) / kThreadsPerBlock);
-
     bool supported = dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
         // A type alias rather than a constexpr local: MSVC treats a constexpr
         // local of this lambda read from the nested [&] lambda below as a
         // capture, so it's no longer a constant expression there (C2672).
         using AlphabetC = decltype(alphabetC);
+        // One GPU thread per chunk of every row group the range touches (see
+        // kChunksPerGroup) - about NAMEBREAK_ROWS_PER_THREAD rows each. The
+        // kernel works out the chunks itself and covers all of them whatever
+        // the grid, so this count only spreads the work. Every 32 consecutive
+        // threads form a "warp" that the hardware runs in lockstep (SIMT) -
+        // that grouping is automatic (256 threads/block = 8 warps/block here),
+        // not something chosen at this call site.
+        const uint64_t groups = lastRow / AlphabetC::value - firstRow / AlphabetC::value + 1;
+        const uint64_t threads = groups * kChunksPerGroup<AlphabetC::value>;
+        const unsigned blocks = (unsigned) ((threads + kThreadsPerBlock - 1) / kThreadsPerBlock);
         dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
             constexpr int SuffixLen = decltype(suffixC)::value;
             filteredRowsKernel<AlphabetC::value, SuffixLen><<<blocks, kThreadsPerBlock>>>(
-                    trailingLen, (uint32_t) firstRow, (uint32_t) rowCount, firstRowStartK, lastRowEndK, targetA_, params, bufs_);
+                    trailingLen, (uint32_t) firstRow, (uint32_t) lastRow, firstRowStartK, lastRowEndK, targetA_, params, bufs_);
         });
     });
     if (!supported) {

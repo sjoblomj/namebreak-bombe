@@ -307,17 +307,21 @@ list(APPEND ROW_BACKENDS cpu)
 #                  CPU-side leading part, and a shallower row decode
 #   window6        the widest supported window: 5 prefix digits per row and
 #                  trailing indices beyond 32 bits
-# All three also make the cpu backend split every batch, however small,
-# across its threads, and window2 makes it use its portable (non-AVX2) code.
+# Each also splits the CUDA kernel's row groups differently
+# (NAMEBREAK_ROWS_PER_THREAD, see kChunksPerGroup in cuda_backend.cu): 3 rows
+# per thread (uneven chunks, cut up by the tiny launches), 1 (a thread per
+# row), and 64 (a thread per whole group). All three also make the cpu backend
+# split every batch, however small, across its threads, and window2 makes it
+# use its portable (non-AVX2) code.
 namebreak_test_executable(search_integration_test tests/search_integration_test.cpp namebreak_search)
 foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(integration-${backend} search_integration_test --backend ${backend})
 endforeach()
 if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
     foreach(config IN ITEMS
-            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
-            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_CPU_NO_AVX2"
-            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
+            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_ROWS_PER_THREAD=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
+            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_ROWS_PER_THREAD=1;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_CPU_NO_AVX2"
+            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_ROWS_PER_THREAD=64;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
         list(POP_FRONT config suffix)
         namebreak_search_library(namebreak_search_${suffix} ${config})
         namebreak_test_executable(search_integration_test_${suffix} tests/search_integration_test.cpp namebreak_search_${suffix})
@@ -353,9 +357,9 @@ foreach(backend IN LISTS STRESS_BACKENDS ITEMS reference)
     namebreak_test(stress-${backend} search_stress_test --backend ${backend})
 endforeach()
 if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
-    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
-    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_CPU_NO_AVX2)
-    set(STRESS_window6 NAMEBREAK_GPU_WINDOW_CHARS=6 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_ROWS_PER_THREAD=1 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_CPU_NO_AVX2)
+    set(STRESS_window6 NAMEBREAK_GPU_WINDOW_CHARS=6 NAMEBREAK_ROWS_PER_THREAD=64 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
     set(STRESS_filter1 NAMEBREAK_LOWBITS_FILTER_BITS=1)
     foreach(variant IN ITEMS small_launch window2 window6 filter1)
         namebreak_search_library(namebreak_search_stress_${variant} ${STRESS_DEFINITIONS} ${STRESS_${variant}})

@@ -26,6 +26,11 @@ struct Case {
     // at it); the range's only candidate; or just before its start / just
     // after its end, in the same row.
     enum { Inside, AtStart, AtEnd, Only, JustBefore, JustAfter } where;
+    // Which row of its row group - the alphabetSize rows that share every
+    // character but the row's last (see kChunksPerGroup in the CUDA backend) -
+    // the planted candidate is in: one in the middle, or the group's first or
+    // last row, with the range reaching into the group before or after it.
+    enum { MiddleRow, FirstRowOfGroup, LastRowOfGroup } row = MiddleRow;
 };
 
 uint32_t hashFromScratch(const std::string& filename, const uint32_t* cryptTable, int offset) {
@@ -78,7 +83,12 @@ bool runCase(SearchBackend& backend, const Case& c, const uint32_t* cryptTable, 
     for (int i = 0; i < c.trailingLen; ++i)
         space *= as;
     const uint64_t rows = space / as;
-    const uint64_t planted = (rows / 3) * as + (uint64_t) c.k;
+    uint64_t row = rows / 3;
+    if (c.trailingLen > 1 && c.row == Case::FirstRowOfGroup)
+        row -= row % as;
+    else if (c.trailingLen > 1 && c.row == Case::LastRowOfGroup)
+        row += as - 1 - row % as;
+    const uint64_t planted = row * as + (uint64_t) c.k;
 
     // A few candidates on either side, reaching into the neighbouring rows
     // where there are any, so the range starts and ends mid-row.
@@ -138,8 +148,8 @@ bool runCase(SearchBackend& backend, const Case& c, const uint32_t* cryptTable, 
     backend.endSearch();
 
     char where[256];
-    snprintf(where, sizeof(where), " (alphabet size %d, prefix length %zu, suffix length %zu, trailing length %d, last character %d)",
-             c.alphabetSize, c.prefix.size(), c.suffix.size(), c.trailingLen, c.k);
+    snprintf(where, sizeof(where), " (alphabet size %d, prefix length %zu, suffix length %zu, trailing length %d, row %llu, last character %d)",
+             c.alphabetSize, c.prefix.size(), c.suffix.size(), c.trailingLen, (unsigned long long) row, c.k);
     for (const std::string& hit : result.hits) {
         if (hit.size() != c.prefix.size() + c.trailingLen + c.suffix.size() || hit.compare(0, c.prefix.size(), c.prefix) != 0 ||
             !hashAMatches(hashFromScratch(hit, cryptTable, 0x100), constants.targetHashA)) {
@@ -195,6 +205,14 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
         {big, "REZ\\", ".WAV", window, 40, Case::Only},
         {big, "Z\xC4\\", longSuffix, std::min(2, window), 32, Case::AtStart},
         {small, "", "", 1, 5, Case::AtEnd},
+        // In the first and last row of a row group, with the range reaching
+        // into the next or previous group.
+        {big, "REZ\\", ".WAV", window, 20, Case::Inside, Case::FirstRowOfGroup},
+        {big, "REZ\\", ".WAV", window, 45, Case::Inside, Case::LastRowOfGroup},
+        {big, "REZ\\", ".WAV", window, 33, Case::AtStart, Case::FirstRowOfGroup},
+        {big, "REZ\\", ".WAV", window, 31, Case::AtEnd, Case::LastRowOfGroup},
+        {small, "REZ\\", ".WAV", window, 7, Case::Inside, Case::LastRowOfGroup},
+        {big, "Z\xC4\\", longSuffix, std::min(3, window), 12, Case::Inside, Case::FirstRowOfGroup},
         {big, "REZ\\", ".WAV", window, 20, Case::JustBefore},
         {big, "REZ\\", ".WAV", window, 20, Case::JustAfter},
     };

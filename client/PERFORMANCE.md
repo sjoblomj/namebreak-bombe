@@ -14,11 +14,16 @@ blur a kernel comparison) and the whole `ctest` passes - the dense-hit
 `stress-*` tests above all, since every item below touches code that could
 silently drop candidates.
 
-Where things stand (measured): the CUDA backend searches 1,084-1,130 G
-candidates/s, up from 209-218 before the filter. It issues about 150
-instructions per row of 49 candidates, down from about 1,130. Nsight
-Systems puts about 5% of the GPU's time between launches (478 ms of kernel
-time in a 0.5 s search: 2,044 launches of 233 us each).
+Where things stand: the CUDA backend searches 1,434-1,467 G candidates/s
+with a hot GPU, and up to about 1,650 with a cool one (**measured**), from
+209-218 before the lookup filter and 1,088-1,124 with the filter but one row
+per thread. It issues about 100 instructions per row of 49 candidates
+(*estimated* from its SASS: about 30 per row, the verify loop's, and a
+share of its thread's setup), down from about 1,130 before the filter.
+Before the rows were split into chunks, Nsight Systems put about 5% of the
+GPU's time between launches (478 ms of kernel time in a 0.5 s search: 2,044
+launches of 233 us each); with launches a quarter shorter since, that share
+will have grown (not measured again).
 
 ## The lookup filter on the other backends
 
@@ -30,33 +35,51 @@ time in a 0.5 s search: 2,044 launches of 233 us each).
   from the CPU's L2); every width from 6 to 10 beat the current backend by
   3-5 times. It's also simpler code than the SIMD it would replace. Later,
   the row states themselves could be computed eight at a time with AVX2,
-  and their table entries gathered.
+  and their table entries gathered. The backend already walks its rows
+  incrementally (`searchRowsWith`), and so did the prototype: the port must
+  keep that, so there's no row decoding to add here.
 - [ ] **OpenCL.** Port `filteredRowsKernel` to `search.cl`, with the table in
   a global buffer, and the same checks as the CUDA backend (a sample of the
   table checked, and read back, before every search). *Estimated* about the
   same factor as CUDA's; it ran at 88% of the unfiltered CUDA kernel.
+  - [ ] **Incremental row decoding**, as the CUDA kernel's: row groups split
+    into chunks of about `NAMEBREAK_ROWS_PER_THREAD` rows, one per
+    work-item, walked with a loop the launch size can't cut short. After
+    the filter port, not before - until then decoding is only about 5% of a
+    row's work (*estimated*). Tune the chunk size for OpenCL separately.
 - [ ] **Metal.** The same port. It can't be run without a Mac, so it would
   lean on the self-test, which runs on the Mac itself. Its kernel should
   take `HASHA_MATCH_MASK` the way the OpenCL one does, so that the stress
   tests cover it too.
+  - [ ] **Incremental row decoding**, as for OpenCL: after the filter port,
+    with its chunk size tuned on a Mac.
 - [ ] **HIP.** Gets the filter with the CUDA code, but has never run on an
   AMD GPU. The self-test now runs there before every use, which lowers the
   risk - but measuring it on real AMD hardware is still to do.
+  - [ ] **Tune the chunk size on AMD.** HIP has the CUDA kernel's
+    incremental row decoding already, but its 25 rows per thread was tuned
+    on an NVIDIA GPU. Many AMD GPUs run 64 threads in lockstep rather than
+    32, with different occupancy limits, so the best
+    `NAMEBREAK_ROWS_PER_THREAD` may differ: re-sweep it (the README's kernel
+    section has the NVIDIA numbers to compare with).
 
 ## CUDA backend
 
-- [ ] **Incremental row decoding.** Decoding a row - four divisions by the
-  alphabet's size, eight shared-memory loads, four hash steps - is now about
-  50 of the 150 instructions a row costs (**measured**, SASS of
-  `filteredRowsKernel<49, 4>`). Consecutive rows differ only in their last
-  shared character 48 times out of 49, so a thread walking several rows in
-  a row would pay one hash step per row instead. *Estimated* +20-30%.
-  The HIP backend is this same code, so it gets the change for free. The
-  OpenCL and Metal kernels decode rows the same way, but without the filter
-  a row there still hashes all its candidates, and decoding is only about 5%
-  of that (*estimated* from the unfiltered CUDA kernel they were ported
-  from) - so for them it's worth doing after the filter is ported, not
-  before. The CPU backend already walks rows incrementally
+- [x] **Incremental row decoding.** Decoding a row - four divisions by the
+  alphabet's size, eight shared-memory loads, four hash steps - was about
+  50 of the 150 instructions a row cost (SASS of `filteredRowsKernel<49, 4>`).
+  Now a thread takes a chunk of about 25 consecutive rows of one row group
+  (`NAMEBREAK_ROWS_PER_THREAD`, see the README's kernel section): the
+  group's characters are hashed once, and each row costs about 30
+  instructions besides its verify loop. **Measured** +32% side by side
+  (1,088-1,124 to 1,434-1,467 G candidates/s), +36% in a cooler sweep, where
+  1 row per thread did 1,133, 7 did 1,575, 10-16 about 1,605, 25 did 1,659
+  and 49 did 1,611. The HIP backend is this same code, so it has the change
+  too. The OpenCL and Metal kernels decode rows the old way, but without the
+  filter a row there still hashes all its candidates, and decoding is only
+  about 5% of that (*estimated* from the unfiltered CUDA kernel they were
+  ported from) - so for them it's worth doing after the filter is ported,
+  not before. The CPU backend already walked rows incrementally
   (`searchRowsWith`).
 - [ ] **Less divergence in the verify loop.** A warp repeats the loop over
   flagged candidates as many times as its busiest lane needs: about 1.4
@@ -76,7 +99,9 @@ time in a 0.5 s search: 2,044 launches of 233 us each).
   *Estimated* +5%, and it makes the next item cheap.
 - [ ] **Re-tune the window and launch size.** `NAMEBREAK_GPU_WINDOW_CHARS`
   (5) and `NAMEBREAK_ROWS_PER_LAUNCH` were chosen with the kernel as it was
-  before the filter, whose launches took five times as long.
+  before the filter, whose launches took about seven times as long as now.
+  `NAMEBREAK_ROWS_PER_THREAD` (25) interacts with both: a smaller window
+  means fewer rows per launch, so fewer threads.
 - [ ] **Stop spinning a CPU core.** `cudaDeviceSynchronize` busy-waits: the
   running client keeps one core at 100% (**measured** with `ps`/`top`). On a
   laptop, CPU and GPU share one power and cooling budget, so that core may
@@ -156,18 +181,29 @@ backend is self-tested before use (see the README). What's still open:
 - [ ] **Longer stress runs.** `search_stress_test --budget <candidates>`
   runs longer than ctest's default of 300 million (about 60,000-73,000 hits
   in the default geometry); worth a long run after any change to a kernel.
-- [ ] **Mutation testing as a script.** The experiment in the README (nine
-  deliberately broken CUDA kernels, each of which the self-test, the
+- [ ] **Mutation testing as a script.** The experiment in the README
+  (deliberately broken CUDA kernels, each of which the self-test, the
   integration test and the stress test must catch on their own) was run by
-  hand, from copies of the source. A script that applies each mutation to a
-  copy, switches off `createBackend`'s self-test there, builds, and checks
-  that every test fails would make it repeatable after any kernel change -
-  and should fail loudly when a mutation no longer applies. The mutations:
-  `mask &= (uint64_t(1) << AlphabetSize) - 1` to `mask &= 0xFFFFFFFFull`;
-  `lowBitsFilterIndex(seed1, seed2)` to `(seed2, seed1)` in the kernel;
-  `<< lastRowEndK` to `<< (lastRowEndK - 1)`; `<< firstRowStartK` to
-  `<< (firstRowStartK + 1)`; the first row's condition `t == 0` to `true`;
-  both edge conditions to `false`; `while (mask != 0)` to
+  hand, from copies of the source, in three rounds - and each round found a
+  gap in the checks, which is the best argument for running it after every
+  kernel change. A script would copy the source, apply one mutation (an
+  exact string replacement, failing loudly if the string isn't found exactly
+  once), switch off `createBackend`'s self-test in the copy, build, and
+  check that the self-test, `search_integration_test` and
+  `search_stress_test` each fail. The eighteen of the last round, in
+  `cuda_backend.cu` unless noted: `mask &= (uint64_t(1) << AlphabetSize) - 1`
+  to `mask &= 0xFFFFFFFFull`; `lowBitsFilterIndex(seed1, seed2)` to
+  `(seed2, seed1)`; `<< lastRowEndK` to `<< (lastRowEndK - 1)`;
+  `<< firstRowStartK` to `<< (firstRowStartK + 1)`; both `d == firstRowD` /
+  `d == lastRowD` to `false`; `while (mask != 0)` to
   `while ((mask & (mask - 1)) != 0)`; the suffix loop to `i + 1 < SuffixLen`;
-  and `targetHashA` to `targetHashA ^ 1` in `buildLowBitsFilterTable`.
-  The same for the other backends as they get the filter.
+  `targetHashA` to `targetHashA ^ 1` in `buildLowBitsFilterTable`
+  (`lowbits_filter.cpp`); a chunk's `dEnd` minus 1 and `dBegin` plus 1; the
+  range's clips `firstRow - groupStart` plus 1 and `lastRow + 1 - groupStart`
+  minus 1; `firstRowD` plus 1 and `lastRowD` minus 1; `hashRowDigits<..., 3>`
+  to `<..., 2>` for a trailing length of 5; `sOrd[d]` to `sOrd[dBegin]` in a
+  row's own step; `chunkCount` minus 1; and `chunkCount` without the last
+  group when there's more than one. (Launching one thread too few, host
+  side, is deliberately harmless now - keep it as the one mutation that
+  must *not* be caught.) The same for the other backends as they get the
+  filter.

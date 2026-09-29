@@ -25,6 +25,19 @@
 #define NAMEBREAK_ROWS_PER_LAUNCH (1u << 23)
 #endif
 
+// About how many consecutive rows one thread searches (see kChunksPerGroup
+// in cuda_backend.cu): it hashes the characters they share once, then one
+// step per row. More rows per thread means less of that, but fewer threads
+// per launch. On the RTX 3080 Ti Laptop (search_bench --scale 20, three runs
+// each), 1 row per thread did 1,133 G candidates/s, 4 did 1,477, 7 did 1,575,
+// 10-16 about 1,605, 25 did 1,659 and 49 did 1,611 - 25, i.e. two chunks per
+// row group for the real 49-character alphabet, was best in every run.
+// Overridable at compile time (-DNAMEBREAK_ROWS_PER_THREAD=N) so the tests can
+// exercise other splits, and benchmarks re-sweep it.
+#ifndef NAMEBREAK_ROWS_PER_THREAD
+#define NAMEBREAK_ROWS_PER_THREAD 25
+#endif
+
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index
 // (alphabetSize^(trailingLen-1)) must fit in 32 bits: 50^5 < 2^32 <= 50^6.
 constexpr int kMaxTrailingLen = 6;
@@ -36,6 +49,7 @@ constexpr int kThreadsPerBlock = 256;
 static_assert(NAMEBREAK_GPU_WINDOW_CHARS >= 1 && NAMEBREAK_GPU_WINDOW_CHARS <= kMaxTrailingLen,
               "NAMEBREAK_GPU_WINDOW_CHARS must be between 1 and kMaxTrailingLen");
 static_assert(NAMEBREAK_ROWS_PER_LAUNCH >= 1, "NAMEBREAK_ROWS_PER_LAUNCH must be >= 1");
+static_assert(NAMEBREAK_ROWS_PER_THREAD >= 1, "NAMEBREAK_ROWS_PER_THREAD must be >= 1");
 static_assert(NAMEBREAK_ROWS_PER_LAUNCH <= (1u << 30), "a launch's row count must stay well within 32 bits");
 
 #endif // NAMEBREAK_BACKENDS_CUDA_TUNING_H

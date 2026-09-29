@@ -188,8 +188,9 @@ crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
 stress tests (`stress-*`), which make one candidate in 4096 a hit and
 compare every one of them with a brute force - see [The lookup
 filter](#the-lookup-filter-most-candidates-are-never-hashed). The search is
-built in several configurations for this (different GPU window / launch
-sizes, the stress tests' weaker match, a one-bit filter), each with its own
+built in several configurations for this (different GPU window, launch
+sizes and rows per thread, the stress tests' weaker match, a one-bit
+filter), each with its own
 compile of the CUDA backend - the build runs them in parallel.
 `cmake --build --preset default --target run_search_bench` times the real
 search over a fixed range (`build/tests/search_bench --scale <n>` for a
@@ -239,8 +240,8 @@ so a GPU build still works on a machine without that GPU:
 
 - `cuda/` - the CUDA kernels and the code that launches them. The only
   backend so far with [the lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
-  (`common/lowbits_filter.h`): about 1,100 G candidates/s on the RTX 3080 Ti
-  Laptop.
+  (`common/lowbits_filter.h`): about 1,450-1,650 G candidates/s on the RTX
+  3080 Ti Laptop, depending on how hot it is.
 - `hip` - AMD GPUs: `cuda/`'s code compiled with ROCm's HIP instead, which
   accepts CUDA's kernel syntax as is; `gpu_runtime.h` maps the handful of
   CUDA runtime calls onto HIP's. Not built by default, and not yet tested on
@@ -333,7 +334,25 @@ knob rather than only a per-thread-cost one - and it's also what bounds how
 long any single launch can run for, since pause and abort are only checked
 *between* launches, not in the middle of one.
 
-What a thread then does with its row is where the backends differ. The
+The CUDA kernel takes this one step further. Consecutive rows share even
+more than their candidates do: the rows `XA*`, `XB*`, ... `XZ*` all start
+with `X`. So a *row group* - the rows that share every trailing character
+but the row's own last - is split into chunks of about
+`NAMEBREAK_ROWS_PER_THREAD` consecutive rows (25, in `tuning.h`: two chunks
+per group for a 49-character alphabet), and one thread takes a chunk: it
+hashes the group's shared characters once, and each of its rows then costs
+one more step, instead of every thread working out its row's characters
+from its number (a division per character) and hashing all of them. A chunk
+never crosses into another group, and the kernel walks all the chunks of a
+launch itself, so how many threads are launched only decides how the work
+is shared out, never what gets searched. That made the search about a third
+faster again (1,088-1,124 to 1,434-1,467 G candidates/s, three runs each
+side by side; 1 row per thread measured 1,133, 7 rows 1,575, 25 rows 1,659
+and 49 rows 1,611 in a cooler run). The OpenCL and Metal kernels still give
+each thread one row, which costs them much less as long as they hash every
+candidate of it (see [PERFORMANCE.md](PERFORMANCE.md)).
+
+What a thread then does with its rows is where the backends differ. The
 CUDA kernel (`filteredRowsKernel`) looks the row up in a table and hashes
 only the handful of its candidates that could possibly match - see [The
 lookup filter](#the-lookup-filter-most-candidates-are-never-hashed) below.
@@ -474,21 +493,33 @@ backend already had:
 - The `reference` backend never gets the filter: it's what the others are
   held to.
 
-To check that these checks would actually catch a broken kernel, nine were
-built on purpose - each a bug that silently misses (or invents)
-candidates: rows' masks cut to 32 bits; seed1 and seed2 swapped in the
-lookup; every launch's last row, or first row, one candidate short; the
-first row's cut applied to every row; the edges of the range ignored; the
-loop over a row's flagged candidates stopping one early; the suffix hashed
-one character short; the table built for the wrong target. Every one was
-caught by the self-test, by the integration test and by the stress test,
-each on its own (the latter two with the self-test switched off) - the
-integration test failed 54-1007 of its 2,267 cases, the stress test 76-316
-of its roughly 320, and the wrong-target table stopped both at their first
-search.
-That experiment is what added the self-test's and the stress test's
-planted edge cases: before them, a launch whose last row was one short got
-past both, and only the integration test caught it.
+To check that these checks would actually catch a broken kernel, broken
+ones were built on purpose - each a bug that silently misses (or invents)
+candidates - and run against each check on its own (the integration and
+stress tests with the self-test switched off). Against the kernel as it is
+now, with row groups split into chunks, eighteen of them: rows' masks cut to
+32 bits; seed1 and seed2 swapped in the lookup; a launch's last row, or
+first row, one candidate short; the edges of the range ignored; the loop
+over a row's flagged candidates stopping one early; the suffix hashed one
+character short; the table built for the wrong target; and, in the
+chunking, a chunk's first or last row skipped; the range cut one row short
+at its start or end; the first or last row's cut applied to the wrong row;
+one character too few of a group hashed; the wrong character in a row's
+own step; the last chunk, or the last group, of a launch never searched.
+Every one was caught by the self-test, by the integration test and by the
+stress test - the integration test failed 6-1007 of its 2,267 cases, the
+stress test 38-292 of its 321, and the wrong-target table stopped both at
+their first search.
+
+Each round of this found something. The first one added the self-test's
+and the stress test's planted edge cases: before them, a launch whose last
+row was one short got past both, and only the integration test caught it.
+The second made the self-test plant candidates in the first and last row of
+a row group, where it had missed a chunk's last row being skipped; and it
+found that launching one thread too few went unnoticed by everything - it
+only mattered when the thread count was just past a multiple of 256 - so
+the kernel now works out its chunks itself, and how many threads are
+launched can no longer change what gets searched.
 `tests/self_test_test.cpp` does the same for the self-test on the CPU
 backends, on every `ctest` run.
 

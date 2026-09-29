@@ -9,8 +9,9 @@
 // a handful of small batches, each with a candidate planted as the target
 // (both hashes), that must be found - at the first and last last-character
 // positions, on both sides of bit 32 of a row's mask, in rows cut short at
-// both ends, as the very first and very last candidate of a range, with
-// long, empty and non-ASCII suffixes and prefixes - plus targets planted just
+// both ends, as the very first and very last candidate of a range, in the
+// first and last row of a row group, with long, empty and non-ASCII suffixes
+// and prefixes - plus targets planted just
 // outside a batch's range, which must not be. Every hit reported must also
 // genuinely match.
 //
