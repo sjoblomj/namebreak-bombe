@@ -253,12 +253,15 @@ so a GPU build still works on a machine without that GPU:
   an AMD GPU: it has only been run through HIP's NVIDIA mapping, on an
   NVIDIA GPU, where its tests pass.
 - `metal/` - the Mac's GPU (Apple Silicon, or an Intel Mac's), through
-  Metal: the OpenCL kernel as it was before the lookup filter, in Metal's shading language
-  (`search.metal`), compiled by Metal at runtime the same way; the host
-  side is Objective-C++ (`metal_backend.mm`). On a Mac, use the `portable`
-  preset. Not yet run on a Mac: its kernel has only been tested on the CPU,
-  compiled as C++ against a stand-in for Metal's standard library and run
-  one GPU thread at a time, where every test configuration passes.
+  Metal: the OpenCL kernel, lookup filter and all, in Metal's shading
+  language (`search.metal`), compiled by Metal at runtime the same way; the
+  host side is Objective-C++ (`metal_backend.mm`). On a Mac, use the
+  `portable` preset. Not yet run on a Mac: its kernel has only been tested
+  on the CPU, compiled as C++ against a stand-in for Metal's standard
+  library and run one GPU thread at a time behind a C++ transcription of
+  `metal_backend.mm`, where every test configuration, the stress tests and
+  the kernel's mutation experiment pass; `metal_backend.mm` itself has
+  never been compiled.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
   installed. CUDA's kernel ported (`search.cl`), lookup filter, row groups
@@ -416,8 +419,7 @@ side by side; 1 row per thread measured 1,133, 7 rows 1,575, 25 rows 1,659
 and 49 rows 1,611 in a cooler run). The OpenCL kernel does the same, but
 does best with a whole row group per work-item (1 row per work-item measured
 about 880, 7 about 1,300, 25 about 1,435, and 49 and 64 about 1,460). The
-Metal kernel still gives each thread one row - which, as it still hashes
-every candidate of it, is a small part of its work anyway (see
+Metal kernel still gives each thread one row (see
 [PERFORMANCE.md](PERFORMANCE.md)).
 
 Group `X**` from above, with its 26 rows split into two chunks of 13 (26
@@ -444,12 +446,12 @@ Thread 1 hashes `X` once, then one more character for each of `XA*` to
 `XM*`; thread 2 does the same for `XN*` to `XZ*`. Every row then costs one
 table lookup, and only its `#`s are hashed any further.
 
-What a thread then does with its rows is where the backends differ. The
-CUDA and OpenCL kernels (`filteredRowsKernel`, `search.cl`) look the row up
-in a table and hash only the handful of its candidates that could possibly
-match - see [The lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
-below. The Metal kernel and the CPU backend don't have the filter yet and
-hash every candidate of the row, which two more things make fast:
+What a thread then does with its rows: the GPU kernels
+(`filteredRowsKernel`, `search.cl`, `search.metal`) look each row up in a
+table and hash only the handful of its candidates that could possibly
+match, as [The lookup filter](#the-lookup-filter-most-candidates-are-never-hashed)
+below explains. Before they had the filter, they hashed every candidate of the row,
+as the CPU backend still does, which two more things made fast:
 
 - **The loop over the last character is fully unrolled**, with its
   alphabet position known at compile time for every iteration. That lets
@@ -486,8 +488,8 @@ collisions in a single launch), but it's handled explicitly and tested
 
 ### The lookup filter: most candidates are never hashed
 
-The CUDA and OpenCL backends don't hash every candidate of a row. In the
-real search (a 49-character alphabet and `.WAV`) they hash about one in
+The GPU backends - CUDA, OpenCL and Metal - don't hash every candidate of a
+row. In the real search (a 49-character alphabet and `.WAV`) they hash about one in
 256 - on average 0.19 of a row's 49 candidates - because they can tell from
 a single table lookup that the rest can't match. That made the whole search
 5.2 times as fast with CUDA (`search_bench --scale 20` on the RTX 3080 Ti
@@ -639,8 +641,8 @@ In detail:
   boundary, a row's first or last character - or just outside the range,
   where it must not be reported. It runs in every geometry the integration
   test does, with a one-bit filter too (`NAMEBREAK_LOWBITS_FILTER_BITS=1`:
-  about half of each row gets through), and on every backend but Metal.
-- Before every search, the CUDA and OpenCL backends check 1,024 random
+  about half of each row gets through), and on every backend.
+- Before every search, the GPU backends check 1,024 random
   entries of the table they have just built against their definition (the
   test's check, from random high bits), upload it, and read it back to
   compare. If either
@@ -696,7 +698,10 @@ one bit too far, and the kernel compiled for a table one bit narrower - with
 half as many work-items, and a work-group too many, as the changes that
 mustn't matter. Every one was caught by all three checks too (the
 integration test failed 6-1007 of its 2,266 cases, the stress test 48-394 of
-its 436), each time the script was run on it.
+its 436), each time the script was run on it. The Metal kernel has its own
+list (`--backend metal`, on a Mac); with no Mac here, its kernel mutations
+were run through an emulation of Metal on the CPU (see [Backends](#backends)),
+and each was caught by all three checks there too.
 
 Each round of this found something. The first one added the self-test's
 and the stress test's planted edge cases: before them, a launch whose last

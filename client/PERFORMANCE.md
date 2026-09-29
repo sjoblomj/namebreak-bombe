@@ -54,10 +54,19 @@ will have grown (not measured again).
     row group per work-item (64 rows, so one chunk whatever the alphabet)
     did best - about 1,460 G candidates/s against 1,435 at CUDA's 25 and 880
     at 1, in the same run; 1,082-1,086 before, with one row per work-item.
-- [ ] **Metal.** The same port. It can't be run without a Mac, so it would
-  lean on the self-test, which runs on the Mac itself. Its kernel should
-  take `HASHA_MATCH_MASK` the way the OpenCL one does, so that the stress
-  tests cover it too.
+- [x] **Metal.** The same port, with one thread per row, and its kernel
+  takes `HASHA_MATCH_MASK` too, so the stress tests cover Metal on a Mac.
+  There's no Mac here, so it was tested by compiling `search.metal` as C++
+  against a stand-in for `<metal_stdlib>` and running it one GPU thread at a
+  time (a threadgroup in two passes around its barrier) behind a C++
+  transcription of `metal_backend.mm`: every integration and stress test
+  configuration and the overflow test pass that way, and all twelve of its
+  kernel mutations are caught by each check. `metal_backend.mm` itself has
+  never been compiled.
+  - [ ] **Run it on a Mac**, or on the release workflow's macOS runner (run
+    it by hand from the Actions tab): that compiles `metal_backend.mm` and
+    runs `ctest` there, and `tests/mutation_test.py --backend metal` covers
+    the host-side mutations the emulation can't.
   - [ ] **Incremental row decoding**, as for OpenCL: after the filter port,
     with its chunk size tuned on a Mac.
 - [ ] **HIP.** Gets the filter with the CUDA code, but has never run on an

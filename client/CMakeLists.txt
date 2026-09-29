@@ -342,14 +342,12 @@ endforeach()
 # Dense-hit differential test: built so that a hashA "hit" only has to match
 # the target's low 12 bits (NAMEBREAK_HASHA_MATCH_BITS, src/engine/hash_match.h),
 # about one candidate in 4096, and compared hit for hit with a brute force
-# over hundreds of random ranges - see the file. Every backend but Metal,
-# whose kernel doesn't take the weakened match. The variants (row-based
+# over hundreds of random ranges - see the file. Every backend. The variants (row-based
 # backends only - `reference` ignores all of these values) mirror the
 # integration test's geometries, plus a lookup filter of a single bit
 # (NAMEBREAK_LOWBITS_FILTER_BITS=1), which lets about half of every row
 # through to be hashed in full.
 set(STRESS_BACKENDS ${ROW_BACKENDS})
-list(REMOVE_ITEM STRESS_BACKENDS metal)
 set(STRESS_DEFINITIONS NAMEBREAK_HASHA_MATCH_BITS=12)
 namebreak_search_library(namebreak_search_stress ${STRESS_DEFINITIONS})
 namebreak_test_executable(search_stress_test tests/search_stress_test.cpp namebreak_search_stress)

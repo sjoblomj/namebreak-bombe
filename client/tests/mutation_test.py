@@ -19,7 +19,8 @@ anything, and the script stops), and so must the mutations marked harmless -
 changes that must *not* change what gets searched.
 
 One backend per run (--backend): cuda (the default), hip (the same code,
-compiled with HIP) or opencl, each with its own list of mutations (--list).
+compiled with HIP), opencl or metal (on a Mac), each with its own list of
+mutations (--list).
 Needs the GPU the backend runs on, its toolchain or driver, and CMake. It
 copies CMakeLists.txt, src/ and tests/ as they are on disk into a work
 directory, so it tests uncommitted changes too and never touches build/.
@@ -56,6 +57,8 @@ KERNEL = "src/backends/cuda/cuda_backend.cu"
 FILTER = "src/backends/common/lowbits_filter.cpp"
 CL_KERNEL = "src/backends/opencl/search.cl"
 CL_HOST = "src/backends/opencl/opencl_backend.cpp"
+MTL_KERNEL = "src/backends/metal/search.metal"
+MTL_HOST = "src/backends/metal/metal_backend.mm"
 
 
 @dataclass
@@ -180,11 +183,50 @@ OPENCL_MUTATIONS = [
                      "const size_t global = (chunks + 2 * local - 1) / local * local;")]),
 ]
 
+# The Metal ones can only be run on a Mac (--backend metal).
+METAL_MUTATIONS = [
+    # The lookup filter's mask.
+    Mutation("mask32", "a row's mask cut to 32 bits",
+             [(MTL_KERNEL, "mask &= (1ul << ALPHABET_SIZE) - 1ul;", "mask &= 0xFFFFFFFFul;")]),
+    Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
+             [(MTL_KERNEL, "ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];", "ulong mask = filterTable[FILTER_INDEX(seed2, seed1)];")]),
+    Mutation("indexshift", "the kernel's table index shifting seed2's bits one too far",
+             [(MTL_KERNEL, "(((seed2) & FILTER_STATE_MASK) << FILTER_BITS))", "(((seed2) & FILTER_STATE_MASK) << (FILTER_BITS + 1)))")]),
+    Mutation("filterbits", "the kernel compiled for a table one bit narrower",
+             [(MTL_HOST, '@"FILTER_BITS": @(kLowBitsFilterBits),', '@"FILTER_BITS": @(kLowBitsFilterBits - 1),')]),
+    Mutation("lastrow", "a batch's last row one candidate short",
+             [(MTL_KERNEL, "mask &= (1ul << args.lastRowEndK) - 1ul;", "mask &= (1ul << (args.lastRowEndK - 1)) - 1ul;")]),
+    Mutation("firstrow", "a batch's first row one candidate short",
+             [(MTL_KERNEL, "mask &= ~0ul << args.firstRowStartK;", "mask &= ~0ul << (args.firstRowStartK + 1);")]),
+    Mutation("noedges", "where the range starts and ends mid-row ignored",
+             [(MTL_KERNEL, "if (t == 0)\n        mask &=", "if (false)\n        mask &="),
+              (MTL_KERNEL, "if (t == args.rowCount - 1)\n        mask &=", "if (false)\n        mask &=")]),
+    Mutation("skiplast", "the loop over a row's flagged candidates stops one early",
+             [(MTL_KERNEL, "while (mask != 0) {", "while ((mask & (mask - 1ul)) != 0) {")]),
+    Mutation("wrongbit", "a flagged bit in the low half taken for the character after it",
+             [(MTL_KERNEL, "(low != 0) ? int(ctz(low)) : 32 + int(ctz(high));", "(low != 0) ? int(ctz(low)) + 1 : 32 + int(ctz(high));")]),
+    Mutation("highhalf", "a flagged bit in the high half taken for the character before it",
+             [(MTL_KERNEL, "(low != 0) ? int(ctz(low)) : 32 + int(ctz(high));", "(low != 0) ? int(ctz(low)) : 31 + int(ctz(high));")]),
+    Mutation("suffixshort", "the suffix hashed one character short",
+             [(MTL_KERNEL, "for (int i = 0; i < SUFFIX_LEN; ++i)\n            MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);",
+               "for (int i = 0; i + 1 < SUFFIX_LEN; ++i)\n            MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);")]),
+    Mutation("rowdigits", "one character too few of a row hashed",
+             [(MTL_KERNEL, "for (int i = 0; i < TRAILING_LEN - 1; ++i)\n        MPQ_STEP(seed1, seed2, sKey[digit[i]], sOrd[digit[i]]);",
+               "for (int i = 0; i + 1 < TRAILING_LEN - 1; ++i)\n        MPQ_STEP(seed1, seed2, sKey[digit[i]], sOrd[digit[i]]);")]),
+    WRONG_TARGET,
+    # Threads past the batch's last row return at once, so launching a whole
+    # threadgroup too many must not change what gets searched.
+    Mutation("extragroup", "a whole threadgroup too many launched", expect="harmless",
+             edits=[(MTL_HOST, "const NSUInteger threadgroups = (rows.rowCount + threadgroupSize - 1) / threadgroupSize;",
+                     "const NSUInteger threadgroups = (rows.rowCount + threadgroupSize - 1) / threadgroupSize + 1;")]),
+]
+
 # Per backend: how to build it, what its createBackend name is, and its mutations.
 BACKENDS = {
     "cuda": (["-DNAMEBREAK_GPU=cuda", "-DNAMEBREAK_OPENCL=OFF"], CUDA_MUTATIONS),
     "hip": (["-DNAMEBREAK_GPU=hip", "-DNAMEBREAK_OPENCL=OFF"], CUDA_MUTATIONS),
     "opencl": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=ON"], OPENCL_MUTATIONS),
+    "metal": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=OFF", "-DNAMEBREAK_METAL=ON"], METAL_MUTATIONS),
 }
 
 CONTROL = Mutation("none", "the code as it is", [], expect="harmless")

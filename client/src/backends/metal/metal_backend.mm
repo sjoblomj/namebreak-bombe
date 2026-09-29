@@ -12,12 +12,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
 #include "backends/metal/search_kernel.h" // generated from search.metal - see CMakeLists.txt
+#include "engine/hash_match.h"
 #include "engine/limits.h"
 
 namespace {
@@ -50,7 +53,8 @@ public:
         alphabetOrd_ = [device_ newBufferWithLength:MAX_ALPHABET_SIZE * sizeof(uint32_t) options:shared];
         suffixKey_ = [device_ newBufferWithLength:kMaxSuffixSize * sizeof(uint32_t) options:shared];
         suffixOrd_ = [device_ newBufferWithLength:kMaxSuffixSize * sizeof(uint32_t) options:shared];
-        if (!queue_ || !matchCount_ || !matchIdx_ || !alphabetKey_ || !alphabetOrd_ || !suffixKey_ || !suffixOrd_) {
+        filterTable_ = [device_ newBufferWithLength:kLowBitsFilterEntries * sizeof(uint64_t) options:shared];
+        if (!queue_ || !matchCount_ || !matchIdx_ || !alphabetKey_ || !alphabetOrd_ || !suffixKey_ || !suffixOrd_ || !filterTable_) {
             fprintf(stderr, "Metal: couldn't allocate the search's buffers\n");
             exit(1);
         }
@@ -77,6 +81,9 @@ private:
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> matchCount_, matchIdx_;
     id<MTLBuffer> alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_;
+    // This search's lookup filter: kLowBitsFilterEntries entries, see
+    // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
+    id<MTLBuffer> filterTable_;
     // Compiled once per (alphabet size, suffix length, trailing length) and
     // kept for the backend's lifetime - a coordinator client searches range
     // after range of the same shape, and each compile takes a moment.
@@ -88,6 +95,19 @@ private:
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
 };
+
+// How many of the lookup filter's entries beginSearch checks against their
+// definition before every search (see checkLowBitsFilterTable), each with two
+// different random high bits - about a millisecond, as in the CUDA backend.
+constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
+
+// A search must not start with a filter table that is wrong: it could drop a
+// match without any other sign. This ends the process, as the other Metal
+// errors do - a coordinator range is then reassigned when its lease runs out.
+[[noreturn]] void refuseFilterTable(const char* what, const std::string& detail) {
+    fprintf(stderr, "INTERNAL ERROR: the lookup filter table %s (%s) - refusing to search with it\n", what, detail.c_str());
+    exit(1);
+}
 
 void MetalBackend::beginSearch(const SearchConstants& constants) {
     if (!announcedDevice_) {
@@ -117,6 +137,21 @@ void MetalBackend::beginSearch(const SearchConstants& constants) {
     }
     // Establishes the "matchCount is 0 at launch" invariant runBatch keeps.
     *static_cast<int32_t*>(matchCount_.contents) = 0;
+
+    // This search's lookup filter - it depends on the alphabet, the suffix and
+    // the target, so it's built for every search. Checked against its
+    // definition before it's used, and compared with what the GPU will read
+    // after the copy.
+    const std::vector<uint64_t> table = buildLowBitsFilterTable(constants);
+    std::string error;
+    if (!checkLowBitsFilterTable(table, constants, kFilterEntriesCheckedPerSearch, 2, std::random_device{}(), error))
+        refuseFilterTable("failed its check", error);
+    const size_t tableBytes = table.size() * sizeof(uint64_t);
+    if (filterTable_.length < tableBytes)
+        refuseFilterTable("doesn't fit its buffer", std::to_string(tableBytes) + " bytes");
+    memcpy(filterTable_.contents, table.data(), tableBytes);
+    if (memcmp(filterTable_.contents, table.data(), tableBytes) != 0)
+        refuseFilterTable("in the GPU's buffer differs from the one built", std::to_string(tableBytes) + " bytes");
 }
 
 id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen) {
@@ -132,6 +167,8 @@ id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen) {
             @"SUFFIX_LEN": @(suffixLen_),
             @"TRAILING_LEN": @(trailingLen),
             @"MAX_MATCHES": @(MAX_MATCHES),
+            @"HASHA_MATCH_MASK": @(kHashAMatchMask),
+            @"FILTER_BITS": @(kLowBitsFilterBits),
         };
         NSError* error = nil;
         id<MTLLibrary> library = [device_ newLibraryWithSource:@(kSearchKernelSource) options:options error:&error];
@@ -185,6 +222,7 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
         [encoder setBuffer:suffixOrd_ offset:0 atIndex:4];
         [encoder setBuffer:matchCount_ offset:0 atIndex:5];
         [encoder setBuffer:matchIdx_ offset:0 atIndex:6];
+        [encoder setBuffer:filterTable_ offset:0 atIndex:7];
         const NSUInteger threadgroupSize = std::min(kPreferredThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
         const NSUInteger threadgroups = (rows.rowCount + threadgroupSize - 1) / threadgroupSize;
         [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupSize, 1, 1)];
