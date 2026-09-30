@@ -17,7 +17,8 @@
 // (size, characters, order, bytes >= 0x80), prefix, suffix and candidate
 // length, and in a third of them the engine's pruning of leading characters
 // (so pruned leading values fall between the batches a backend searches
-// together) - and compares the complete set of hits it reports with an
+// together), in half of those at every character but the last (so the
+// backend prunes rows and row groups too) - and compares the complete set of hits it reports with an
 // independent brute force that hashes every candidate of the range from
 // scratch: any hit missing, any extra, any reported twice, or any WARNING
 // from a backend's own cross-checks, fails it. On top of the random hits,
@@ -133,17 +134,21 @@ struct Case {
     bool plantedInside = true;
     uint64_t plantedIndex = 0;
     // The engine's pruning of a candidate's first leadingLen characters (see
-    // runSearch): a pruned candidate is never searched, so never a hit.
-    bool pruneSymbolRuns = false, pruneUnopenedBrackets = false;
+    // runSearch) - or, with pruneWholeCandidate, of every character but its
+    // last, which the backend does for its trailing part: a pruned candidate
+    // is never searched, so never a hit.
+    bool pruneSymbolRuns = false, pruneUnopenedBrackets = false, pruneWholeCandidate = false;
     int maxBackslashCount = 0;
     int leadingLen = 0;
+    // How many of a candidate's first characters the rules look at.
+    int checkedLen() const { return pruneWholeCandidate ? len - 1 : leadingLen; }
 };
 
-// Whether runSearch prunes a candidate of `c` by its leading characters - the
-// same checks, from engine/candidate.h, on the part of it this test itself
-// works out is leading.
+// Whether runSearch prunes a candidate of `c` - the same checks, from
+// engine/candidate.h, on the part of it this test itself works out they
+// look at.
 static bool isPruned(const Case& c, const std::string& candidate) {
-    const std::string_view leading(candidate.data(), c.leadingLen);
+    const std::string_view leading(candidate.data(), c.checkedLen());
     return (c.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading)) ||
            (c.maxBackslashCount != 0 && countBackslashes_CPU(leading) > c.maxBackslashCount) ||
            (c.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, openBracketsAfter_CPU(c.prefix)));
@@ -166,7 +171,7 @@ static std::vector<std::string> bruteForce(const Case& c) {
         std::vector<size_t> digit(c.len);
         for (int i = 0; i < c.len; ++i)
             digit[i] = c.alphabet.find(cand[i]);
-        bool pruned = isPruned(c, cand); // re-checked whenever a leading character changes
+        bool pruned = isPruned(c, cand); // re-checked whenever a character the rules look at changes
         for (uint64_t n = from; n < to; ++n) {
             if (!pruned) {
                 uint32_t seed1 = prefix1, seed2 = prefix2;
@@ -186,7 +191,7 @@ static std::vector<std::string> bruteForce(const Case& c) {
                 digit[i] = 0;
                 cand[i] = c.alphabet[0];
             }
-            if (i < c.leadingLen)
+            if (i < c.checkedLen())
                 pruned = isPruned(c, cand);
         }
     };
@@ -206,10 +211,11 @@ static std::vector<std::string> bruteForce(const Case& c) {
 static std::string describe(const Case& c) {
     char buf[512];
     snprintf(buf, sizeof(buf),
-             "alphabet size %zu, prefix length %zu, suffix length %zu, candidate length %d, indices %llu..%llu, target 0x%08X, pruning %s%s%s",
+             "alphabet size %zu, prefix length %zu, suffix length %zu, candidate length %d, indices %llu..%llu, target 0x%08X, pruning %s%s%s%s",
              c.alphabet.size(), c.prefix.size(), c.suffix.size(), c.len, (unsigned long long) c.first, (unsigned long long) c.last, c.targetA,
              c.pruneSymbolRuns ? "symbol runs " : "", c.pruneUnopenedBrackets ? "brackets " : "",
-             c.maxBackslashCount != 0 ? "backslashes" : (c.pruneSymbolRuns || c.pruneUnopenedBrackets ? "" : "none"));
+             c.maxBackslashCount != 0 ? "backslashes " : (c.pruneSymbolRuns || c.pruneUnopenedBrackets ? "" : "none "),
+             c.pruneWholeCandidate ? "(whole candidate)" : "(leading characters)");
     return buf;
 }
 
@@ -304,6 +310,7 @@ static long runCase(Case c, std::mt19937_64& rng) {
     req.pruneSymbolRuns = c.pruneSymbolRuns;
     req.pruneUnopenedBrackets = c.pruneUnopenedBrackets;
     req.maxBackslashCount = c.maxBackslashCount;
+    req.pruneWholeCandidate = c.pruneWholeCandidate;
 
     std::vector<std::string> reported;
     OutputCapture capture;
@@ -419,6 +426,9 @@ int main(int argc, char** argv) {
             c.pruneSymbolRuns = rng() % 2 == 0;
             c.pruneUnopenedBrackets = rng() % 2 == 0;
             c.maxBackslashCount = rng() % 3 == 0 ? 1 + (int) (rng() % 2) : 0;
+            // Half of them at every character but the last, which the
+            // backend prunes rows and row groups for.
+            c.pruneWholeCandidate = rng() % 2 == 0;
             if (rng() % 4 == 0) {
                 // Brackets and backslashes are rare in a random alphabet:
                 // make sure they're in it.

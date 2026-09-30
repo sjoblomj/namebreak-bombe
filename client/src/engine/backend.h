@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "engine/candidate.h"
 #include "engine/limits.h"
 
 // What runSearch() (search.h) needs from the hardware it runs on. The engine
@@ -30,6 +31,10 @@ struct BatchParams {
     short prefixSize;
     uint32_t seed1Start;         // hash state after the (extended) prefix - see
     uint32_t seed2Start;         // mpqHashWithPrefixCache_CPU / IncrementalPrefixHasher
+    // The pruning rules' state after the leading characters - where a backend
+    // starts checking the trailing ones, if SearchConstants::trailingRules
+    // has any.
+    PruneState pruneEntry;
 };
 
 // One runBatch() call's worth of work: the candidates whose trailing index is
@@ -47,6 +52,12 @@ struct SearchConstants {
     const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
+    // The rules every trailing character but the last must pass
+    // (SearchRequest::pruneWholeCandidate), starting from each batch's
+    // BatchParams::pruneEntry - or none, and every candidate of a batch is
+    // searched. Every backend searches exactly what they allow, so that a
+    // search covers the same candidates whichever backend runs it.
+    PruneRules trailingRules;
 };
 
 // What one runBatch() (or runBatches()) call found.
@@ -88,7 +99,9 @@ public:
     // coordinator range), and must not carry anything over between them.
     virtual void beginSearch(const SearchConstants& constants) = 0;
     // Hashes every candidate whose trailing index is in [start, start + count)
-    // (count > 0), each preceded by params' prefix and followed by the suffix.
+    // (count > 0), each preceded by params' prefix and followed by the suffix
+    // - except those whose trailing characters, all but the last, break
+    // trailingRules (see SearchConstants).
     virtual BatchOutcome runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) = 0;
     virtual void endSearch() = 0;
 

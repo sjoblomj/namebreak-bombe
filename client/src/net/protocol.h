@@ -61,6 +61,8 @@ struct ClaimResponse {
     bool pruneSymbolRuns = false;
     // Optional in the response (false when absent).
     bool pruneUnopenedBrackets = false;
+    // Optional in the response (false when absent).
+    bool pruneWholeCandidate = false;
     int64_t maxBackslashCount = 0;
     std::string lowerBoundFilename;
     std::string upperBoundFilename;

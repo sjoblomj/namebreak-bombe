@@ -25,6 +25,8 @@
 //     excluding the prefix, and lower_bound == upper_bound. Pruning ones run
 //     twice: once with the target on the surviving side (must be found) and
 //     once on the pruned side (must NOT be).
+//  6. pruneWholeCandidate: the same rules at every character but the last,
+//     where the backend prunes rows and row groups of its trailing part.
 //  G. Geometry, for each of the 6 supported alphabet sizes: the kernel
 //     handles a *row* (every value of the last character) per thread, so
 //     ranges that start/end mid-row, sit inside one row, are row-aligned,
@@ -159,9 +161,11 @@ static int trailingLenFor(int candidateLen, int alphabetSize) {
     return std::min(candidateLen, std::max(g_window, candidateLen - maxSafeIndexLenFor(alphabetSize)));
 }
 
+// With pruneWholeCandidate the rules look at every character but the last
+// instead of the leading ones only.
 static bool isPruned(const std::string& candidate, int leadingLen, bool pruneSymbolRuns, int maxBackslashCount, bool pruneUnopenedBrackets,
-                     const std::string& prefix) {
-    std::string_view leading(candidate.data(), leadingLen);
+                     const std::string& prefix, bool pruneWholeCandidate = false) {
+    std::string_view leading(candidate.data(), pruneWholeCandidate ? candidate.size() - 1 : leadingLen);
     if (pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
         return true;
     if (maxBackslashCount != 0 && countBackslashes_CPU(leading) > maxBackslashCount)
@@ -224,6 +228,7 @@ struct CaseSpec {
     bool pruneSymbolRuns = false;
     int maxBackslashCount = 0;
     bool pruneUnopenedBrackets = false;
+    bool pruneWholeCandidate = false;
     uint32_t targetHashA = 0x12345678;
     uint32_t targetHashB = 0xDEADBEEF;
     // A candidate the reference must contain in its match set (a sanity check
@@ -250,7 +255,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
         const uint64_t kMaxRange = 20'000'000;
         while (true) {
             ++total;
-            if (isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix)) {
+            if (isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate)) {
                 ++pruned;
             } else {
                 ++checked;
@@ -297,6 +302,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
     req.targetHashB = c.targetHashB;
     req.pruneSymbolRuns = c.pruneSymbolRuns;
     req.pruneUnopenedBrackets = c.pruneUnopenedBrackets;
+    req.pruneWholeCandidate = c.pruneWholeCandidate;
     req.continuous = false;
 
     std::set<std::string> reported;
@@ -544,6 +550,140 @@ static bool scenarioPrefixBackslashes() {
         // maxBackslashCount != 0, but nothing in this range gets pruned - the reference agrees, that's fine
         ok &= runCase("4: leading value \"AA\" (no backslashes at all)", c);
     }
+    return ok;
+}
+
+// 6: pruneWholeCandidate - the rules checked at every character but the
+// last, so the backend leaves out rows, and whole row groups, of its trailing
+// part. Each range straddles a place where pruning starts or stops, with
+// targets on both sides; `expect` is what the test means each to be, and the
+// reference must agree before runSearch() is asked.
+struct WholeTarget {
+    uint64_t index;
+    bool survives;
+};
+static bool wholeCandidateCase(const std::string& what, const std::string& alphabet, const std::string& prefix, bool runs, bool brackets,
+                               int maxBackslash, int len, uint64_t first, uint64_t last, const std::vector<WholeTarget>& targets,
+                               bool somethingPruned = true) {
+    bool ok = true;
+    for (const WholeTarget& t : targets) {
+        CaseSpec c;
+        c.alphabet = alphabet;
+        c.prefix = prefix;
+        c.suffix = ".DAT";
+        c.pruneSymbolRuns = runs;
+        c.pruneUnopenedBrackets = brackets;
+        c.maxBackslashCount = maxBackslash;
+        c.pruneWholeCandidate = true;
+        c.lower = indexToString(first, len, alphabet);
+        c.upper = indexToString(last, len, alphabet);
+        const std::string target = indexToString(t.index, len, alphabet);
+        c.targetHashA = hashA(prefix + target + c.suffix);
+        c.requireBothPrunedAndChecked = somethingPruned;
+        const std::string label = "6: " + what + ", target '" + target + "' " + (t.survives ? "survives" : "is pruned (must NOT be found)");
+        const int leadingLen = len - trailingLenFor(len, (int) alphabet.size());
+        if (isPruned(target, leadingLen, runs, maxBackslash, brackets, prefix, true) == t.survives) {
+            fprintf(stderr, "TEST BUG in '%s': the reference disagrees about the target\n", label.c_str());
+            ++g_failures;
+            ok = false;
+            continue;
+        }
+        if (t.survives) {
+            c.mustBeFound = target;
+            c.targetHashB = hashB(prefix + target + c.suffix);
+            c.expectFound = target;
+        }
+        ok &= runCase(label, c);
+    }
+    return ok;
+}
+
+static bool scenarioPruneWholeCandidate() {
+    printf("=== 6: pruneWholeCandidate (every character but the last) ===\n");
+    bool ok = true;
+    // At least 5 characters, so that a rule can break at the row's own last
+    // character with room before it; at a window of 5 and more, one leading
+    // character, so that everything below is up to the backend.
+    const int len = std::max(g_window + 1, 5);
+    const std::string runsAlphabet = "!A &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV"; // '!' = 0, 'A' = 1
+    const uint64_t as = runsAlphabet.size();
+    uint64_t index = 0;
+    std::string error;
+
+    // A row pruned by its own last character - "AA!!!" followed by anything
+    // (at len 6) - between two that aren't: the one before ends in "!VVV",
+    // the one after is "AA!!A": its first candidate ends in "!!A!", fine.
+    stringToIndex(std::string(len - 4, 'A') + "!!!", runsAlphabet, index, error);
+    uint64_t row = index * as;
+    ok &= wholeCandidateCase("symbol runs, a pruned row", runsAlphabet, "TEST_", true, false, 0, len, row - 60, row + as + 60,
+                             {{row - 1, true}, {row, false}, {row + 7, false}, {row + as - 1, false}, {row + as, true}, {row + as + 5, true}});
+    // A pruned row group: "B!!!" followed by any row, at len 6 (where a
+    // group has characters of its own).
+    if (len >= 6) {
+        stringToIndex("B" + std::string(len - 6, 'A') + "!!!", runsAlphabet, index, error);
+        const uint64_t group = index * as * as;
+        ok &= wholeCandidateCase("symbol runs, a pruned row group", runsAlphabet, "TEST_", true, false, 0, len, group - 100, group + as * as + 100,
+                                 {{group - 1, true}, {group, false}, {group + as * as / 2, false}, {group + as * as - 1, false}, {group + as * as, true}});
+    }
+    // A run the leading characters start and the trailing ones finish: at a
+    // window of 5 and more, a leading "!" makes "!!!VVV" pruned in its first
+    // two trailing characters, while "!!AA!!", a little after it, survives.
+    stringToIndex("!!A" + std::string(len - 3, '!'), runsAlphabet, index, error);
+    uint64_t survivor = 0;
+    stringToIndex("!!AA" + std::string(len - 4, '!'), runsAlphabet, survivor, error);
+    ok &= wholeCandidateCase("symbol runs carried over from the leading characters", runsAlphabet, "TEST_", true, false, 0, len, index - 200,
+                             survivor + 200, {{index - 100, false}, {index - 1, false}, {survivor, true}});
+
+    // Brackets: ')' = 1. "BAAA)" followed by anything closes a bracket never
+    // opened; with the prefix's '(' open it doesn't, and "BAA))" does.
+    const std::string bracketAlphabet = "A) &'(+,-.!0123456789BCDEFGHIJKLMNOPQRSTUV";
+    stringToIndex("B" + std::string(len - 3, 'A') + ")", bracketAlphabet, index, error);
+    row = index * as;
+    ok &= wholeCandidateCase("unopened brackets, a pruned row", bracketAlphabet, "TEST_", false, true, 0, len, row - 60, row + as + 60,
+                             {{row - 1, true}, {row - as + 1, true}, {row, false}, {row + as - 1, false}, {row + as, true}});
+    // (Nothing in this range breaks a rule: every row closes one bracket at
+    // most, and a candidate's last character isn't checked.)
+    ok &= wholeCandidateCase("unopened brackets, the prefix's opened", bracketAlphabet, "TEST(", false, true, 0, len, row - 60, row + as + 60,
+                             {{row, true}, {row + 1, true}, {row + as - 1, true}}, false);
+    stringToIndex("B" + std::string(len - 4, 'A') + "))", bracketAlphabet, index, error);
+    row = index * as;
+    ok &= wholeCandidateCase("unopened brackets, one more than the prefix opened", bracketAlphabet, "TEST(", false, true, 0, len, row - 60,
+                             row + as + 60, {{row - as + 1, true}, {row, false}, {row + as - 1, false}, {row + as, true}});
+
+    // More brackets open than a row has characters to close them with: the
+    // prefix leaves six, "A" followed by closers throughout closes one fewer
+    // than the window at most - so nothing is pruned, however few of those
+    // six a backend thinks can matter.
+    {
+        stringToIndex("A" + std::string(len - 1, ')'), bracketAlphabet, index, error);
+        ok &= wholeCandidateCase("unopened brackets, more open than a row can close", bracketAlphabet, "TEST((((((", false, true, 0, len,
+                                 index - 200, index + 200, {{index, true}, {index - 1, true}, {index - as, true}}, false);
+    }
+
+    // Two leading values searched in one launch, each from its own state:
+    // "(" leaves a bracket open, "B" right after it doesn't - so the trailing
+    // parts of "B" that start with ')' are pruned, those of "(" not. A
+    // backend that pruned a launch's batches all with one batch's state
+    // would get one side wrong.
+    {
+        const std::string twoStates = ")A(B &'+,-.!0123456789CDEFGHIJKLMNOPQRSTUV"; // ')' = 0, 'A' = 1, '(' = 2, 'B' = 3
+        const int twoLen = g_window + 1; // one leading character
+        uint64_t T = 1;
+        for (int i = 0; i < g_window; ++i)
+            T *= twoStates.size();
+        uint64_t closerFirst = 0; // ")AAAA": the first trailing part not closing a second bracket
+        stringToIndex(")" + std::string(g_window - 1, 'A'), twoStates, closerFirst, error);
+        ok &= wholeCandidateCase("two leading values in one launch, each with its own state", twoStates, "TEST_", false, true, 0, twoLen,
+                                 3 * T - 200, 3 * T + closerFirst + 200,
+                                 {{3 * T - 1, true}, {3 * T - 150, true}, {3 * T, false}, {3 * T + closerFirst, false}});
+    }
+
+    // Backslashes, at most one: "AAA\\" followed by anything has two.
+    const std::string backslashAlphabet = "\\A &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV"; // '\\' = 0
+    stringToIndex(std::string(len - 3, 'A') + "\\\\", backslashAlphabet, index, error);
+    row = index * as;
+    ok &= wholeCandidateCase("maxBackslashCount, a pruned row", backslashAlphabet, "TEST\\", false, false, 1, len, row - 60, row + as + 60,
+                             {{row - 1, true}, {row, false}, {row + as - 1, false}, {row + as, true}});
     return ok;
 }
 
@@ -921,6 +1061,7 @@ static bool fuzz(int iterations, uint64_t seed) {
         if (!highBytes && uni(3) == 0) c.pruneSymbolRuns = true;
         if (!highBytes && uni(4) == 0) c.maxBackslashCount = 1 + (int) uni(3);
         if (uni(3) == 0) c.pruneUnopenedBrackets = true;
+        if (uni(2) == 0) c.pruneWholeCandidate = true;
 
         // Plant a target at a random position in the range (or none).
         if (uni(10) < 8) {
@@ -928,7 +1069,8 @@ static bool fuzz(int iterations, uint64_t seed) {
             advanceBy(planted, c.alphabet, uni(steps + 1));
             c.targetHashA = hashA(c.prefix + planted + c.suffix);
             int leadingLen = len - trailingLenFor(len, as);
-            bool survives = !isPruned(planted, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix);
+            bool survives = !isPruned(planted, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix,
+                                      c.pruneWholeCandidate);
             if (survives) c.mustBeFound = planted;
             if (uni(2) == 0) {
                 c.targetHashB = hashB(c.prefix + planted + c.suffix);
@@ -936,16 +1078,17 @@ static bool fuzz(int iterations, uint64_t seed) {
             }
         }
         char label[200];
-        snprintf(label, sizeof(label), "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d brackets=%d high=%d",
+        snprintf(label, sizeof(label), "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d brackets=%d whole=%d high=%d",
                  (unsigned long long) seed, it, as, len, (unsigned long long) n, pl, sl, c.pruneSymbolRuns, c.maxBackslashCount,
-                 c.pruneUnopenedBrackets, highBytes);
+                 c.pruneUnopenedBrackets, c.pruneWholeCandidate, highBytes);
         // An entirely-pruned range is a legitimate outcome here; skip the reference's "nothing survived" TEST BUG check for those.
         {
             int leadingLen = len - trailingLenFor(len, as);
             std::string cand = lower;
             bool anySurvives = false;
             for (uint64_t i = 0; i <= steps && !anySurvives; ++i) {
-                if (!isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix)) anySurvives = true;
+                if (!isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate))
+                    anySurvives = true;
                 stepCandidate(cand, c.alphabet);
             }
             if (!anySurvives) continue;
@@ -999,6 +1142,7 @@ int main(int argc, char** argv) {
     allPassed &= scenarioMaxBackslash();
     allPassed &= scenarioPruneUnopenedBrackets();
     allPassed &= scenarioPrefixBackslashes();
+    allPassed &= scenarioPruneWholeCandidate();
     allPassed &= scenarioSingleCandidate();
     allPassed &= scenarioGeometry();
     allPassed &= scenarioEveryLastCharacter();

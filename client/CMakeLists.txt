@@ -126,6 +126,7 @@ set(SEARCH_SOURCES
     src/backends/common/launch_waiter.cpp
     src/backends/common/lowbits_filter.cpp
     src/backends/common/row_batch.cpp
+    src/backends/common/row_pruning.cpp
     src/backends/cpu/cpu_backend.cpp
     src/backends/reference/reference_backend.cpp)
 if(NAMEBREAK_GPU STREQUAL "cuda")

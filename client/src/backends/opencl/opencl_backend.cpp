@@ -22,6 +22,7 @@
 #include "backends/common/launch_waiter.h"
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
+#include "backends/common/row_pruning.h"
 #include "backends/opencl/search_kernel.h" // generated from search.cl - see CMakeLists.txt
 #include "engine/hash_match.h"
 #include "engine/limits.h"
@@ -69,6 +70,8 @@ struct LaunchBatch {
     cl_int lastRowEndK;
     cl_uint seed1Start;
     cl_uint seed2Start;
+    cl_uint groupsOffset;
+    cl_uint groupCount;
 };
 struct Hit {
     cl_ulong trailingIdx;
@@ -80,7 +83,7 @@ struct BatchResults {
     cl_int unused;
     Hit hits[MAX_MATCHES];
 };
-static_assert(sizeof(LaunchBatch) == 24 && sizeof(Hit) == 16 && offsetof(BatchResults, hits) == 8,
+static_assert(sizeof(LaunchBatch) == 32 && sizeof(Hit) == 16 && offsetof(BatchResults, hits) == 8,
               "LaunchBatch, Hit and BatchResults must be laid out as in search.cl");
 // How many hits come back with the count, in the one read every launch needs.
 constexpr int kHitsReadWithCount = MAX_MATCHES < 16 ? MAX_MATCHES : 16;
@@ -114,6 +117,8 @@ public:
         }
         filterTable_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, kLowBitsFilterEntries * sizeof(cl_ulong), nullptr, &err);
         CL_CHECK(err);
+        rowMasks_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, kRowFlagCount * sizeof(cl_ulong), nullptr, &err);
+        CL_CHECK(err);
     }
 
     ~OpenClBackend() override {
@@ -121,8 +126,10 @@ public:
             clReleaseKernel(entry.second.kernel);
             clReleaseProgram(entry.second.program);
         }
-        for (cl_mem buffer : {results_, batches_, alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_, filterTable_})
+        for (cl_mem buffer : {results_, batches_, alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_, filterTable_, rowMasks_})
             clReleaseMemObject(buffer);
+        if (groups_)
+            clReleaseMemObject(groups_);
         clReleaseCommandQueue(queue_);
         clReleaseContext(context_);
     }
@@ -148,7 +155,8 @@ private:
         size_t workGroupSize;
     };
 
-    const CompiledKernel& kernelFor(int trailingLen);
+    const CompiledKernel& kernelFor(int trailingLen, bool listed);
+    void uploadGroups();
 
     cl_device_id device_;
     cl_context context_;
@@ -168,16 +176,34 @@ private:
     // This search's lookup filter: kLowBitsFilterEntries entries, see
     // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
     cl_mem filterTable_ = nullptr;
-    // Compiled once per (alphabet size, suffix length, trailing length) and
-    // kept for the backend's lifetime - a coordinator client searches range
-    // after range of the same shape, and each compile takes a moment.
-    std::map<std::tuple<int, int, int>, CompiledKernel> kernels_;
+    // Compiled once per (alphabet size, suffix length, trailing length,
+    // LISTED) and kept for the backend's lifetime - a coordinator client
+    // searches range after range of the same shape, and each compile takes a
+    // moment.
+    std::map<std::tuple<int, int, int, bool>, CompiledKernel> kernels_;
     bool announcedDevice_ = false;
 
     HitVerifier verifier_;
     int alphabetSize_ = 0;
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
+
+    // The row groups each batch searches (see backends/common/row_pruning.h),
+    // and their copy on the device: the first groupsUploaded_ entries of
+    // rowPruning_.arena(), of generation groupsGeneration_, in a buffer of
+    // groupsCapacity_ entries. Kept from one search to the next, as the
+    // lists are.
+    RowPruning rowPruning_;
+    cl_mem rowMasks_ = nullptr; // kRowFlagCount of them
+    cl_mem groups_ = nullptr;
+    size_t groupsCapacity_ = 0;
+    size_t groupsUploaded_ = 0;
+    uint64_t groupsGeneration_ = 0;
+    // Whether this search prunes the whole candidate, and the kernel walks
+    // lists of row groups (LISTED in search.cl): only then - a kernel that
+    // walks every group measured about 6% faster than one walking a list of
+    // them all.
+    bool listed_ = false;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -218,6 +244,11 @@ void OpenClBackend::beginSearch(const SearchConstants& constants) {
     CL_CHECK(clEnqueueWriteBuffer(queue_, alphabetOrd_, CL_TRUE, 0, ord.size() * sizeof(cl_uint), ord.data(), 0, nullptr, nullptr));
     CL_CHECK(clEnqueueWriteBuffer(queue_, suffixKey_, CL_TRUE, 0, suffixKey.size() * sizeof(cl_uint), suffixKey.data(), 0, nullptr, nullptr));
     CL_CHECK(clEnqueueWriteBuffer(queue_, suffixOrd_, CL_TRUE, 0, suffixOrd.size() * sizeof(cl_uint), suffixOrd.data(), 0, nullptr, nullptr));
+    listed_ = constants.trailingRules.any();
+    if (listed_) {
+        rowPruning_.begin(constants);
+        CL_CHECK(clEnqueueWriteBuffer(queue_, rowMasks_, CL_TRUE, 0, kRowFlagCount * sizeof(cl_ulong), rowPruning_.rowMasks(), 0, nullptr, nullptr));
+    }
     // Establishes the "matchCount is 0 at launch" invariant runBatches keeps.
     const cl_int zero = 0;
     CL_CHECK(clEnqueueWriteBuffer(queue_, results_, CL_TRUE, offsetof(BatchResults, matchCount), sizeof(zero), &zero, 0, nullptr, nullptr));
@@ -240,8 +271,8 @@ void OpenClBackend::beginSearch(const SearchConstants& constants) {
         refuseFilterTable("read back from the device differs from the one uploaded", std::to_string(tableBytes) + " bytes");
 }
 
-const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen) {
-    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen);
+const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, bool listed) {
+    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen, listed);
     auto found = kernels_.find(key);
     if (found != kernels_.end())
         return found->second;
@@ -254,7 +285,7 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen) {
                                 " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES) +
                                 " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
                                 " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits) +
-                                " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread);
+                                " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread) + " -DLISTED=" + (listed ? "1" : "0");
     if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
         size_t size = 0;
         clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);
@@ -278,6 +309,33 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen) {
     return kernels_.emplace(key, compiled).first->second;
 }
 
+// Brings the device's copy of the row groups' lists up to date with
+// rowPruning_.arena(), which only grows within a generation: only what was
+// added since goes up, unless the buffer is too small or the lists were
+// cleared. The write is blocking, and nothing is running on the device here
+// (runBatches waits for every launch before it returns).
+void OpenClBackend::uploadGroups() {
+    const std::vector<uint32_t>& arena = rowPruning_.arena();
+    if (rowPruning_.generation() != groupsGeneration_) {
+        groupsGeneration_ = rowPruning_.generation();
+        groupsUploaded_ = 0;
+    }
+    if (arena.size() > groupsCapacity_) {
+        if (groups_)
+            CL_CHECK(clReleaseMemObject(groups_));
+        groupsCapacity_ = std::max(arena.size(), 2 * groupsCapacity_);
+        cl_int err = CL_SUCCESS;
+        groups_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, groupsCapacity_ * sizeof(cl_uint), nullptr, &err);
+        CL_CHECK(err);
+        groupsUploaded_ = 0;
+    }
+    if (arena.size() > groupsUploaded_) {
+        CL_CHECK(clEnqueueWriteBuffer(queue_, groups_, CL_TRUE, groupsUploaded_ * sizeof(cl_uint), (arena.size() - groupsUploaded_) * sizeof(cl_uint),
+                                      arena.data() + groupsUploaded_, 0, nullptr, nullptr));
+        groupsUploaded_ = arena.size();
+    }
+}
+
 BatchOutcome OpenClBackend::runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) {
     return runBatches(trailingLen, {BatchRequest{start, count, params}});
 }
@@ -289,7 +347,7 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
         exit(1);
     }
     // Each batch's rows, cut to its range in its first and last row (see
-    // search.cl), and the most row groups any of them touches.
+    // search.cl), its row groups to search, and the most any of them has.
     uint64_t maxGroups = 0, candidates = 0;
     for (int b = 0; b < batchCount; ++b) {
         const RowRange rows = rowRangeFor(requests[b].start, requests[b].count, alphabetSize_);
@@ -305,10 +363,23 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
         batch.lastRowEndK = rows.lastRowEndK;
         batch.seed1Start = requests[b].params.seed1Start;
         batch.seed2Start = requests[b].params.seed2Start;
-        maxGroups = std::max<uint64_t>(maxGroups, batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1);
+        if (listed_) {
+            const RowPruning::Slice groups =
+                rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry, batch.firstRow / alphabetSize_, batch.lastRow / alphabetSize_);
+            batch.groupsOffset = groups.offset;
+            batch.groupCount = groups.count;
+            maxGroups = std::max<uint64_t>(maxGroups, groups.count);
+        } else {
+            maxGroups = std::max<uint64_t>(maxGroups, batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1);
+        }
         candidates += requests[b].count;
     }
-    const CompiledKernel& compiled = kernelFor(trailingLen);
+    // Every row of every batch pruned: nothing to launch.
+    if (maxGroups == 0)
+        return BatchOutcome();
+    if (listed_)
+        uploadGroups();
+    const CompiledKernel& compiled = kernelFor(trailingLen, listed_);
     cl_kernel kernel = compiled.kernel;
     // Not waited for: the queue runs it before the kernel, and hostBatches_
     // isn't touched again until this launch is done.
@@ -323,9 +394,11 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem), &suffixOrd_));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &filterTable_));
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_mem), &results_));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_mem), &groups_)); // null (allowed) until a search has lists
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &rowMasks_));
 
     // One row of work-groups per batch (dimension 1), and in it a work-item
-    // per chunk of every row group the batch touches (see CHUNKS_PER_GROUP
+    // per chunk of every row group the batch searches (see CHUNKS_PER_GROUP
     // in search.cl) - as many as the largest batch needs, rounded up to whole
     // work-groups. The kernel works out each batch's chunks itself and covers
     // all of them whatever the global size, so this only spreads the work.

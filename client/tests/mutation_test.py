@@ -73,6 +73,7 @@ CL_HOST = "src/backends/opencl/opencl_backend.cpp"
 MTL_KERNEL = "src/backends/metal/search.metal"
 MTL_HOST = "src/backends/metal/metal_backend.mm"
 CPU = "src/backends/cpu/cpu_backend.cpp"
+PRUNING = "src/backends/common/row_pruning.cpp"
 
 
 @dataclass
@@ -92,12 +93,52 @@ WRONG_TARGET = Mutation("wrongtarget", "the table built for the wrong target",
                         [(FILTER, "const Lane targetA = (Lane) constants.targetHashA;",
                           "const Lane targetA = (Lane) (constants.targetHashA ^ 1);")])
 
+# The lists of row groups a search that prunes the whole candidate searches
+# (backends/common/row_pruning.cpp), shared by the GPU backends.
+ROW_PRUNING_MUTATIONS = [
+    Mutation("groupsunpruned", "no row group left out of a list",
+             [(PRUNING, "if (pruneStep_CPU(rules_, state[depth + 1], alphabet_[digit[depth]])) {",
+               "if (pruneStep_CPU(rules_, state[depth + 1], alphabet_[digit[depth]]) || true) {")]),
+    Mutation("runflag", "a row whose own last character makes a symbol run of 3 not left out",
+             [(PRUNING, "if (rules.symbolRuns && state.symbolRun >= 2)", "if (rules.symbolRuns && state.symbolRun >= 3)")]),
+    Mutation("closerrow", "the rows of '(' left out where those of ')' should be",
+             [(PRUNING, "((flags & kNoRoundCloser) && c == ')')", "((flags & kNoRoundCloser) && c == '(')")]),
+    Mutation("sliceend", "a batch's slice of its list one row group short at its end",
+             [(PRUNING, "std::upper_bound(lo, end, lastGroup,", "std::upper_bound(lo, end, lastGroup - 1,")]),
+    Mutation("slicestart", "a batch's slice of its list one row group short at its start",
+             [(PRUNING, "std::lower_bound(begin, end, firstGroup,", "std::lower_bound(begin, end, firstGroup + 1,")]),
+    # Only a search that leaves more brackets open before its trailing part
+    # than that has characters to close them can tell.
+    Mutation("bracketclamp", "an entry state's open brackets counted one fewer than they can matter",
+             [(PRUNING, "std::min(entry.open.round, reach)", "std::min(entry.open.round, reach - 1)")],
+             caught_by=("integration",)),
+    # Only a backend that keeps its copy of the lists between searches can
+    # tell; the self-test's cases have two alphabets, the others many.
+    Mutation("nogeneration", "the lists cleared for another alphabet without a backend being told",
+             [(PRUNING, "    lists_.clear();\n    ++generation_;", "    lists_.clear();")]),
+]
+
+# The engine's side of pruning the whole candidate: the self-test tests a
+# backend without the engine.
+ENGINE_PRUNING_MUTATIONS = [
+    Mutation("wholeoff", "the backend never told to prune the whole candidate",
+             [(ENGINE, "if (req.pruneWholeCandidate)\n        constants.trailingRules = rules;",
+               "if (false)\n        constants.trailingRules = rules;")],
+             caught_by=("integration", "stress")),
+    Mutation("noentry", "every batch's rules started as if there were no leading characters",
+             [(ENGINE, "params.pruneEntry = pruneEntry;", "params.pruneEntry = candidateStart;")],
+             caught_by=("integration", "stress")),
+]
+
 CUDA_MUTATIONS = [
     # The lookup filter's mask.
     Mutation("mask32", "a row's mask cut to 32 bits",
              [(KERNEL, "mask &= (uint64_t(1) << AlphabetSize) - 1;", "mask &= 0xFFFFFFFFull;")]),
     Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
-             [(KERNEL, "bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]", "bufs.filterTable[lowBitsFilterIndex(seed2, seed1)]")]),
+             [(KERNEL, "? __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]) : 0;",
+               "? __ldg(&bufs.filterTable[lowBitsFilterIndex(seed2, seed1)]) : 0;"),
+              (KERNEL, "mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);",
+               "mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed2, seed1)]);")]),
     Mutation("lastrow", "a launch's last row one candidate short",
              [(KERNEL, "mask &= (uint64_t(1) << lastRowEndK) - 1;", "mask &= (uint64_t(1) << (lastRowEndK - 1)) - 1;")]),
     Mutation("firstrow", "a launch's first row one candidate short",
@@ -172,14 +213,37 @@ CUDA_MUTATIONS = [
     Mutation("firstbatchgrid", "only as many threads as the first batch needs", expect="harmless",
              edits=[(KERNEL, "maxGroups = std::max(maxGroups, lastRow / alphabetSize - firstRow / alphabetSize + 1);",
                      "maxGroups = b == 0 ? lastRow / alphabetSize - firstRow / alphabetSize + 1 : maxGroups;")]),
-]
+    # Pruning the whole candidate: the lists of row groups, and the rows of each.
+    Mutation("notlisted", "the whole candidate never pruned",
+             [(KERNEL, "listed_ = constants.trailingRules.any();", "listed_ = false;")]),
+    Mutation("listoffset", "every batch searching the list from the start of all of them",
+             [(KERNEL, "const uint32_t* groups = bufs.groups + batch.groupsOffset;", "const uint32_t* groups = bufs.groups;")]),
+    Mutation("listcount", "a batch's list's last chunk never searched",
+             [(KERNEL, "(uint64_t) batch.groupCount * kChunks;", "(uint64_t) batch.groupCount * kChunks - 1;")]),
+    Mutation("listgroup", "a list entry's group read with its flags' top bit",
+             [(KERNEL, "searchChunk<AlphabetSize, SuffixLen, true>(entry >> kRowFlagBits,",
+               "searchChunk<AlphabetSize, SuffixLen, true>(entry >> (kRowFlagBits - 1),")]),
+    Mutation("rowflags", "every list entry's flags taken as none",
+             [(KERNEL, "sRowMasks[entry & (kRowFlagCount - 1)]", "sRowMasks[0]")]),
+    Mutation("rowbit", "a row pruned or not by the next row's bit",
+             [(KERNEL, "((rowMask >> d) & 1) ?", "((rowMask >> (d + 1)) & 1) ?")]),
+    # Only a launch whose batches start in different states can tell - the
+    # stress test's random ranges rarely give one.
+    Mutation("sliceentry", "every batch of a launch pruned as the first one",
+             [(KERNEL, "rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry,",
+               "rowPruning_.groupsFor(trailingLen, requests[0].params.pruneEntry,")],
+             caught_by=("self-test", "integration")),
+    Mutation("stalelists", "the lists on the GPU kept when they're cleared for another alphabet",
+             [(KERNEL, "if (rowPruning_.generation() != groupsGeneration_) {", "if (false) {")]),
+] + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS
 
 OPENCL_MUTATIONS = [
     # The lookup filter's mask.
     Mutation("mask32", "a row's mask cut to 32 bits",
              [(CL_KERNEL, "mask &= (1UL << ALPHABET_SIZE) - 1UL;", "mask &= 0xFFFFFFFFUL;")]),
     Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
-             [(CL_KERNEL, "ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];", "ulong mask = filterTable[FILTER_INDEX(seed2, seed1)];")]),
+             [(CL_KERNEL, "ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];", "ulong mask = filterTable[FILTER_INDEX(seed2, seed1)];"),
+              (CL_KERNEL, "? filterTable[FILTER_INDEX(seed1, seed2)] : 0UL;", "? filterTable[FILTER_INDEX(seed2, seed1)] : 0UL;")]),
     Mutation("indexshift", "the kernel's table index shifting seed2's bits one too far",
              [(CL_KERNEL, "(((seed2) & FILTER_STATE_MASK) << FILTER_BITS))", "(((seed2) & FILTER_STATE_MASK) << (FILTER_BITS + 1)))")]),
     Mutation("filterbits", "the kernel compiled for a table one bit narrower",
@@ -255,7 +319,30 @@ OPENCL_MUTATIONS = [
     Mutation("firstbatchgrid", "only as many work-items as the first batch needs", expect="harmless",
              edits=[(CL_HOST, "maxGroups = std::max<uint64_t>(maxGroups, batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1);",
                      "maxGroups = b == 0 ? batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1 : maxGroups;")]),
-]
+    # Pruning the whole candidate: the lists of row groups, and the rows of each.
+    Mutation("notlisted", "the whole candidate never pruned",
+             [(CL_HOST, "listed_ = constants.trailingRules.any();", "listed_ = false;")]),
+    Mutation("listedflag", "the kernel compiled to walk every row group, with the whole candidate pruned",
+             [(CL_HOST, '" -DLISTED=" + (listed ? "1" : "0");', '" -DLISTED=0";')]),
+    Mutation("listoffset", "every batch searching the list from the start of all of them",
+             [(CL_KERNEL, "__global const uint* batchGroups = groups + batch.groupsOffset;", "__global const uint* batchGroups = groups;")]),
+    Mutation("listcount", "a batch's list's last chunk never searched",
+             [(CL_KERNEL, "(ulong) batch.groupCount * CHUNKS_PER_GROUP;", "(ulong) batch.groupCount * CHUNKS_PER_GROUP - 1;")]),
+    Mutation("listgroup", "a list entry's group read with its flags' top bit",
+             [(CL_KERNEL, "const uint group = entry >> ROW_FLAG_BITS;", "const uint group = entry >> (ROW_FLAG_BITS - 1);")]),
+    Mutation("rowflags", "every list entry's flags taken as none",
+             [(CL_KERNEL, "sRowMasks[entry & (ROW_FLAG_COUNT - 1)]", "sRowMasks[0]")]),
+    Mutation("rowbit", "a row pruned or not by the next row's bit",
+             [(CL_KERNEL, "((rowMask >> d) & 1UL) ?", "((rowMask >> (d + 1)) & 1UL) ?")]),
+    # Only a launch whose batches start in different states can tell - the
+    # stress test's random ranges rarely give one.
+    Mutation("sliceentry", "every batch of a launch pruned as the first one",
+             [(CL_HOST, "rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry,",
+               "rowPruning_.groupsFor(trailingLen, requests[0].params.pruneEntry,")],
+             caught_by=("self-test", "integration")),
+    Mutation("stalelists", "the lists on the device kept when they're cleared for another alphabet",
+             [(CL_HOST, "if (rowPruning_.generation() != groupsGeneration_) {", "if (false) {")]),
+] + ROW_PRUNING_MUTATIONS
 
 # The Metal ones can only be run on a Mac (--backend metal).
 METAL_MUTATIONS = [
@@ -263,7 +350,8 @@ METAL_MUTATIONS = [
     Mutation("mask32", "a row's mask cut to 32 bits",
              [(MTL_KERNEL, "mask &= (1ul << ALPHABET_SIZE) - 1ul;", "mask &= 0xFFFFFFFFul;")]),
     Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
-             [(MTL_KERNEL, "ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];", "ulong mask = filterTable[FILTER_INDEX(seed2, seed1)];")]),
+             [(MTL_KERNEL, "ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];", "ulong mask = filterTable[FILTER_INDEX(seed2, seed1)];"),
+              (MTL_KERNEL, "? filterTable[FILTER_INDEX(seed1, seed2)] : 0ul;", "? filterTable[FILTER_INDEX(seed2, seed1)] : 0ul;")]),
     Mutation("indexshift", "the kernel's table index shifting seed2's bits one too far",
              [(MTL_KERNEL, "(((seed2) & FILTER_STATE_MASK) << FILTER_BITS))", "(((seed2) & FILTER_STATE_MASK) << (FILTER_BITS + 1)))")]),
     Mutation("filterbits", "the kernel compiled for a table one bit narrower",
@@ -317,14 +405,31 @@ METAL_MUTATIONS = [
     Mutation("extragroup", "a whole threadgroup too many launched", expect="harmless",
              edits=[(MTL_HOST, "const NSUInteger threadgroups = (chunks + threadgroupSize - 1) / threadgroupSize;",
                      "const NSUInteger threadgroups = (chunks + threadgroupSize - 1) / threadgroupSize + 1;")]),
-]
+    # Pruning the whole candidate: the lists of row groups, and the rows of each.
+    Mutation("notlisted", "the whole candidate never pruned",
+             [(MTL_HOST, "listed_ = constants.trailingRules.any();", "listed_ = false;")]),
+    Mutation("listedflag", "the kernel compiled to walk every row group, with the whole candidate pruned",
+             [(MTL_HOST, '@"LISTED": @(listed ? 1 : 0),', '@"LISTED": @(0),')]),
+    Mutation("listoffset", "the batch searching the list from the start of all of them",
+             [(MTL_KERNEL, "device const uint* batchGroups = groups + args.groupsOffset;", "device const uint* batchGroups = groups;")]),
+    Mutation("listcount", "the batch's list's last chunk never searched",
+             [(MTL_KERNEL, "(ulong) args.groupCount * CHUNKS_PER_GROUP;", "(ulong) args.groupCount * CHUNKS_PER_GROUP - 1;")]),
+    Mutation("listgroup", "a list entry's group read with its flags' top bit",
+             [(MTL_KERNEL, "const uint group = entry >> ROW_FLAG_BITS;", "const uint group = entry >> (ROW_FLAG_BITS - 1);")]),
+    Mutation("rowflags", "every list entry's flags taken as none",
+             [(MTL_KERNEL, "sRowMasks[entry & (ROW_FLAG_COUNT - 1)]", "sRowMasks[0]")]),
+    Mutation("rowbit", "a row pruned or not by the next row's bit",
+             [(MTL_KERNEL, "((rowMask >> d) & 1ul) ?", "((rowMask >> (d + 1)) & 1ul) ?")]),
+    Mutation("stalelists", "the lists on the GPU kept when they're cleared for another alphabet",
+             [(MTL_HOST, "if (rowPruning_.generation() != groupsGeneration_) {", "if (false) {")]),
+] + ROW_PRUNING_MUTATIONS
 
 # The CPU backend: the same filter, its own row walk, and its rows shared out
 # among its threads as work items.
 CPU_MUTATIONS = [
     # The lookup filter's mask.
     Mutation("mask32", "a row's mask cut to 32 bits",
-             [(CPU, "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask;", "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask & 0xFFFFFFFFull;")]),
+             [(CPU, "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask : 0;", "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask & 0xFFFFFFFFull : 0;")]),
     Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
              [(CPU, "ctx.table[lowBitsFilterIndex(s1, s2)]", "ctx.table[lowBitsFilterIndex(s2, s1)]")]),
     Mutation("lastrow", "a batch's last row one candidate short",
@@ -368,7 +473,14 @@ CPU_MUTATIONS = [
              edits=[(CPU, "(totalRows + threads * 8 - 1) / (threads * 8)", "(totalRows + threads * 2 - 1) / (threads * 2)")]),
     Mutation("onethread", "every call searched on one thread", expect="harmless",
              edits=[(CPU, "    threads = std::min<uint64_t>(threads, totalRows);", "    threads = 1;")]),
-]
+    # Pruning the whole candidate: which rows the row walk searches.
+    Mutation("cpunoprune", "every row searched, with the whole candidate pruned",
+             [(CPU, "uint64_t mask = valid[ctx.prefixDigits] ? ctx.table", "uint64_t mask = true ? ctx.table")]),
+    Mutation("cpuentry", "the rules started as if there were no leading characters",
+             [(CPU, "pruneState[0] = ctx.pruneEntry;", "pruneState[0] = PruneState();")]),
+    Mutation("cpucarry", "a row's characters checked each on their own, not after those before them",
+             [(CPU, "valid[d + 1] = valid[d] && pruneStep_CPU(", "valid[d + 1] = pruneStep_CPU(")]),
+] + ENGINE_PRUNING_MUTATIONS
 
 # Per backend: how to build it, what its createBackend name is, and its mutations.
 BACKENDS = {

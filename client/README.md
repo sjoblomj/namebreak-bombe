@@ -125,6 +125,7 @@ resume_from_last_candidate = true
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex (`0x` prefix optional). |
 | `prune_symbol_runs` | no (default `false`) | Skip candidates containing 3+ consecutive non-alphanumeric, non-space characters (real MPQ filenames essentially never have runs like that) - see [Design decisions](#design-decisions). |
 | `prune_unopened_brackets` | no (default `false`) | Skip candidates that close a bracket never opened: reading left to right, a `)` at a point where more `)` than `(` have been seen, or likewise a `]` with `[`. The two kinds are counted separately (how they nest within each other isn't checked). Brackets left open by `prefix` count as opened, so a candidate may close those - see [Design decisions](#design-decisions). |
+| `prune_whole_candidate` | no (default `false`) | Apply `prune_symbol_runs`, `prune_unopened_brackets` and `max_backslash_count` to every character of a candidate but the last, instead of only to its leading characters (all but the last five or so). About a fifth fewer candidates are searched, and a search is about 10% faster on a GPU - see [Design decisions](#design-decisions). |
 
 `[coordinator]` keys (`coordinator` mode only) are `server_url` (required),
 plus optional `username`, `hostname` (auto-detected and interactively
@@ -205,7 +206,7 @@ compile of the CUDA backend - the build runs them in parallel.
 `cmake --build --preset default --target run_search_bench` times the real
 search over a fixed range (`build/tests/search_bench --scale <n>` for a
 longer one), pruning as the real configuration does (`--prune symbols` or
-`none` for less). It reports the range covered per second, the rate at
+`none` for less, `--whole` to prune the whole candidate). It reports the range covered per second, the rate at
 which the backend searched what pruning left, and a projection for a real
 search, whose leading characters all vary - the timed range only varies
 its last few, so it prunes far less than a real search would. The
@@ -394,7 +395,8 @@ So the window stayed at 5, and a launch searches 16 leading values instead
 (see below): the GPU now idles 1.6% of the time, and the search got about
 7% faster. Note the window
 also decides how much `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count`
-can see (they only examine the leading characters, see below): a larger window means fewer
+can see, unless `prune_whole_candidate` is on (they otherwise only examine the leading
+characters, see below): a larger window means fewer
 characters are pruned on, so those settings skip slightly fewer
 candidates than they did at a window of 4 (never more).
 
@@ -817,6 +819,22 @@ its short ranges were cut into work items a row long, each decoded afresh -
 so a row walk wrapping its characters one early got past it; it now also
 searches a range three row groups long, and finds a candidate a few rows
 into it, in the last row of a group.
+Pruning the whole candidate (see [Design
+decisions](#design-decisions)) added mutations of its own: in the host's
+lists of row groups (none left out, a flag or a row mask wrong, a batch's
+slice one group short at either end, lists cleared without the backend
+noticing), in each kernel's walk of them (the wrong offset, count, group
+or flags, a row's bit taken from the next row), in each backend's upload
+and state, in the CPU backend's row walk, and in the engine (the backend
+never told, or every batch started as if there were no leading
+characters). Their first run found two gaps, both in how a launch's
+batches get their states: pruning every batch with the first batch's
+state, and counting one bracket too few of those the leading characters
+leave open, got past every check but the self-test (the first) or all of
+them (the second). The integration test now searches two leading values
+in one launch, one leaving a bracket open and the next not, and a search
+whose prefix leaves more brackets open than a row can close; each catches
+its mutation.
 `tests/self_test_test.cpp` does the same for the self-test on the CPU
 backends, on every `ctest` run.
 
@@ -872,9 +890,56 @@ nothing in the trailing window can change that - it just never looks at a
 stray closer that only appears in the trailing window.
 
 Those measurements were of the kernel as it was before the lookup filter,
-when a check had to be paid on every candidate. With the filter, leaving
-out a last character the rules reject costs one AND on a row's mask, and
-applying the rules to the whole candidate would skip about a fifth more of
-it at every length (worked out exactly for the real alphabet, with both
-rules on). But that changes which candidates a search covers - so it's a
-decision rather than a speedup; see [PERFORMANCE.md](PERFORMANCE.md).
+when a check had to be paid on every candidate - and a check in the kernel
+still saves nothing unless a whole warp can skip the work together.
+
+### `prune_whole_candidate`: the rules on every character but the last
+
+With `prune_whole_candidate` (a `[search]` key, or a target setting sent
+with every claim - see the coordinator README), the three rules apply to
+every character of a candidate but its last. The leading characters are
+checked on the CPU as before; the rest are left to the backend, which
+doesn't check them candidate by candidate but leaves whole rows and row
+groups out of what it searches:
+
+- Whether a candidate breaks a rule at a trailing character depends only on
+  the trailing characters before it and on the state the leading ones left
+  - the symbol run so far, the brackets open, the backslashes used. For
+  each such state (32 occur in a real search: 470 KB of list each, 15 MB
+  in all), the host
+  lists the row groups that survive, and for each, which of its rows do: a
+  flag for each rule its characters have used up (no symbol, no `)`, no
+  `]`, no `\` allowed next), which stands for a set of the rows' own last
+  characters (`backends/common/row_pruning.h`). A list depends only on the
+  alphabet, the rules, the trailing length and that state, so it's built the
+  first time a batch needs it, uploaded once, and kept for the next search.
+- The GPU kernels walk the batch's list instead of every row group, so a
+  pruned group costs nothing. A pruned row, inside a group that isn't,
+  still takes its turn - the lanes of a warp step through their rows
+  together, so skipping one would save its lane only idle time - but gets
+  no candidates. A kernel walking a list measured about 5% slower (CUDA;
+  6% OpenCL) than one walking every group, so a search that doesn't prune
+  the whole candidate gets the kernel that walks every group, as before -
+  the kernels are compiled both ways. The CPU backend checks its rows as it
+  walks them, and skips the pruned ones.
+- A candidate's last character is never checked. Skipping one would save
+  nothing - its row is hashed anyway, and at most a few of its candidates
+  get past the lookup filter - so every candidate a row has is searched,
+  whatever its last character. That the last character is left out is part
+  of what the setting means, so that every backend searches exactly the
+  same candidates.
+
+That skips about a fifth more of the candidate space at every length than
+pruning only the leading characters (worked out exactly for the real
+alphabet, both rules on - see [PERFORMANCE.md](PERFORMANCE.md)): 33.4% of
+all 10-character candidates instead of 20.3%. Measured with `search_bench
+--whole` on the RTX 3080 Ti Laptop, a real search's projected rate goes up
+about 11% on CUDA and 10% on OpenCL: less than the fifth fewer candidates,
+because of the list-walking kernel's 5-6% and the pruned rows that still
+take their turn. Of the 6,406 file names (without extension) of the
+StarCraft listfile in `tests/data`, one breaks a rule before its last
+character (`STAREDIT\WAV\STEAL!  THE!  BEACON!!!!.WAV`); none only at it.
+It changes which candidates a search covers, so it's a setting - and every
+client searching a target has to agree on it, which is why a target has
+it: a client too old to know it searches as if it were off, more than it
+has to, never less.

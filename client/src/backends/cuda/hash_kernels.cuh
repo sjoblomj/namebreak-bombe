@@ -31,5 +31,9 @@ __device__ __constant__ short d_suffix_size;
 __device__ __constant__ uint32_t d_alphabetKey[MAX_ALPHABET_SIZE];
 __device__ __constant__ uint32_t d_alphabetOrd[MAX_ALPHABET_SIZE];
 __device__ __constant__ uint32_t d_suffixKey[kMaxSuffixSize];
+// The row masks of this search's row pruning (RowPruning::rowMasks,
+// backends/common/row_pruning.h): the last row characters an entry of a
+// group list allows, by the entry's flags.
+__device__ __constant__ uint64_t d_rowMasks[16];
 
 #endif // NAMEBREAK_BACKENDS_CUDA_HASH_KERNELS_CUH

@@ -19,6 +19,7 @@
 
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
+#include "backends/common/row_pruning.h"
 #include "backends/metal/search_kernel.h" // generated from search.metal - see CMakeLists.txt
 #include "engine/hash_match.h"
 #include "engine/limits.h"
@@ -45,6 +46,8 @@ struct RowArgs {
     uint32_t targetA;
     uint32_t seed1Start;
     uint32_t seed2Start;
+    uint32_t groupsOffset;
+    uint32_t groupCount;
 };
 
 class MetalBackend : public SearchBackend {
@@ -61,7 +64,12 @@ public:
         suffixKey_ = [device_ newBufferWithLength:kMaxSuffixSize * sizeof(uint32_t) options:shared];
         suffixOrd_ = [device_ newBufferWithLength:kMaxSuffixSize * sizeof(uint32_t) options:shared];
         filterTable_ = [device_ newBufferWithLength:kLowBitsFilterEntries * sizeof(uint64_t) options:shared];
-        if (!queue_ || !matchCount_ || !matchIdx_ || !alphabetKey_ || !alphabetOrd_ || !suffixKey_ || !suffixOrd_ || !filterTable_) {
+        rowMasks_ = [device_ newBufferWithLength:kRowFlagCount * sizeof(uint64_t) options:shared];
+        // Bound to the kernel even when it doesn't read it (LISTED 0), so it
+        // always exists; grown when a search's lists need more.
+        groups_ = [device_ newBufferWithLength:sizeof(uint32_t) options:shared];
+        if (!queue_ || !matchCount_ || !matchIdx_ || !alphabetKey_ || !alphabetOrd_ || !suffixKey_ || !suffixOrd_ || !filterTable_ ||
+            !rowMasks_ || !groups_) {
             fprintf(stderr, "Metal: couldn't allocate the search's buffers\n");
             exit(1);
         }
@@ -82,7 +90,8 @@ public:
     void endSearch() override {}
 
 private:
-    id<MTLComputePipelineState> pipelineFor(int trailingLen);
+    id<MTLComputePipelineState> pipelineFor(int trailingLen, bool listed);
+    void uploadGroups();
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
@@ -91,16 +100,30 @@ private:
     // This search's lookup filter: kLowBitsFilterEntries entries, see
     // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
     id<MTLBuffer> filterTable_;
-    // Compiled once per (alphabet size, suffix length, trailing length) and
-    // kept for the backend's lifetime - a coordinator client searches range
-    // after range of the same shape, and each compile takes a moment.
-    std::map<std::tuple<int, int, int>, id<MTLComputePipelineState>> pipelines_;
+    // Compiled once per (alphabet size, suffix length, trailing length,
+    // LISTED) and kept for the backend's lifetime - a coordinator client
+    // searches range after range of the same shape, and each compile takes a
+    // moment.
+    std::map<std::tuple<int, int, int, bool>, id<MTLComputePipelineState>> pipelines_;
     bool announcedDevice_ = false;
 
     HitVerifier verifier_;
     int alphabetSize_ = 0;
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
+
+    // The row groups a batch searches when the whole candidate is pruned
+    // (see backends/common/row_pruning.h), and their copy in groups_: the
+    // first groupsUploaded_ entries of rowPruning_.arena(), of generation
+    // groupsGeneration_. Kept from one search to the next, as the lists are.
+    // Only then does the kernel walk lists (LISTED in search.metal) - the
+    // CUDA and OpenCL kernels walking every group measured 5-6% faster than
+    // walking a list of them all.
+    RowPruning rowPruning_;
+    bool listed_ = false;
+    id<MTLBuffer> rowMasks_, groups_;
+    size_t groupsUploaded_ = 0;
+    uint64_t groupsGeneration_ = 0;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -144,6 +167,11 @@ void MetalBackend::beginSearch(const SearchConstants& constants) {
     }
     // Establishes the "matchCount is 0 at launch" invariant runBatch keeps.
     *static_cast<int32_t*>(matchCount_.contents) = 0;
+    listed_ = constants.trailingRules.any();
+    if (listed_) {
+        rowPruning_.begin(constants);
+        memcpy(rowMasks_.contents, rowPruning_.rowMasks(), kRowFlagCount * sizeof(uint64_t));
+    }
 
     // This search's lookup filter - it depends on the alphabet, the suffix and
     // the target, so it's built for every search. Checked against its
@@ -161,8 +189,34 @@ void MetalBackend::beginSearch(const SearchConstants& constants) {
         refuseFilterTable("in the GPU's buffer differs from the one built", std::to_string(tableBytes) + " bytes");
 }
 
-id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen) {
-    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen);
+// Brings groups_ up to date with rowPruning_.arena(), which only grows within
+// a generation: only what was added since is copied, unless the buffer is too
+// small or the lists were cleared. Nothing is running on the GPU here
+// (runBatch waits for its command buffer before it returns).
+void MetalBackend::uploadGroups() {
+    const std::vector<uint32_t>& arena = rowPruning_.arena();
+    if (rowPruning_.generation() != groupsGeneration_) {
+        groupsGeneration_ = rowPruning_.generation();
+        groupsUploaded_ = 0;
+    }
+    const size_t capacity = groups_.length / sizeof(uint32_t);
+    if (arena.size() > capacity) {
+        groups_ = [device_ newBufferWithLength:std::max(arena.size(), 2 * capacity) * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        if (!groups_) {
+            fprintf(stderr, "Metal: couldn't allocate the row groups' lists (%zu entries)\n", arena.size());
+            exit(1);
+        }
+        groupsUploaded_ = 0;
+    }
+    if (arena.size() > groupsUploaded_) {
+        memcpy(static_cast<uint32_t*>(groups_.contents) + groupsUploaded_, arena.data() + groupsUploaded_,
+               (arena.size() - groupsUploaded_) * sizeof(uint32_t));
+        groupsUploaded_ = arena.size();
+    }
+}
+
+id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen, bool listed) {
+    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen, listed);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end())
         return found->second;
@@ -177,6 +231,7 @@ id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen) {
             @"HASHA_MATCH_MASK": @(kHashAMatchMask),
             @"FILTER_BITS": @(kLowBitsFilterBits),
             @"ROWS_PER_THREAD": @(kRowsPerThread),
+            @"LISTED": @(listed ? 1 : 0),
         };
         NSError* error = nil;
         id<MTLLibrary> library = [device_ newLibraryWithSource:@(kSearchKernelSource) options:options error:&error];
@@ -208,8 +263,6 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
                 (unsigned long long) rows.firstRow, (unsigned long long) (rows.firstRow + rows.rowCount - 1));
         exit(1);
     }
-    id<MTLComputePipelineState> pipeline = pipelineFor(trailingLen);
-
     RowArgs args;
     args.firstRow = (uint32_t) rows.firstRow;
     args.lastRow = (uint32_t) (rows.firstRow + rows.rowCount - 1);
@@ -218,6 +271,22 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
     args.targetA = targetA_;
     args.seed1Start = params.seed1Start;
     args.seed2Start = params.seed2Start;
+    // The row groups to search: all those the rows touch, or with the whole
+    // candidate pruned, those of them in the batch's list.
+    NSUInteger groupCount = args.lastRow / alphabetSize_ - args.firstRow / alphabetSize_ + 1;
+    args.groupsOffset = 0;
+    args.groupCount = 0;
+    if (listed_) {
+        const RowPruning::Slice groups =
+            rowPruning_.groupsFor(trailingLen, params.pruneEntry, args.firstRow / alphabetSize_, args.lastRow / alphabetSize_);
+        args.groupsOffset = groups.offset;
+        args.groupCount = groups.count;
+        groupCount = groups.count;
+        if (groupCount == 0)
+            return BatchOutcome(); // every row pruned: nothing to launch
+        uploadGroups();
+    }
+    id<MTLComputePipelineState> pipeline = pipelineFor(trailingLen, listed_);
 
     @autoreleasepool {
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
@@ -231,13 +300,15 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
         [encoder setBuffer:matchCount_ offset:0 atIndex:5];
         [encoder setBuffer:matchIdx_ offset:0 atIndex:6];
         [encoder setBuffer:filterTable_ offset:0 atIndex:7];
-        // A thread per chunk of every row group the batch touches (see
+        [encoder setBuffer:groups_ offset:0 atIndex:8];
+        [encoder setBuffer:rowMasks_ offset:0 atIndex:9];
+        // A thread per chunk of every row group the batch searches (see
         // CHUNKS_PER_GROUP in search.metal), rounded up to whole threadgroups.
         // The kernel works out the chunks itself and covers all of them
         // whatever the grid's size, so this only spreads the work.
         const NSUInteger threadgroupSize = std::min(kPreferredThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
         const NSUInteger chunksPerGroup = (NSUInteger) (alphabetSize_ + kRowsPerThread - 1) / kRowsPerThread;
-        const NSUInteger chunks = (NSUInteger) (args.lastRow / alphabetSize_ - args.firstRow / alphabetSize_ + 1) * chunksPerGroup;
+        const NSUInteger chunks = groupCount * chunksPerGroup;
         const NSUInteger threadgroups = (chunks + threadgroupSize - 1) / threadgroupSize;
         [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupSize, 1, 1)];
         [encoder endEncoding];

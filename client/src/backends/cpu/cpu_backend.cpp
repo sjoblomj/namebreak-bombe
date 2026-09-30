@@ -67,11 +67,14 @@ struct BatchContext {
     const uint32_t* ord;       // the character itself
     const uint32_t* suffixKey; // suffixLen entries
     const uint32_t* suffixOrd;
+    const char* alphabet;      // the characters themselves, for the pruning rules
     const uint64_t* table;     // this search's lookup filter (backends/common/lowbits_filter.h)
     RowRange rows;
     int prefixDigits;          // trailingLen - 1: the characters a row shares
     uint32_t seed1Start;
     uint32_t seed2Start;
+    const PruneRules* rules;   // SearchConstants::trailingRules
+    PruneState pruneEntry;     // BatchParams::pruneEntry
 };
 
 void record(ThreadHits& found, int batch, uint64_t trailingIndex) {
@@ -104,11 +107,22 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
     std::vector<uint32_t> state1(ctx.prefixDigits + 1), state2(ctx.prefixDigits + 1);
     state1[0] = ctx.seed1Start;
     state2[0] = ctx.seed2Start;
+    // And, when the whole candidate is pruned, the rules' state after the
+    // first d of them - a row is searched only if none of its characters
+    // breaks a rule (valid[prefixDigits]).
+    const bool pruning = ctx.rules->any();
+    std::vector<PruneState> pruneState(ctx.prefixDigits + 1);
+    std::vector<char> valid(ctx.prefixDigits + 1, 1);
+    pruneState[0] = ctx.pruneEntry;
     auto rehashFrom = [&](int d) {
         for (; d < ctx.prefixDigits; ++d) {
             state1[d + 1] = state1[d];
             state2[d + 1] = state2[d];
             mpqStep(state1[d + 1], state2[d + 1], ctx.key[digit[d]], ctx.ord[digit[d]]);
+            if (pruning) {
+                pruneState[d + 1] = pruneState[d];
+                valid[d + 1] = valid[d] && pruneStep_CPU(*ctx.rules, pruneState[d + 1], ctx.alphabet[digit[d]]);
+            }
         }
     };
     rehashFrom(0);
@@ -122,8 +136,8 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
         // Bit k: the candidate with last character k is worth hashing.
         // Restricted to the alphabet - which the table never exceeds anyway,
         // but a stray bit must not index past key/ord - and to the batch's
-        // range in its first and last row.
-        uint64_t mask = ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask;
+        // range in its first and last row. None, in a pruned row.
+        uint64_t mask = valid[ctx.prefixDigits] ? ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask : 0;
         if (i == 0)
             mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;       // firstRowStartK is in [0, as)
         if (i == ctx.rows.rowCount - 1)
@@ -181,7 +195,9 @@ public:
         if (!checkLowBitsFilterTable(table_, constants, kFilterEntriesCheckedPerSearch, 2, std::random_device{}(), error))
             refuseFilterTable(error);
         alphabetSize_ = (int) constants.alphabet.size();
+        alphabet_ = constants.alphabet;
         targetA_ = constants.targetHashA;
+        rules_ = constants.trailingRules;
         std::fill(std::begin(key_), std::end(key_), 0);
         std::fill(std::begin(ord_), std::end(ord_), 0);
         for (int k = 0; k < alphabetSize_; ++k) {
@@ -208,7 +224,9 @@ private:
     unsigned threadCount_;
     HitVerifier verifier_;
     int alphabetSize_ = 0;
+    std::string alphabet_;
     uint32_t targetA_ = 0;
+    PruneRules rules_;
     uint32_t key_[MAX_ALPHABET_SIZE] = {};
     uint32_t ord_[MAX_ALPHABET_SIZE] = {};
     std::vector<uint64_t> table_;
@@ -233,11 +251,14 @@ BatchOutcome CpuBackend::runBatches(int trailingLen, const std::vector<BatchRequ
         ctx.ord = ord_;
         ctx.suffixKey = suffixKey_.data();
         ctx.suffixOrd = suffixOrd_.data();
+        ctx.alphabet = alphabet_.data();
         ctx.table = table_.data();
         ctx.rows = rowRangeFor(requests[b].start, requests[b].count, alphabetSize_);
         ctx.prefixDigits = trailingLen - 1;
         ctx.seed1Start = requests[b].params.seed1Start;
         ctx.seed2Start = requests[b].params.seed2Start;
+        ctx.rules = &rules_;
+        ctx.pruneEntry = requests[b].params.pruneEntry;
         totalRows += ctx.rows.rowCount;
         totalCount += requests[b].count;
     }

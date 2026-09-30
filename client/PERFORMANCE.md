@@ -319,8 +319,8 @@ will have grown (not measured again).
 
 ## The search space (a decision, not only a speedup)
 
-- [ ] **Prune the whole candidate.** `prune_symbol_runs` and
-  `prune_unopened_brackets` only look at the leading characters. Applied to
+- [x] **Prune the whole candidate.** `prune_symbol_runs` and
+  `prune_unopened_brackets` only looked at the leading characters. Applied to
   the whole candidate, they'd skip about a fifth more of it at every length
   (**computed** exactly for the real alphabet, both rules on):
 
@@ -331,12 +331,46 @@ will have grown (not measured again).
   | 10 | 79.75% | 66.64% (-16.4%) | 63.82% (-20.0%) |
   | 11 | 76.17% | 63.82% (-16.2%) | 61.15% (-19.7%) |
 
-  With the filter, leaving out a rejected last character is one AND on a
-  row's mask. Rows are where most of it is, and skipping them needs a list
-  of the rows that survive for each state the leading characters leave
-  behind, instead of every row. It changes which candidates a search
-  covers, so it needs deciding - and every client has to agree on it for a
-  target (it would belong with the prune flags the coordinator sends).
+  Now a setting, `prune_whole_candidate` (a `[search]` key, and a target's
+  setting on the coordinator, sent with every claim; off by default): the
+  rules, `max_backslash_count` too, at every character **but the last** -
+  the middle column. Leaving out a last character saves nothing (its row is
+  hashed anyway), and the host can't drop the hits it would leave out
+  without dropping a real match too. For each state the leading characters
+  leave (32 occur in a real search), the host lists the row groups that
+  survive, with a flag per group for the rows' own last characters its
+  characters rule out (`backends/common/row_pruning.h`); the GPU kernels
+  walk their batch's list, and a pruned row inside a surviving group gets
+  no candidates - skipping it wouldn't save its lane anything, as the warp
+  steps through its rows together. See the README's "Design decisions".
+  **Measured** (`search_bench --scale 40`, alternating with the code before
+  it): a real search projected **+10.8%** on CUDA (2,639 against 2,382 G
+  candidates/s, five runs each) and **+9.8%** on OpenCL (2,265 against
+  2,063). Tried on the way:
+  - One kernel for both, walking a list of every group when nothing is
+    pruned: **5% slower** than before on CUDA (six pairs; 6.5% on OpenCL),
+    whatever was tried - reading each chunk's entry before the barrier,
+    no per-row check at all (slower still, about 20%: the compiler
+    schedules the loop differently), the group computed as before instead
+    of read (also about 20% slower). So a search that doesn't prune the
+    whole candidate still gets the kernel without lists (`Listed` in the
+    CUDA kernel, `LISTED` in the OpenCL and Metal ones), and measures the
+    same as before (0.4% and 0.7% slower, within the noise).
+  - Iterating only a chunk's surviving rows (their bits): 13% slower with
+    nothing pruned. A branch around each pruned row: 4.5% slower with
+    nothing pruned. Two loops, one without a check for chunks with no
+    pruned rows: as fast with nothing pruned, but with the whole candidate
+    pruned slower than a single loop, as a warp with both kinds of chunk
+    runs both.
+  - [ ] **Get the rest.** 20% fewer candidates would be about +20%
+    (2,870 projected). The list-walking kernel's 5% is part of it - Nsight
+    Compute should say what it spends that on - and the pruned rows that
+    still take their turn the rest: of the rows asked for, 12.7% are left
+    out with their whole group, 3.8% only by their own last character
+    (*estimated* from 3 million random 10-character candidates).
+  - [ ] **Metal** has it too, walking its batch's list with `LISTED`
+    (compiled here only as C++ against a stand-in for `<metal_stdlib>`, for
+    its syntax): run the tests on a Mac.
 
 ## Tooling
 

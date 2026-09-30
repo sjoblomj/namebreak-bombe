@@ -20,6 +20,7 @@
 #include "backends/common/launch_waiter.h"
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
+#include "backends/common/row_pruning.h"
 #include "backends/cuda/hash_kernels.cuh"
 #include "backends/cuda/tuning.h"
 #include "engine/backend.h"
@@ -80,14 +81,18 @@ struct DeviceBuffers {
     // This search's lookup filter: kLowBitsFilterEntries entries, see
     // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
     uint64_t* filterTable;
+    // The row groups to search - RowPruning::arena() (backends/common/row_pruning.h),
+    // of which each batch has a slice.
+    const uint32_t* groups;
 };
 
 static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "filteredRowsKernel needs one thread per alphabet entry to fill its shared tables");
 
 // One batch of a launch, as filteredRowsKernel needs it: its rows
 // firstRow..lastRow of the trailing space, cut to [firstRowStartK,
-// lastRowEndK) in its first and last row (see runBatches), and the hash state
-// after its prefix.
+// lastRowEndK) in its first and last row (see runBatches), the hash state
+// after its prefix, and the row groups among them to search -
+// DeviceBuffers::groups[groupsOffset .. groupsOffset + groupCount).
 struct LaunchBatch {
     uint32_t firstRow;
     uint32_t lastRow;
@@ -95,6 +100,8 @@ struct LaunchBatch {
     int lastRowEndK;
     uint32_t seed1Start;
     uint32_t seed2Start;
+    uint32_t groupsOffset;
+    uint32_t groupCount;
 };
 // A launch's batches - a kernel argument, so passed by value.
 struct LaunchBatches {
@@ -153,12 +160,14 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, uint32_t& seed1, uin
 template<int AlphabetSize>
 constexpr uint32_t kChunksPerGroup = (AlphabetSize + NAMEBREAK_ROWS_PER_THREAD - 1) / NAMEBREAK_ROWS_PER_THREAD;
 
-// One thread's work in filteredRowsKernel: chunk `chunk` of row group `group`.
-template<int AlphabetSize, int SuffixLen>
-__device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int trailingLen, uint32_t firstRow, uint32_t lastRow,
-                                            int firstRowStartK, int lastRowEndK, uint32_t targetA, uint32_t seed1Start,
-                                            uint32_t seed2Start, uint32_t batch, const DeviceBuffers& bufs, const uint32_t* sKey,
-                                            const uint32_t* sOrd) {
+// One thread's work in filteredRowsKernel: chunk `chunk` of row group `group` -
+// and if Listed, only the rows whose last row character is in `rowMask` (see
+// backends/common/row_pruning.h).
+template<int AlphabetSize, int SuffixLen, bool Listed>
+__device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, uint32_t chunk, int trailingLen, uint32_t firstRow,
+                                            uint32_t lastRow, int firstRowStartK, int lastRowEndK, uint32_t targetA,
+                                            uint32_t seed1Start, uint32_t seed2Start, uint32_t batch, const DeviceBuffers& bufs,
+                                            const uint32_t* sKey, const uint32_t* sOrd) {
     constexpr uint32_t kChunks = kChunksPerGroup<AlphabetSize>;
     // The chunk's rows, as last row characters d of `group`, cut to the
     // launch's range in its first and last group.
@@ -202,7 +211,17 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
         // the alphabet, which the table never exceeds anyway, but a stray bit
         // must not be able to index past sKey. The table doesn't change during
         // a launch, so it's read through the read-only data path (__ldg).
-        uint64_t mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
+        //
+        // A row the pruning leaves out (not in rowMask) gets no candidates:
+        // the lanes of a warp step through their rows together, so skipping
+        // one would save its lane nothing but idle time - while a branch
+        // around every row cost about 4% more (measured with no row pruned).
+        // Whole row groups are left out by the list the chunks come from.
+        uint64_t mask;
+        if constexpr (Listed)
+            mask = ((rowMask >> d) & 1) ? __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]) : 0;
+        else
+            mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
         mask &= (uint64_t(1) << AlphabetSize) - 1;
         if (d == firstRowD)
             mask &= ~uint64_t(0) << firstRowStartK;          // firstRowStartK is in [0, AlphabetSize)
@@ -232,11 +251,12 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
     }
 }
 
-// No maxBackslashCount, pruneSymbolRuns or pruneUnopenedBrackets check here -
-// all are applied only to the leading characters, on the CPU, before this kernel is
-// ever launched (see the leadingIdx loop in runSearch), not to the trailing
-// characters this kernel searches. See README.md's "Design decisions"
-// section for why.
+// No maxBackslashCount, pruneSymbolRuns or pruneUnopenedBrackets check here:
+// the leading characters are checked on the CPU, before this kernel is ever
+// launched (see the leadingIdx loop in runSearch), and when a search prunes
+// the whole candidate, the host works out which row groups and rows survive
+// (RowPruning, backends/common/row_pruning.h) - the kernel only walks its
+// batch's list of them. See README.md's "Design decisions" section for why.
 //
 // A launch searches up to kMaxBatchesPerLaunch batches - usually each a whole
 // leading value's trailing space, with its own seeds - one per blockIdx.y
@@ -257,7 +277,7 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
 // A hashA hit only records its trailing index and batch (BatchResults): the
 // host builds the filename and checks it - hashA again, from scratch, and
 // hashB - so none of that bloats this hot kernel.
-template<int AlphabetSize, int SuffixLen>
+template<int AlphabetSize, int SuffixLen, bool Listed>
 __global__ void filteredRowsKernel(
     int trailingLen,
     LaunchBatches batches,
@@ -268,10 +288,15 @@ __global__ void filteredRowsKernel(
     constexpr uint32_t kChunks = kChunksPerGroup<AlphabetSize>;
     __shared__ uint32_t sKey[AlphabetSize];
     __shared__ uint32_t sOrd[AlphabetSize];
+    // In shared memory for the same reason as sKey: the lanes of a warp read
+    // different entries.
+    __shared__ uint64_t sRowMasks[kRowFlagCount];
     if (threadIdx.x < AlphabetSize) {
         sKey[threadIdx.x] = d_alphabetKey[threadIdx.x];
         sOrd[threadIdx.x] = d_alphabetOrd[threadIdx.x];
     }
+    if (Listed && threadIdx.x < kRowFlagCount)
+        sRowMasks[threadIdx.x] = d_rowMasks[threadIdx.x];
     __syncthreads();
 
     // This block's batch - the same for the whole block, so reading it from
@@ -279,15 +304,29 @@ __global__ void filteredRowsKernel(
     const uint32_t batchIndex = blockIdx.y;
     const LaunchBatch batch = batches.batch[batchIndex];
 
-    // Every chunk of every group the batch touches, whatever the grid's size:
-    // the number of threads launched only decides how the chunks are shared
-    // out (normally one each), never which of them get searched.
-    const uint32_t firstGroup = batch.firstRow / AlphabetSize;
-    const uint64_t chunkCount = (uint64_t) (batch.lastRow / AlphabetSize - firstGroup + 1) * kChunks;
-    for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += (uint64_t) gridDim.x * blockDim.x) {
-        searchChunk<AlphabetSize, SuffixLen>(firstGroup + (uint32_t) (c / kChunks), (uint32_t) (c % kChunks), trailingLen, batch.firstRow,
-                                             batch.lastRow, batch.firstRowStartK, batch.lastRowEndK, targetA, batch.seed1Start,
-                                             batch.seed2Start, batchIndex, bufs, sKey, sOrd);
+    // Every chunk of every group the batch touches - or if Listed, of every
+    // group in the batch's list, those of them that aren't pruned - whatever
+    // the grid's size: the number of threads launched only decides how the
+    // chunks are shared out (normally one each), never which of them get
+    // searched.
+    const uint64_t stride = (uint64_t) gridDim.x * blockDim.x;
+    if constexpr (Listed) {
+        const uint32_t* groups = bufs.groups + batch.groupsOffset;
+        const uint64_t chunkCount = (uint64_t) batch.groupCount * kChunks;
+        for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += stride) {
+            const uint32_t entry = __ldg(&groups[c / kChunks]);
+            searchChunk<AlphabetSize, SuffixLen, true>(entry >> kRowFlagBits, sRowMasks[entry & (kRowFlagCount - 1)], (uint32_t) (c % kChunks),
+                                                       trailingLen, batch.firstRow, batch.lastRow, batch.firstRowStartK, batch.lastRowEndK,
+                                                       targetA, batch.seed1Start, batch.seed2Start, batchIndex, bufs, sKey, sOrd);
+        }
+    } else {
+        const uint32_t firstGroup = batch.firstRow / AlphabetSize;
+        const uint64_t chunkCount = (uint64_t) (batch.lastRow / AlphabetSize - firstGroup + 1) * kChunks;
+        for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += stride) {
+            searchChunk<AlphabetSize, SuffixLen, false>(firstGroup + (uint32_t) (c / kChunks), 0, (uint32_t) (c % kChunks), trailingLen,
+                                                        batch.firstRow, batch.lastRow, batch.firstRowStartK, batch.lastRowEndK, targetA,
+                                                        batch.seed1Start, batch.seed2Start, batchIndex, bufs, sKey, sOrd);
+        }
     }
 }
 
@@ -346,6 +385,8 @@ public:
     ~CudaBackend() override {
         if (pinnedResults_)
             (void) cudaFreeHost(pinnedResults_);
+        if (groups_)
+            (void) cudaFree(groups_);
     }
 
 #ifdef NAMEBREAK_HIP
@@ -385,6 +426,22 @@ private:
     // Sleeps through most of each launch, instead of spinning in
     // cudaDeviceSynchronize for all of it (see backends/common/launch_waiter.h).
     LaunchWaiter waiter_;
+
+    // The row groups each batch searches (see backends/common/row_pruning.h),
+    // and their copy on the GPU: the first groupsUploaded_ entries of
+    // rowPruning_.arena(), of generation groupsGeneration_, in a buffer of
+    // groupsCapacity_ entries. Kept from one search to the next, as the
+    // lists are.
+    RowPruning rowPruning_;
+    uint32_t* groups_ = nullptr;
+    size_t groupsCapacity_ = 0;
+    size_t groupsUploaded_ = 0;
+    uint64_t groupsGeneration_ = 0;
+    void uploadGroups();
+    // Whether this search prunes the whole candidate, and the kernel walks
+    // lists of row groups: only then - a kernel that walks every group
+    // measured about 5% faster than one walking a list of them all.
+    bool listed_ = false;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -443,6 +500,11 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
         CUDA_CHECK(cudaMallocHost((void**) &pinnedResults_, sizeof(BatchResults)));
     waiter_.beginSearch();
     verifier_.begin(constants);
+    listed_ = constants.trailingRules.any();
+    if (listed_) {
+        rowPruning_.begin(constants);
+        CUDA_CHECK(cudaMemcpyToSymbol(d_rowMasks, rowPruning_.rowMasks(), kRowFlagCount * sizeof(uint64_t)));
+    }
 
     // This search's lookup filter - it depends on the alphabet, the suffix and
     // the target, so it's built for every search. Checked against its
@@ -467,6 +529,32 @@ void CudaBackend::endSearch() {
     bufs_ = {};
 }
 
+// Brings the GPU's copy of the row groups' lists up to date with
+// rowPruning_.arena(), which only grows within a generation: only what was
+// added since goes up, unless the buffer is too small or the lists were
+// cleared. Nothing is running on the GPU here (runBatches waits for every
+// launch before it returns), so a plain copy is safe.
+void CudaBackend::uploadGroups() {
+    const std::vector<uint32_t>& arena = rowPruning_.arena();
+    if (rowPruning_.generation() != groupsGeneration_) {
+        groupsGeneration_ = rowPruning_.generation();
+        groupsUploaded_ = 0;
+    }
+    if (arena.size() > groupsCapacity_) {
+        if (groups_)
+            CUDA_CHECK(cudaFree(groups_));
+        groupsCapacity_ = std::max(arena.size(), 2 * groupsCapacity_);
+        CUDA_CHECK(cudaMalloc(&groups_, groupsCapacity_ * sizeof(uint32_t)));
+        groupsUploaded_ = 0;
+    }
+    if (arena.size() > groupsUploaded_) {
+        CUDA_CHECK(cudaMemcpy(groups_ + groupsUploaded_, arena.data() + groupsUploaded_, (arena.size() - groupsUploaded_) * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice));
+        groupsUploaded_ = arena.size();
+    }
+    bufs_.groups = groups_;
+}
+
 BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params) {
     return runBatches(trailingLen, {BatchRequest{startIdx, count, params}});
 }
@@ -486,7 +574,9 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
 
     // Each batch's range [start, start + count) covers its rows
     // firstRow..lastRow; only the first and last row can be partial (see
-    // filteredRowsKernel).
+    // filteredRowsKernel). With the whole candidate pruned, each also gets
+    // the list of its row groups that survive.
+    const bool listed = listed_;
     LaunchBatches batches = {};
     uint64_t maxGroups = 0;
     for (int b = 0; b < batchCount; ++b) {
@@ -507,8 +597,21 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
         batch.lastRowEndK = (int) (endIdx - lastRow * alphabetSize); // in [1, alphabetSize]
         batch.seed1Start = requests[b].params.seed1Start;
         batch.seed2Start = requests[b].params.seed2Start;
-        maxGroups = std::max(maxGroups, lastRow / alphabetSize - firstRow / alphabetSize + 1);
+        if (listed) {
+            const RowPruning::Slice groups =
+                rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry, firstRow / alphabetSize, lastRow / alphabetSize);
+            batch.groupsOffset = groups.offset;
+            batch.groupCount = groups.count;
+            maxGroups = std::max<uint64_t>(maxGroups, groups.count);
+        } else {
+            maxGroups = std::max(maxGroups, lastRow / alphabetSize - firstRow / alphabetSize + 1);
+        }
     }
+    // Every row of every batch pruned: nothing to launch.
+    if (maxGroups == 0)
+        return outcome;
+    if (listed)
+        uploadGroups();
 
     const auto launched = std::chrono::steady_clock::now();
     bool supported = dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
@@ -529,7 +632,10 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
         const dim3 blocks((unsigned) ((threads + kThreadsPerBlock - 1) / kThreadsPerBlock), (unsigned) batchCount);
         dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
             constexpr int SuffixLen = decltype(suffixC)::value;
-            filteredRowsKernel<AlphabetC::value, SuffixLen><<<blocks, kThreadsPerBlock>>>(trailingLen, batches, targetA_, bufs_);
+            if (listed)
+                filteredRowsKernel<AlphabetC::value, SuffixLen, true><<<blocks, kThreadsPerBlock>>>(trailingLen, batches, targetA_, bufs_);
+            else
+                filteredRowsKernel<AlphabetC::value, SuffixLen, false><<<blocks, kThreadsPerBlock>>>(trailingLen, batches, targetA_, bufs_);
         });
     });
     if (!supported) {

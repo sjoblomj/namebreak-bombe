@@ -285,10 +285,10 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     printf("upperBoundLimit: '%s'\n", upperBoundLimit.c_str());
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
-    printf("pruneSymbolRuns: %s (leading characters only)\n", req.pruneSymbolRuns ? "true" : "false");
-    printf("pruneUnopenedBrackets: %s (leading characters only)\n", req.pruneUnopenedBrackets ? "true" : "false");
-    printf("maxBackslashCount: %d%s (leading characters only)\n", req.maxBackslashCount,
-           req.maxBackslashCount == 0 ? " (unlimited)" : "");
+    const char* pruneScope = req.pruneWholeCandidate ? "every character but the last" : "leading characters only";
+    printf("pruneSymbolRuns: %s (%s)\n", req.pruneSymbolRuns ? "true" : "false", pruneScope);
+    printf("pruneUnopenedBrackets: %s (%s)\n", req.pruneUnopenedBrackets ? "true" : "false", pruneScope);
+    printf("maxBackslashCount: %d%s (%s)\n", req.maxBackslashCount, req.maxBackslashCount == 0 ? " (unlimited)" : "", pruneScope);
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
@@ -298,9 +298,16 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     // extends by that iteration's leading characters.
     std::pair<uint32_t, uint32_t> prefixBaseState = mpqHashWithPrefixCache_CPU(req.prefix.c_str(), h_cryptTable);
 
-    // Brackets req.prefix leaves open, which a candidate is free to close -
-    // see req.pruneUnopenedBrackets.
-    const OpenBrackets prefixOpenBrackets = openBracketsAfter_CPU(req.prefix);
+    // The pruning rules, and their state before a candidate's first
+    // character: brackets req.prefix leaves open are a candidate's to close
+    // (see req.pruneUnopenedBrackets), and neither the prefix's symbols nor
+    // its backslashes count.
+    PruneRules rules;
+    rules.symbolRuns = req.pruneSymbolRuns;
+    rules.unopenedBrackets = req.pruneUnopenedBrackets;
+    rules.maxBackslashCount = req.maxBackslashCount;
+    PruneState candidateStart;
+    candidateStart.open = openBracketsAfter_CPU(req.prefix);
 
     std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
     if (!outputDir.empty()) {
@@ -325,6 +332,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     constants.cryptTable = h_cryptTable;
     constants.targetHashA = req.targetHashA;
     constants.targetHashB = req.targetHashB;
+    if (req.pruneWholeCandidate)
+        constants.trailingRules = rules;
     backend.beginSearch(constants);
 
     bool found_match = false;
@@ -464,11 +473,17 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             // batchSize candidates) without spending anything in the
             // backend (for a GPU, not even a kernel launch) - cheaper than
             // even one of those candidates would have cost individually.
-            if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
-                continue;
-            if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
-                continue;
-            if (req.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, prefixOpenBrackets))
+            // The state it leaves is where the backend carries on, if it
+            // prunes the trailing characters too (req.pruneWholeCandidate).
+            PruneState pruneEntry = candidateStart;
+            bool pruned = false;
+            for (char c : leading) {
+                if (!pruneStep_CPU(rules, pruneEntry, c)) {
+                    pruned = true;
+                    break;
+                }
+            }
+            if (pruned)
                 continue;
 
             // Handed to every runBatch call below; see BatchParams.
@@ -479,6 +494,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             std::pair<uint32_t, uint32_t> pair = leadingHasher.state();
             params.seed1Start = pair.first;
             params.seed2Start = pair.second;
+            params.pruneEntry = pruneEntry;
 
             uint64_t trailStart = 0, trailEnd = 0;
             if (leadingIdx == startLeadingIdx) {

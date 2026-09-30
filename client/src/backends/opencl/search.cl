@@ -13,6 +13,9 @@
 //   FILTER_BITS    kLowBitsFilterBits: how many low bits of each seed index
 //                  the lookup filter's table (backends/common/lowbits_filter.h)
 //   ROWS_PER_THREAD  about how many rows one work-item searches
+//   LISTED         1 if the search prunes the whole candidate: a batch then
+//                  searches the row groups of its list (see below), 0 if
+//                  every group it touches
 //
 // Rows are every value of the candidate's last character, for one
 // combination of the other trailing characters (see the terminology in
@@ -27,6 +30,12 @@
 // A launch searches up to 32 batches - usually each a whole leading value's
 // trailing space, with its own seeds - one per row of work-groups
 // (get_group_id(1); see runBatches in opencl_backend.cpp).
+//
+// With LISTED, a batch searches the row groups of its list - those the
+// search's pruning leaves - and of each, the rows its entry's flags allow
+// (see backends/common/row_pruning.h). Without it, every group it touches,
+// every row of them: that kernel measured about 6% faster than one walking a
+// list of every group.
 
 #ifndef HASHA_MATCH_MASK
 #define HASHA_MATCH_MASK 0xFFFFFFFFu
@@ -53,10 +62,16 @@
 // group exactly once and never cross into another.
 #define CHUNKS_PER_GROUP ((ALPHABET_SIZE + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD)
 
+// An entry of a row groups' list: the group, shifted past its flags
+// (kRowFlagBits in backends/common/row_pruning.h).
+#define ROW_FLAG_BITS 4
+#define ROW_FLAG_COUNT (1 << ROW_FLAG_BITS)
+
 // These three must match their namesakes in opencl_backend.cpp.
 // One batch of a launch: its rows firstRow..lastRow of the trailing space,
-// cut to [firstRowStartK, lastRowEndK) in its first and last row, and the
-// hash state after its prefix.
+// cut to [firstRowStartK, lastRowEndK) in its first and last row, the hash
+// state after its prefix, and the row groups among them to search:
+// groups[groupsOffset .. groupsOffset + groupCount).
 typedef struct {
     uint firstRow;
     uint lastRow;
@@ -64,6 +79,8 @@ typedef struct {
     int lastRowEndK;
     uint seed1Start;
     uint seed2Start;
+    uint groupsOffset;
+    uint groupCount;
 } LaunchBatch;
 // One hashA hit: the candidate's trailing index, and which batch it's in.
 typedef struct {
@@ -87,18 +104,27 @@ __kernel void searchRows(uint targetA,
                          __constant uint* suffixKey,
                          __constant uint* suffixOrd,
                          __global const ulong* filterTable,    // this search's lookup filter
-                         __global BatchResults* results) {
+                         __global BatchResults* results,
+                         __global const uint* groups,          // the row groups' lists (RowPruning::arena)
+                         __constant ulong* rowMasks) {         // the rows an entry's flags allow (RowPruning::rowMasks)
     // The rows' characters, and the few last characters the filter lets
     // through, differ between work-items, so they're looked up here rather
     // than in constant memory, where work-items reading different entries
     // would be serialized.
     __local uint sKey[ALPHABET_SIZE];
     __local uint sOrd[ALPHABET_SIZE];
+#if LISTED
+    __local ulong sRowMasks[ROW_FLAG_COUNT];
+#endif
     const uint lid = get_local_id(0);
     if (lid < ALPHABET_SIZE) {
         sKey[lid] = alphabetKey[lid];
         sOrd[lid] = alphabetOrd[lid];
     }
+#if LISTED
+    if (lid < ROW_FLAG_COUNT)
+        sRowMasks[lid] = rowMasks[lid];
+#endif
     barrier(CLK_LOCAL_MEM_FENCE); // before anything returns, so every work-item reaches it
 
     // This work-group's batch - the same for the whole work-group.
@@ -108,13 +134,26 @@ __kernel void searchRows(uint targetA,
     const int firstRowStartK = batch.firstRowStartK, lastRowEndK = batch.lastRowEndK;
     const uint seed1Start = batch.seed1Start, seed2Start = batch.seed2Start;
 
-    // Every chunk of every group the batch touches, whatever the global work
-    // size: that only decides how the chunks are shared out (normally one
-    // each), never which of them get searched.
+    // Every chunk of every group the batch touches - or with LISTED, of every
+    // group in its list - whatever the global work size: that only decides
+    // how the chunks are shared out (normally one each), never which of them
+    // get searched.
+#if LISTED
+    __global const uint* batchGroups = groups + batch.groupsOffset;
+    const ulong chunkCount = (ulong) batch.groupCount * CHUNKS_PER_GROUP;
+#else
     const uint firstGroup = firstRow / ALPHABET_SIZE;
     const ulong chunkCount = (ulong) (lastRow / ALPHABET_SIZE - firstGroup + 1) * CHUNKS_PER_GROUP;
+#endif
     for (ulong c = get_global_id(0); c < chunkCount; c += get_global_size(0)) {
+#if LISTED
+        const uint entry = batchGroups[c / CHUNKS_PER_GROUP];
+        const uint group = entry >> ROW_FLAG_BITS;
+        // Bit d: row d isn't pruned.
+        const ulong rowMask = sRowMasks[entry & (ROW_FLAG_COUNT - 1)];
+#else
         const uint group = firstGroup + (uint) (c / CHUNKS_PER_GROUP);
+#endif
         const uint chunk = (uint) (c % CHUNKS_PER_GROUP);
         // The chunk's rows, as last row characters d of `group`, cut to the
         // batch's range in its first and last group.
@@ -158,8 +197,15 @@ __kernel void searchRows(uint targetA,
             // Bit k: the candidate with last character k is worth hashing.
             // Restricted to the batch's range in its first and last row - and
             // to the alphabet, which the table never exceeds anyway, but a
-            // stray bit must not be able to index past sKey.
+            // stray bit must not be able to index past sKey. None, in a row the
+            // pruning leaves out: the work-items of a warp step through their
+            // rows together, so skipping one would save its work-item nothing
+            // (as in the CUDA kernel, whose comment has more).
+#if LISTED
+            ulong mask = ((rowMask >> d) & 1UL) ? filterTable[FILTER_INDEX(seed1, seed2)] : 0UL;
+#else
             ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];
+#endif
             mask &= (1UL << ALPHABET_SIZE) - 1UL;              // ALPHABET_SIZE is at most 50
             if (d == firstRowD)
                 mask &= ~0UL << firstRowStartK;                // firstRowStartK is in [0, ALPHABET_SIZE)

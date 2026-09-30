@@ -20,6 +20,12 @@
 // compare windows by the projection.
 // --prune symbols gives the configuration every figure measured before
 // 2026-09-30 used (symbol runs only); --prune none (or `noprune`) none.
+// --whole prunes at every character but the last
+// (SearchRequest::pruneWholeCandidate): the backend then leaves out some of
+// the rows it's asked for, so the search rate counts candidates it was asked
+// for, and the projection those it searched - the share of the range's
+// candidates that survive the rules, estimated too - over the share of all
+// candidates of this length that survive them.
 //
 // Creating the backend (for CUDA, the GPU context, and its self-test) and a
 // first, small warm-up search happen before the clock starts: a fast GPU
@@ -99,24 +105,45 @@ double processCpuSeconds() {
 #endif
 }
 
-// The share of all leading values of `leadingLen` characters that the engine
-// prunes under `req` - estimated from `samples` random ones, run through the
+// Whether `req` prunes the first `checkedLen` characters of `candidate` - the
 // same three checks as runSearch's leading loop, with the same prefix state.
-double prunedShare(const SearchRequest& req, int leadingLen, int samples) {
+bool prunes(const SearchRequest& req, const std::string& candidate, int checkedLen) {
+    const std::string_view checked(candidate.data(), checkedLen);
+    return (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(checked)) ||
+           (req.maxBackslashCount != 0 && countBackslashes_CPU(checked) > req.maxBackslashCount) ||
+           (req.pruneUnopenedBrackets && hasUnopenedBracket_CPU(checked, openBracketsAfter_CPU(req.prefix)));
+}
+
+// The share of all candidates of `len` characters that `req` prunes by their
+// first `checkedLen` - estimated from `samples` random ones.
+double prunedShare(const SearchRequest& req, int len, int checkedLen, int samples) {
     std::mt19937_64 random(20260930);
     std::uniform_int_distribution<size_t> character(0, req.alphabet.size() - 1);
-    const OpenBrackets prefixOpenBrackets = openBracketsAfter_CPU(req.prefix);
-    std::string leading(leadingLen, ' ');
+    std::string candidate(len, ' ');
     int pruned = 0;
     for (int n = 0; n < samples; ++n) {
-        for (char& c : leading)
+        for (char& c : candidate)
             c = req.alphabet[character(random)];
-        if ((req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading)) ||
-            (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount) ||
-            (req.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, prefixOpenBrackets)))
-            ++pruned;
+        pruned += prunes(req, candidate, checkedLen);
     }
     return (double) pruned / samples;
+}
+
+// Of the candidates in [0, total) that survive their first `leadingLen`
+// characters' check - those the engine asks a backend for - the share that
+// also survive `checkedLen`'s, estimated from `samples` random ones.
+double survivingShare(const SearchRequest& req, uint64_t total, int len, int leadingLen, int checkedLen, int samples) {
+    std::mt19937_64 random(20260930);
+    std::uniform_int_distribution<uint64_t> index(0, total - 1);
+    int asked = 0, survived = 0;
+    while (asked < samples) {
+        const std::string candidate = indexToString(index(random), len, req.alphabet);
+        if (prunes(req, candidate, leadingLen))
+            continue;
+        ++asked;
+        survived += !prunes(req, candidate, checkedLen);
+    }
+    return (double) survived / asked;
 }
 
 } // namespace
@@ -126,6 +153,7 @@ int main(int argc, char** argv) {
     // the default backend is the first that can run here (see
     // backends/backends.h).
     std::string prune = "all";
+    bool whole = false;
     std::string backendName;
     uint64_t scale = 1;
     for (int i = 1; i < argc; ++i) {
@@ -134,6 +162,8 @@ int main(int argc, char** argv) {
             prune = "none";
         } else if (arg == "--prune" && i + 1 < argc) {
             prune = argv[++i];
+        } else if (arg == "--whole") {
+            whole = true;
         } else if (arg == "--backend" && i + 1 < argc) {
             backendName = argv[++i];
         } else if (arg == "--scale" && i + 1 < argc) {
@@ -142,7 +172,7 @@ int main(int argc, char** argv) {
             prune = "?";
         }
         if (prune != "all" && prune != "symbols" && prune != "none") {
-            fprintf(stderr, "Usage: %s [--prune all|symbols|none] [noprune] [--backend <name>] [--scale <n>]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--prune all|symbols|none] [noprune] [--whole] [--backend <name>] [--scale <n>]\n", argv[0]);
             return 1;
         }
     }
@@ -171,6 +201,7 @@ int main(int argc, char** argv) {
     req.targetHashB = 0x00000000;
     req.pruneSymbolRuns = prune != "none";
     req.pruneUnopenedBrackets = prune == "all";
+    req.pruneWholeCandidate = whole;
     req.continuous = false;
 
     uint64_t matchCount = 0;
@@ -210,9 +241,10 @@ int main(int argc, char** argv) {
     uint64_t totalCandidates;
     stringToIndex(end_full, alphabet, totalCandidates, err);
 
-    printf("\n=== search_bench: real runSearch() on the %s backend, candidateLen=%d, window %d, pruning: %s ===\n",
+    printf("\n=== search_bench: real runSearch() on the %s backend, candidateLen=%d, window %d, pruning: %s%s ===\n",
            backend.name(), candidateLen, backend.windowChars(),
-           prune == "all" ? "symbol runs and brackets" : prune == "symbols" ? "symbol runs" : "none");
+           prune == "all" ? "symbol runs and brackets" : prune == "symbols" ? "symbol runs" : "none",
+           prune != "none" ? (whole ? ", every character but the last" : ", leading characters") : "");
     printf("candidates: %llu\n", (unsigned long long) totalCandidates);
     printf("searched:   %llu (%.2f%% of the range; the rest pruned on the CPU)\n", (unsigned long long) backend.searched,
            100.0 * (double) backend.searched / (double) totalCandidates);
@@ -221,12 +253,17 @@ int main(int argc, char** argv) {
     printf("CPU time:   %.3f s (%.0f%% of a core)\n", cpuSeconds, 100.0 * cpuSeconds / seconds);
     printf("throughput: %.3f G candidates/sec (of the range, pruned ones included)\n", totalCandidates / seconds / 1e9);
     const double searchRate = backend.searched / seconds / 1e9;
-    printf("search rate: %.3f G candidates/sec (searched by the backend)\n", searchRate);
-    // How runSearch splits a candidate of this length (see its trailingLen).
+    printf("search rate: %.3f G candidates/sec (asked of the backend)\n", searchRate);
+    // How runSearch splits a candidate of this length (see its trailingLen),
+    // and how much of it the rules look at.
     const int leadingLen = std::max(0, candidateLen - backend.windowChars());
-    const double share = prunedShare(req, leadingLen, 4'000'000);
-    printf("real search: %.2f%% of all %d-character leading values pruned (estimated) -> %.3f G candidates/sec projected\n",
-           100.0 * share, leadingLen, searchRate / (1.0 - share));
+    const int checkedLen = whole ? candidateLen - 1 : leadingLen;
+    const double searchedShare = whole ? survivingShare(req, totalCandidates, candidateLen, leadingLen, checkedLen, 1'000'000) : 1.0;
+    if (whole)
+        printf("of which:   %.2f%% searched (estimated; the rest pruned by the backend)\n", 100.0 * searchedShare);
+    const double share = prunedShare(req, candidateLen, checkedLen, 4'000'000);
+    printf("real search: %.2f%% of all %d-character candidates pruned (estimated, by their first %d) -> %.3f G candidates/sec projected\n",
+           100.0 * share, candidateLen, checkedLen, searchRate * searchedShare / (1.0 - share));
 
     // With nothing pruned, the engine must have asked the backend for every
     // candidate of the range exactly once.

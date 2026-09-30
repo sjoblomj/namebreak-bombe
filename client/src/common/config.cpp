@@ -257,6 +257,7 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     if (!r.getRequired("hash_b", hashBHex, error)) return false;
     std::string pruneStr = r.getOptional("prune_symbol_runs", "false");
     std::string pruneBracketsStr = r.getOptional("prune_unopened_brackets", "false");
+    std::string pruneWholeStr = r.getOptional("prune_whole_candidate", "false");
     std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
 
     std::string unknown = r.firstUnknownKey();
@@ -277,6 +278,10 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     }
     if (!parseBool(pruneBracketsStr, out.pruneUnopenedBrackets)) {
         error = "invalid prune_unopened_brackets: '" + pruneBracketsStr + "' (expected true/false)";
+        return false;
+    }
+    if (!parseBool(pruneWholeStr, out.pruneWholeCandidate)) {
+        error = "invalid prune_whole_candidate: '" + pruneWholeStr + "' (expected true/false)";
         return false;
     }
     bool resume = false;

@@ -13,6 +13,9 @@
 //   FILTER_BITS    kLowBitsFilterBits: how many low bits of each seed index
 //                  the lookup filter's table (backends/common/lowbits_filter.h)
 //   ROWS_PER_THREAD  about how many rows one thread searches
+//   LISTED         1 if the search prunes the whole candidate: the batch then
+//                  searches the row groups of its list (see below), 0 if
+//                  every group it touches
 //
 // Rows are every value of the candidate's last character, for one
 // combination of the other trailing characters (see the terminology in
@@ -23,6 +26,12 @@
 // target (README.md's "The lookup filter" has why) - and hashes only those,
 // in full. It records the trailing index of every hashA hit; the host
 // rebuilds and checks those.
+//
+// With LISTED, the batch searches the row groups of its list - those the
+// search's pruning leaves - and of each, the rows its entry's flags allow
+// (see backends/common/row_pruning.h). Without it, every group it touches,
+// every row of them - as the CUDA and OpenCL kernels do, where walking a list
+// of every group measured 5-6% slower.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -46,6 +55,11 @@ using namespace metal;
 // group exactly once and never cross into another.
 #define CHUNKS_PER_GROUP ((ALPHABET_SIZE + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD)
 
+// An entry of a row groups' list: the group, shifted past its flags
+// (kRowFlagBits in backends/common/row_pruning.h).
+#define ROW_FLAG_BITS 4
+#define ROW_FLAG_COUNT (1 << ROW_FLAG_BITS)
+
 // Must match RowArgs in metal_backend.mm.
 struct RowArgs {
     uint firstRow;
@@ -55,6 +69,10 @@ struct RowArgs {
     uint targetA;
     uint seed1Start;
     uint seed2Start;
+    // With LISTED, the row groups to search: groups[groupsOffset ..
+    // groupsOffset + groupCount).
+    uint groupsOffset;
+    uint groupCount;
 };
 
 #define MPQ_STEP(seed1, seed2, key, ord)                        \
@@ -71,6 +89,8 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
                        device atomic_int* matchCount [[buffer(5)]],   // hits this batch - may exceed MAX_MATCHES
                        device ulong* matchIdx [[buffer(6)]],          // the first MAX_MATCHES hits' trailing indices
                        device const ulong* filterTable [[buffer(7)]], // this search's lookup filter
+                       device const uint* groups [[buffer(8)]],       // the row groups' lists (RowPruning::arena)
+                       constant ulong* rowMasks [[buffer(9)]],        // the rows an entry's flags allow (RowPruning::rowMasks)
                        uint t [[thread_position_in_grid]],
                        uint lid [[thread_position_in_threadgroup]],
                        uint threads [[threads_per_grid]]) {
@@ -79,19 +99,39 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
     // in constant memory.
     threadgroup uint sKey[ALPHABET_SIZE];
     threadgroup uint sOrd[ALPHABET_SIZE];
+#if LISTED
+    threadgroup ulong sRowMasks[ROW_FLAG_COUNT];
+#endif
     if (lid < ALPHABET_SIZE) {
         sKey[lid] = alphabetKey[lid];
         sOrd[lid] = alphabetOrd[lid];
     }
+#if LISTED
+    if (lid < ROW_FLAG_COUNT)
+        sRowMasks[lid] = rowMasks[lid];
+#endif
     threadgroup_barrier(mem_flags::mem_threadgroup); // before anything returns, so every thread reaches it
 
-    // Every chunk of every group the batch touches, whatever the grid's
-    // size: that only decides how the chunks are shared out (normally one
-    // each), never which of them get searched.
+    // Every chunk of every group the batch touches - or with LISTED, of every
+    // group in its list - whatever the grid's size: that only decides how the
+    // chunks are shared out (normally one each), never which of them get
+    // searched.
+#if LISTED
+    device const uint* batchGroups = groups + args.groupsOffset;
+    const ulong chunkCount = (ulong) args.groupCount * CHUNKS_PER_GROUP;
+#else
     const uint firstGroup = args.firstRow / ALPHABET_SIZE;
     const ulong chunkCount = (ulong) (args.lastRow / ALPHABET_SIZE - firstGroup + 1) * CHUNKS_PER_GROUP;
+#endif
     for (ulong c = t; c < chunkCount; c += threads) {
+#if LISTED
+        const uint entry = batchGroups[c / CHUNKS_PER_GROUP];
+        const uint group = entry >> ROW_FLAG_BITS;
+        // Bit d: row d isn't pruned.
+        const ulong rowMask = sRowMasks[entry & (ROW_FLAG_COUNT - 1)];
+#else
         const uint group = firstGroup + (uint) (c / CHUNKS_PER_GROUP);
+#endif
         const uint chunk = (uint) (c % CHUNKS_PER_GROUP);
         // The chunk's rows, as last row characters d of `group`, cut to the
         // batch's range in its first and last group.
@@ -135,8 +175,15 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
             // Bit k: the candidate with last character k is worth hashing.
             // Restricted to the batch's range in its first and last row - and
             // to the alphabet, which the table never exceeds anyway, but a
-            // stray bit must not be able to index past sKey.
+            // stray bit must not be able to index past sKey. None, in a row the
+            // pruning leaves out: the threads of a SIMD-group step through
+            // their rows together, so skipping one would save its thread
+            // nothing (as in the CUDA kernel, whose comment has more).
+#if LISTED
+            ulong mask = ((rowMask >> d) & 1ul) ? filterTable[FILTER_INDEX(seed1, seed2)] : 0ul;
+#else
             ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];
+#endif
             mask &= (1ul << ALPHABET_SIZE) - 1ul;               // ALPHABET_SIZE is at most 50
             if (d == firstRowD)
                 mask &= ~0ul << args.firstRowStartK;            // firstRowStartK is in [0, ALPHABET_SIZE)

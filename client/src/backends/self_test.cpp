@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 
+#include "engine/candidate.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
 #include "engine/mpq_hash.h"
@@ -190,9 +191,16 @@ bool runCase(SearchBackend& backend, const Case& c, const uint32_t* cryptTable, 
 // A backend that used one batch's seeds or edges for another, lost track of
 // which batch a hit was in (it would report the wrong filename), or skipped a
 // batch, fails.
+//
+// With `prune`, the search prunes symbol runs at every character but the
+// last, and every batch starts at a trailing part beginning with '!' - after
+// a symbol run of 2 in the odd batches, whose rows are then all pruned, and
+// none in the even ones, which lose none: a backend that used one batch's
+// pruning for another misses the planted candidate or reports a pruned one.
 struct GroupedCase {
     int plantBatch; // -1: the last
     enum { Inside, AtStart, AtEnd, JustAfter } where;
+    bool prune = false;
 };
 
 bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount, int alphabetSize, int trailingLen, const uint32_t* cryptTable,
@@ -204,13 +212,17 @@ bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount
         space *= as;
     const std::string suffix = ".WAV";
     const int plantBatch = c.plantBatch < 0 ? batchCount - 1 : c.plantBatch;
+    if (plantBatch >= batchCount)
+        return true; // fewer batches per call than this case needs
 
     std::vector<BatchRequest> batches(batchCount);
     std::vector<std::string> prefixes(batchCount);
     for (int b = 0; b < batchCount; ++b) {
         prefixes[b] = std::string("REZ\\") + kCharacters[10 + b]; // '0', '1', ... - a different leading character each
         BatchRequest& batch = batches[b];
-        batch.start = std::min(space - 1, space / 3 + (uint64_t) b * 7);
+        batch.start = std::min(space - 1, (c.prune ? alphabet.find('!') * (space / as) : space / 3) + (uint64_t) b * 7);
+        if (c.prune)
+            batch.params.pruneEntry.symbolRun = b % 2 == 1 ? 2 : 0;
         batch.count = std::min(space - batch.start, 2 * as + 5 + (uint64_t) b);
         memcpy(batch.params.prefix, prefixes[b].c_str(), prefixes[b].size() + 1);
         batch.params.prefixSize = (short) prefixes[b].size();
@@ -228,15 +240,24 @@ bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount
     }
     if (planted >= space)
         return true; // the trailing space is too small for this case
-    const bool inside = c.where != GroupedCase::JustAfter;
 
-    const std::string plantedName = prefixes[plantBatch] + trailingString(planted, trailingLen, alphabet) + suffix;
+    PruneRules rules;
+    rules.symbolRuns = c.prune;
+    const std::string plantedTrailing = trailingString(planted, trailingLen, alphabet);
+    PruneState state = target.params.pruneEntry;
+    bool survives = true;
+    for (int i = 0; i + 1 < trailingLen && survives; ++i)
+        survives = pruneStep_CPU(rules, state, plantedTrailing[i]);
+    const bool inside = c.where != GroupedCase::JustAfter && survives;
+
+    const std::string plantedName = prefixes[plantBatch] + plantedTrailing + suffix;
     SearchConstants constants;
     constants.alphabet = alphabet;
     constants.suffix = suffix;
     constants.cryptTable = cryptTable;
     constants.targetHashA = hashFromScratch(plantedName, cryptTable, 0x100);
     constants.targetHashB = hashFromScratch(plantedName, cryptTable, 0x200);
+    constants.trailingRules = rules;
 
     // As the engine does it (searchBatches, search.cpp): all at once, or each
     // on its own if their hits together were more than could be recorded.
@@ -262,8 +283,8 @@ bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount
     backend.endSearch();
 
     char where[256];
-    snprintf(where, sizeof(where), " (%d batches searched together, planted in batch %d, alphabet size %d, trailing length %d)", batchCount,
-             plantBatch, alphabetSize, trailingLen);
+    snprintf(where, sizeof(where), " (%d batches searched together, planted in batch %d, alphabet size %d, trailing length %d%s)", batchCount,
+             plantBatch, alphabetSize, trailingLen, c.prune ? ", pruning symbol runs" : "");
     if (again.hits != result.hits || again.found != result.found || again.foundFilename != result.foundFilename) {
         error = "searching the same batches again in the same search reported something else - " + std::to_string(result.hits.size()) +
                 " hit(s) the first time, " + std::to_string(again.hits.size()) + " the second" + where;
@@ -281,7 +302,83 @@ bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount
         return false;
     }
     if (!inside && (reported || result.found)) {
-        error = "reported '" + plantedName + "', which is outside the searched ranges" + where;
+        error = "reported '" + plantedName + "', which is outside the searched ranges" + (survives ? "" : ", or pruned") + where;
+        return false;
+    }
+    return true;
+}
+
+// A search that prunes the whole candidate (SearchConstants::trailingRules):
+// a candidate planted at `trailing` - every rule on, at most one backslash,
+// starting from a state as if the leading characters had left a symbol run
+// of 1, a '(' open and a backslash used - must be reported exactly when its
+// characters, all but the last, break none of them. The range reaches two
+// row groups either side, where other groups and rows are pruned or not, so
+// a backend that searched the wrong ones, or used the wrong rows of one,
+// misses it or reports a pruned one.
+bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& trailing, const uint32_t* cryptTable, std::string& error) {
+    // With a backslash, in place of the last character.
+    std::string alphabet = kCharacters.substr(0, alphabetSize);
+    alphabet.back() = '\\';
+    const uint64_t as = (uint64_t) alphabetSize;
+    const int trailingLen = (int) trailing.size();
+    uint64_t space = 1, planted = 0;
+    for (char c : trailing) {
+        space *= as;
+        planted = planted * as + alphabet.find(c);
+    }
+    const std::string prefix = "REZ\\(!";
+    const std::string suffix = ".WAV";
+    const std::string plantedName = prefix + trailing + suffix;
+
+    SearchConstants constants;
+    constants.alphabet = alphabet;
+    constants.suffix = suffix;
+    constants.cryptTable = cryptTable;
+    constants.targetHashA = hashFromScratch(plantedName, cryptTable, 0x100);
+    constants.targetHashB = hashFromScratch(plantedName, cryptTable, 0x200);
+    constants.trailingRules.symbolRuns = true;
+    constants.trailingRules.unopenedBrackets = true;
+    constants.trailingRules.maxBackslashCount = 1;
+
+    BatchParams params;
+    memcpy(params.prefix, prefix.c_str(), prefix.size() + 1);
+    params.prefixSize = (short) prefix.size();
+    std::pair<uint32_t, uint32_t> seeds = mpqHashWithPrefixCache_CPU(prefix.c_str(), cryptTable);
+    params.seed1Start = seeds.first;
+    params.seed2Start = seeds.second;
+    params.pruneEntry.symbolRun = 1;
+    params.pruneEntry.open.round = 1;
+    params.pruneEntry.backslashes = 1;
+
+    // What the rules say, worked out here one character at a time.
+    PruneState state = params.pruneEntry;
+    bool survives = true;
+    for (int i = 0; i + 1 < trailingLen && survives; ++i)
+        survives = pruneStep_CPU(constants.trailingRules, state, trailing[i]);
+
+    const uint64_t reach = 2 * as * as + 7;
+    const uint64_t start = planted - std::min(planted, reach);
+    const uint64_t end = std::min(space, planted + reach);
+    Result result;
+    const uint64_t batchSize = backend.batchSize(alphabetSize);
+    backend.beginSearch(constants);
+    for (uint64_t i = start; i < end && !result.found;) {
+        const uint64_t chunkEnd = std::min(end, (i / batchSize + 1) * batchSize);
+        searchChunk(backend, trailingLen, i, chunkEnd - i, params, result);
+        i = chunkEnd;
+    }
+    backend.endSearch();
+
+    const std::string where = " (pruning the whole candidate, alphabet size " + std::to_string(alphabetSize) + ", trailing length " +
+                              std::to_string(trailingLen) + ")";
+    const bool reported = std::find(result.hits.begin(), result.hits.end(), plantedName) != result.hits.end();
+    if (survives && (!reported || !result.found || result.foundFilename != plantedName)) {
+        error = "missed the planted candidate '" + plantedName + "'" + where;
+        return false;
+    }
+    if (!survives && (reported || result.found)) {
+        error = "reported '" + plantedName + "', which the pruning rules leave out" + where;
         return false;
     }
     return true;
@@ -340,6 +437,37 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             return false;
     }
 
+    // Pruning the whole candidate (see runPruneCase), with the rules' state
+    // from before the trailing part as if the leading characters had left a
+    // symbol run of 1, a '(' open and the one backslash allowed used. Each
+    // breaks - or doesn't - at a different character: in a row group's
+    // characters or at the row's own last one, and never at the last, which
+    // isn't checked.
+    if (window >= 3) {
+        // As they are at a window of 3; a longer window adds 'A's.
+        const std::string pad(window - 3, 'A');
+        const std::string shorter(std::max(0, window - 4), 'A');
+        const std::vector<std::string> pruneCases = {
+            "!" + pad + "A!",                             // a symbol run of 2: survives - and the last character isn't checked
+            "!!" + pad + "A",                             // a run of 3, in the row group's characters: pruned
+            window == 3 ? "!!A" : shorter + "!!!A",       // a run of 3 at the row's own last character: pruned
+            ")" + pad + "AA",                             // closes the '(' left open: survives
+            window == 3 ? "))A" : "A)" + shorter + ")A",  // closes one more, at the row's own last character: pruned
+            "A" + pad + "))",                             // ... at the last character: survives
+            "A\\" + pad + "A",                            // a second backslash: pruned
+            pad + "A\\A",                                 // ... at the row's own last character: pruned
+            pad + "AA\\",                                 // ... at the last character: survives
+            ")" + pad + "(A",                             // a '(' right after the last open bracket is closed: survives
+            "AB" + pad + "(",                             // nothing: survives
+        };
+        for (int size : {big, small}) {
+            for (const std::string& trailing : pruneCases) {
+                if (!runPruneCase(backend, size, trailing, cryptTable, error))
+                    return false;
+            }
+        }
+    }
+
     // As many batches at once as the backend takes (see runGroupedCase).
     const int batchCount = std::min(backend.maxBatchesPerCall(), (int) kCharacters.size() - 10);
     if (batchCount > 1) {
@@ -347,6 +475,8 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             {0, GroupedCase::Inside},    {1, GroupedCase::Inside},  {-1, GroupedCase::Inside},
             {-1, GroupedCase::AtStart},  {-1, GroupedCase::AtEnd},  {0, GroupedCase::AtEnd},
             {1, GroupedCase::AtStart},   {0, GroupedCase::JustAfter}, {-1, GroupedCase::JustAfter},
+            {0, GroupedCase::Inside, true}, {1, GroupedCase::Inside, true}, {2, GroupedCase::AtEnd, true},
+            {3, GroupedCase::AtStart, true}, {-1, GroupedCase::Inside, true},
         };
         for (const GroupedCase& c : groupedCases) {
             if (!runGroupedCase(backend, c, batchCount, big, window, cryptTable, error))
