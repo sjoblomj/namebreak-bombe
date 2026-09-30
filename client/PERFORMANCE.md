@@ -82,11 +82,13 @@ will have grown (not measured again).
 - [ ] **HIP.** Gets the filter with the CUDA code, but has never run on an
   AMD GPU. The self-test now runs there before every use, which lowers the
   risk - but measuring it on real AMD hardware is still to do.
-  - [x] **Tested through HIP's NVIDIA platform**, filter and row groups
-    and all: built against ROCm 6.1.2's own HIP headers (compiled by nvcc)
-    and run as `--backend hip` on the RTX 3080 Ti, every test passes - the
-    integration test in its four geometries, the stress test in its five
-    configurations and the overflow test. That tests the HIP API mapping,
+  - [x] **Tested through HIP's NVIDIA platform**, filter, row groups and
+    16 batches per launch and all: built against ROCm 6.1.2's own HIP
+    headers (compiled by nvcc) and run as `--backend hip` on the RTX 3080
+    Ti, with `NAMEBREAK_REQUIRE_GPU` on, every test passes - the integration
+    test in its four geometries, the stress test in its six configurations
+    and the overflow test, whose batches searched together overflowed and
+    were searched again one by one, as they should. That tests the HIP API mapping,
     not AMD's compiler, and the NVIDIA platform would even compile a CUDA
     runtime call `gpu_runtime.h` doesn't map, so two more things were
     checked by hand: every `cuda*` name the backend uses is mapped, and the
