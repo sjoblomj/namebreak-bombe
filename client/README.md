@@ -291,13 +291,14 @@ so a GPU build still works on a machine without that GPU:
   About 1,300-1,460 G candidates/s on the RTX 3080 Ti Laptop, depending on
   how hot it is - six to seven times what it did before it got the filter, and
   close to the CUDA backend.
-- `cpu/` - every core of the CPU, with the same row trick as the CUDA
-  kernel and the candidates of a row hashed several at a time with SIMD
-  instructions (AVX2 on x86-64 CPUs that have it, picked at runtime; SSE2
-  or NEON otherwise). About 9 G candidates/s on a laptop i9-12900H - far
-  below its GPU, but it lets any machine contribute. Every build has it.
-  (A prototype of it with the lookup filter was about 4.6 times as fast -
-  see [PERFORMANCE.md](PERFORMANCE.md).)
+- `cpu/` - every core of the CPU, with the same row trick and [lookup
+  filter](#the-lookup-filter-most-candidates-are-never-hashed) as the GPU
+  kernels: a row's shared characters hashed once, a table lookup, and only
+  the few candidates it flags hashed in full - plain C++, no SIMD. It
+  searches 16 leading values per call, their rows shared out among the
+  threads as they go. About 50 G candidates/s on a laptop i9-12900H (it was
+  about 10.6 hashing every candidate with AVX2) - far below its GPU, but it
+  lets any machine contribute. Every build has it.
 - `reference/` - one thread, every candidate hashed from scratch. Far too
   slow for real searches, but simple enough to be obviously right: it's what
   the others are held to. Every build has it.
@@ -777,7 +778,18 @@ its 436), each time the script was run on it. The Metal kernel has its own
 list (`--backend metal`, on a Mac); with no Mac here, its kernel mutations
 were run through an emulation of Metal on the CPU (see [Backends](#backends)),
 and each was caught by all three checks there too, while half as many
-threads, or a threadgroup too many, went unnoticed, as they must.
+threads, or a threadgroup too many, went unnoticed, as they must. The CPU
+backend has its own list too (`--backend cpu`), since it got the filter:
+the same kinds of bug in its mask, lookup, row edges, loop and suffix, the
+highest flagged bit taken for the lowest, and in its own code the row
+walk's characters wrapping one early, the wrong one rehashed after a
+change, a work item's first row decoded one off, a row skipped between two
+work items, a call's last batch never searched, hits recorded or checked
+with the wrong batch, and an overflow hidden by counting a thread's hits no
+higher than can be recorded - with larger work items, and everything on one
+thread, as the changes that mustn't matter. Each was caught by the checks
+it names (the integration test failed 17-1138 of its 2,338 cases, the
+stress test 55-426 of its 511).
 
 Each round of this found something. The first one added the self-test's
 and the stress test's planted edge cases: before them, a launch whose last
@@ -799,7 +811,12 @@ reading hits back with the count found that the default builds' tests had
 stopped noticing what one launch leaves for the next - a hit count never
 reset got past all three checks, as their searches had become single
 launches - so the self-test now searches its grouped batches twice in one
-search, and the script runs `stress-small` too.
+search, and the script runs `stress-small` too. The CPU backend's first
+run found that the self-test never stepped from one row to the next on it -
+its short ranges were cut into work items a row long, each decoded afresh -
+so a row walk wrapping its characters one early got past it; it now also
+searches a range three row groups long, and finds a candidate a few rows
+into it, in the last row of a group.
 `tests/self_test_test.cpp` does the same for the self-test on the CPU
 backends, on every `ctest` run.
 

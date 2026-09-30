@@ -30,17 +30,27 @@ will have grown (not measured again).
 
 ## The lookup filter on the other backends
 
-- [ ] **CPU backend.** A prototype (the cpu backend's row walk, with each
+- [x] **CPU backend.** A prototype (the cpu backend's row walk, with each
   row's last character looked up in the table instead of hashed with SIMD)
-  passed the whole test suite and measured **4.6 times as fast**: 19.5 G
-  candidates/s against 4.3, on a machine busy enough that both were below
-  the README's 9. Tables of 8 or 9 bits per seed were best (512 KB / 2 MB,
-  from the CPU's L2); every width from 6 to 10 beat the current backend by
-  3-5 times. It's also simpler code than the SIMD it would replace. Later,
-  the row states themselves could be computed eight at a time with AVX2,
-  and their table entries gathered. The backend already walks its rows
-  incrementally (`searchRowsWith`), and so did the prototype: the port must
-  keep that, so there's no row decoding to add here.
+  passed the whole test suite and measured 4.6 times as fast, on a busy
+  machine. Now the backend itself: it keeps its incremental row walk, looks
+  each row up in the search's table (built and sample-checked in
+  `beginSearch`, as the GPU backends do), and hashes only the flagged
+  candidates in full - plain C++, the SIMD versions (AVX2, SSE2/NEON, and
+  plain loops) gone. It also takes 16 batches per call (`runBatches`), its
+  rows cut into work items - about eight per thread - that the threads take
+  in turn, so that they start once per 16 leading values instead of once
+  per batch, and batches of any size share out evenly (with one call per
+  batch, and a leading value split into a batch of 2^22 rows and a smaller
+  one, it measured about 26-28 G candidates/s). **Measured**
+  (`search_bench --backend cpu`, i9-12900H, 20 threads): about **50 G
+  candidates/s, against 10.6** - 4.7 times as fast - at the shared 7-bit
+  table (the prototype found 8-9 bits best on the CPU, but every width from
+  6 to 10 within a few tens of percent). The mutation script now has a
+  `cpu` list too.
+  - [ ] **Later**: the row states computed eight at a time with AVX2, and
+    their table entries gathered; a table width of its own, if 8 or 9 bits
+    still measure better here.
 - [x] **OpenCL.** `filteredRowsKernel` ported to `search.cl`, with the table
   in a global buffer and the same checks as the CUDA backend (a sample of
   the table checked, and read back, before every search). **Measured** 5.3

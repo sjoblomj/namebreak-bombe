@@ -24,8 +24,11 @@ struct Case {
     // Where the planted candidate is: inside the searched range; its very
     // first or very last candidate (the range then starts or ends mid-row,
     // at it); the range's only candidate; or just before its start / just
-    // after its end, in the same row.
-    enum { Inside, AtStart, AtEnd, Only, JustBefore, JustAfter } where;
+    // after its end, in the same row. Or in a longer range - a few rows
+    // after its start, and three row groups before its end - where a backend
+    // reaches it by stepping from row to row (a CPU work item, a GPU chunk)
+    // rather than by working its row out afresh.
+    enum { Inside, AtStart, AtEnd, Only, JustBefore, JustAfter, InLongRange } where;
     // Which row of its row group - the alphabetSize rows that share every
     // character but the row's last (see kChunksPerGroup in the CUDA backend) -
     // the planted candidate is in: one in the middle, or the group's first or
@@ -118,6 +121,10 @@ bool runCase(SearchBackend& backend, const Case& c, const uint32_t* cryptTable, 
         case Case::JustAfter:
             end = planted;
             start = end - std::min(end, reach);
+            break;
+        case Case::InLongRange:
+            start = planted - std::min(planted, 5 * as + 2);
+            end = std::min(space, planted + 3 * as * as);
             break;
     }
 
@@ -319,6 +326,10 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
         {big, "REZ\\", ".WAV", window, 31, Case::AtEnd, Case::LastRowOfGroup},
         {small, "REZ\\", ".WAV", window, 7, Case::Inside, Case::LastRowOfGroup},
         {big, "Z\xC4\\", longSuffix, std::min(3, window), 12, Case::Inside, Case::FirstRowOfGroup},
+        // Reached by stepping from row to row, into the last row of a group,
+        // where the characters before the last wrap around.
+        {big, "REZ\\", ".WAV", window, 20, Case::InLongRange, Case::LastRowOfGroup},
+        {small, "REZ\\", ".WAV", window, 3, Case::InLongRange, Case::LastRowOfGroup},
         {big, "REZ\\", ".WAV", window, 20, Case::JustBefore},
         {big, "REZ\\", ".WAV", window, 20, Case::JustAfter},
     };

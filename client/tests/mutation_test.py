@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Mutation testing of the GPU backends' search kernels.
+"""Mutation testing of the backends' search code.
 
-Builds copies of the client in which a backend's kernel is broken on purpose -
+Builds copies of the client in which a backend's search is broken on purpose -
 each mutation a small bug that would make a search silently miss (or invent)
 candidates - and checks that every one of them is caught by each of the
 three checks that guard the search, on its own:
@@ -31,8 +31,8 @@ anything, and the script stops), and so must the mutations marked harmless -
 changes that must *not* change what gets searched.
 
 One backend per run (--backend): cuda (the default), hip (the same code,
-compiled with HIP), opencl or metal (on a Mac), each with its own list of
-mutations (--list).
+compiled with HIP), opencl, metal (on a Mac) or cpu, each with its own list
+of mutations (--list).
 Needs the GPU the backend runs on, its toolchain or driver, and CMake. It
 copies CMakeLists.txt, src/ and tests/ as they are on disk into a work
 directory, so it tests uncommitted changes too and never touches build/.
@@ -72,6 +72,7 @@ CL_KERNEL = "src/backends/opencl/search.cl"
 CL_HOST = "src/backends/opencl/opencl_backend.cpp"
 MTL_KERNEL = "src/backends/metal/search.metal"
 MTL_HOST = "src/backends/metal/metal_backend.mm"
+CPU = "src/backends/cpu/cpu_backend.cpp"
 
 
 @dataclass
@@ -88,8 +89,8 @@ class Mutation:
 
 # The table builder is shared by every backend that has the filter.
 WRONG_TARGET = Mutation("wrongtarget", "the table built for the wrong target",
-                        [(FILTER, "if (((seed1[b] ^ constants.targetHashA) & kLowBitsFilterHashMask) == 0)",
-                          "if (((seed1[b] ^ (constants.targetHashA ^ 1)) & kLowBitsFilterHashMask) == 0)")])
+                        [(FILTER, "const Lane targetA = (Lane) constants.targetHashA;",
+                          "const Lane targetA = (Lane) (constants.targetHashA ^ 1);")])
 
 CUDA_MUTATIONS = [
     # The lookup filter's mask.
@@ -318,12 +319,64 @@ METAL_MUTATIONS = [
                      "const NSUInteger threadgroups = (chunks + threadgroupSize - 1) / threadgroupSize + 1;")]),
 ]
 
+# The CPU backend: the same filter, its own row walk, and its rows shared out
+# among its threads as work items.
+CPU_MUTATIONS = [
+    # The lookup filter's mask.
+    Mutation("mask32", "a row's mask cut to 32 bits",
+             [(CPU, "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask;", "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask & 0xFFFFFFFFull;")]),
+    Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
+             [(CPU, "ctx.table[lowBitsFilterIndex(s1, s2)]", "ctx.table[lowBitsFilterIndex(s2, s1)]")]),
+    Mutation("lastrow", "a batch's last row one candidate short",
+             [(CPU, "mask &= (uint64_t(1) << ctx.rows.lastRowEndK) - 1;", "mask &= (uint64_t(1) << (ctx.rows.lastRowEndK - 1)) - 1;")]),
+    Mutation("firstrow", "a batch's first row one candidate short",
+             [(CPU, "mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;", "mask &= ~uint64_t(0) << (ctx.rows.firstRowStartK + 1);")]),
+    Mutation("noedges", "where the range starts and ends mid-row ignored",
+             [(CPU, "if (i == 0)\n            mask &=", "if (false)\n            mask &="),
+              (CPU, "if (i == ctx.rows.rowCount - 1)\n            mask &=", "if (false)\n            mask &=")]),
+    Mutation("skiplast", "the loop over a row's flagged candidates stops one early",
+             [(CPU, "while (mask != 0) {", "while ((mask & (mask - 1)) != 0) {")]),
+    Mutation("highestbit", "a row's highest flagged bit taken for its lowest",
+             [(CPU, "return __builtin_ctzll(mask);", "return 63 - __builtin_clzll(mask);")]),
+    Mutation("suffixshort", "the suffix hashed one character short",
+             [(CPU, "for (int j = 0; j < ctx.suffixLen; ++j)\n                mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);",
+               "for (int j = 0; j + 1 < ctx.suffixLen; ++j)\n                mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);")]),
+    WRONG_TARGET,
+    # The row walk.
+    Mutation("odometer", "a row's shared characters wrapping one early",
+             [(CPU, "while (p >= 0 && ++digit[p] == as) {", "while (p >= 0 && ++digit[p] == as - 1) {")]),
+    Mutation("rehash", "the character that changed left out of the next row's hash",
+             [(CPU, "rehashFrom(p < 0 ? 0 : p);", "rehashFrom(p < 0 ? 0 : p + 1);")]),
+    Mutation("startrow", "a work item's first row decoded one off",
+             [(CPU, "uint64_t rowValue = ctx.rows.firstRow + from;", "uint64_t rowValue = ctx.rows.firstRow + from + 1;")]),
+    # Sharing the rows out, and the batches.
+    Mutation("itemgap", "a row skipped between two work items",
+             [(CPU, "from < contexts[b].rows.rowCount; from += rowsPerItem)", "from < contexts[b].rows.rowCount; from += rowsPerItem + 1)")]),
+    Mutation("lastbatch", "a call's last batch never searched, when there's more than one",
+             [(CPU, "    for (int b = 0; b < batchCount; ++b) {\n        for (uint64_t from = 0;",
+               "    for (int b = 0; b < std::max(1, batchCount - 1); ++b) {\n        for (uint64_t from = 0;")]),
+    Mutation("hitbatch", "every hit recorded as the call's first batch's",
+             [(CPU, "record(found, batch, row * as + k);", "record(found, 0, row * as + k);")]),
+    Mutation("verifybatch", "every hit checked with the call's first batch's prefix",
+             [(CPU, "requests[mine.batches[i]].params", "requests[0].params")]),
+    # Only the overflow test has more hits in a call than can be recorded.
+    Mutation("overflowcount", "a thread's hits counted no higher than can be recorded, hiding the overflow",
+             [(CPU, "std::min<uint64_t>(mine.hitCount, MAX_MATCHES + 1)", "std::min<uint64_t>(mine.hitCount, MAX_MATCHES)")],
+             caught_by=("overflow",)),
+    # How the rows are shared out must not change what gets searched.
+    Mutation("biggeritems", "a quarter as many work items, four times as large", expect="harmless",
+             edits=[(CPU, "(totalRows + threads * 8 - 1) / (threads * 8)", "(totalRows + threads * 2 - 1) / (threads * 2)")]),
+    Mutation("onethread", "every call searched on one thread", expect="harmless",
+             edits=[(CPU, "    threads = std::min<uint64_t>(threads, totalRows);", "    threads = 1;")]),
+]
+
 # Per backend: how to build it, what its createBackend name is, and its mutations.
 BACKENDS = {
     "cuda": (["-DNAMEBREAK_GPU=cuda", "-DNAMEBREAK_OPENCL=OFF"], CUDA_MUTATIONS),
     "hip": (["-DNAMEBREAK_GPU=hip", "-DNAMEBREAK_OPENCL=OFF"], CUDA_MUTATIONS),
     "opencl": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=ON"], OPENCL_MUTATIONS),
     "metal": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=OFF", "-DNAMEBREAK_METAL=ON"], METAL_MUTATIONS),
+    "cpu": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=OFF"], CPU_MUTATIONS),
 }
 
 CONTROL = Mutation("none", "the code as it is", [], expect="harmless")

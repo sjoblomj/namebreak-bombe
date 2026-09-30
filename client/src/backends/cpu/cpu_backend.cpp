@@ -1,50 +1,25 @@
 #include "backends/cpu/cpu_backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <string>
 #include <thread>
 #include <vector>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
+#include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
 
-// The hot loop hashes kLanes candidates at once, as a few independent chains
-// of SIMD vectors (independent, so each step of the serial hash recurrence
-// has other work to overlap with). With GCC or Clang that's written with
-// their vector types - 4 lanes wide, which is SSE2 on x86-64 and NEON on
-// ARM, plus an 8-lane AVX2 version on x86-64 that's used when the CPU has
-// it. Other compilers (MSVC) get plain loops over the lanes, which they
-// vectorize as they see fit.
-#if defined(__GNUC__) || defined(__clang__)
-#define NAMEBREAK_VECTOR_TYPES 1
-#define NAMEBREAK_ALWAYS_INLINE inline __attribute__((always_inline))
-typedef uint32_t U32x4 __attribute__((vector_size(16)));
-// NAMEBREAK_CPU_NO_AVX2 leaves the AVX2 version out, so the tests can
-// exercise the portable one on a CPU that has AVX2 (see CMakeLists.txt).
-#if defined(__x86_64__) && !defined(NAMEBREAK_CPU_NO_AVX2)
-#define NAMEBREAK_AVX2 1
-typedef uint32_t U32x8 __attribute__((vector_size(32)));
-#endif
-#else
-#define NAMEBREAK_ALWAYS_INLINE inline
-#endif
-
 namespace {
 
-// Candidates hashed side by side by the portable versions: four chains of
-// 4-lane vectors.
-constexpr int kLanes = 16;
-// The AVX2 version hashes a whole row at once: as many 8-lane chains as the
-// alphabet needs (up to 7 - more would no longer fit in its 16 registers).
-constexpr int kAvx2Width = 8;
-constexpr int kMaxAvx2Chains = (MAX_ALPHABET_SIZE + kAvx2Width - 1) / kAvx2Width;
-static_assert(kMaxAvx2Chains <= 7, "a whole row's AVX2 chains must fit in registers");
-// The alphabet padded to a whole number of lane groups; lanes past the
-// alphabet's end hash harmless garbage that's never reported.
-constexpr int kPaddedAlphabet = (MAX_ALPHABET_SIZE + kLanes - 1) / kLanes * kLanes;
-static_assert(kPaddedAlphabet >= kMaxAvx2Chains * kAvx2Width, "the padding must cover a whole row's AVX2 chains");
 // Batches smaller than this many candidates are searched on the calling
 // thread - starting threads would cost more than it saves. Overridable at
 // compile time so the tests can split even their small batches across
@@ -54,16 +29,33 @@ static_assert(kPaddedAlphabet >= kMaxAvx2Chains * kAvx2Width, "the padding must 
 #endif
 constexpr uint64_t kMinCandidatesPerThread = NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD;
 
+// How many of the lookup filter's entries beginSearch checks against their
+// definition before every search, as the GPU backends do (see
+// checkLowBitsFilterTable).
+constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
+
 inline void mpqStep(uint32_t& seed1, uint32_t& seed2, uint32_t key, uint32_t ord) {
     seed1 = key ^ (seed1 + seed2);
     seed2 = ord + seed1 + seed2 + (seed2 << 5) + 3;
 }
 
-// What one thread searches, and what it found.
-struct RowJob {
-    uint64_t from, to;          // rows [from, to) of the batch's RowRange (0 = its first row)
-    std::vector<uint64_t> hits; // trailing indices, at most MAX_MATCHES of them
-    uint64_t hitCount = 0;      // all hits, including those past MAX_MATCHES
+// The lowest bit set in a non-zero mask.
+inline int lowestBit(uint64_t mask) {
+#ifdef _MSC_VER
+    unsigned long index;
+    _BitScanForward64(&index, mask);
+    return (int) index;
+#else
+    return __builtin_ctzll(mask);
+#endif
+}
+
+// What one thread found: the trailing index and batch of each hit, at most
+// MAX_MATCHES of them.
+struct ThreadHits {
+    std::vector<uint64_t> trailingIndices;
+    std::vector<int> batches;
+    uint64_t hitCount = 0; // all hits, including those past MAX_MATCHES
 };
 
 // Everything fixed for one runBatch() call.
@@ -71,106 +63,40 @@ struct BatchContext {
     int alphabetSize;
     int suffixLen;
     uint32_t targetA;
-    const uint32_t* key;       // kPaddedAlphabet entries: crypt-table key per alphabet position
-    const uint32_t* ord;       // kPaddedAlphabet entries: the character itself
+    const uint32_t* key;       // crypt-table key per alphabet position
+    const uint32_t* ord;       // the character itself
     const uint32_t* suffixKey; // suffixLen entries
     const uint32_t* suffixOrd;
+    const uint64_t* table;     // this search's lookup filter (backends/common/lowbits_filter.h)
     RowRange rows;
     int prefixDigits;          // trailingLen - 1: the characters a row shares
     uint32_t seed1Start;
     uint32_t seed2Start;
 };
 
-// Hashes candidates k0 .. k0 + Chains * (lanes per Vec) - 1 of a row whose
-// shared characters left the hash state at (s1, s2), as Chains independent
-// chains of Vec: stores each one's hashA in outA if any of them is the
-// target, and returns whether one is.
-template <typename Vec, int Chains>
-NAMEBREAK_ALWAYS_INLINE bool hashLanes(const BatchContext& ctx, int k0, uint32_t s1, uint32_t s2, uint32_t* outA) {
-    constexpr int kWidth = sizeof(Vec) / sizeof(uint32_t);
-    constexpr int kChains = Chains;
-    Vec a[kChains], b[kChains];
-    const uint32_t sum = s1 + s2;
-    const uint32_t bBase = s2 + (s2 << 5) + 3;
-    for (int c = 0; c < kChains; ++c) {
-        Vec key, ord;
-        memcpy(&key, ctx.key + k0 + c * kWidth, sizeof(key));
-        memcpy(&ord, ctx.ord + k0 + c * kWidth, sizeof(ord));
-        a[c] = key ^ sum;
-        b[c] = ord + a[c] + bBase;
+void record(ThreadHits& found, int batch, uint64_t trailingIndex) {
+    if (found.hitCount++ < MAX_MATCHES) {
+        found.trailingIndices.push_back(trailingIndex);
+        found.batches.push_back(batch);
     }
-    for (int j = 0; j < ctx.suffixLen; ++j) {
-        const uint32_t suffixKey = ctx.suffixKey[j], suffixOrd = ctx.suffixOrd[j];
-        for (int c = 0; c < kChains; ++c) {
-            Vec na = suffixKey ^ (a[c] + b[c]);
-            b[c] = suffixOrd + na + b[c] + (b[c] << 5) + 3;
-            a[c] = na;
-        }
-    }
-    // Only the bits a hit must match - all of them, and so nothing to do,
-    // outside the stress tests' builds (see engine/hash_match.h). The masked
-    // values still compare right with hashAMatches below.
-    if constexpr (kHashAMatchMask != 0xFFFFFFFFu) {
-        for (int c = 0; c < kChains; ++c)
-            a[c] &= kHashAMatchMask;
-    }
-    const uint32_t target = ctx.targetA & kHashAMatchMask;
-    Vec hit = (Vec) (a[0] == target);
-    for (int c = 1; c < kChains; ++c)
-        hit |= (Vec) (a[c] == target);
-    uint64_t words[sizeof(Vec) / sizeof(uint64_t)];
-    memcpy(words, &hit, sizeof(words));
-    uint64_t any = 0;
-    for (uint64_t word : words)
-        any |= word;
-    if (any == 0)
-        return false;
-    for (int c = 0; c < kChains; ++c)
-        memcpy(outA + c * kWidth, &a[c], sizeof(Vec));
-    return true;
 }
 
-// The plain-loop version, for compilers without vector types: kLanes lanes.
-NAMEBREAK_ALWAYS_INLINE bool hashLanesScalar(const BatchContext& ctx, int k0, uint32_t s1, uint32_t s2, uint32_t* outA) {
-    uint32_t a[kLanes], b[kLanes];
-    for (int l = 0; l < kLanes; ++l) {
-        a[l] = ctx.key[k0 + l] ^ (s1 + s2);
-        b[l] = ctx.ord[k0 + l] + a[l] + (s2 + (s2 << 5) + 3);
-    }
-    for (int j = 0; j < ctx.suffixLen; ++j) {
-        for (int l = 0; l < kLanes; ++l) {
-            uint32_t na = ctx.suffixKey[j] ^ (a[l] + b[l]);
-            b[l] = ctx.suffixOrd[j] + na + b[l] + (b[l] << 5) + 3;
-            a[l] = na;
-        }
-    }
-    bool any = false;
-    for (int l = 0; l < kLanes; ++l) {
-        outA[l] = a[l];
-        any |= hashAMatches(a[l], ctx.targetA);
-    }
-    return any;
-}
-
-void record(RowJob& job, uint64_t trailingIndex) {
-    if (job.hitCount++ < MAX_MATCHES)
-        job.hits.push_back(trailingIndex);
-}
-
-// Searches rows [job.from, job.to). A row's shared characters are hashed
+// Searches rows [from, to) of batch `batch` (0 = its first row). A row's shared characters are hashed
 // incrementally, like IncrementalPrefixHasher does for the leading part:
 // consecutive rows differ in their last shared character almost every time,
 // so moving to the next row costs about one hash step, not prefixDigits.
-// Hashes a whole row's candidates (s1, s2: the state after its shared
-// characters), in groups of Group lanes; `hash` hashes one group.
-template <int Group, typename HashGroup>
-NAMEBREAK_ALWAYS_INLINE void searchRowsWith(const BatchContext& ctx, RowJob& job, HashGroup hash) {
+// Then, as the GPU kernels do, one lookup in this search's filter table
+// gives the set of last characters whose hashA has the target's low bits -
+// always including any that matches the target (README.md's "The lookup
+// filter" has why) - and only those are hashed in full: about
+// alphabetSize / 2^kLowBitsFilterBits of a row's candidates.
+void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, ThreadHits& found) {
     const int as = ctx.alphabetSize;
 
     // digit[i]: the row's i-th shared character (most significant first);
     // state1/2[d]: the hash state after the first d of them.
     std::vector<int> digit(ctx.prefixDigits);
-    uint64_t rowValue = ctx.rows.firstRow + job.from;
+    uint64_t rowValue = ctx.rows.firstRow + from;
     for (int i = ctx.prefixDigits - 1; i >= 0; --i) {
         digit[i] = (int) (rowValue % as);
         rowValue /= as;
@@ -187,34 +113,30 @@ NAMEBREAK_ALWAYS_INLINE void searchRowsWith(const BatchContext& ctx, RowJob& job
     };
     rehashFrom(0);
 
-    for (uint64_t i = job.from; i < job.to; ++i) {
+    const uint64_t alphabetMask = (uint64_t(1) << as) - 1; // as is at most 50
+    for (uint64_t i = from; i < to; ++i) {
         const uint64_t row = ctx.rows.firstRow + i;
         const uint32_t s1 = state1[ctx.prefixDigits];
         const uint32_t s2 = state2[ctx.prefixDigits];
-        const int kBegin = (i == 0) ? ctx.rows.firstRowStartK : 0;
-        const int kEnd = (i == ctx.rows.rowCount - 1) ? ctx.rows.lastRowEndK : as;
 
-        if (kBegin == 0 && kEnd == as) {
-            for (int k0 = 0; k0 < as; k0 += Group) {
-                uint32_t a[Group];
-                if (hash(k0, s1, s2, a)) {
-                    for (int l = 0; l < Group && k0 + l < as; ++l) {
-                        if (hashAMatches(a[l], ctx.targetA))
-                            record(job, row * as + k0 + l);
-                    }
-                }
-            }
-        } else {
-            // A partial row at the edge of the batch's range - at most two
-            // per batch, so only correctness matters here.
-            for (int k = kBegin; k < kEnd; ++k) {
-                uint32_t a = s1, b = s2;
-                mpqStep(a, b, ctx.key[k], ctx.ord[k]);
-                for (int j = 0; j < ctx.suffixLen; ++j)
-                    mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);
-                if (hashAMatches(a, ctx.targetA))
-                    record(job, row * as + k);
-            }
+        // Bit k: the candidate with last character k is worth hashing.
+        // Restricted to the alphabet - which the table never exceeds anyway,
+        // but a stray bit must not index past key/ord - and to the batch's
+        // range in its first and last row.
+        uint64_t mask = ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask;
+        if (i == 0)
+            mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;       // firstRowStartK is in [0, as)
+        if (i == ctx.rows.rowCount - 1)
+            mask &= (uint64_t(1) << ctx.rows.lastRowEndK) - 1;     // lastRowEndK is in [1, as]
+        while (mask != 0) {
+            const int k = lowestBit(mask);
+            mask &= mask - 1;
+            uint32_t a = s1, b = s2;
+            mpqStep(a, b, ctx.key[k], ctx.ord[k]);
+            for (int j = 0; j < ctx.suffixLen; ++j)
+                mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);
+            if (hashAMatches(a, ctx.targetA))
+                record(found, batch, row * as + k);
         }
 
         // Next row: increment the shared characters like an odometer, and
@@ -228,45 +150,12 @@ NAMEBREAK_ALWAYS_INLINE void searchRowsWith(const BatchContext& ctx, RowJob& job
     }
 }
 
-#ifdef NAMEBREAK_AVX2
-template <int Chains>
-__attribute__((target("avx2"))) void searchRowsAvx2(const BatchContext& ctx, RowJob& job) {
-    searchRowsWith<Chains * kAvx2Width>(ctx, job, [&](int k0, uint32_t s1, uint32_t s2, uint32_t* outA) __attribute__((always_inline)) {
-        return hashLanes<U32x8, Chains>(ctx, k0, s1, s2, outA);
-    });
-}
-
-// The whole row in one group: ceil(alphabetSize / 8) chains.
-void searchRowsAvx2(const BatchContext& ctx, RowJob& job) {
-    switch ((ctx.alphabetSize + kAvx2Width - 1) / kAvx2Width) {
-        case 1: searchRowsAvx2<1>(ctx, job); break;
-        case 2: searchRowsAvx2<2>(ctx, job); break;
-        case 3: searchRowsAvx2<3>(ctx, job); break;
-        case 4: searchRowsAvx2<4>(ctx, job); break;
-        case 5: searchRowsAvx2<5>(ctx, job); break;
-        case 6: searchRowsAvx2<6>(ctx, job); break;
-        default: searchRowsAvx2<7>(ctx, job); break;
-    }
-}
-#endif
-
-void searchRows(const BatchContext& ctx, RowJob& job) {
-#ifdef NAMEBREAK_AVX2
-    static const bool hasAvx2 = __builtin_cpu_supports("avx2");
-    if (hasAvx2) {
-        searchRowsAvx2(ctx, job);
-        return;
-    }
-#endif
-#ifdef NAMEBREAK_VECTOR_TYPES
-    searchRowsWith<kLanes>(ctx, job, [&](int k0, uint32_t s1, uint32_t s2, uint32_t* outA) {
-        return hashLanes<U32x4, kLanes / 4>(ctx, k0, s1, s2, outA);
-    });
-#else
-    searchRowsWith<kLanes>(ctx, job, [&](int k0, uint32_t s1, uint32_t s2, uint32_t* outA) {
-        return hashLanesScalar(ctx, k0, s1, s2, outA);
-    });
-#endif
+// A search must not start with a filter table that is wrong: it could drop a
+// match without any other sign. As in the GPU backends, this ends the
+// process - a coordinator range is then reassigned when its lease runs out.
+[[noreturn]] void refuseFilterTable(const std::string& detail) {
+    fprintf(stderr, "INTERNAL ERROR: the lookup filter table failed its check (%s) - refusing to search with it\n", detail.c_str());
+    exit(1);
 }
 
 class CpuBackend : public SearchBackend {
@@ -285,6 +174,12 @@ public:
 
     void beginSearch(const SearchConstants& constants) override {
         verifier_.begin(constants);
+        // This search's lookup filter, checked against its definition before
+        // it's used, as the GPU backends do.
+        table_ = buildLowBitsFilterTable(constants);
+        std::string error;
+        if (!checkLowBitsFilterTable(table_, constants, kFilterEntriesCheckedPerSearch, 2, std::random_device{}(), error))
+            refuseFilterTable(error);
         alphabetSize_ = (int) constants.alphabet.size();
         targetA_ = constants.targetHashA;
         std::fill(std::begin(key_), std::end(key_), 0);
@@ -302,6 +197,10 @@ public:
     }
 
     BatchOutcome runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) override;
+    // Several batches - usually leading values - at once, so that its threads
+    // start once for all of them (see runBatches).
+    int maxBatchesPerCall() const override { return batchesPerLaunchOr(16); }
+    BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches) override;
 
     void endSearch() override {}
 
@@ -310,56 +209,87 @@ private:
     HitVerifier verifier_;
     int alphabetSize_ = 0;
     uint32_t targetA_ = 0;
-    alignas(64) uint32_t key_[kPaddedAlphabet] = {};
-    alignas(64) uint32_t ord_[kPaddedAlphabet] = {};
+    uint32_t key_[MAX_ALPHABET_SIZE] = {};
+    uint32_t ord_[MAX_ALPHABET_SIZE] = {};
+    std::vector<uint64_t> table_;
     std::vector<uint32_t> suffixKey_;
     std::vector<uint32_t> suffixOrd_;
 };
 
 BatchOutcome CpuBackend::runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) {
-    BatchContext ctx;
-    ctx.alphabetSize = alphabetSize_;
-    ctx.suffixLen = (int) suffixKey_.size();
-    ctx.targetA = targetA_;
-    ctx.key = key_;
-    ctx.ord = ord_;
-    ctx.suffixKey = suffixKey_.data();
-    ctx.suffixOrd = suffixOrd_.data();
-    ctx.rows = rowRangeFor(start, count, alphabetSize_);
-    ctx.prefixDigits = trailingLen - 1;
-    ctx.seed1Start = params.seed1Start;
-    ctx.seed2Start = params.seed2Start;
+    return runBatches(trailingLen, {BatchRequest{start, count, params}});
+}
 
-    // Contiguous slices of rows, one per thread (or all on this thread, for
-    // a small batch).
-    uint64_t threads = std::min<uint64_t>(threadCount_, std::max<uint64_t>(1, count / kMinCandidatesPerThread));
-    threads = std::min<uint64_t>(threads, ctx.rows.rowCount);
-    std::vector<RowJob> jobs(threads);
-    const uint64_t rowsPerJob = (ctx.rows.rowCount + threads - 1) / threads;
-    for (uint64_t t = 0; t < threads; ++t) {
-        jobs[t].from = std::min(ctx.rows.rowCount, t * rowsPerJob);
-        jobs[t].to = std::min(ctx.rows.rowCount, (t + 1) * rowsPerJob);
+BatchOutcome CpuBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& requests) {
+    const int batchCount = (int) requests.size();
+    std::vector<BatchContext> contexts(batchCount);
+    uint64_t totalRows = 0, totalCount = 0;
+    for (int b = 0; b < batchCount; ++b) {
+        BatchContext& ctx = contexts[b];
+        ctx.alphabetSize = alphabetSize_;
+        ctx.suffixLen = (int) suffixKey_.size();
+        ctx.targetA = targetA_;
+        ctx.key = key_;
+        ctx.ord = ord_;
+        ctx.suffixKey = suffixKey_.data();
+        ctx.suffixOrd = suffixOrd_.data();
+        ctx.table = table_.data();
+        ctx.rows = rowRangeFor(requests[b].start, requests[b].count, alphabetSize_);
+        ctx.prefixDigits = trailingLen - 1;
+        ctx.seed1Start = requests[b].params.seed1Start;
+        ctx.seed2Start = requests[b].params.seed2Start;
+        totalRows += ctx.rows.rowCount;
+        totalCount += requests[b].count;
     }
+
+    // Work items: slices of one batch's rows, about eight per thread, which
+    // the threads take in turn as they finish - so that batches of any size
+    // (a range's first and last are usually partial) share out evenly. All on
+    // this thread, for a small call: starting threads would cost more than
+    // it saves.
+    uint64_t threads = std::min<uint64_t>(threadCount_, std::max<uint64_t>(1, totalCount / kMinCandidatesPerThread));
+    threads = std::min<uint64_t>(threads, totalRows);
+    const uint64_t rowsPerItem = std::max<uint64_t>(1, (totalRows + threads * 8 - 1) / (threads * 8));
+    struct Item {
+        int batch;
+        uint64_t from, to;
+    };
+    std::vector<Item> items;
+    for (int b = 0; b < batchCount; ++b) {
+        for (uint64_t from = 0; from < contexts[b].rows.rowCount; from += rowsPerItem)
+            items.push_back({b, from, std::min(contexts[b].rows.rowCount, from + rowsPerItem)});
+    }
+    std::vector<ThreadHits> found(threads);
+    std::atomic<size_t> next{0};
+    auto work = [&](ThreadHits& mine) {
+        for (size_t i = next++; i < items.size(); i = next++)
+            searchRows(contexts[items[i].batch], items[i].batch, items[i].from, items[i].to, mine);
+    };
     if (threads == 1) {
-        searchRows(ctx, jobs[0]);
+        work(found[0]);
     } else {
         std::vector<std::thread> workers;
         for (uint64_t t = 1; t < threads; ++t)
-            workers.emplace_back(searchRows, std::cref(ctx), std::ref(jobs[t]));
-        searchRows(ctx, jobs[0]);
+            workers.emplace_back(work, std::ref(found[t]));
+        work(found[0]);
         for (std::thread& worker : workers)
             worker.join();
     }
 
     BatchOutcome outcome;
-    std::vector<uint64_t> hits;
-    for (const RowJob& job : jobs) {
-        outcome.hitCount += (int) std::min<uint64_t>(job.hitCount, MAX_MATCHES + 1);
-        hits.insert(hits.end(), job.hits.begin(), job.hits.end());
-    }
+    for (const ThreadHits& mine : found)
+        outcome.hitCount += (int) std::min<uint64_t>(mine.hitCount, MAX_MATCHES + 1);
     // As documented on BatchOutcome: past MAX_MATCHES, report only the count.
-    if (outcome.hitCount <= MAX_MATCHES)
-        verifier_.addHits(hits, trailingLen, params, outcome);
+    if (outcome.hitCount > MAX_MATCHES) {
+        outcome.hitCount = MAX_MATCHES + 1;
+        return outcome;
+    }
+    // Every hit, checked with its own batch's prefix (HitVerifier: rebuilt
+    // from its trailing index and hashed from scratch, and hashB checked).
+    for (const ThreadHits& mine : found) {
+        for (size_t i = 0; i < mine.trailingIndices.size(); ++i)
+            verifier_.addHits({mine.trailingIndices[i]}, trailingLen, requests[mine.batches[i]].params, outcome);
+    }
     return outcome;
 }
 
