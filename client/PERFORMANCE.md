@@ -9,8 +9,9 @@ tried) and what it would take.
 
 Numbers are from the RTX 3080 Ti Laptop GPU and i9-12900H this was developed
 on. Nothing here counts as done until it's measured with `search_bench
---scale 20` (warmed up, and without `noprune` too, so that pruning doesn't
-blur a kernel comparison) and the whole `ctest` passes - the dense-hit
+--scale 20` (warmed up; compare kernels by its search rate, and anything
+that changes the window by its projection for a real search) and the whole
+`ctest` passes - the dense-hit
 `stress-*` tests above all, since every item below touches code that could
 silently drop candidates.
 
@@ -228,9 +229,20 @@ will have grown (not measured again).
 
 ## Tooling
 
-- [ ] **`search_bench`** counts pruned candidates as searched and prunes
-  symbol runs but not brackets, unlike the real configuration. That's right
-  for "how fast does a search finish", but compare kernels with `noprune`.
+- [x] **`search_bench`** counted pruned candidates as searched and pruned
+  symbol runs but not brackets, unlike the real configuration. It now
+  prunes as the real configuration does (`--prune symbols` gives the old
+  behaviour, which every figure here from before 2026-09-30 used), counts
+  what it hands the backend, and reports three rates: the range covered,
+  the search rate (what the backend searched, per second), and a projection
+  for a real search. Its timed range only varies the last two leading
+  characters, where symbol runs can't occur, so it prunes 6.3% where a real
+  search of that length prunes 20.3% - the projection uses the latter,
+  estimated from 4 million random leading values put through the engine's
+  own checks (exactly: 20.25% of all 5-character leading values, 16.45% of
+  4-character ones - the estimate is within 0.03 points). With nothing
+  pruned it checks that the backend was asked for every candidate of the
+  range exactly once.
 - [ ] **CPU and GPU together.** Run the CPU backend on the cores the GPU
   backend leaves idle. *Estimated* a few percent at best - only worth it
   once the CPU backend has the filter.

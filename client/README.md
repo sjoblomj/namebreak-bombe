@@ -199,7 +199,13 @@ filter), each with its own
 compile of the CUDA backend - the build runs them in parallel.
 `cmake --build --preset default --target run_search_bench` times the real
 search over a fixed range (`build/tests/search_bench --scale <n>` for a
-longer one), and `--target run_mutation_test` (and
+longer one), pruning as the real configuration does (`--prune symbols` or
+`none` for less). It reports the range covered per second, the rate at
+which the backend searched what pruning left, and a projection for a real
+search, whose leading characters all vary - the timed range only varies
+its last few, so it prunes far less than a real search would. The
+projection takes the share a real search prunes from random leading values
+put through the engine's own checks; compare GPU windows by it. And `--target run_mutation_test` (and
 `run_mutation_test_opencl`) checks that the tests catch deliberately broken
 kernels - see [The lookup
 filter](#the-lookup-filter-most-candidates-are-never-hashed) - which takes
