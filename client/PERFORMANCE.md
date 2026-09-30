@@ -266,14 +266,33 @@ will have grown (not measured again).
   - [ ] **Metal**: `waitUntilCompleted` is documented as a blocking wait, so
     it may not spin at all - measure on a Mac before changing anything; its
     launches, one batch of 2^21 rows, are short too.
-- [ ] **Build the table faster, or less often.** Building it takes 4 ms for
-  `.WAV` and 10 ms for a 17-byte suffix, and the check before every search
-  0.4-1.6 ms (**measured**) - nothing next to a real range, but it's most
-  of the cost of the test suite's thousands of tiny searches. Building it
-  on the GPU would take microseconds; or cache it, keyed by *everything* it
-  depends on (alphabet, suffix, target hashA, and the filter/match bit
-  counts) - in coordinator mode, range after range has the same target.
-  Keep the check either way.
+- [x] **Build the table faster, or less often.** At 8 bits, building it
+  took 4 ms for `.WAV` and 10 ms for a 17-byte suffix, and the check before
+  every search 0.4-1.6 ms - nothing next to a real range, but most of the
+  cost of the test suite's thousands of tiny searches. At today's 7 bits
+  (a quarter of the entries) it was 0.78 and 1.9 ms, the check 0.31 and
+  1.1 ms (**measured**, best of 20) - still 45% of the integration test's
+  time on its own (2,296 searches), 69% of OpenCL's.
+  - [x] **Faster**: the hash step is a T-function, so a table of n-bit
+    states can be computed in the narrowest integer that holds n bits,
+    modulo its size, and its low bits come out exactly as the 32-bit hash's:
+    8-bit lanes up to 8 bits, 16-bit ones up to 10 - four or two times as
+    many per vector instruction - with each block's masks gathered locally
+    and written once. **Measured**: 0.42 and 0.86 ms (1.9-2.2 times as
+    fast), and the integration test on CUDA 2.96 s instead of 4.14. The
+    check is unchanged - 32-bit, from random high bits - and
+    `lowbits_filter_test` now also runs at 1, 8 and 10 bits, to cover both
+    lane widths at their narrowest and widest (a builder shifting by 4
+    instead of 5, using 8-bit lanes at 10 bits, or truncating a key, fails
+    it).
+  - Less often: **measured** not worth it. The integration test's 2,296
+    searches have 2,179 different alphabet/suffix/target combinations, the
+    stress test's 379 have 375, so a cache would save about 5% of the tests'
+    builds; in coordinator mode, where range after range shares a target,
+    it would save 0.4 ms per range.
+  - Building it on the GPU would take microseconds, but it would be a
+    second builder per backend - three, with Metal's - for what is now half
+    a millisecond.
 - [ ] **Any alphabet size.** The per-candidate loop that needed the alphabet
   size at compile time is gone; it's now only used for the row decode's
   divisions, which could use multipliers computed on the host (as a

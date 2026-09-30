@@ -103,7 +103,11 @@ static void testWholeTables(std::mt19937_64& rng) {
         {" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#", "", 0x00000000},
         {"A", ".TXT", 0xFFFFFFFF},
     };
-    for (int i = 0; i < 24; ++i) {
+    // 24 random ones at the default 7 bits (16,384 entries each), fewer for
+    // the wider tables CMakeLists.txt also builds this for - the same number
+    // of entries in all, and at least 2 tables.
+    const int randomTables = std::max(2, std::min(24, (int) (24 * 16384ull / kLowBitsFilterEntries)));
+    for (int i = 0; i < randomTables; ++i) {
         const int size = 1 + (int) (rng() % MAX_ALPHABET_SIZE);
         const size_t suffixLen = (i % 6 == 0) ? 20 + rng() % 44 : rng() % 12;
         configs.push_back({randomAlphabet(rng, size), randomBytes(rng, suffixLen), (uint32_t) rng()});
@@ -146,6 +150,17 @@ static void testCheckCatchesWrongTables(std::mt19937_64& rng) {
     const std::vector<uint64_t> good = buildLowBitsFilterTable(c);
     std::string error;
     auto mustFail = [&](const std::vector<uint64_t>& table, const char* what) {
+        // A "wrong" table the same as the right one isn't wrong: at the
+        // narrowest widths CMakeLists.txt builds this for (1 bit), another
+        // suffix or target can give the same table. At the widths searches
+        // use, each of these must differ, or this test tests nothing.
+        if (table == good) {
+            if (kLowBitsFilterBits >= 4)
+                fail(std::string("TEST BUG: ") + what + " gives the same table");
+            else
+                printf("    (%s gives the same table at %d bits - nothing to catch)\n", what, kLowBitsFilterBits);
+            return;
+        }
         if (checkLowBitsFilterTable(table, c, 0, 1, rng(), error))
             fail(std::string("the table check doesn't notice ") + what);
     };

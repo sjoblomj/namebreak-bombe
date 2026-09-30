@@ -270,6 +270,17 @@ namebreak_test(prefix_hasher_test prefix_hasher_test)
 # wrong table.
 namebreak_test_executable(lowbits_filter_test tests/lowbits_filter_test.cpp namebreak_search)
 namebreak_test(lowbits_filter_test lowbits_filter_test)
+# The same at other table widths, built from just the two sources it needs
+# rather than a whole search library each: the table is built in 8-bit lanes
+# up to 8 bits and 16-bit ones above (buildLowBitsFilterTable), so 1, 8 and 10
+# bits cover both at their narrowest and widest.
+foreach(bits IN ITEMS 1 8 10)
+    add_executable(lowbits_filter_test_${bits} tests/lowbits_filter_test.cpp src/backends/common/lowbits_filter.cpp src/engine/mpq_hash.cpp)
+    target_include_directories(lowbits_filter_test_${bits} PRIVATE src)
+    target_compile_definitions(lowbits_filter_test_${bits} PRIVATE NAMEBREAK_LOWBITS_FILTER_BITS=${bits})
+    set_target_properties(lowbits_filter_test_${bits} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    namebreak_test(lowbits_filter_test-${bits}bits lowbits_filter_test_${bits})
+endforeach()
 
 # That the backend self-test createBackend runs (src/backends/self_test.h)
 # catches a backend that searches wrongly - CPU backends wrapped in broken ones.
