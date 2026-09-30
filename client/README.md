@@ -192,7 +192,12 @@ crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
 0x80, the both-hashes-match path, and a seeded fuzzer), and the dense-hit
 stress tests (`stress-*`), which make one candidate in 4096 a hit and
 compare every one of them with a brute force - see [The lookup
-filter](#the-lookup-filter-most-candidates-are-never-hashed). The search is
+filter](#the-lookup-filter-most-candidates-are-never-hashed), and a
+known-answer test (`listfile-*`), which must find each of the 6,407 names of
+a real StarCraft listfile (`tests/data/sc-listfile.txt`) from its two hashes,
+in a small search planted around it - with hashes from the test's own copy
+of the MPQ hash, so it also catches a bug the client's hashing shares with
+every other test. The search is
 built in several configurations for this (different GPU window, launch
 sizes and rows per thread, the stress tests' weaker match, a one-bit
 filter), each with its own

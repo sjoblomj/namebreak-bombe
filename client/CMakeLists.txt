@@ -356,6 +356,17 @@ if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
     endforeach()
 endif()
 
+# Known-answer test: every name of a real StarCraft listfile
+# (tests/data/sc-listfile.txt) must be found from its two hashes, each in a
+# small search planted around it - see the file. Every backend, with its
+# shipped tuning; `reference`, which hashes every candidate from scratch, on
+# every 5th name only.
+namebreak_test_executable(listfile_test tests/listfile_test.cpp namebreak_search)
+foreach(backend IN LISTS ROW_BACKENDS)
+    namebreak_test(listfile-${backend} listfile_test --backend ${backend} --listfile ${CMAKE_SOURCE_DIR}/tests/data/sc-listfile.txt)
+endforeach()
+namebreak_test(listfile-reference listfile_test --backend reference --listfile ${CMAKE_SOURCE_DIR}/tests/data/sc-listfile.txt --every 5)
+
 # What runSearch() does when a batch has more hashA hits than MAX_MATCHES can
 # record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
 namebreak_search_library(namebreak_search_overflow MAX_MATCHES=1)
