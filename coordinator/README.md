@@ -157,6 +157,15 @@ See the top-level plan/design notes for the full rationale; the short version:
   opened - a `)` or `]` at a point where more brackets have been closed than
   opened - `(`/`)` and `[`/`]` counted separately. Brackets left open by the
   target's prefix count as opened.
+- **Whole-candidate pruning**: by default, those three rules only look at a
+  candidate's leading characters - all but the last five or so, which the
+  client enumerates on its CPU. A target with `prune_whole_candidate`
+  (default `false`) has them look at every character but the last: about a
+  fifth fewer candidates are searched at every length, and a GPU client
+  searches about 10% faster. Of the real names in the client's StarCraft
+  listfile, one breaks a rule before its last character (see the client
+  README's "Design decisions"). A client too old to know the setting
+  searches as if it were off - more than it has to, never less.
 - **Progress checkpointing**: every 60s the client heartbeats the most recent
   partial (Hash A only) match `namebreak` has printed for its current range, if
   any. `namebreak` only logs a match after the CUDA batch containing it has
@@ -206,6 +215,7 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "upper_bound": "GAMEMENU",
     "prune_symbol_runs": true,
     "prune_unopened_brackets": true,
+    "prune_whole_candidate": true,
     "alphabet_name": "size49",
     "max_backslash_count": 0,
     "priority": 0,
@@ -277,8 +287,8 @@ curl localhost:8080/api/v1/status
 ```
 
 Pause/resume a target, and/or change its priority, description,
-alphabet_name, prune_symbol_runs, prune_unopened_brackets, max_backslash_count
-or start_len:
+alphabet_name, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate,
+max_backslash_count or start_len:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -288,7 +298,7 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 
 Any field can be omitted to leave it unchanged (pass `"description": ""` to
 clear an existing one), but at least one must be given. A changed
-`prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count` affects every range claimed
+`prune_symbol_runs`/`prune_unopened_brackets`/`prune_whole_candidate`/`max_backslash_count` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
 progress finish with the old setting. Raising `start_len` past where carving
 has reached makes it jump straight to the start of the new length the next

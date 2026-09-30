@@ -251,8 +251,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, max_backslash_count, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -263,6 +263,7 @@ pub async fn admin_create_target(
     .bind(upper_bound)
     .bind(req.prune_symbol_runs as i64)
     .bind(req.prune_unopened_brackets as i64)
+    .bind(req.prune_whole_candidate as i64)
     .bind(req.max_backslash_count)
     .bind(alphabet_name)
     .bind(alphabet)
@@ -339,12 +340,13 @@ pub async fn admin_patch_target(
         && req.alphabet_name.is_none()
         && req.prune_symbol_runs.is_none()
         && req.prune_unopened_brackets.is_none()
+        && req.prune_whole_candidate.is_none()
         && req.max_backslash_count.is_none()
         && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of status, priority, description, alphabet_name, prune_symbol_runs, prune_unopened_brackets, \
-             max_backslash_count or start_len must be provided"
+             prune_whole_candidate, max_backslash_count or start_len must be provided"
                 .into(),
         ));
     }
@@ -384,7 +386,7 @@ pub async fn admin_patch_target(
          description = COALESCE(?, description), \
          alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet), \
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
-         max_backslash_count = COALESCE(?, max_backslash_count), start_len = COALESCE(?, start_len) \
+         prune_whole_candidate = COALESCE(?, prune_whole_candidate), max_backslash_count = COALESCE(?, max_backslash_count), start_len = COALESCE(?, start_len) \
          WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.status)
@@ -394,6 +396,7 @@ pub async fn admin_patch_target(
     .bind(&alphabet)
     .bind(req.prune_symbol_runs.map(i64::from))
     .bind(req.prune_unopened_brackets.map(i64::from))
+    .bind(req.prune_whole_candidate.map(i64::from))
     .bind(req.max_backslash_count)
     .bind(req.start_len)
     .bind(target_id)
