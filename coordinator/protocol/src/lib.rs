@@ -141,6 +141,10 @@ pub struct ClaimResponse {
     /// `AdminCreateTargetRequest::prune_unopened_brackets`.
     #[serde(default)]
     pub prune_unopened_brackets: bool,
+    /// Apply the pruning rules to every character but the last, not only the
+    /// leading ones - see `AdminCreateTargetRequest::prune_whole_candidate`.
+    #[serde(default)]
+    pub prune_whole_candidate: bool,
     /// Max '\' occurrences namebreak will allow in a candidate; 0 means unlimited.
     pub max_backslash_count: i64,
     pub lower_bound_filename: String,
@@ -231,6 +235,16 @@ pub struct AdminCreateTargetRequest {
     /// Brackets the prefix leaves open count as opened. Defaults to false.
     #[serde(default)]
     pub prune_unopened_brackets: bool,
+    /// Apply `prune_symbol_runs`, `prune_unopened_brackets` and
+    /// `max_backslash_count` to every character of a candidate but the last,
+    /// instead of only its leading characters (those a client enumerates on
+    /// the CPU - all but the last five or so). About a fifth fewer candidates
+    /// are then searched, at every length, and the search gets about 10%
+    /// faster on a GPU. A candidate's last character is never checked.
+    /// Defaults to false. A client too old to know it searches as if it were
+    /// false - more than it has to, never less.
+    #[serde(default)]
+    pub prune_whole_candidate: bool,
     /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`.
     #[serde(default)]
     pub alphabet_name: Option<String>,
@@ -295,6 +309,11 @@ pub struct AdminPatchTargetRequest {
     /// to leave it unchanged.
     #[serde(default)]
     pub prune_unopened_brackets: Option<bool>,
+    /// See `AdminCreateTargetRequest::prune_whole_candidate`. Leave unset to
+    /// leave it unchanged. Applies to ranges claimed after the patch, like
+    /// `prune_symbol_runs`.
+    #[serde(default)]
+    pub prune_whole_candidate: Option<bool>,
     /// See `AdminCreateTargetRequest::max_backslash_count`. Leave unset to
     /// leave it unchanged. Applies to ranges claimed after the patch, like
     /// `prune_symbol_runs`.
