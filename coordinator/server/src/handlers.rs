@@ -251,8 +251,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, max_backslash_count, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -263,6 +263,7 @@ pub async fn admin_create_target(
     .bind(upper_bound)
     .bind(req.prune_symbol_runs as i64)
     .bind(req.prune_unopened_brackets as i64)
+    .bind(req.prune_whole_candidate as i64)
     .bind(req.max_backslash_count)
     .bind(alphabet_name)
     .bind(alphabet)
@@ -339,12 +340,13 @@ pub async fn admin_patch_target(
         && req.alphabet_name.is_none()
         && req.prune_symbol_runs.is_none()
         && req.prune_unopened_brackets.is_none()
+        && req.prune_whole_candidate.is_none()
         && req.max_backslash_count.is_none()
         && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of status, priority, description, alphabet_name, prune_symbol_runs, prune_unopened_brackets, \
-             max_backslash_count or start_len must be provided"
+             prune_whole_candidate, max_backslash_count or start_len must be provided"
                 .into(),
         ));
     }
@@ -384,7 +386,7 @@ pub async fn admin_patch_target(
          description = COALESCE(?, description), \
          alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet), \
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
-         max_backslash_count = COALESCE(?, max_backslash_count), start_len = COALESCE(?, start_len) \
+         prune_whole_candidate = COALESCE(?, prune_whole_candidate), max_backslash_count = COALESCE(?, max_backslash_count), start_len = COALESCE(?, start_len) \
          WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.status)
@@ -394,6 +396,7 @@ pub async fn admin_patch_target(
     .bind(&alphabet)
     .bind(req.prune_symbol_runs.map(i64::from))
     .bind(req.prune_unopened_brackets.map(i64::from))
+    .bind(req.prune_whole_candidate.map(i64::from))
     .bind(req.max_backslash_count)
     .bind(req.start_len)
     .bind(target_id)
@@ -462,6 +465,13 @@ pub async fn admin_create_priority_range(
     }
 
     let spans = pattern_spans(&target.alphabet, &req.pattern, req.length).map_err(AppError::BadRequest)?;
+    let spans = ranges::clip_spans_to_bounds(&target.alphabet, &target.lower_bound, &target.upper_bound, req.length, &spans);
+    if spans.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "'{}' at length {} matches nothing within the target's bounds ('{}' to '{}')",
+            req.pattern, req.length, target.lower_bound, target.upper_bound
+        )));
+    }
 
     // A priority range only makes sense ahead of where the target's own
     // cursor already reached. Everything before that has already been fully
@@ -473,7 +483,8 @@ pub async fn admin_create_priority_range(
         .await?;
     if req.length < progress.candidate_len {
         return Err(AppError::BadRequest(format!(
-            "the target has already fully searched every {}-character candidate - nothing left to prioritize there",
+            "the main sweep has already passed every {}-character candidate - nothing left to prioritize there \
+             (to get candidates a skip range left out searched, remove the skip range instead)",
             req.length
         )));
     }
@@ -492,7 +503,8 @@ pub async fn admin_create_priority_range(
     let next_index = if clamp_to_cursor { start_index.max(progress.next()) } else { start_index };
     if !spans.iter().any(|&(_, end)| end > next_index) {
         return Err(AppError::BadRequest(format!(
-            "'{}' at length {} has already been fully searched by the main sweep - nothing left to prioritize",
+            "'{}' at length {} has already been passed by the main sweep - nothing left to prioritize \
+             (to get candidates a skip range left out searched, remove the skip range instead)",
             req.pattern, req.length
         )));
     }
@@ -571,8 +583,8 @@ pub async fn admin_delete_skip_range(
     _admin: AdminAuth,
     Path(skip_range_id): Path<i64>,
 ) -> Result<Json<AdminDeleteSkipRangeResponse>, AppError> {
-    let deleted = ranges::remove_skip_range(&state.pool, skip_range_id).await?.ok_or(AppError::NotFound)?;
-    Ok(Json(AdminDeleteSkipRangeResponse { deleted }))
+    let requeued = ranges::remove_skip_range(&state.pool, skip_range_id).await?.ok_or(AppError::NotFound)?;
+    Ok(Json(AdminDeleteSkipRangeResponse { requeued }))
 }
 
 #[cfg(test)]

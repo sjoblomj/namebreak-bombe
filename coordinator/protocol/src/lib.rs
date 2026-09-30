@@ -77,7 +77,8 @@ impl std::str::FromStr for Version {
 /// - 1.0.0 - initial versioned release; every alphabet in
 ///   `PREDEFINED_ALPHABETS` as of this version is tagged `since: (1, 0)`.
 /// - 1.1.0 - `RegisterRequest::client_release` (see `ClientReleases`).
-pub const PROTOCOL_VERSION: Version = Version::new(1, 1, 0);
+/// - 1.2.0 - the `size41`, `size40`, `size30` and `size29` alphabets.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 2, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -140,6 +141,10 @@ pub struct ClaimResponse {
     /// `AdminCreateTargetRequest::prune_unopened_brackets`.
     #[serde(default)]
     pub prune_unopened_brackets: bool,
+    /// Apply the pruning rules to every character but the last, not only the
+    /// leading ones - see `AdminCreateTargetRequest::prune_whole_candidate`.
+    #[serde(default)]
+    pub prune_whole_candidate: bool,
     /// Max '\' occurrences namebreak will allow in a candidate; 0 means unlimited.
     pub max_backslash_count: i64,
     pub lower_bound_filename: String,
@@ -230,6 +235,16 @@ pub struct AdminCreateTargetRequest {
     /// Brackets the prefix leaves open count as opened. Defaults to false.
     #[serde(default)]
     pub prune_unopened_brackets: bool,
+    /// Apply `prune_symbol_runs`, `prune_unopened_brackets` and
+    /// `max_backslash_count` to every character of a candidate but the last,
+    /// instead of only its leading characters (those a client enumerates on
+    /// the CPU - all but the last five or so). About a fifth fewer candidates
+    /// are then searched, at every length, and the search gets about 10%
+    /// faster on a GPU. A candidate's last character is never checked.
+    /// Defaults to false. A client too old to know it searches as if it were
+    /// false - more than it has to, never less.
+    #[serde(default)]
+    pub prune_whole_candidate: bool,
     /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`.
     #[serde(default)]
     pub alphabet_name: Option<String>,
@@ -294,6 +309,11 @@ pub struct AdminPatchTargetRequest {
     /// to leave it unchanged.
     #[serde(default)]
     pub prune_unopened_brackets: Option<bool>,
+    /// See `AdminCreateTargetRequest::prune_whole_candidate`. Leave unset to
+    /// leave it unchanged. Applies to ranges claimed after the patch, like
+    /// `prune_symbol_runs`.
+    #[serde(default)]
+    pub prune_whole_candidate: Option<bool>,
     /// See `AdminCreateTargetRequest::max_backslash_count`. Leave unset to
     /// leave it unchanged. Applies to ranges claimed after the patch, like
     /// `prune_symbol_runs`.
@@ -360,16 +380,17 @@ pub struct AdminCreateSkipRangeResponse {
     pub skip_range_id: i64,
 }
 
-/// What `DELETE /api/v1/admin/skip-ranges/{id}` did. Carving stops skipping
-/// what the skip range matches either way. Its `skipped` ranges carving
-/// hasn't reached yet are removed, so they get searched; the ones it has
-/// already passed stay skipped, since carving never goes back.
+/// What `DELETE /api/v1/admin/skip-ranges/{id}` did. The skip range is
+/// deleted and nothing it matched stays skipped: its `skipped` ranges
+/// carving hasn't reached yet are removed, so carving searches them, and
+/// the ones carving has already passed (it never goes back) are requeued
+/// as pending ranges instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminDeleteSkipRangeResponse {
-    /// True if the skip range is gone entirely. False if any of its
-    /// `skipped` ranges had to stay: it's then kept, marked removed, so the
-    /// dashboard can still show why those candidates were skipped.
-    pub deleted: bool,
+    /// Candidates requeued as pending because carving had already passed
+    /// them. 128-bit, since a skip range at a long candidate length can span
+    /// more than an i64 holds.
+    pub requeued: i128,
 }
 
 /// What `DELETE /api/v1/admin/priority-ranges/{id}` did. Work already

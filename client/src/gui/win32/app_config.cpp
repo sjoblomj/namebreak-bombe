@@ -70,6 +70,7 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         fields.hashB = get(config.search, "hash_b", "");
         fields.pruneSymbolRuns = get(config.search, "prune_symbol_runs", "false") == "true";
         fields.pruneUnopenedBrackets = get(config.search, "prune_unopened_brackets", "false") == "true";
+        fields.pruneWholeCandidate = get(config.search, "prune_whole_candidate", "false") == "true";
         fields.initialTab = (loaded && (config.mode == "bounded" || config.mode == "continuous")) ? kTabLocalSearch : kTabCoordinator;
         fields.initialContinuous = loaded && config.mode == "continuous";
 
@@ -97,7 +98,8 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
                                             {"hash_a", fields.hashA},
                                             {"hash_b", fields.hashB},
                                             {"prune_symbol_runs", fields.pruneSymbolRuns ? "true" : "false"},
-                                            {"prune_unopened_brackets", fields.pruneUnopenedBrackets ? "true" : "false"}},
+                                            {"prune_unopened_brackets", fields.pruneUnopenedBrackets ? "true" : "false"},
+                                            {"prune_whole_candidate", fields.pruneWholeCandidate ? "true" : "false"}},
                                            writeError);
         }
         if (!writeOk) {

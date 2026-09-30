@@ -28,6 +28,29 @@ std::string describeAlphabetSizes(const SearchBackend& backend) {
     return text;
 }
 
+BatchOutcome SearchBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& batches) {
+    BatchOutcome total;
+    for (const BatchRequest& batch : batches) {
+        BatchOutcome outcome = runBatch(trailingLen, batch.start, batch.count, batch.params);
+        total.hitCount += outcome.hitCount;
+        if (outcome.hitCount > MAX_MATCHES || total.hitCount > MAX_MATCHES) {
+            // The caller searches every batch again on its own.
+            total.hitCount = MAX_MATCHES + 1;
+            total.hits.clear();
+            total.found = false;
+            total.foundFilename.clear();
+            return total;
+        }
+        total.hits.insert(total.hits.end(), outcome.hits.begin(), outcome.hits.end());
+        if (outcome.found) {
+            total.found = true;
+            total.foundFilename = outcome.foundFilename;
+            return total;
+        }
+    }
+    return total;
+}
+
 namespace {
 
 // Searches the trailing indices [startIdx, startIdx + count) (count > 0) with
@@ -40,11 +63,11 @@ namespace {
 // the range's candidates - not something a real 32-bit hash produces, but the
 // one outcome that must never happen is a both-hashes match going
 // unchecked), the range is searched again as two halves, recursively.
-int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params, FILE* fout,
-                const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
-                std::string& outFoundFilename, const std::atomic<bool>* pauseRequested) {
+// Returns false if the search is to be aborted - waiting out a pause first,
+// if one is requested.
+bool waitUnlessAborted(const std::atomic<bool>* abortRequested, const std::atomic<bool>* pauseRequested) {
     if (abortRequested && abortRequested->load(std::memory_order_relaxed))
-        return -1;
+        return false;
 
     // Called between batches only (runBatch returns once its batch is
     // finished), so a batch already in flight is never interrupted - pausing
@@ -53,9 +76,38 @@ int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint
     // block forever.
     while (pauseRequested && pauseRequested->load(std::memory_order_relaxed)) {
         if (abortRequested && abortRequested->load(std::memory_order_relaxed))
-            return -1;
+            return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+    return true;
+}
+
+// Writes out the hits of an outcome that has them all (hitCount <=
+// MAX_MATCHES). Returns 1 if one matched both hashes (outFoundFilename is
+// filled), 0 otherwise.
+int reportOutcome(const BatchOutcome& outcome, FILE* fout, const std::function<void(const std::string&)>& onPartialMatch,
+                  std::string& outFoundFilename) {
+    for (const std::string& hit : outcome.hits) {
+        printf("%s\n", hit.c_str());
+        fprintf(fout, "%s\n", hit.c_str());
+        fflush(fout);
+        if (onPartialMatch)
+            onPartialMatch(hit);
+    }
+    if (outcome.found) {
+        printf("%s\n", outcome.foundFilename.c_str());
+        printf("BOTH HASHES MATCH: %s\n", outcome.foundFilename.c_str());
+        outFoundFilename = outcome.foundFilename;
+        return 1;
+    }
+    return 0;
+}
+
+int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params, FILE* fout,
+                const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
+                std::string& outFoundFilename, const std::atomic<bool>* pauseRequested) {
+    if (!waitUnlessAborted(abortRequested, pauseRequested))
+        return -1;
 
     BatchOutcome outcome = backend.runBatch(trailingLen, startIdx, count, params);
 
@@ -78,20 +130,37 @@ int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint
         return searchChunk(backend, trailingLen, startIdx + half, count - half, params, fout, abortRequested, onPartialMatch,
                            outFoundFilename, pauseRequested);
     }
-    for (const std::string& hit : outcome.hits) {
-        printf("%s\n", hit.c_str());
-        fprintf(fout, "%s\n", hit.c_str());
-        fflush(fout);
-        if (onPartialMatch)
-            onPartialMatch(hit);
+    return reportOutcome(outcome, fout, onPartialMatch, outFoundFilename);
+}
+
+// searchChunk for several batches at once, in one backend.runBatches() call
+// (see SearchBackend::maxBatchesPerCall) - one alone goes to searchChunk.
+// Returns the same as searchChunk. If they had more hits together than can be
+// recorded, each is searched again on its own, with searchChunk (which
+// splits it further if it has to).
+int searchBatches(SearchBackend& backend, int trailingLen, const std::vector<BatchRequest>& batches, FILE* fout,
+                  const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
+                  std::string& outFoundFilename, const std::atomic<bool>* pauseRequested) {
+    if (batches.size() == 1)
+        return searchChunk(backend, trailingLen, batches[0].start, batches[0].count, batches[0].params, fout, abortRequested,
+                           onPartialMatch, outFoundFilename, pauseRequested);
+    if (!waitUnlessAborted(abortRequested, pauseRequested))
+        return -1;
+
+    BatchOutcome outcome = backend.runBatches(trailingLen, batches);
+    if (outcome.hitCount > MAX_MATCHES) {
+        // Nothing from these batches has been verified or reported yet.
+        fprintf(stderr, "note: %d hashA hits in %zu batches searched together, more than the %d that can be recorded - searching each on its own\n",
+                outcome.hitCount, batches.size(), MAX_MATCHES);
+        for (const BatchRequest& batch : batches) {
+            int r = searchChunk(backend, trailingLen, batch.start, batch.count, batch.params, fout, abortRequested, onPartialMatch,
+                                outFoundFilename, pauseRequested);
+            if (r != 0)
+                return r;
+        }
+        return 0;
     }
-    if (outcome.found) {
-        printf("%s\n", outcome.foundFilename.c_str());
-        printf("BOTH HASHES MATCH: %s\n", outcome.foundFilename.c_str());
-        outFoundFilename = outcome.foundFilename;
-        return 1;
-    }
-    return 0;
+    return reportOutcome(outcome, fout, onPartialMatch, outFoundFilename);
 }
 
 } // namespace
@@ -216,10 +285,10 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     printf("upperBoundLimit: '%s'\n", upperBoundLimit.c_str());
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
-    printf("pruneSymbolRuns: %s (leading characters only)\n", req.pruneSymbolRuns ? "true" : "false");
-    printf("pruneUnopenedBrackets: %s (leading characters only)\n", req.pruneUnopenedBrackets ? "true" : "false");
-    printf("maxBackslashCount: %d%s (leading characters only)\n", req.maxBackslashCount,
-           req.maxBackslashCount == 0 ? " (unlimited)" : "");
+    const char* pruneScope = req.pruneWholeCandidate ? "every character but the last" : "leading characters only";
+    printf("pruneSymbolRuns: %s (%s)\n", req.pruneSymbolRuns ? "true" : "false", pruneScope);
+    printf("pruneUnopenedBrackets: %s (%s)\n", req.pruneUnopenedBrackets ? "true" : "false", pruneScope);
+    printf("maxBackslashCount: %d%s (%s)\n", req.maxBackslashCount, req.maxBackslashCount == 0 ? " (unlimited)" : "", pruneScope);
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
@@ -229,9 +298,16 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     // extends by that iteration's leading characters.
     std::pair<uint32_t, uint32_t> prefixBaseState = mpqHashWithPrefixCache_CPU(req.prefix.c_str(), h_cryptTable);
 
-    // Brackets req.prefix leaves open, which a candidate is free to close -
-    // see req.pruneUnopenedBrackets.
-    const OpenBrackets prefixOpenBrackets = openBracketsAfter_CPU(req.prefix);
+    // The pruning rules, and their state before a candidate's first
+    // character: brackets req.prefix leaves open are a candidate's to close
+    // (see req.pruneUnopenedBrackets), and neither the prefix's symbols nor
+    // its backslashes count.
+    PruneRules rules;
+    rules.symbolRuns = req.pruneSymbolRuns;
+    rules.unopenedBrackets = req.pruneUnopenedBrackets;
+    rules.maxBackslashCount = req.maxBackslashCount;
+    PruneState candidateStart;
+    candidateStart.open = openBracketsAfter_CPU(req.prefix);
 
     std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
     if (!outputDir.empty()) {
@@ -256,6 +332,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     constants.cryptTable = h_cryptTable;
     constants.targetHashA = req.targetHashA;
     constants.targetHashB = req.targetHashB;
+    if (req.pruneWholeCandidate)
+        constants.trailingRules = rules;
     backend.beginSearch(constants);
 
     bool found_match = false;
@@ -265,6 +343,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     int candidateLen = start_candidate.size();
     // Candidates per batch - see SearchBackend::batchSize.
     const uint64_t batchSize = backend.batchSize(alphabetSize);
+    // Batches per backend call - see SearchBackend::maxBatchesPerCall.
+    const size_t maxBatchesPerCall = (size_t) std::max(1, backend.maxBatchesPerCall());
 
     // The search space is walked by four nested levels, outermost to innermost:
     //  1. This `while` loop: over candidateLen itself - "try every 1-character
@@ -285,12 +365,15 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     //     alphabetSize^trailingLen) remaining space for one leading value into
     //     batchSize-sized chunks (aligned to multiples of batchSize, so only a
     //     range's own first/last chunk can start/end mid-row) - each iteration
-    //     is one searchChunk call, i.e. one SearchBackend::runBatch (for the
-    //     CUDA backend: one kernel launch, plus a second, tiny one only if
-    //     that launch had a hashA hit).
+    //     is one batch. Up to backend.maxBatchesPerCall() consecutive batches,
+    //     of one leading value or several, are then searched together - one
+    //     SearchBackend::runBatches call (for the CUDA backend: one kernel
+    //     launch, plus a second, tiny one only if that launch had a hashA
+    //     hit), or runBatch for a batch alone.
     //  4. Inside the backend - for the CUDA backend, one GPU thread per *row*
-    //     of the chunk, each looping over its row's alphabetSize candidates -
-    //     see bruteForceKernel's comment.
+    //     of the chunk, each hashing only the few of its row's alphabetSize
+    //     candidates its lookup filter lets through - see filteredRowsKernel's
+    //     comment.
     if (candidateLen < 1) {
         // An empty start candidate (prefix + suffix alone) means "from the
         // very beginning": the shortest candidates, starting from the lower
@@ -319,7 +402,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         if (trailingLen > backend.maxTrailingLen()) {
             // Only reachable if MAX_CANDIDATE_LEN/the alphabet sizes change so that
             // candidateLen - maxSafeIndexLen exceeds what the backend supports (for
-            // CUDA, bruteForceKernel's 32-bit row index) - refuse rather than overflow it.
+            // CUDA, filteredRowsKernel's 32-bit row index) - refuse rather than overflow it.
             fprintf(stderr, "candidateLen (%d) needs a %d-character trailing part, which exceeds the %s backend's maximum (%d) - exiting\n",
                     candidateLen, trailingLen, backend.name(), backend.maxTrailingLen());
             break;
@@ -365,6 +448,17 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         // common case (see windowChars above) affordable.
         IncrementalPrefixHasher leadingHasher(prefixBaseState, leadingLen, req.alphabet, h_cryptTable);
         leadingHasher.reset(startLeadingIdx);
+
+        // Batches not searched yet, up to maxBatchesPerCall of them - searched
+        // together, possibly across several leading values (level 3 below).
+        // All are of this candidateLen, so what's left is searched before the
+        // next one, whose trailingLen may differ.
+        std::vector<BatchRequest> pending;
+        auto searchPending = [&]() {
+            int r = searchBatches(backend, trailingLen, pending, fout, abortRequested, onPartialMatch, foundFilename, pauseRequested);
+            pending.clear();
+            return r;
+        };
         for (uint64_t leadingIdx = startLeadingIdx; leadingIdx <= endLeadingIdx; ++leadingIdx) {
             if (leadingIdx != startLeadingIdx) {
                 leadingHasher.advance();
@@ -379,11 +473,17 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             // batchSize candidates) without spending anything in the
             // backend (for a GPU, not even a kernel launch) - cheaper than
             // even one of those candidates would have cost individually.
-            if (req.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
-                continue;
-            if (req.maxBackslashCount != 0 && countBackslashes_CPU(leading) > req.maxBackslashCount)
-                continue;
-            if (req.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, prefixOpenBrackets))
+            // The state it leaves is where the backend carries on, if it
+            // prunes the trailing characters too (req.pruneWholeCandidate).
+            PruneState pruneEntry = candidateStart;
+            bool pruned = false;
+            for (char c : leading) {
+                if (!pruneStep_CPU(rules, pruneEntry, c)) {
+                    pruned = true;
+                    break;
+                }
+            }
+            if (pruned)
                 continue;
 
             // Handed to every runBatch call below; see BatchParams.
@@ -394,6 +494,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             std::pair<uint32_t, uint32_t> pair = leadingHasher.state();
             params.seed1Start = pair.first;
             params.seed2Start = pair.second;
+            params.pruneEntry = pruneEntry;
 
             uint64_t trailStart = 0, trailEnd = 0;
             if (leadingIdx == startLeadingIdx) {
@@ -414,10 +515,11 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             // Level 3 (see the walkthrough above the outer `while`).
             for (uint64_t i = trailStart; i < trailEnd; ) {
                 uint64_t chunkEnd = std::min(trailEnd, (i / batchSize + 1) * batchSize);
-                uint64_t count = chunkEnd - i;
-                int r = searchChunk(backend, trailingLen, i, count, params, fout, abortRequested, onPartialMatch, foundFilename,
-                                    pauseRequested);
+                pending.push_back({i, chunkEnd - i, params});
                 i = chunkEnd;
+                if (pending.size() < maxBatchesPerCall)
+                    continue;
+                int r = searchPending();
                 if (r == -1) {
                     aborted = true;
                     goto breakfree;
@@ -426,6 +528,17 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
                     found_match = true;
                     goto breakfree;
                 }
+            }
+        }
+        if (!pending.empty()) {
+            int r = searchPending();
+            if (r == -1) {
+                aborted = true;
+                goto breakfree;
+            }
+            if (r == 1) {
+                found_match = true;
+                goto breakfree;
             }
         }
 

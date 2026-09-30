@@ -59,6 +59,32 @@ bool hasUnopenedBracket_CPU(std::string_view s, OpenBrackets openBefore) {
     return false;
 }
 
+bool isRunSymbol_CPU(char c) {
+    return !isAlnumMpq_CPU(c) && c != ' ';
+}
+
+bool pruneStep_CPU(const PruneRules& rules, PruneState& state, char c) {
+    if (isRunSymbol_CPU(c)) {
+        if (++state.symbolRun >= 3 && rules.symbolRuns)
+            return false;
+        state.symbolRun = std::min(state.symbolRun, 2);
+    } else {
+        state.symbolRun = 0;
+    }
+    if (c == '(') {
+        state.open.round++;
+    } else if (c == ')' && --state.open.round < 0 && rules.unopenedBrackets) {
+        return false;
+    } else if (c == '[') {
+        state.open.square++;
+    } else if (c == ']' && --state.open.square < 0 && rules.unopenedBrackets) {
+        return false;
+    } else if (c == '\\' && ++state.backslashes > rules.maxBackslashCount && rules.maxBackslashCount != 0) {
+        return false;
+    }
+    return true;
+}
+
 bool stringToIndex(const std::string& str, const std::string& alphabet, uint64_t& out, std::string& error) {
     uint64_t index = 0;
     for (char c : str) {

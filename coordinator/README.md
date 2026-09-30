@@ -109,14 +109,17 @@ See the top-level plan/design notes for the full rationale; the short version:
   (the main sweep or a priority range) jumps straight over them. Ranges
   already carved, even pending ones, are left alone. Where a skip range
   overlaps a priority range, skipping wins.
-  `DELETE /api/v1/admin/skip-ranges/{id}` stops it from skipping. Its rows
-  that carving hasn't reached yet are removed, so those candidates get
-  searched after all; the ones the main sweep (or, inside a priority range,
-  the priority range) has already passed stay skipped, since carving never
-  goes back. The response's `deleted` is false when any are left - the skip
-  range is then kept, marked removed, so those rows keep their reason. On a
-  change of the target's alphabet, the rows carving hasn't reached are
-  rewritten in the new alphabet the same way.
+  `DELETE /api/v1/admin/skip-ranges/{id}` deletes it, and nothing it
+  matched stays skipped. Its rows that carving hasn't reached yet are
+  removed, so carving searches those candidates as it gets there. The ones
+  the main sweep (or, inside a priority range, the priority range) has
+  already passed - carving never goes back - are requeued as pending
+  ranges, which are handed out a chunk at a time before any fresh carving.
+  The response says how many candidates were requeued
+  (`{"requeued": 1250}`). A priority range can't be used for this instead:
+  one never starts behind the main sweep. On a change of the target's
+  alphabet, the rows carving hasn't reached are rewritten in the new
+  alphabet the same way.
 - **Patterns**: a skip or priority range's `pattern` pins down a candidate's
   leading characters, one per position - `"_[A-Z]"` is every candidate of
   that length starting with an underscore and then a letter. Candidates are
@@ -134,8 +137,9 @@ See the top-level plan/design notes for the full rationale; the short version:
   (`server/src/alphabet.rs`'s `PREDEFINED_ALPHABETS`, also listable via
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
   without brackets/backslash and with a reduced punctuation set, currently
-  `size50`, `size49`, `size48`, `size47`, `size43` and `size42`. The set of
-  distinct *sizes* (42/43/47/48/49/50) is compiled into namebreak's CUDA backend as
+  `size50`, `size49`, `size48`, `size47`, `size43`, `size42`, `size41`,
+  `size40`, `size30` and `size29`. The set of distinct *sizes*
+  (29/30/40/41/42/43/47/48/49/50) is compiled into namebreak's CUDA backend as
   separate template instantiations (the same zero-cost trick already used for
   `--prune-symbol-runs`), so picking a different alphabet costs no performance -
   but it does mean a genuinely new *size* (not just a new named profile at an
@@ -153,6 +157,15 @@ See the top-level plan/design notes for the full rationale; the short version:
   opened - a `)` or `]` at a point where more brackets have been closed than
   opened - `(`/`)` and `[`/`]` counted separately. Brackets left open by the
   target's prefix count as opened.
+- **Whole-candidate pruning**: by default, those three rules only look at a
+  candidate's leading characters - all but the last five or so, which the
+  client enumerates on its CPU. A target with `prune_whole_candidate`
+  (default `false`) has them look at every character but the last: about a
+  fifth fewer candidates are searched at every length, and a GPU client
+  searches about 10% faster. Of the real names in the client's StarCraft
+  listfile, one breaks a rule before its last character (see the client
+  README's "Design decisions"). A client too old to know the setting
+  searches as if it were off - more than it has to, never less.
 - **Progress checkpointing**: every 60s the client heartbeats the most recent
   partial (Hash A only) match `namebreak` has printed for its current range, if
   any. `namebreak` only logs a match after the CUDA batch containing it has
@@ -202,6 +215,7 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "upper_bound": "GAMEMENU",
     "prune_symbol_runs": true,
     "prune_unopened_brackets": true,
+    "prune_whole_candidate": true,
     "alphabet_name": "size49",
     "max_backslash_count": 0,
     "priority": 0,
@@ -273,8 +287,8 @@ curl localhost:8080/api/v1/status
 ```
 
 Pause/resume a target, and/or change its priority, description,
-alphabet_name, prune_symbol_runs, prune_unopened_brackets, max_backslash_count
-or start_len:
+alphabet_name, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate,
+max_backslash_count or start_len:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -284,7 +298,7 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 
 Any field can be omitted to leave it unchanged (pass `"description": ""` to
 clear an existing one), but at least one must be given. A changed
-`prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count` affects every range claimed
+`prune_symbol_runs`/`prune_unopened_brackets`/`prune_whole_candidate`/`max_backslash_count` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
 progress finish with the old setting. Raising `start_len` past where carving
 has reached makes it jump straight to the start of the new length the next

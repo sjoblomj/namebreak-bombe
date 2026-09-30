@@ -246,6 +246,7 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getString(obj, "hash_b_hex", out.hashBHex) &&
            getBool(  obj, "prune_symbol_runs", out.pruneSymbolRuns) &&
            getOptionalBool(obj, "prune_unopened_brackets", out.pruneUnopenedBrackets) &&
+           getOptionalBool(obj, "prune_whole_candidate", out.pruneWholeCandidate) &&
            getInt64( obj, "max_backslash_count", out.maxBackslashCount) &&
            getString(obj, "lower_bound_filename", out.lowerBoundFilename) &&
            getString(obj, "upper_bound_filename", out.upperBoundFilename) &&

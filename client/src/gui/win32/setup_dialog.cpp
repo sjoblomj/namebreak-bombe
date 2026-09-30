@@ -40,6 +40,7 @@ constexpr int kIdSetupContinuousRadio = 304;
 constexpr int kIdSetupPruneCheckbox = 305;
 constexpr int kIdSetupAbout = 306;
 constexpr int kIdSetupPruneBracketsCheckbox = 307;
+constexpr int kIdSetupPruneWholeCheckbox = 308;
 
 // Marker stored in a help "?" control's GWLP_USERDATA so SetupPageWndProc can
 // tell it apart from an ordinary label when coloring it.
@@ -54,7 +55,8 @@ struct SetupDialogState {
     HWND hwndPageCoordinator = nullptr;
     HWND hwndPageSearch = nullptr;
     HWND hwndUsername = nullptr, hwndHostname = nullptr, hwndServerUrl = nullptr, hwndPollInterval = nullptr;
-    HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr, hwndPruneBrackets = nullptr;
+    HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr, hwndPruneBrackets = nullptr,
+         hwndPruneWhole = nullptr;
     HWND hwndAlphabet = nullptr, hwndMaxBackslash = nullptr, hwndPrefix = nullptr, hwndSuffix = nullptr, hwndStartCandidate = nullptr,
          hwndLowerBound = nullptr, hwndUpperBound = nullptr, hwndHashA = nullptr, hwndHashB = nullptr;
     // Tooltip strings must outlive the tooltip (it keeps pointers, not
@@ -153,6 +155,7 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         state->fields->hashB = hashB;
                         state->fields->pruneSymbolRuns = SendMessage(state->hwndPrune, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->pruneUnopenedBrackets = SendMessage(state->hwndPruneBrackets, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                        state->fields->pruneWholeCandidate = SendMessage(state->hwndPruneWhole, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         bool continuous = SendMessage(state->hwndContinuousRadio, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->mode = continuous ? "continuous" : "bounded";
                     }
@@ -384,6 +387,12 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     addHelp(ps, kH2, row(6) + 2,
             "Skip candidates that close a bracket that was never opened - a ) with no ( before it, or a ] with no [ before it "
             "(brackets opened in the prefix count). Real filenames practically never have those. Makes the search faster.");
+    state.hwndPruneWhole =
+        makeCheckbox(ps, "Prune the whole candidate", kL1, row(7) + 1, 190, kIdSetupPruneWholeCheckbox, fields.pruneWholeCandidate);
+    addHelp(ps, kH1, row(7) + 2,
+            "Apply the two rules above, and Max backslash, to every character of a candidate but the last - not only to the "
+            "characters before the last five or so, which the CPU goes through. About a fifth fewer candidates are searched, and "
+            "the search is about 10% faster on a GPU.");
 
     // --- Buttons ---
     CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 512, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout, hInstance,
