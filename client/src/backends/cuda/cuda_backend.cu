@@ -57,6 +57,16 @@ struct Hit {
 // time than one without; the host then checks every hit itself (see
 // runBatches).
 struct BatchResults {
+    // 32 bits, though a launch of 16 leading values covers about 4.5 billion
+    // candidates - more than it can count. Past 2^31 hits it would go negative
+    // (and `slot < MAX_MATCHES` would let the kernel write outside `hits`),
+    // past 2^32 wrap to a small count, and hits could be missed. But a real
+    // launch has about one (4.5 billion / 2^32): overflowing this would take
+    // half of all its candidates sharing one 32-bit hashA, which only a broken
+    // hash or kernel could produce - and that would fail far more than this.
+    // A 64-bit count would rule it out by construction, at no measurable
+    // cost; it was left as it is. The other backends' batches (at most 50 *
+    // 2^23 candidates) can't overflow theirs.
     int matchCount;
     int unused;
     Hit hits[MAX_MATCHES];
