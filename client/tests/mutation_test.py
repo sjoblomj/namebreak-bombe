@@ -11,17 +11,22 @@ three checks that guard the search, on its own:
   integration        tests/search_integration_test.cpp
   stress             tests/search_stress_test.cpp
 
-A fourth, tests/search_overflow_test.cpp ("overflow"), runs on every copy
-too. It covers what happens when a launch has more hits than it can record,
-which the other three rarely or never reach, so a mutation there is expected
-to be caught by it alone; and the engine's mutations can't be caught by the
-self-test, which tests a backend without the engine. Each mutation names the
-checks that must catch it (all three, by default).
+Two more run on every copy too. tests/search_overflow_test.cpp
+("overflow") covers what happens when a launch has more hits than it can
+record, which the other three rarely or never reach. And the stress test
+built for tiny batches, a few searched per launch ("stress-small" - the
+small_launch variant in CMakeLists.txt): a CUDA launch covers 16 leading
+values, so in the default build nearly every test search is a single launch,
+and only this one searches with many - where what one launch leaves behind
+can break the next. A mutation there is expected to be caught by those
+alone; and the engine's mutations can't be caught by the self-test, which
+tests a backend without the engine. Each mutation names the checks that must
+catch it (the first three, by default).
 
 In the copies, createBackend's own self-test is switched off, so that the
 integration and stress tests are judged by themselves; the self-test is run
 separately instead. Two kinds of run check the experiment itself: the
-unmodified code must pass all four checks (otherwise nothing here means
+unmodified code must pass all five checks (otherwise nothing here means
 anything, and the script stops), and so must the mutations marked harmless -
 changes that must *not* change what gets searched.
 
@@ -31,7 +36,7 @@ mutations (--list).
 Needs the GPU the backend runs on, its toolchain or driver, and CMake. It
 copies CMakeLists.txt, src/ and tests/ as they are on disk into a work
 directory, so it tests uncommitted changes too and never touches build/.
-The CUDA list takes about twelve minutes on a laptop i9-12900H and RTX 3080
+The CUDA list takes about fifteen minutes on a laptop i9-12900H and RTX 3080
 Ti.
 
 Run from anywhere:  python3 client/tests/mutation_test.py [--backend opencl] [options]
@@ -39,7 +44,7 @@ or, from a configured build:  cmake --build --preset default --target run_mutati
                               (or run_mutation_test_opencl)
 
 Exit status: 0 if every mutation was caught by the checks it names and every
-control passed all four, 1 if not, 2 if the experiment couldn't be run.
+control passed all five, 1 if not, 2 if the experiment couldn't be run.
 
 A mutation is an exact string replacement in one file. When the code it
 targets changes, the string no longer matches and the script says so -
@@ -131,9 +136,21 @@ CUDA_MUTATIONS = [
     Mutation("batchseeds", "every batch of a launch searched with the first one's seeds and edges",
              [(KERNEL, "const LaunchBatch batch = batches.batch[batchIndex];", "const LaunchBatch batch = batches.batch[0];")]),
     Mutation("hitbatch", "every hit recorded as the launch's first batch's",
-             [(KERNEL, "bufs.matchBatch[slot] = (uint8_t) batch;", "bufs.matchBatch[slot] = 0;")]),
-    Mutation("verifybatch", "every hit verified with the launch's first batch's prefix",
-             [(KERNEL, "const BatchParams params = bufs.params[bufs.matchBatch[i]];", "const BatchParams params = bufs.params[0];")]),
+             [(KERNEL, "Hit{(groupStart + d) * AlphabetSize + k, batch, 0};", "Hit{(groupStart + d) * AlphabetSize + k, 0, 0};")]),
+    Mutation("verifybatch", "every hit checked with the launch's first batch's prefix",
+             [(KERNEL, "verifier_.addHits({hit.trailingIdx}, trailingLen, requests[hit.batch].params, outcome);",
+               "verifier_.addHits({hit.trailingIdx}, trailingLen, requests[0].params, outcome);")]),
+    # Reading the hits back.
+    # Only the stress test's dense hits put more than the first few hits read
+    # with the count in one launch.
+    Mutation("hitsread", "the hits past the first ones read with the count read one short",
+             [(KERNEL, "(hitCount - kHitsReadWithCount) * sizeof(Hit), cudaMemcpyDeviceToHost));",
+               "(hitCount - kHitsReadWithCount - 1) * sizeof(Hit), cudaMemcpyDeviceToHost));")],
+             caught_by=("stress",)),
+    # Only a search of many launches can tell.
+    Mutation("nohitreset", "the hit count never reset after a launch with hits",
+             [(KERNEL, "CUDA_CHECK(cudaMemsetAsync(&bufs_.results->matchCount, 0, sizeof(int), 0));", "")],
+             caught_by=("self-test", "stress-small")),
     Mutation("lastbatch", "a launch's last batch never searched, when there's more than one",
              [(KERNEL, "(unsigned) batchCount);", "(unsigned) std::max(1, batchCount - 1));")]),
     # The engine's side of it: the self-test tests the backend alone.
@@ -311,12 +328,14 @@ int main(int argc, char** argv) {
 }
 '''
 
-TARGETS = ["search_integration_test", "search_stress_test", "search_overflow_test", "mutation_self_test_runner"]
+TARGETS = ["search_integration_test", "search_stress_test", "search_overflow_test", "search_stress_test_small_launch",
+           "mutation_self_test_runner"]
 CHECKS = [
     ("self-test", "mutation_self_test_runner"),
     ("integration", "search_integration_test"),
     ("stress", "search_stress_test"),
     ("overflow", "search_overflow_test"),
+    ("stress-small", "search_stress_test_small_launch"),
 ]
 
 
@@ -389,7 +408,7 @@ def build(work, base, mutation, args):
         replace_exactly_once(src / file, old, new, f"mutation {mutation.name}")
     build_dir = src / "build"
     configure = ["cmake", "-S", str(src), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release", "-DNAMEBREAK_METAL=OFF",
-                 "-DNAMEBREAK_NETWORK=OFF", "-DNAMEBREAK_TEST_VARIANTS=OFF"] + BACKENDS[args.backend][0]
+                 "-DNAMEBREAK_NETWORK=OFF", "-DNAMEBREAK_TEST_VARIANTS=ON"] + BACKENDS[args.backend][0]
     configure += args.cmake_arg
     compile_ = ["cmake", "--build", str(build_dir), "-j", str(args.jobs), "--target"] + TARGETS
     log = src / "build.log"
@@ -515,7 +534,7 @@ def main():
         control.checks = run_checks(build_dir, CONTROL, args)
         say(describe(control))
         if not control.as_expected():
-            raise ExperimentError("the unmodified code doesn't pass all four checks, so the experiment can't tell anything")
+            raise ExperimentError("the unmodified code doesn't pass all five checks, so the experiment can't tell anything")
         outcomes.append(control)
 
         # Each mutation is built while earlier ones are checked on the GPU.
@@ -544,7 +563,8 @@ def main():
 
     minutes = (time.monotonic() - start) / 60
     unexpected = [o for o in outcomes if not o.as_expected()]
-    print(f"\n{'mutation':<15} {'expected':<9} {'self-test':<10} {'integration':<12} {'stress':<10} {'overflow':<9} result")
+    widths = [max(len(c), 8) + 2 for c, _ in CHECKS]
+    print(f"\n{'mutation':<15} {'expected':<9} " + "".join(f"{c:<{w}}" for (c, _), w in zip(CHECKS, widths)) + "result")
     for o in outcomes:
         # A check a mutation doesn't have to fail is in parentheses.
         cells = []
@@ -553,8 +573,8 @@ def main():
             if o.mutation.expect == "caught" and c not in o.mutation.caught_by and not o.error:
                 cell = f"({cell})"
             cells.append(cell)
-        print(f"{o.mutation.name:<15} {o.mutation.expect:<9} {cells[0]:<10} {cells[1]:<12} {cells[2]:<10} {cells[3]:<9} "
-              f"{'ok' if o.as_expected() else 'NOT AS EXPECTED'}")
+        print(f"{o.mutation.name:<15} {o.mutation.expect:<9} " + "".join(f"{cell:<{w}}" for cell, w in zip(cells, widths)) +
+              ("ok" if o.as_expected() else "NOT AS EXPECTED"))
     print(f"\n{len(outcomes)} run(s) in {minutes:.1f} minutes: {len(outcomes) - len(unexpected)} as expected, {len(unexpected)} not.")
     if unexpected:
         print("Not as expected: " + ", ".join(o.mutation.name for o in unexpected) +

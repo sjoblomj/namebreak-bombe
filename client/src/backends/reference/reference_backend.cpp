@@ -83,9 +83,9 @@ BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_
             for (int i = 0; i < trailingLen; ++i)
                 filename += alphabet_[digit[i]];
             filename += suffix_;
-            // The same cross-check verifyMatchesKernel does: hashing the
-            // complete filename from scratch must agree with the
-            // prefix-state path that found it.
+            // The same cross-check HitVerifier does for the other backends:
+            // hashing the complete filename from scratch must agree with
+            // the prefix-state path that found it.
             uint32_t verifyHashA = hashFromScratch(filename, 0x100);
             if (verifyHashA != seed1) {
                 printf("WARNING: hashA mismatch for '%s' - incremental hash 0x%08X, full-filename hash 0x%08X\n", filename.c_str(), seed1,

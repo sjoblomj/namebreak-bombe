@@ -415,11 +415,11 @@ add_custom_target(run_search_bench COMMAND search_bench ${SEARCH_BENCH_ARGS} WOR
 # Mutation testing (tests/mutation_test.py) - not a ctest test: it builds
 # a copy of the client per mutation, with a GPU kernel broken on purpose, and
 # checks that the self-test, the integration test and the stress test (and,
-# for the ones only it can see, the overflow test) catch every one. About
-# twelve minutes for CUDA's list and four for OpenCL's on the RTX 3080 Ti
-# Laptop: `cmake --build --preset default --target run_mutation_test` (the
-# CUDA or HIP kernel) or run_mutation_test_opencl, after any change to the
-# kernel.
+# for the ones only they can see, the overflow test and the small-launch
+# stress test) catch every one. About fifteen minutes for CUDA's list and
+# four for OpenCL's on the RTX 3080 Ti Laptop: `cmake --build --preset
+# default --target run_mutation_test` (the CUDA or HIP kernel) or
+# run_mutation_test_opencl, after any change to the kernel.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND AND WITH_OPENCL)
     add_custom_target(run_mutation_test_opencl COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mutation_test.py --backend opencl

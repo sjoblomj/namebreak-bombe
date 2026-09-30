@@ -59,9 +59,9 @@ constexpr int rowsPerThreadOr([[maybe_unused]] int backendDefault) {
 // Turns the trailing indices of a batch's hashA hits into what runBatch
 // returns: rebuilds each hit's complete filename on the host and checks it
 // against hashB. Also hashes every filename from scratch, as a cross-check
-// of the backend's own hashing, printing a WARNING (which the tests treat as
-// a failure) if the two disagree - the same check verifyMatchesKernel does
-// for the CUDA backend, here done on the CPU.
+// of the backend's own hashing - independent code, on the CPU - printing a
+// WARNING (which the tests treat as a failure) if the two disagree. Every
+// backend but `reference` checks its hits with it.
 class HitVerifier {
 public:
     void begin(const SearchConstants& constants);

@@ -47,9 +47,9 @@
 //     non-ASCII order), prefixes, suffixes, candidate lengths and ranges.
 //
 // Every runSearch() call's stdout/stderr is captured, and any "WARNING" in it
-// fails the case: verifyMatchesKernel re-derives each reported hit through
-// the original, independent hashing path and prints one whenever that
-// disagrees with the fast kernel that reported it.
+// fails the case: every backend re-derives each reported hit through an
+// independent hashing path (HitVerifier, on the CPU) and prints one whenever
+// that disagrees with the fast kernel that reported it.
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
 // to the current directory - ctest runs each test in its own directory under

@@ -354,9 +354,9 @@ flowchart TD
     seed -->|"16 collected"| kernel
     subgraph gpu ["GPU: one launch per 16 leading values"]
         kernel["filteredRowsKernel<br/>a thread per chunk of rows:<br/>a step per row, a lookup,<br/>hash only what it flags"]
-        kernel -->|"hashA hits"| verify["verifyMatchesKernel<br/>hash each hit again<br/>from scratch, check hashB"]
     end
     kernel -->|"no hits"| next
+    kernel -->|"hashA hits"| verify["CPU: hash each hit again<br/>from scratch, check hashB"]
     verify --> host["CPU: write the hits<br/>to the matches file"]
     host -->|"hashB matches too"| found(["found: stop"])
     host --> next
@@ -499,14 +499,21 @@ Together, the row-based design measured about 16x faster than the
 previous one-thread-per-candidate kernel, while still producing
 bit-for-bit identical hashes.
 
-The search kernel only *records where* each hashA hit is - it doesn't build
-the filename or check hashB, keeping its hot path as small as possible. A
-second, much smaller kernel (`verifyMatchesKernel`) runs only when a batch
-actually had a hit: it rebuilds that candidate's complete filename and
-checks hashB - using the *original*, independent hashing code (not
-the row-based fast path), so every hit gets cross-checked by a second
-implementation at runtime. Any disagreement between the two prints a
-`WARNING`, which the test suite treats as a failure.
+The search kernel only *records where* each hashA hit is - its trailing
+index and batch - and doesn't build the filename or check hashB, keeping
+its hot path as small as possible. The count of hits and the first 16 of
+them come back with the one small copy that follows every launch, and the
+CPU checks each one (`HitVerifier`, shared by every backend but
+`reference`): it rebuilds the complete filename from the trailing index and
+hashes it from scratch - independent code, on a different processor, not
+the row-based fast path - and checks hashB. So every hit gets cross-checked
+by a second implementation at runtime, and a launch with a hit costs the
+GPU no more idle time than one without. Any disagreement between the two
+prints a `WARNING`, which the test suite treats as a failure. (The CUDA
+backend used to do this in a second kernel, launched after every launch
+with a hit; with 16 leading values per launch, two launches in three have
+one, and that kernel and its copies left the GPU idle about 35 us each
+time.)
 
 Only the first `MAX_MATCHES` (1024) hits from one launch can be recorded
 at all. If a launch somehow has more than that, each of its batches is
@@ -647,7 +654,7 @@ flowchart LR
         direction TB
         s1["at startup: the self-test<br/>planted candidates must<br/>be found, those outside<br/>the range must not"]
         s2["every search: the table<br/>checked against its<br/>definition, read back<br/>from the GPU"]
-        s3["every hit:<br/>verifyMatchesKernel<br/>hashes it again,<br/>independently"]
+        s3["every hit: the CPU<br/>hashes it again,<br/>independently"]
         s1 --> s2 --> s3
     end
     dev --> run
@@ -699,8 +706,8 @@ In detail:
   GPU); this runs on every volunteer's GPU, driver and compiler. A backend
   that fails isn't used: namebreak says so and falls back to the next one
   (for a GPU backend, eventually the CPU).
-- `verifyMatchesKernel` still cross-checks every hit through the
-  independent hashing path, as before.
+- Every hit is still cross-checked through an independent hashing path,
+  on the CPU (`HitVerifier`).
 - The `reference` backend never gets the filter: it's what the others are
   held to.
 
@@ -709,18 +716,22 @@ ones are built on purpose - each a bug that silently misses (or invents)
 candidates - and run against each check on its own (the integration and
 stress tests with the self-test switched off). `tests/mutation_test.py`
 does it, a backend at a time: `cmake --build --preset default --target
-run_mutation_test` for the CUDA kernel (about twelve minutes on the RTX 3080
-Ti Laptop), `run_mutation_test_opencl` for the OpenCL one (about four).
+run_mutation_test` for the CUDA kernel (about fifteen minutes on the RTX
+3080 Ti Laptop), `run_mutation_test_opencl` for the OpenCL one (about four).
 Run it after any change to a kernel - and when it
 says a mutation no longer applies, because the code it breaks has changed,
-update the mutation rather than drop it. It also runs a fourth check on
-every copy, the overflow test, which covers what the other three rarely or
-never reach: more hits in a launch than it can record. It first checks that
-the unchanged code passes all four checks, and that a change which mustn't
-matter (one thread, or one work-group, too few or too many launched) passes
-them too, so that it can't pass by always saying "caught". Against the CUDA
-kernel as it is now - row groups split into chunks, and 16 batches per
-launch - twenty-four mutations: rows' masks cut to
+update the mutation rather than drop it. It also runs two more checks on
+every copy, for what the other three rarely or never reach: the overflow
+test (more hits in a launch than it can record), and the stress test built
+for tiny batches, a few per launch (`stress-small`) - with 16 leading
+values per launch, nearly every search of the other tests is a single
+launch, and only this one has many, where what one launch leaves behind can
+break the next. It first checks that the unchanged code passes all five
+checks, and that a change which mustn't matter (one thread, or one
+work-group, too few or too many launched) passes them too, so that it can't
+pass by always saying "caught". Against the CUDA kernel as it is now - row
+groups split into chunks, 16 batches per launch, and its hits read back
+with its hit count - twenty-six mutations: rows' masks cut to
 32 bits; seed1 and seed2 swapped in the lookup; a batch's last row, or
 first row, one candidate short; the edges of the range ignored; the loop
 over a row's flagged candidates stopping one early; the suffix hashed one
@@ -730,17 +741,22 @@ at its start or end; the first or last row's cut applied to the wrong row;
 one character too few of a group hashed; the wrong character in a row's
 own step; the last chunk, or the last group, of a batch never searched; and
 in the batching, every batch of a launch searched with the first one's
-seeds and edges; every hit recorded as, or verified with, the first
-batch's; a launch's last batch never searched; and two in the engine - the
-batches left over at the end of a candidate length never searched, and a
-launch whose hits overflowed never searched again batch by batch. Every
-kernel mutation was caught by the self-test, by the integration test and by
-the stress test - the integration test failed 6-1007 of its 2,266 cases,
-the stress test 17-315 of its 346, and the wrong-target table stopped both
-at their first search. The engine's two can't be caught by the self-test,
-which tests a backend without the engine: the first was caught by the
-integration and stress tests, and the overflow one by the overflow test
-alone - as it has to be, since the other checks never overflow a launch. Against the OpenCL kernel, twenty-one: the same kinds
+seeds and edges; every hit recorded as, or checked with, the first
+batch's; a launch's last batch never searched; the hits past the first 16
+read one short, and the hit count never reset after a launch with hits;
+and two in the engine - the batches left over at the end of a candidate
+length never searched, and a launch whose hits overflowed never searched
+again batch by batch. Every kernel mutation but the last two was caught by
+the self-test, by the integration test and by the stress test - the
+integration test failed 6-1007 of its 2,266 cases, the stress test 17-315 of
+its 346, and the wrong-target table stopped both at their first search. The
+rest can only be caught where they can happen: more than 16 hits in a
+launch only in the stress test (which caught it), a count left over from
+one launch only in a search of many (the self-test, which searches its
+grouped batches twice in one search, and `stress-small`); the engine's two
+not by the self-test, which tests a backend without the engine (the first
+was caught by the integration and stress tests, the overflow one by the
+overflow test alone). Against the OpenCL kernel, twenty-one: the same kinds
 of bug in its mask, lookup, row edges, loop, suffix and chunking, plus a
 lowest-set-bit taken one too high, its own copy of the table index shifting
 one bit too far, and the kernel compiled for a table one bit narrower - with
@@ -768,7 +784,12 @@ searched again on its own. Breaking it went unnoticed by every check, so
 the overflow test now spreads a pair of colliding candidates over two
 batches of one launch (in adjacent leading values, and with a pruned one
 between them), and a stress-test build with room for a single hit per
-launch (`stress-*-overflow`) overflows launches and batches at random.
+launch (`stress-*-overflow`) overflows launches and batches at random. And
+reading hits back with the count found that the default builds' tests had
+stopped noticing what one launch leaves for the next - a hit count never
+reset got past all three checks, as their searches had become single
+launches - so the self-test now searches its grouped batches twice in one
+search, and the script runs `stress-small` too.
 `tests/self_test_test.cpp` does the same for the self-test on the CPU
 backends, on every `ctest` run.
 

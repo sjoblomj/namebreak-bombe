@@ -233,22 +233,35 @@ bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount
 
     // As the engine does it (searchBatches, search.cpp): all at once, or each
     // on its own if their hits together were more than could be recorded.
-    Result result;
+    auto search = [&]() {
+        Result result;
+        BatchOutcome outcome = backend.runBatches(trailingLen, batches);
+        if (outcome.hitCount > MAX_MATCHES) {
+            for (const BatchRequest& batch : batches)
+                searchChunk(backend, trailingLen, batch.start, batch.count, batch.params, result);
+        } else {
+            result.hits = outcome.hits;
+            result.found = outcome.found;
+            result.foundFilename = outcome.foundFilename;
+        }
+        std::sort(result.hits.begin(), result.hits.end());
+        return result;
+    };
+    // Twice in one search: a real search has many launches, and whatever one
+    // leaves behind - a hit count not reset, say - must not change the next.
     backend.beginSearch(constants);
-    BatchOutcome outcome = backend.runBatches(trailingLen, batches);
-    if (outcome.hitCount > MAX_MATCHES) {
-        for (const BatchRequest& batch : batches)
-            searchChunk(backend, trailingLen, batch.start, batch.count, batch.params, result);
-    } else {
-        result.hits = outcome.hits;
-        result.found = outcome.found;
-        result.foundFilename = outcome.foundFilename;
-    }
+    const Result result = search();
+    const Result again = search();
     backend.endSearch();
 
     char where[256];
     snprintf(where, sizeof(where), " (%d batches searched together, planted in batch %d, alphabet size %d, trailing length %d)", batchCount,
              plantBatch, alphabetSize, trailingLen);
+    if (again.hits != result.hits || again.found != result.found || again.foundFilename != result.foundFilename) {
+        error = "searching the same batches again in the same search reported something else - " + std::to_string(result.hits.size()) +
+                " hit(s) the first time, " + std::to_string(again.hits.size()) + " the second" + where;
+        return false;
+    }
     for (const std::string& hit : result.hits) {
         if (!hashAMatches(hashFromScratch(hit, cryptTable, 0x100), constants.targetHashA)) {
             error = "reported '" + hit + "', which doesn't match the target" + where;

@@ -6,6 +6,8 @@
 #include "backends/cuda/cuda_backend.h"
 
 #include "backends/cuda/gpu_runtime.h"
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +17,7 @@
 #include <type_traits>
 #include <vector>
 #include "backends/common/lowbits_filter.h"
+#include "backends/common/row_batch.h"
 #include "backends/cuda/hash_kernels.cuh"
 #include "backends/cuda/tuning.h"
 #include "engine/backend.h"
@@ -38,40 +41,36 @@
 //   last character, so row r's candidate with last character k has trailing
 //   index r * alphabetSize + k. One GPU thread handles one whole row.
 
-// Written by verifyMatchesKernel alongside BatchResults::foundFlag, so the
-// host can recover *which* candidate matched both hashes without scanning
-// stdout for it - see buildCompleteFilename (hash_kernels.cuh).
-__device__ char d_foundFilename[MAX_FILENAME_LEN];
-
-// The kernels' small per-batch outputs, kept together in one device buffer
-// so the host reads them back with a single cudaMemcpy (each separate driver
-// call is ~10us of GPU idle time between two consecutive kernels).
-struct BatchResults {
-    int matchCount; // hashA hits this batch (may exceed MAX_MATCHES; the engine then re-searches the range in halves)
-    int foundFlag;  // 1 once any candidate has matched both hashes - never reset mid-search
+// One hashA hit, as filteredRowsKernel records it: the candidate's trailing
+// index, and which of the launch's batches it's in.
+struct Hit {
+    uint64_t trailingIdx;
+    uint32_t batch;
+    uint32_t unused;
 };
+
+// Everything a launch reports, in one device buffer: how many hashA hits it
+// had - which may exceed MAX_MATCHES, when the engine searches its batches
+// again in smaller pieces - and the first MAX_MATCHES of them. The host reads
+// the count and the first kHitsReadWithCount hits back in one copy, queued
+// behind the kernel, so a launch with a hit or two costs the GPU no more idle
+// time than one without; the host then checks every hit itself (see
+// runBatches).
+struct BatchResults {
+    int matchCount;
+    int unused;
+    Hit hits[MAX_MATCHES];
+};
+constexpr int kHitsReadWithCount = MAX_MATCHES < 16 ? MAX_MATCHES : 16;
 
 struct DeviceBuffers {
     BatchResults* results;
-    // matchIdx[i]: trailing index of the i-th hashA hit (only the first MAX_MATCHES
-    // hits of a launch are recorded), and matchBatch[i] which of the launch's
-    // batches it's in. Written by filteredRowsKernel, consumed by
-    // verifyMatchesKernel.
-    uint64_t* matchIdx;
-    uint8_t* matchBatch;
-    // The launch's batches' prefixes and seeds, for verifyMatchesKernel -
-    // uploaded only when a launch has hits.
-    BatchParams* params;
-    // matches + i * MAX_FILENAME_LEN: the i-th hit's complete filename.
-    // Written by verifyMatchesKernel, consumed by the host.
-    char* matches;
     // This search's lookup filter: kLowBitsFilterEntries entries, see
     // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
     uint64_t* filterTable;
 };
 
 static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "filteredRowsKernel needs one thread per alphabet entry to fill its shared tables");
-static_assert(kMaxBatchesPerLaunch <= 256, "DeviceBuffers::matchBatch holds a batch's index in a byte");
 
 // One batch of a launch, as filteredRowsKernel needs it: its rows
 // firstRow..lastRow of the trailing space, cut to [firstRowStartK,
@@ -214,10 +213,8 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
             }
             if (hashAMatches(a, targetA)) {
                 int slot = atomicAdd(&bufs.results->matchCount, 1);
-                if (slot < MAX_MATCHES) {
-                    bufs.matchIdx[slot] = (groupStart + d) * AlphabetSize + k;
-                    bufs.matchBatch[slot] = (uint8_t) batch;
-                }
+                if (slot < MAX_MATCHES)
+                    bufs.results->hits[slot] = Hit{(groupStart + d) * AlphabetSize + k, batch, 0};
             }
         }
     }
@@ -245,10 +242,9 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
 // candidate that matches the target. Only those are hashed in full. README.md's
 // "The lookup filter" has why the lookup can never leave a match out.
 //
-// A hashA hit only records its trailing index and batch (bufs.matchIdx,
-// bufs.matchBatch): building the filename and checking hashB happen in
-// verifyMatchesKernel, launched only when there was a hit, so none of that
-// (printf, a 128-byte filename buffer) bloats this hot kernel.
+// A hashA hit only records its trailing index and batch (BatchResults): the
+// host builds the filename and checks it - hashA again, from scratch, and
+// hashB - so none of that bloats this hot kernel.
 template<int AlphabetSize, int SuffixLen>
 __global__ void filteredRowsKernel(
     int trailingLen,
@@ -283,62 +279,9 @@ __global__ void filteredRowsKernel(
     }
 }
 
-// Second stage, launched only for a batch that had hashA hits (one thread per
-// recorded hit): rebuilds each hit's complete filename and does everything
-// that used to happen inline in the search kernel - the hashB check, the
-// found flag/filename. Deliberately implemented with the
-// *original*, independent hashing path (indexToCandidate +
-// mpqHashCandidateAndSuffix + from-scratch mpqHashSeed1/Seed2), not
-// filteredRowsKernel's row-based one, so every hit filteredRowsKernel reports
-// is cross-checked against a second implementation at runtime.
-template<int AlphabetSize>
-__global__ void verifyMatchesKernel(
-    int trailingLen,
-    int matchCount,
-    uint32_t targetA,
-    uint32_t targetB,
-    DeviceBuffers bufs
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= matchCount)
-        return;
-    // The hit's own batch's prefix and seeds - copied, since
-    // buildCompleteFilename (hash_kernels.cuh) needs a BatchParams whose
-    // address isn't taken.
-    const BatchParams params = bufs.params[bufs.matchBatch[i]];
-
-    char candidate[MAX_CANDIDATE_LEN];
-    indexToCandidate<AlphabetSize>(bufs.matchIdx[i], trailingLen, candidate);
-    char filename[MAX_FILENAME_LEN];
-    buildCompleteFilename(params, candidate, trailingLen, filename);
-
-    // hashA via the prefix-cache/incremental path must agree with both the
-    // target filteredRowsKernel claimed to hit and hashing the complete filename
-    // from scratch. A mismatch would mean one of them is out of sync with the
-    // actual filename - a real bug, not a candidate to skip.
-    uint32_t hashA = mpqHashCandidateAndSuffix(candidate, trailingLen, params.seed1Start, params.seed2Start);
-    if (!hashAMatches(hashA, targetA)) {
-        printf("WARNING: filteredRowsKernel reported a hashA hit for '%s' but the reference hashing path gives 0x%08X, not the target 0x%08X\n",
-               filename, hashA, targetA);
-    }
-    uint32_t verifyHashA = mpqHashSeed1(filename);
-    if (verifyHashA != hashA) {
-        printf("WARNING: hashA mismatch for '%s' - incremental hash 0x%08X, full-filename hash 0x%08X\n",
-               filename, hashA, verifyHashA);
-    }
-
-    uint32_t hashB = mpqHashSeed2(filename);
-    if (hashB == targetB) {
-        memcpy(d_foundFilename, filename, MAX_FILENAME_LEN);
-        bufs.results->foundFlag = 1;
-    }
-
-    memcpy(&bufs.matches[(size_t) i * MAX_FILENAME_LEN], filename, MAX_FILENAME_LEN);
-}
-
 // alphabetSize/suffix length have to be dispatched to one of a fixed set of
-// compile-time template instantiations (see indexToCandidate's and
-// filteredRowsKernel's comments for why) - dispatchAlphabetSize/
+// compile-time template instantiations (see filteredRowsKernel's comment
+// for why) - dispatchAlphabetSize/
 // dispatchSuffixLen call `f` with a std::integral_constant of the matching
 // value.
 //
@@ -386,6 +329,13 @@ namespace {
 
 class CudaBackend : public SearchBackend {
 public:
+    // Not CUDA_CHECK'd, and its result deliberately ignored: this can run as
+    // the process exits, after the CUDA runtime itself has shut down.
+    ~CudaBackend() override {
+        if (pinnedResults_)
+            (void) cudaFreeHost(pinnedResults_);
+    }
+
 #ifdef NAMEBREAK_HIP
     const char* name() const override { return "hip"; }
 #else
@@ -412,11 +362,13 @@ private:
     int alphabetSize_ = 0;
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
-    uint32_t targetB_ = 0;
-    // The batch's results, copied back into pinned host memory by a copy
-    // queued behind the kernel (see runBatch).
+    // A launch's results, copied back into pinned host memory by a copy
+    // queued behind the kernel (see runBatches). Allocated once, by the first
+    // search - it holds nothing from one launch to the next.
     BatchResults* pinnedResults_ = nullptr;
     DeviceBuffers bufs_ = {};
+    // Checks every hit the kernel reports, on the CPU (see runBatches).
+    HitVerifier verifier_;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -437,13 +389,10 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     alphabetSize_ = (int) constants.alphabet.size();
     suffixLen_ = (int) constants.suffix.size();
     targetA_ = constants.targetHashA;
-    targetB_ = constants.targetHashB;
 
     short suffixSize = (short) suffixLen_;
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix_size, &suffixSize, sizeof(suffixSize)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_suffix, constants.suffix.c_str(), suffixLen_ + 1));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_alphabet, constants.alphabet.c_str(), alphabetSize_ + 1));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_cryptTable, constants.cryptTable, 0x500 * sizeof(uint32_t)));
 
     // The per-search tables filteredRowsKernel reads - see their declaration
     // in hash_kernels.cuh.
@@ -466,10 +415,6 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     // malloc/free per call - these buffers are always the same size, so
     // there's no reason to pay driver allocation overhead on every single
     // kernel launch.
-    CUDA_CHECK(cudaMalloc(&bufs_.matches, MAX_MATCHES * MAX_FILENAME_LEN));
-    CUDA_CHECK(cudaMalloc(&bufs_.matchIdx, MAX_MATCHES * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&bufs_.matchBatch, MAX_MATCHES * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&bufs_.params, kMaxBatchesPerLaunch * sizeof(BatchParams)));
     CUDA_CHECK(cudaMalloc(&bufs_.results, sizeof(BatchResults)));
     // A long-lived process (coordinator mode) runs many searches over its
     // lifetime, one per claimed range - zeroing this fresh allocation every
@@ -478,7 +423,9 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     // falsely report "found" immediately. It also establishes the
     // "matchCount is 0 at launch" invariant runBatch maintains from here.
     CUDA_CHECK(cudaMemset(bufs_.results, 0, sizeof(BatchResults)));
-    CUDA_CHECK(cudaMallocHost((void**) &pinnedResults_, sizeof(BatchResults)));
+    if (!pinnedResults_)
+        CUDA_CHECK(cudaMallocHost((void**) &pinnedResults_, sizeof(BatchResults)));
+    verifier_.begin(constants);
 
     // This search's lookup filter - it depends on the alphabet, the suffix and
     // the target, so it's built for every search. Checked against its
@@ -498,14 +445,8 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
 }
 
 void CudaBackend::endSearch() {
-    CUDA_CHECK(cudaFree(bufs_.matches));
-    CUDA_CHECK(cudaFree(bufs_.matchIdx));
-    CUDA_CHECK(cudaFree(bufs_.matchBatch));
-    CUDA_CHECK(cudaFree(bufs_.params));
     CUDA_CHECK(cudaFree(bufs_.results));
     CUDA_CHECK(cudaFree(bufs_.filterTable));
-    CUDA_CHECK(cudaFreeHost(pinnedResults_));
-    pinnedResults_ = nullptr;
     bufs_ = {};
 }
 
@@ -522,13 +463,9 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
         exit(1);
     }
 
-    // No pre-launch check of bufs_.results->foundFlag: beginSearch zeroes it
-    // before the first batch, and a batch that finds a match reports it
-    // (below) - so runSearch stops calling this - rather than leaving it set
-    // for a later call to notice. bufs_.results->matchCount is likewise already 0
-    // here (see the reset after the readback below), so there's no per-batch
-    // memset either. Each of those was a synchronous driver call in the gap
-    // between two kernels.
+    // bufs_.results->matchCount is already 0 here: beginSearch zeroes it, and a
+    // launch with hits queues its reset (see below), so there's no per-launch
+    // memset in the gap between two kernels.
 
     // Each batch's range [start, start + count) covers its rows
     // firstRow..lastRow; only the first and last row can be partial (see
@@ -586,60 +523,48 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
     // The results' copy is queued right behind the kernel, into pinned memory,
     // so the GPU starts it the moment the kernel ends and one wait covers
     // both - a blocking cudaMemcpy after the wait cost the GPU another round
-    // trip, idle, between every two launches (about 6 of the 11 us, measured).
-    CUDA_CHECK(cudaMemcpyAsync(pinnedResults_, bufs_.results, sizeof(BatchResults), cudaMemcpyDeviceToHost, 0));
+    // trip, idle, between every two launches. It brings the hit count and the
+    // first kHitsReadWithCount hits, so a launch with a few hits needs no
+    // second round trip either.
+    const size_t readWithCount = offsetof(BatchResults, hits) + kHitsReadWithCount * sizeof(Hit);
+    CUDA_CHECK(cudaMemcpyAsync(pinnedResults_, bufs_.results, readWithCount, cudaMemcpyDeviceToHost, 0));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    BatchResults h_results = *pinnedResults_;
-    outcome.hitCount = h_results.matchCount;
+    const int hitCount = pinnedResults_->matchCount;
+    outcome.hitCount = hitCount;
+    if (hitCount == 0)
+        return outcome;
 
-    // Hits are rare (a few per thousand batches), so everything below is the
-    // exception path - the common launch costs exactly the one copy above.
-    if (h_results.matchCount > MAX_MATCHES) {
-        // More hits than bufs_.matchIdx can record: the excess would never reach
-        // verifyMatchesKernel. Nothing from this launch has been verified, so
-        // leave it all to the engine to search again in smaller pieces.
-        CUDA_CHECK(cudaMemset(&bufs_.results->matchCount, 0, sizeof(int)));
+    // Hits are rare (a launch of 16 leading values has one about two times in
+    // three), so everything below is the exception path.
+    if (hitCount <= MAX_MATCHES && hitCount > kHitsReadWithCount) {
+        CUDA_CHECK(cudaMemcpy(pinnedResults_->hits + kHitsReadWithCount, bufs_.results->hits + kHitsReadWithCount,
+                              (hitCount - kHitsReadWithCount) * sizeof(Hit), cudaMemcpyDeviceToHost));
+    }
+    // Restores "matchCount is 0 at launch" for the next launch - queued, so it
+    // runs before that without anything waiting for it here.
+    CUDA_CHECK(cudaMemsetAsync(&bufs_.results->matchCount, 0, sizeof(int), 0));
+    if (hitCount > MAX_MATCHES) {
+        // More hits than could be recorded: nothing from this launch has been
+        // checked, so leave it all to the engine to search again in smaller
+        // pieces.
         return outcome;
     }
-    if (h_results.matchCount > 0) {
-        const int recorded = h_results.matchCount;
 
-        // Each hit's batch's prefix, for the filename verifyMatchesKernel builds.
-        std::vector<BatchParams> params(batchCount);
-        for (int b = 0; b < batchCount; ++b)
-            params[b] = requests[b].params;
-        CUDA_CHECK(cudaMemcpy(bufs_.params, params.data(), batchCount * sizeof(BatchParams), cudaMemcpyHostToDevice));
-
-        dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
-            constexpr int AlphabetSize = decltype(alphabetC)::value;
-            verifyMatchesKernel<AlphabetSize><<<(recorded + 63) / 64, 64>>>(trailingLen, recorded, targetA_, targetB_, bufs_);
-        });
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        std::vector<char> h_matches((size_t) recorded * MAX_FILENAME_LEN);
-        CUDA_CHECK(cudaMemcpy(h_matches.data(), bufs_.matches, h_matches.size(), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < recorded; ++i)
-            outcome.hits.emplace_back(&h_matches[(size_t) i * MAX_FILENAME_LEN]);
-
-        // verifyMatchesKernel is what sets foundFlag, so re-read it now.
-        CUDA_CHECK(cudaMemcpy(&h_results, bufs_.results, sizeof(h_results), cudaMemcpyDeviceToHost));
-
-        // Restores the "matchCount is 0 at launch" invariant the next launch relies on.
-        CUDA_CHECK(cudaMemset(&bufs_.results->matchCount, 0, sizeof(int)));
-    }
-
-    // Read after this launch's own kernels have finished, so a match found by
-    // *this* launch is reported now instead of going undetected until
-    // whatever call happens to come after it, which may never come (e.g. a
-    // "bounded" search whose very last batch is the one that finds it would
-    // otherwise report "not found").
-    if (h_results.foundFlag) {
-        char foundFilename[MAX_FILENAME_LEN];
-        CUDA_CHECK(cudaMemcpyFromSymbol(foundFilename, d_foundFilename, MAX_FILENAME_LEN));
-        outcome.found = true;
-        outcome.foundFilename = foundFilename;
+    // Every hit, checked on the CPU with its own batch's prefix: the filename
+    // is built from the trailing index again, and hashed from scratch - an
+    // independent implementation on a different processor, which prints a
+    // WARNING if it doesn't get the target's hashA (the tests treat that as a
+    // failure) - and hashB is checked. A match found by *this* launch is
+    // reported now, not by whatever call comes after it, which may never come
+    // (a bounded search's last launch).
+    for (int i = 0; i < hitCount; ++i) {
+        const Hit& hit = pinnedResults_->hits[i];
+        if (hit.batch >= (uint32_t) batchCount) {
+            fprintf(stderr, "INTERNAL ERROR: the kernel reported a hit in batch %u of a launch of %d - exiting\n", hit.batch, batchCount);
+            exit(1);
+        }
+        verifier_.addHits({hit.trailingIdx}, trailingLen, requests[hit.batch].params, outcome);
     }
     return outcome;
 }

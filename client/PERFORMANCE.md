@@ -177,7 +177,7 @@ will have grown (not measured again).
     blocks (`blockIdx.y`) per batch, whose rows, edges and seeds are a
     by-value kernel argument (indexed loads from the constant bank - no
     local-memory copy, and 32 registers instead of 37). A hit records its
-    batch, and `verifyMatchesKernel` rebuilds it with that batch's prefix.
+    batch, and is rebuilt with that batch's prefix.
     If a launch's hits together overflow, each batch is searched again on
     its own. **Measured**: in the timed search the GPU idles 1.6% of the
     time instead of 9.4% (Nsight Systems; the kernels themselves ran 2%
@@ -190,17 +190,28 @@ will have grown (not measured again).
     and their gaps likely the same share - a `runBatches()` each, with a
     batch array in a buffer (or a kernel argument), and their mutation
     lists extended as the CUDA one was.
-  - [ ] **A cheaper hit path.** A launch of 16 leading values (4.5G
-    candidates) has a hashA hit about two times in three, and each costs
-    about 35 us more of GPU idle: the batches' prefixes uploaded, a
-    synchronize after `verifyMatchesKernel`, and three blocking copies.
-    Queuing the prefixes' upload before the kernel, and the readbacks
-    behind the verify kernel, would leave one wait. About 1% (*estimated*).
+  - [x] **A cheaper hit path.** A launch of 16 leading values (4.5G
+    candidates) has a hashA hit about two times in three, and each cost
+    about 35 us more of GPU idle: the batches' prefixes uploaded, a second
+    kernel (`verifyMatchesKernel`) to rebuild and check the hits, a
+    synchronize, and three blocking copies. Queuing all that would still
+    have left the verify kernel and its wait, so instead the kernel records
+    each hit's trailing index and batch in the results buffer, right after
+    the count, and the copy that follows every launch brings back the count
+    and the first 16 hits; the CPU checks them with `HitVerifier`, as every
+    other backend already did (from scratch, on another processor - as
+    independent a cross-check as the verify kernel was). A launch with more
+    than 16 hits (only the stress test's) costs one more copy.
+    **Measured**: the median gap between launches went from 47 to 16 us
+    and the GPU's idle time from 1.5% to 0.7% (Nsight Systems), and
+    `search_bench --scale 40` was faster in six alternating pairs out of
+    six, about **+1.5%** (+1.1 to +2.0%, leaving out a first pair inflated
+    by a cold start).
   - [ ] **Keep the next launch queued** while this one's results are read:
     a launch/collect pair beside `runBatch`, with two sets of result
     buffers, so the GPU never waits. It reshapes the engine's search loop
     (the split on too many hits, pause, abort, a match found with a batch
-    in flight) and needs its own tests and mutations - with 1.6% idle
+    in flight) and needs its own tests and mutations - with 0.7% idle
     left, worth little now.
 - [x] **Re-tune the window and launch size.** `NAMEBREAK_GPU_WINDOW_CHARS`
   (5) and `NAMEBREAK_ROWS_PER_LAUNCH` were chosen with the kernel as it was
