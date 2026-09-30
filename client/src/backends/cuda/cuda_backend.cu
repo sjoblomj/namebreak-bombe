@@ -7,6 +7,7 @@
 
 #include "backends/cuda/gpu_runtime.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 #include "backends/common/lowbits_filter.h"
@@ -369,6 +371,8 @@ public:
     BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches) override;
 
 private:
+    void waitForLaunch(uint64_t candidates, std::chrono::steady_clock::time_point launched);
+
     int alphabetSize_ = 0;
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
@@ -379,6 +383,13 @@ private:
     DeviceBuffers bufs_ = {};
     // Checks every hit the kernel reports, on the CPU (see runBatches).
     HitVerifier verifier_;
+
+    // How waitForLaunch sleeps through most of a launch: the time a candidate
+    // took in this search's recent large launches (0 until there's been one -
+    // another search's alphabet or suffix can make it faster), and how much
+    // later than asked a sleep has recently ended on this machine.
+    double secondsPerCandidate_ = 0;
+    double sleepOvershoot_ = 0.5e-3;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -435,6 +446,7 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     CUDA_CHECK(cudaMemset(bufs_.results, 0, sizeof(BatchResults)));
     if (!pinnedResults_)
         CUDA_CHECK(cudaMallocHost((void**) &pinnedResults_, sizeof(BatchResults)));
+    secondsPerCandidate_ = 0;
     verifier_.begin(constants);
 
     // This search's lookup filter - it depends on the alphabet, the suffix and
@@ -458,6 +470,59 @@ void CudaBackend::endSearch() {
     CUDA_CHECK(cudaFree(bufs_.results));
     CUDA_CHECK(cudaFree(bufs_.filterTable));
     bufs_ = {};
+}
+
+// Waiting for a launch by spinning - the CUDA runtime's default - keeps a CPU
+// core busy for the whole search, and on a laptop, where CPU and GPU share
+// one power budget, that core costs the GPU clock. Sleeping in the driver
+// instead (cudaDeviceScheduleBlockingSync) frees it, but the thread then
+// wakes about half a millisecond after the launch is done, with the GPU idle
+// meanwhile (measured: the search 3.6% slower). So this sleeps through most
+// of the launch, and spins only for the end of it: it predicts how long the
+// launch takes from the time a candidate took in recent large launches, and
+// sleeps until a margin before that - twice as long before as its sleeps
+// have recently overshot, so that it wakes before the launch is done. Where
+// sleeps are coarse (Windows' default timer: 15.6 ms), the margin outgrows
+// the launch and it never sleeps, spinning as before.
+//
+// A launch is timed on the host, from launching it to the end of the wait:
+// accurate when the wait still had some spinning to do. When it didn't - the
+// launch was done before the sleep ended, and the GPU may have idled - that
+// time says nothing about the launch, so the prediction is cut short
+// instead.
+void CudaBackend::waitForLaunch(uint64_t candidates, std::chrono::steady_clock::time_point launched) {
+    // Launches too small to time well - the fixed cost of one would dominate
+    // - are neither predicted from nor learned from.
+    constexpr uint64_t kLearnFrom = 100'000'000;
+    constexpr double kShare = 0.95;                // of the predicted time, at most
+    constexpr double kMinSleep = 0.2e-3;           // shorter isn't worth a sleep
+    constexpr double kSpunLongEnough = 20e-6;      // a wait this long had spinning to do
+    using Clock = std::chrono::steady_clock;
+    auto since = [](Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); };
+    const bool large = candidates >= kLearnFrom;
+    bool slept = false;
+    if (large && secondsPerCandidate_ > 0) {
+        const double sleep = kShare * (double) candidates * secondsPerCandidate_ - since(launched) - 2 * sleepOvershoot_;
+        if (sleep >= kMinSleep) {
+            const Clock::time_point before = Clock::now();
+            std::this_thread::sleep_for(std::chrono::duration<double>(sleep));
+            const double overshoot = since(before) - sleep;
+            // Up at once, down slowly: one late wake-up is reason enough to
+            // keep a wider margin for a while.
+            sleepOvershoot_ = std::max(overshoot, 0.9 * sleepOvershoot_ + 0.1 * overshoot);
+            slept = true;
+        }
+    }
+    const Clock::time_point waitStart = Clock::now();
+    CUDA_CHECK(cudaDeviceSynchronize()); // spins for the rest
+    if (!large)
+        return;
+    if (slept && since(waitStart) < kSpunLongEnough) {
+        secondsPerCandidate_ *= 0.9; // overslept: predict less next time
+        return;
+    }
+    const double perCandidate = since(launched) / (double) candidates;
+    secondsPerCandidate_ = secondsPerCandidate_ > 0 ? 0.7 * secondsPerCandidate_ + 0.3 * perCandidate : perCandidate;
 }
 
 BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params) {
@@ -503,6 +568,7 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
         maxGroups = std::max(maxGroups, lastRow / alphabetSize - firstRow / alphabetSize + 1);
     }
 
+    const auto launched = std::chrono::steady_clock::now();
     bool supported = dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
         // A type alias rather than a constexpr local: MSVC treats a constexpr
         // local of this lambda read from the nested [&] lambda below as a
@@ -538,7 +604,10 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
     // second round trip either.
     const size_t readWithCount = offsetof(BatchResults, hits) + kHitsReadWithCount * sizeof(Hit);
     CUDA_CHECK(cudaMemcpyAsync(pinnedResults_, bufs_.results, readWithCount, cudaMemcpyDeviceToHost, 0));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    uint64_t candidates = 0;
+    for (const BatchRequest& request : requests)
+        candidates += request.count;
+    waitForLaunch(candidates, launched);
 
     const int hitCount = pinnedResults_->matchCount;
     outcome.hitCount = hitCount;

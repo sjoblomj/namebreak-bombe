@@ -40,6 +40,11 @@
 #include <memory>
 #include <random>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/resource.h>
+#endif
 #include "backends/backends.h"
 #include "engine/search.h"
 #include "engine/candidate.h"
@@ -78,6 +83,21 @@ public:
 private:
     SearchBackend& inner_;
 };
+
+// CPU time this process has used so far, in seconds, every thread's.
+double processCpuSeconds() {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+    auto seconds = [](const FILETIME& t) { return (double) (((uint64_t) t.dwHighDateTime << 32) | t.dwLowDateTime) * 1e-7; };
+    return seconds(kernel) + seconds(user);
+#else
+    rusage usage;
+    getrusage(RUSAGE_SELF, &usage);
+    auto seconds = [](const timeval& t) { return (double) t.tv_sec + (double) t.tv_usec * 1e-6; };
+    return seconds(usage.ru_utime) + seconds(usage.ru_stime);
+#endif
+}
 
 // The share of all leading values of `leadingLen` characters that the engine
 // prunes under `req` - estimated from `samples` random ones, run through the
@@ -168,9 +188,11 @@ int main(int argc, char** argv) {
     runSearch(backend, warmUp);
     backend.searched = 0;
 
+    const double cpuStart = processCpuSeconds();
     auto start = std::chrono::steady_clock::now();
     SearchResult result = runSearch(backend, req, nullptr, onPartialMatch);
     auto end = std::chrono::steady_clock::now();
+    const double cpuSeconds = processCpuSeconds() - cpuStart;
 
     if (!result.ok) {
         fprintf(stderr, "runSearch() failed: %s\n", result.error.c_str());
@@ -195,6 +217,8 @@ int main(int argc, char** argv) {
     printf("searched:   %llu (%.2f%% of the range; the rest pruned on the CPU)\n", (unsigned long long) backend.searched,
            100.0 * (double) backend.searched / (double) totalCandidates);
     printf("time:       %.3f s\n", seconds);
+    // A GPU backend's host thread mostly waits for the GPU: how it waits shows here.
+    printf("CPU time:   %.3f s (%.0f%% of a core)\n", cpuSeconds, 100.0 * cpuSeconds / seconds);
     printf("throughput: %.3f G candidates/sec (of the range, pruned ones included)\n", totalCandidates / seconds / 1e9);
     const double searchRate = backend.searched / seconds / 1e9;
     printf("search rate: %.3f G candidates/sec (searched by the backend)\n", searchRate);

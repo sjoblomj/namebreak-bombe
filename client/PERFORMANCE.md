@@ -230,12 +230,28 @@ will have grown (not measured again).
   The gaps are still worth closing, but only in a way that keeps the
   pruning - several leading values per launch, or the next launch queued
   (see "Gaps between launches").
-- [ ] **Stop spinning a CPU core.** `cudaDeviceSynchronize` busy-waits: the
-  running client keeps one core at 100% (**measured** with `ps`/`top`). On a
-  laptop, CPU and GPU share one power and cooling budget, so that core may
-  cost GPU clock. `cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)`
-  would free it, at the price of some wake-up latency per launch - fine
-  once launches are longer (above). Measure throughput and GPU clocks.
+- [x] **Stop spinning a CPU core.** `cudaDeviceSynchronize` busy-waits: the
+  running client keeps one core at 100% (**measured**: `search_bench` now
+  reports the CPU time of its timed search). On a laptop, CPU and GPU share
+  one power and cooling budget, so that core may cost GPU clock.
+  `cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)` frees it - 5-6% of
+  a core - but **measured 3.6% slower** (six alternating pairs, all
+  slower): the thread wakes about 460 us after a launch ends (Nsight
+  Systems: median gap 16 us before, 461 after), though the kernels
+  themselves ran about 10% faster, the GPU getting the power the CPU no
+  longer used. So the CUDA backend now sleeps through most of each launch
+  and spins only for the end of it (`waitForLaunch`): it predicts a launch's
+  time from the time a candidate took in the search's recent large
+  launches, timed on the host, and wakes a margin early - twice its recent
+  sleep overshoot, so that where sleeps are coarse (Windows' default timer)
+  it never sleeps. **Measured**: 24% of a core instead of 100%, and the
+  same speed (six alternating pairs, -1.0 to +1.6%, about +0.2% on
+  average): its gaps are longer (median 32 us), as the CPU wakes up slower,
+  but its kernels shorter. It can only change when the host looks, never
+  what's found - it still waits with `cudaDeviceSynchronize`.
+  - [ ] **The same for OpenCL and Metal**, whose waits (`clFinish`,
+    `waitUntilCompleted`) may or may not spin, depending on the driver:
+    measure first.
 - [ ] **Build the table faster, or less often.** Building it takes 4 ms for
   `.WAV` and 10 ms for a 17-byte suffix, and the check before every search
   0.4-1.6 ms (**measured**) - nothing next to a real range, but it's most
