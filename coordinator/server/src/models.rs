@@ -40,6 +40,7 @@ pub struct Target {
     pub upper_bound: String,
     pub prune_symbol_runs: i64,
     pub prune_unopened_brackets: i64,
+    pub prune_whole_candidate: i64,
     pub max_backslash_count: i64,
     pub alphabet_name: String,
     pub alphabet: String,

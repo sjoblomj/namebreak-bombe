@@ -174,7 +174,7 @@
      the whole page to scroll horizontally - pre-wrap keeps the exact
      spacing `.mono` is for, while overflow-wrap lets a line break mid-run
      as a last resort. */
-  .target-hashes.mono, .target-alphabet .mono, .target-skip .mono {
+  .target-hashes.mono, .target-alphabet .mono {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
@@ -193,7 +193,6 @@
     font-size: 12px;
     margin-top: 2px;
   }
-  .target-skip .mono { color: var(--skipped); }
   .target-description {
     color: var(--text);
     font-size: 13px;
@@ -1521,19 +1520,6 @@
     bounds.className = 'target-bounds';
     bounds.append(candidateChip(t.lower_bound), ' → ', candidateChip(t.upper_bound));
     card.appendChild(bounds);
-
-    for (const s of t.skip_ranges) {
-      if (s.removed) continue;
-      const skip = document.createElement('div');
-      skip.className = 'target-skip';
-      skip.append(`Skip range #${s.id}: skipping `);
-      const pattern = document.createElement('span');
-      pattern.className = 'mono';
-      pattern.textContent = s.pattern;
-      skip.appendChild(pattern);
-      skip.append(` at length ${s.candidate_len} (${fmtNum(s.candidate_count)}) - ${s.reason}`);
-      card.appendChild(skip);
-    }
 
     if (t.start_len > 1) {
       const startLen = document.createElement('div');

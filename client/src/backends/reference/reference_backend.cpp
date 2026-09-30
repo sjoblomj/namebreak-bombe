@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 
+#include "engine/candidate.h"
+#include "engine/hash_match.h"
+
 namespace {
 
 // Hashes every candidate from scratch (every trailing character, then the
@@ -27,6 +30,7 @@ public:
         cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
         targetA_ = constants.targetHashA;
         targetB_ = constants.targetHashB;
+        rules_ = constants.trailingRules;
     }
 
     BatchOutcome runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) override;
@@ -53,6 +57,7 @@ private:
     std::vector<uint32_t> cryptTable_;
     uint32_t targetA_ = 0;
     uint32_t targetB_ = 0;
+    PruneRules rules_;
 };
 
 BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) {
@@ -70,20 +75,28 @@ BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_
     }
 
     for (uint64_t n = 0; n < count; ++n) {
+        // Pruned: every trailing character but the last, checked from
+        // where the leading characters left off.
+        bool pruned = false;
+        if (rules_.any()) {
+            PruneState state = params.pruneEntry;
+            for (int i = 0; i + 1 < trailingLen && !pruned; ++i)
+                pruned = !pruneStep_CPU(rules_, state, alphabet_[digit[i]]);
+        }
         uint32_t seed1 = params.seed1Start, seed2 = params.seed2Start;
         for (int i = 0; i < trailingLen; ++i)
             step(seed1, seed2, (unsigned char) alphabet_[digit[i]], 0x100);
         for (unsigned char ch : suffix_)
             step(seed1, seed2, ch, 0x100);
 
-        if (seed1 == targetA_ && ++outcome.hitCount <= MAX_MATCHES) {
+        if (!pruned && hashAMatches(seed1, targetA_) && ++outcome.hitCount <= MAX_MATCHES) {
             std::string filename = prefix;
             for (int i = 0; i < trailingLen; ++i)
                 filename += alphabet_[digit[i]];
             filename += suffix_;
-            // The same cross-check verifyMatchesKernel does: hashing the
-            // complete filename from scratch must agree with the
-            // prefix-state path that found it.
+            // The same cross-check HitVerifier does for the other backends:
+            // hashing the complete filename from scratch must agree with
+            // the prefix-state path that found it.
             uint32_t verifyHashA = hashFromScratch(filename, 0x100);
             if (verifyHashA != seed1) {
                 printf("WARNING: hashA mismatch for '%s' - incremental hash 0x%08X, full-filename hash 0x%08X\n", filename.c_str(), seed1,

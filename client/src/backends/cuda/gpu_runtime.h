@@ -18,12 +18,16 @@
 #define cudaMalloc hipMalloc
 #define cudaFree hipFree
 #define cudaMemset hipMemset
+#define cudaMemsetAsync hipMemsetAsync
 #define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+#define cudaFreeHost hipHostFree
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 // HIP takes a __device__/__constant__ variable's address, via HIP_SYMBOL,
 // where CUDA takes the variable itself.
 #define cudaMemcpyToSymbol(symbol, ...) hipMemcpyToSymbol(HIP_SYMBOL(symbol), __VA_ARGS__)
-#define cudaMemcpyFromSymbol(dst, symbol, ...) hipMemcpyFromSymbol(dst, HIP_SYMBOL(symbol), __VA_ARGS__)
 
 #define NAMEBREAK_GPU_RUNTIME_NAME "HIP"
 #else

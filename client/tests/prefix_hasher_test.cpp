@@ -71,6 +71,10 @@ int main() {
 
     const std::string real49 = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";
     std::vector<std::pair<int, std::string>> alphabets = {
+        {29, " -ABCDEFGHIJKLMNOPQRSTUVWXYZ_"},
+        {30, " -ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_"},
+        {40, " -.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"},
+        {41, " -.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_"},
         {42, real49.substr(0, 42)},
         {43, real49.substr(0, 42) + "\\"},
         {47, real49.substr(0, 47)},

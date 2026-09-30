@@ -10,6 +10,9 @@ means finding a candidate string that hashes to both target values - that's
 what the programs here do, by trying every combination of characters in a
 given alphabet.
 
+A progress dashboard for distibuted searching is available
+[here](https://namebreak-coordinator.fly.dev/).
+
 ## What is namebreaking?
 
 Blizzard's classic games keep their files in MPQ archives, which don't store
@@ -64,3 +67,9 @@ Most work happens in [`client/`](client/README.md) (see
 its README for configuring and compiling the client) and, for a distributed
 search across multiple machines, [`coordinator/`](coordinator/README.md)
 (see its README for running the server and pointing clients at it).
+
+## Name
+
+It is named after the [Bombe](https://en.wikipedia.org/wiki/Bombe), a British
+WWII machine for breaking German
+[Enigma](https://en.wikipedia.org/wiki/Enigma_machine) ciphers.

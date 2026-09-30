@@ -45,13 +45,33 @@ constexpr uint64_t rowsPerBatchOr([[maybe_unused]] uint64_t backendDefault) {
     return backendDefault;
 #endif
 }
+// Likewise how many rows of a row group one GPU thread searches (see
+// kChunksPerGroup in backends/cuda/cuda_backend.cu), for the backends that
+// split row groups into chunks (-DNAMEBREAK_ROWS_PER_THREAD=N).
+constexpr int rowsPerThreadOr([[maybe_unused]] int backendDefault) {
+#ifdef NAMEBREAK_ROWS_PER_THREAD
+    return NAMEBREAK_ROWS_PER_THREAD;
+#else
+    return backendDefault;
+#endif
+}
+// And how many batches one launch searches at most
+// (SearchBackend::maxBatchesPerCall), for the backends that search several at
+// once (-DNAMEBREAK_BATCHES_PER_LAUNCH=N).
+constexpr int batchesPerLaunchOr([[maybe_unused]] int backendDefault) {
+#ifdef NAMEBREAK_BATCHES_PER_LAUNCH
+    return NAMEBREAK_BATCHES_PER_LAUNCH;
+#else
+    return backendDefault;
+#endif
+}
 
 // Turns the trailing indices of a batch's hashA hits into what runBatch
 // returns: rebuilds each hit's complete filename on the host and checks it
 // against hashB. Also hashes every filename from scratch, as a cross-check
-// of the backend's own hashing, printing a WARNING (which the tests treat as
-// a failure) if the two disagree - the same check verifyMatchesKernel does
-// for the CUDA backend, here done on the CPU.
+// of the backend's own hashing - independent code, on the CPU - printing a
+// WARNING (which the tests treat as a failure) if the two disagree. Every
+// backend but `reference` checks its hits with it.
 class HitVerifier {
 public:
     void begin(const SearchConstants& constants);

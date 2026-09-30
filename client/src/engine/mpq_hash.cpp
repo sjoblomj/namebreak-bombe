@@ -31,7 +31,7 @@ std::pair<uint32_t, uint32_t> mpqHashWithPrefixCache_CPU(const char* str, const 
 }
 
 // One step of the same MPQ hash recurrence as mpqHashWithPrefixCache_CPU
-// above (and hash_kernels.cuh's mpqHashStep on the device side) - factored
+// above (and cuda_backend.cu's mpqStep on the device side) - factored
 // out so IncrementalPrefixHasher's reset()/advance() can't drift from it.
 static inline void mpqHashStepCPU(unsigned char ch, const uint32_t* cryptTable, uint32_t& seed1, uint32_t& seed2) {
     seed1 = cryptTable[0x100 + ch] ^ (seed1 + seed2);

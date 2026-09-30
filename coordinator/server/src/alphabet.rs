@@ -14,14 +14,14 @@
 
 /// name, characters, and the protocol MINOR version this alphabet was
 /// introduced in (see `namebreak_protocol::PROTOCOL_VERSION`'s doc comment).
-/// Sizes present here (42, 43, 47, 48, 49, 50) must match the sizes
+/// Sizes present here (29, 30, 40, 41, 42, 43, 47, 48, 49, 50) must match the sizes
 /// `namebreak.cu`'s `runCudaBatch` has compiled-in kernel instantiations
 /// for. `size49` is relied on elsewhere (`handlers::admin_create_target`'s
 /// fallback when `alphabet_name` is omitted) - keep that name stable even if its
 /// characters or position here ever change.
 ///
-/// Every alphabet below predates protocol versioning itself, so they're all
-/// tagged `(1, 0)` - the version this feature shipped in. A newly added
+/// The alphabets tagged `(1, 0)` predate protocol versioning itself - that's
+/// the version this feature shipped in. A newly added
 /// alphabet should be tagged with whatever the *next* MINOR version will be,
 /// so `client_alphabet_for` keeps it from clients that declared an older one
 /// (they get a bigger alphabet they do know, if any - see
@@ -34,6 +34,10 @@ pub const PREDEFINED_ALPHABETS: &[(&str, &str, (u64, u64))] = &[
     ("size47", " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_", (1, 0)),
     ("size43", " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_", (1, 0)),
     ("size42", " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_", (1, 0)),
+    ("size41", " -.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_", (1, 2)),
+    ("size40", " -.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_", (1, 2)),
+    ("size30", " -ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_", (1, 2)),
+    ("size29", " -ABCDEFGHIJKLMNOPQRSTUVWXYZ_", (1, 2)),
 ];
 
 pub fn lookup_predefined_alphabet(name: &str) -> Option<&'static str> {
@@ -686,8 +690,8 @@ mod tests {
 
     #[test]
     fn client_alphabet_for_gates_on_minor_version_but_not_patch() {
-        // Every real predefined alphabet is tagged (1, 0) - available to
-        // anything from 1.0.0 onward, patch version doesn't matter.
+        // size49 is tagged (1, 0) - available to anything from 1.0.0
+        // onward, patch version doesn't matter.
         for version in [Version::new(1, 0, 0), Version::new(1, 0, 99), Version::new(1, 5, 0), Version::new(2, 0, 0)] {
             assert_eq!(client_alphabet_for("size49", DEFAULT, version), Some(DEFAULT), "{version}");
         }
@@ -1021,13 +1025,24 @@ mod tests {
 
     #[test]
     fn client_alphabet_for_steps_up_from_size42_to_size43() {
-        // Every predefined alphabet contains size42, and size43 is the smallest.
+        // Of the predefined alphabets containing size42, size43 is the smallest.
         let size43 = lookup_predefined_alphabet("size43").unwrap();
         assert_eq!(client_alphabet_among(PREDEFINED_ALPHABETS, "size42", SIZE42, Version::new(1, 0, 0)), Some(SIZE42));
         let hidden: &'static [(&str, &str, (u64, u64))] = Box::leak(
             PREDEFINED_ALPHABETS.iter().map(|&(n, c, v)| (n, c, if n == "size42" { (1, 9) } else { v })).collect::<Vec<_>>().into_boxed_slice(),
         );
         assert_eq!(client_alphabet_among(hidden, "size42", SIZE42, Version::new(1, 0, 0)), Some(size43));
+    }
+
+    #[test]
+    fn client_alphabet_for_gives_pre_1_2_clients_size42_or_size43_for_the_1_2_alphabets() {
+        let size43 = lookup_predefined_alphabet("size43").unwrap();
+        for (name, size, pre_1_2) in [("size41", 41, size43), ("size40", 40, SIZE42), ("size30", 30, size43), ("size29", 29, SIZE42)] {
+            let chars = lookup_predefined_alphabet(name).unwrap();
+            assert_eq!(alphabet_size(chars), size, "{name}");
+            assert_eq!(client_alphabet_for(name, chars, Version::new(1, 1, 0)), Some(pre_1_2), "{name}");
+            assert_eq!(client_alphabet_for(name, chars, Version::new(1, 2, 0)), Some(chars), "{name}");
+        }
     }
 
     #[test]

@@ -1,7 +1,10 @@
 #include "backends/backends.h"
 
+#include <cstdio>
+
 #include "backends/cpu/cpu_backend.h"
 #include "backends/reference/reference_backend.h"
+#include "backends/self_test.h"
 #if defined(NAMEBREAK_WITH_CUDA) || defined(NAMEBREAK_WITH_HIP)
 #include "backends/cuda/cuda_backend.h"
 #endif
@@ -56,14 +59,24 @@ std::vector<std::string> backendNames() {
     return names;
 }
 
-std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error) {
+std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
+    if (selfTestFailed)
+        *selfTestFailed = false;
     if (name.empty()) {
-        // The reference backend is always there, so something always succeeds.
+        // The reference backend is always there, so something always succeeds
+        // (unless even it fails its self-test).
         std::string reasons;
         for (const BackendEntry& entry : backendEntries()) {
             std::string why;
-            if (std::unique_ptr<SearchBackend> backend = entry.make(why))
+            std::unique_ptr<SearchBackend> backend = entry.make(why);
+            if (backend && selfTestBackend(*backend, why))
                 return backend;
+            if (backend) {
+                // It could run, but searches wrongly here: say so, rather than
+                // quietly settling for a slower backend.
+                fprintf(stderr, "The %s backend failed its self-test on this machine, so it won't be used: %s\n", entry.name, why.c_str());
+                why = "failed its self-test: " + why;
+            }
             reasons += std::string(reasons.empty() ? "" : "; ") + entry.name + ": " + why;
         }
         error = "no backend can run on this machine (" + reasons + ")";
@@ -73,8 +86,14 @@ std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::strin
         if (name == entry.name) {
             std::string why;
             std::unique_ptr<SearchBackend> backend = entry.make(why);
-            if (!backend)
+            if (!backend) {
                 error = "the " + name + " backend can't run on this machine: " + why;
+            } else if (!selfTestBackend(*backend, why)) {
+                error = "the " + name + " backend failed its self-test on this machine: " + why;
+                if (selfTestFailed)
+                    *selfTestFailed = true;
+                backend = nullptr;
+            }
             return backend;
         }
     }

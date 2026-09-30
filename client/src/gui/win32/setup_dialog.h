@@ -38,6 +38,7 @@ struct SetupDialogFields {
     std::string hashB;
     bool pruneSymbolRuns = false;
     bool pruneUnopenedBrackets = false;
+    bool pruneWholeCandidate = false;
 
     // Result: "coordinator" | "bounded" | "continuous", set only if OK was
     // pressed (see showSetupDialog's return value).

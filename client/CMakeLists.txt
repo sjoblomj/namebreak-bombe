@@ -23,6 +23,13 @@ endif()
 # machine with the GPUs to run them on. The CI release builds turn them off.
 option(NAMEBREAK_TEST_VARIANTS "Build the tests' extra tuning configurations" ON)
 
+# ON makes a test whose backend can't run on this machine fail instead of
+# being skipped. For a machine that has the GPUs this build is for: there a
+# backend that can't run is a broken driver - say, CUDA after a laptop's
+# suspend - and skipped tests would still leave ctest at "100% tests passed".
+# OFF (the default) suits machines without them, like the release workflow's.
+option(NAMEBREAK_REQUIRE_GPU "Fail, rather than skip, the tests of a backend that can't run here" OFF)
+
 # OFF builds without any networking: no coordinator client, HTTP or protocol
 # code, no libcurl dependency, and `coordinator` mode is unavailable at
 # runtime (the bounded and continuous modes are unaffected).
@@ -115,7 +122,11 @@ set(SEARCH_SOURCES
     src/engine/mpq_hash.cpp
     src/engine/candidate.cpp
     src/backends/backends.cpp
+    src/backends/self_test.cpp
+    src/backends/common/launch_waiter.cpp
+    src/backends/common/lowbits_filter.cpp
     src/backends/common/row_batch.cpp
+    src/backends/common/row_pruning.cpp
     src/backends/cpu/cpu_backend.cpp
     src/backends/reference/reference_backend.cpp)
 if(NAMEBREAK_GPU STREQUAL "cuda")
@@ -232,12 +243,15 @@ enable_testing()
 # build/testrun/, away from any real matches and from each other (ctest -j).
 # namebreak_test(<name> <executable> [<argument>...])
 # A test exits with 77 when its backend can't run on this machine (a GPU
-# backend without that kind of GPU), which ctest then reports as skipped.
+# backend without that kind of GPU), which ctest then reports as skipped -
+# or, with NAMEBREAK_REQUIRE_GPU, as failed.
 function(namebreak_test name executable)
     set(dir ${CMAKE_BINARY_DIR}/testrun/${name})
     file(MAKE_DIRECTORY ${dir})
     add_test(NAME ${name} COMMAND ${executable} ${ARGN} WORKING_DIRECTORY ${dir})
-    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+    if(NOT NAMEBREAK_REQUIRE_GPU)
+        set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endfunction()
 
 # namebreak_test_executable(<name> <source> <search library>)
@@ -250,6 +264,29 @@ endfunction()
 # Pure-CPU correctness check for IncrementalPrefixHasher (src/engine/mpq_hash.h).
 namebreak_test_executable(prefix_hasher_test tests/prefix_hasher_test.cpp namebreak_search)
 namebreak_test(prefix_hasher_test prefix_hasher_test)
+
+# Pure-CPU correctness check for the lookup filter the CUDA and OpenCL backends search
+# with (src/backends/common/lowbits_filter.h): the property it rests on, every
+# entry of many tables, planted matches, and that its table check catches a
+# wrong table.
+namebreak_test_executable(lowbits_filter_test tests/lowbits_filter_test.cpp namebreak_search)
+namebreak_test(lowbits_filter_test lowbits_filter_test)
+# The same at other table widths, built from just the two sources it needs
+# rather than a whole search library each: the table is built in 8-bit lanes
+# up to 8 bits and 16-bit ones above (buildLowBitsFilterTable), so 1, 8 and 10
+# bits cover both at their narrowest and widest.
+foreach(bits IN ITEMS 1 8 10)
+    add_executable(lowbits_filter_test_${bits} tests/lowbits_filter_test.cpp src/backends/common/lowbits_filter.cpp src/engine/mpq_hash.cpp)
+    target_include_directories(lowbits_filter_test_${bits} PRIVATE src)
+    target_compile_definitions(lowbits_filter_test_${bits} PRIVATE NAMEBREAK_LOWBITS_FILTER_BITS=${bits})
+    set_target_properties(lowbits_filter_test_${bits} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    namebreak_test(lowbits_filter_test-${bits}bits lowbits_filter_test_${bits})
+endforeach()
+
+# That the backend self-test createBackend runs (src/backends/self_test.h)
+# catches a backend that searches wrongly - CPU backends wrapped in broken ones.
+namebreak_test_executable(self_test_test tests/self_test_test.cpp namebreak_search)
+namebreak_test(self_test_test self_test_test)
 
 # Where buildSearchRequest (src/common/config.h) starts a search -
 # start_candidate and resume_from_last_candidate. CPU only.
@@ -293,17 +330,23 @@ list(APPEND ROW_BACKENDS cpu)
 #                  CPU-side leading part, and a shallower row decode
 #   window6        the widest supported window: 5 prefix digits per row and
 #                  trailing indices beyond 32 bits
-# All three also make the cpu backend split every batch, however small,
-# across its threads, and window2 makes it use its portable (non-AVX2) code.
+# Each also splits the CUDA kernel's row groups differently
+# (NAMEBREAK_ROWS_PER_THREAD, see kChunksPerGroup in cuda_backend.cu): 3 rows
+# per thread (uneven chunks, cut up by the tiny launches), 1 (a thread per
+# row), and 64 (a thread per whole group) - and searches its batches
+# (NAMEBREAK_BATCHES_PER_LAUNCH, see runBatches in cuda_backend.cu) 3, 5 and
+# 32 at a time: with batches of a few rows, a launch then often spans several
+# leading values, with pruned ones between them. All three also make the cpu backend
+# split every call, however small, across its threads.
 namebreak_test_executable(search_integration_test tests/search_integration_test.cpp namebreak_search)
 foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(integration-${backend} search_integration_test --backend ${backend})
 endforeach()
 if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
     foreach(config IN ITEMS
-            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
-            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_CPU_NO_AVX2"
-            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
+            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_ROWS_PER_THREAD=3;NAMEBREAK_BATCHES_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
+            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_ROWS_PER_THREAD=1;NAMEBREAK_BATCHES_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
+            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_ROWS_PER_THREAD=64;NAMEBREAK_BATCHES_PER_LAUNCH=32;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
         list(POP_FRONT config suffix)
         namebreak_search_library(namebreak_search_${suffix} ${config})
         namebreak_test_executable(search_integration_test_${suffix} tests/search_integration_test.cpp namebreak_search_${suffix})
@@ -313,6 +356,17 @@ if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
     endforeach()
 endif()
 
+# Known-answer test: every name of a real StarCraft listfile
+# (tests/data/sc-listfile.txt) must be found from its two hashes, each in a
+# small search planted around it - see the file. Every backend, with its
+# shipped tuning; `reference`, which hashes every candidate from scratch, on
+# every 5th name only.
+namebreak_test_executable(listfile_test tests/listfile_test.cpp namebreak_search)
+foreach(backend IN LISTS ROW_BACKENDS)
+    namebreak_test(listfile-${backend} listfile_test --backend ${backend} --listfile ${CMAKE_SOURCE_DIR}/tests/data/sc-listfile.txt)
+endforeach()
+namebreak_test(listfile-reference listfile_test --backend reference --listfile ${CMAKE_SOURCE_DIR}/tests/data/sc-listfile.txt --every 5)
+
 # What runSearch() does when a batch has more hashA hits than MAX_MATCHES can
 # record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
 namebreak_search_library(namebreak_search_overflow MAX_MATCHES=1)
@@ -320,6 +374,39 @@ namebreak_test_executable(search_overflow_test tests/search_overflow_test.cpp na
 foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(overflow-${backend} search_overflow_test --backend ${backend})
 endforeach()
+
+# Dense-hit differential test: built so that a hashA "hit" only has to match
+# the target's low 12 bits (NAMEBREAK_HASHA_MATCH_BITS, src/engine/hash_match.h),
+# about one candidate in 4096, and compared hit for hit with a brute force
+# over hundreds of random ranges - see the file. Every backend. The variants (row-based
+# backends only - `reference` ignores all of these values) mirror the
+# integration test's geometries, plus a lookup filter of a single bit
+# (NAMEBREAK_LOWBITS_FILTER_BITS=1), which lets about half of every row
+# through to be hashed in full, and small_launch's geometry with room for a
+# single hit per launch (MAX_MATCHES=1), so that batches - and batches
+# searched together - overflow all the time, and the engine's fallbacks of
+# searching them again in halves, or one by one, run on random ranges.
+set(STRESS_BACKENDS ${ROW_BACKENDS})
+set(STRESS_DEFINITIONS NAMEBREAK_HASHA_MATCH_BITS=12)
+namebreak_search_library(namebreak_search_stress ${STRESS_DEFINITIONS})
+namebreak_test_executable(search_stress_test tests/search_stress_test.cpp namebreak_search_stress)
+foreach(backend IN LISTS STRESS_BACKENDS ITEMS reference)
+    namebreak_test(stress-${backend} search_stress_test --backend ${backend})
+endforeach()
+if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
+    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_ROWS_PER_THREAD=1 NAMEBREAK_BATCHES_PER_LAUNCH=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_window6 NAMEBREAK_GPU_WINDOW_CHARS=6 NAMEBREAK_ROWS_PER_THREAD=64 NAMEBREAK_BATCHES_PER_LAUNCH=32 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_filter1 NAMEBREAK_LOWBITS_FILTER_BITS=1)
+    set(STRESS_overflow MAX_MATCHES=1 NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    foreach(variant IN ITEMS small_launch window2 window6 filter1 overflow)
+        namebreak_search_library(namebreak_search_stress_${variant} ${STRESS_DEFINITIONS} ${STRESS_${variant}})
+        namebreak_test_executable(search_stress_test_${variant} tests/search_stress_test.cpp namebreak_search_stress_${variant})
+        foreach(backend IN LISTS STRESS_BACKENDS)
+            namebreak_test(stress-${backend}-${variant} search_stress_test_${variant} --backend ${backend})
+        endforeach()
+    endforeach()
+endif()
 
 # Benchmarks - not tests, run with `cmake --build --preset default --target
 # <name>`:
@@ -340,5 +427,39 @@ else()
 endif()
 namebreak_test_executable(prefix_hasher_bench tests/prefix_hasher_bench.cpp namebreak_search)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench)
-add_custom_target(run_search_bench COMMAND search_bench WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench USES_TERMINAL)
+# A GPU covers the default range in hundredths of a second; 20 times it is long enough to time.
+if(NAMEBREAK_GPU STREQUAL "none")
+    set(SEARCH_BENCH_ARGS "")
+else()
+    set(SEARCH_BENCH_ARGS --scale 20)
+endif()
+add_custom_target(run_search_bench COMMAND search_bench ${SEARCH_BENCH_ARGS} WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench USES_TERMINAL)
+
+# Mutation testing (tests/mutation_test.py) - not a ctest test: it builds
+# a copy of the client per mutation, with a GPU kernel broken on purpose, and
+# checks that the self-test, the integration test and the stress test (and,
+# for the ones only they can see, the overflow test and the small-launch
+# stress test) catch every one. About fifteen minutes for CUDA's list and
+# four for OpenCL's on the RTX 3080 Ti Laptop: `cmake --build --preset
+# default --target run_mutation_test` (the CUDA or HIP kernel) or
+# run_mutation_test_opencl, after any change to the kernel.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND AND WITH_OPENCL)
+    add_custom_target(run_mutation_test_opencl COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mutation_test.py --backend opencl
+                      USES_TERMINAL VERBATIM)
+endif()
+if(NOT NAMEBREAK_GPU STREQUAL "none")
+    if(Python3_FOUND)
+        set(MUTATION_TEST_ARGS --backend ${NAMEBREAK_GPU})
+        # A single architecture is passed on; the script's copies build for
+        # CMake's default otherwise.
+        if(NAMEBREAK_GPU STREQUAL "cuda" AND CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES MATCHES ";")
+            list(APPEND MUTATION_TEST_ARGS "--cmake-arg=-DCMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
+        elseif(NAMEBREAK_GPU STREQUAL "hip" AND CMAKE_HIP_ARCHITECTURES AND NOT CMAKE_HIP_ARCHITECTURES MATCHES ";")
+            list(APPEND MUTATION_TEST_ARGS "--cmake-arg=-DCMAKE_HIP_ARCHITECTURES=${CMAKE_HIP_ARCHITECTURES}")
+        endif()
+        add_custom_target(run_mutation_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mutation_test.py ${MUTATION_TEST_ARGS}
+                          USES_TERMINAL VERBATIM)
+    endif()
+endif()
 add_custom_target(run_prefix_hasher_bench COMMAND prefix_hasher_bench USES_TERMINAL)

@@ -95,6 +95,22 @@ int main() {
     check(startOf(makeConfig("REZ\\MMM.PCX", ""), true).rfind("<error:", 0) == 0, "start_candidate with the wrong suffix: an error");
     check(startOf(makeConfig("", "sometimes"), true).rfind("<error:", 0) == 0, "resume_from_last_candidate not a boolean: an error");
 
+    printf("--- prune_whole_candidate ---\n");
+    auto wholeOf = [](const std::string& value) {
+        ConfigFile config = makeConfig("", "");
+        if (!value.empty())
+            config.search["prune_whole_candidate"] = value;
+        SearchRequest req;
+        std::string error;
+        if (!buildSearchRequest(config, true, req, error))
+            return std::string("<error: ") + error + ">";
+        return std::string(req.pruneWholeCandidate ? "true" : "false");
+    };
+    check(wholeOf("") == "false", "not given: false (leading characters only)");
+    check(wholeOf("true") == "true", "true: every character but the last");
+    check(wholeOf("false") == "false", "false: leading characters only");
+    check(wholeOf("sometimes").rfind("<error:", 0) == 0, "not a boolean: an error");
+
     std::filesystem::remove_all(kDir);
     if (g_failures) {
         fprintf(stderr, "%d check(s) FAILED\n", g_failures);

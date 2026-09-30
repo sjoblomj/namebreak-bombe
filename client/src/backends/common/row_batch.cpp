@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "engine/candidate.h"
+#include "engine/hash_match.h"
 
 RowRange rowRangeFor(uint64_t start, uint64_t count, int alphabetSize) {
     const uint64_t end = start + count;
@@ -38,7 +39,7 @@ void HitVerifier::addHits(const std::vector<uint64_t>& trailingIndices, int trai
     for (uint64_t index : trailingIndices) {
         std::string filename = prefix + indexToString(index, trailingLen, alphabet_) + suffix_;
         uint32_t hashA = hashFromScratch(filename, 0x100);
-        if (hashA != targetA_) {
+        if (!hashAMatches(hashA, targetA_)) {
             printf("WARNING: the backend reported a hashA hit for '%s' but hashing it from scratch gives 0x%08X, not the target 0x%08X\n",
                    filename.c_str(), hashA, targetA_);
         }
