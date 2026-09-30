@@ -221,15 +221,39 @@ OPENCL_MUTATIONS = [
     Mutation("lastgroup", "a batch's last row group never searched, when there's more than one",
              [(CL_KERNEL, "(ulong) (lastRow / ALPHABET_SIZE - firstGroup + 1) * CHUNKS_PER_GROUP;",
                "(ulong) (lastRow / ALPHABET_SIZE - firstGroup + (lastRow / ALPHABET_SIZE > firstGroup ? 0 : 1)) * CHUNKS_PER_GROUP;")]),
+    # Several batches - usually leading values - per launch (runBatches).
+    Mutation("batchseeds", "every batch of a launch searched with the first one's seeds and edges",
+             [(CL_KERNEL, "const LaunchBatch batch = batches[batchIndex];", "const LaunchBatch batch = batches[0];")]),
+    Mutation("hitbatch", "every hit recorded as the launch's first batch's",
+             [(CL_KERNEL, "results->hits[slot].batch = batchIndex;", "results->hits[slot].batch = 0;")]),
+    Mutation("verifybatch", "every hit checked with the launch's first batch's prefix",
+             [(CL_HOST, "verifier_.addHits({hit.trailingIdx}, trailingLen, requests[hit.batch].params, outcome);",
+               "verifier_.addHits({hit.trailingIdx}, trailingLen, requests[0].params, outcome);")]),
+    Mutation("lastbatch", "a launch's last batch never searched, when there's more than one",
+             [(CL_HOST, "(size_t) batchCount};", "(size_t) std::max(1, batchCount - 1)};")]),
+    # Reading the hits back: only the stress test's dense hits put more than
+    # the first few in one launch, and only a search of many launches can
+    # tell a count left over from the one before.
+    Mutation("hitsread", "the hits past the first ones read with the count read one short",
+             [(CL_HOST, "(hitCount - kHitsReadWithCount) * sizeof(Hit), hostResults_->hits",
+               "(hitCount - kHitsReadWithCount - 1) * sizeof(Hit), hostResults_->hits")],
+             caught_by=("stress",)),
+    Mutation("nohitreset", "the hit count never reset after a launch with hits",
+             [(CL_HOST, "CL_CHECK(clEnqueueWriteBuffer(queue_, results_, CL_FALSE, offsetof(BatchResults, matchCount), sizeof(kZero), &kZero, 0, nullptr, nullptr));", "")],
+             caught_by=("self-test", "stress-small")),
     # The kernel works out its chunks itself, so the global work size must
     # not change what gets searched - neither half as many work-items (but at
-    # least a work-group) nor a work-group too many.
+    # least a work-group) nor a work-group too many, nor only as many as the
+    # first batch needs.
     Mutation("fewergroups", "half as many work-items launched", expect="harmless",
-             edits=[(CL_HOST, "const size_t global = (chunks + local - 1) / local * local;",
-                     "const size_t global = ((chunks + 1) / 2 + local - 1) / local * local;")]),
+             edits=[(CL_HOST, "const size_t global[2] = {(chunks + local[0] - 1) / local[0] * local[0], (size_t) batchCount};",
+                     "const size_t global[2] = {((chunks + 1) / 2 + local[0] - 1) / local[0] * local[0], (size_t) batchCount};")]),
     Mutation("extragroup", "a whole work-group too many launched", expect="harmless",
-             edits=[(CL_HOST, "const size_t global = (chunks + local - 1) / local * local;",
-                     "const size_t global = (chunks + 2 * local - 1) / local * local;")]),
+             edits=[(CL_HOST, "const size_t global[2] = {(chunks + local[0] - 1) / local[0] * local[0], (size_t) batchCount};",
+                     "const size_t global[2] = {(chunks + 2 * local[0] - 1) / local[0] * local[0], (size_t) batchCount};")]),
+    Mutation("firstbatchgrid", "only as many work-items as the first batch needs", expect="harmless",
+             edits=[(CL_HOST, "maxGroups = std::max<uint64_t>(maxGroups, batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1);",
+                     "maxGroups = b == 0 ? batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1 : maxGroups;")]),
 ]
 
 # The Metal ones can only be run on a Mac (--backend metal).

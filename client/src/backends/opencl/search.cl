@@ -7,7 +7,7 @@
 //   ALPHABET_SIZE  the alphabet's size
 //   SUFFIX_LEN     the suffix's length
 //   TRAILING_LEN   the candidate's trailing (GPU-enumerated) length, >= 1
-//   MAX_MATCHES    how many hits one batch can record
+//   MAX_MATCHES    how many hits one launch can record
 //   HASHA_MATCH_MASK  the bits of hashA a hit must match - all of them, except
 //                  in the stress tests' builds (see engine/hash_match.h)
 //   FILTER_BITS    kLowBitsFilterBits: how many low bits of each seed index
@@ -21,8 +21,12 @@
 // this search's filter table, which gives the set of last characters whose
 // hashA has the target's low bits - always including any that matches the
 // target (README.md's "The lookup filter" has why) - and hashes only those,
-// in full. It records the trailing index of every hashA hit; the host
-// rebuilds and checks those.
+// in full. It records the trailing index and batch of every hashA hit; the
+// host rebuilds and checks those.
+//
+// A launch searches up to 32 batches - usually each a whole leading value's
+// trailing space, with its own seeds - one per row of work-groups
+// (get_group_id(1); see runBatches in opencl_backend.cpp).
 
 #ifndef HASHA_MATCH_MASK
 #define HASHA_MATCH_MASK 0xFFFFFFFFu
@@ -49,15 +53,41 @@
 // group exactly once and never cross into another.
 #define CHUNKS_PER_GROUP ((ALPHABET_SIZE + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD)
 
-__kernel void searchRows(uint firstRow, uint lastRow, int firstRowStartK, int lastRowEndK, uint targetA,
-                         uint seed1Start, uint seed2Start,
+// These three must match their namesakes in opencl_backend.cpp.
+// One batch of a launch: its rows firstRow..lastRow of the trailing space,
+// cut to [firstRowStartK, lastRowEndK) in its first and last row, and the
+// hash state after its prefix.
+typedef struct {
+    uint firstRow;
+    uint lastRow;
+    int firstRowStartK;
+    int lastRowEndK;
+    uint seed1Start;
+    uint seed2Start;
+} LaunchBatch;
+// One hashA hit: the candidate's trailing index, and which batch it's in.
+typedef struct {
+    ulong trailingIdx;
+    uint batch;
+    uint unused;
+} Hit;
+// Everything a launch reports: how many hits it had - which may exceed
+// MAX_MATCHES - and the first MAX_MATCHES of them. The host reads the count
+// and the first few hits in one go.
+typedef struct {
+    int matchCount;
+    int unused;
+    Hit hits[MAX_MATCHES];
+} BatchResults;
+
+__kernel void searchRows(uint targetA,
+                         __constant LaunchBatch* batches,      // the launch's batches
                          __constant uint* alphabetKey,         // crypt-table key of each alphabet character
                          __constant uint* alphabetOrd,         // each alphabet character itself
                          __constant uint* suffixKey,
                          __constant uint* suffixOrd,
                          __global const ulong* filterTable,    // this search's lookup filter
-                         __global int* matchCount,             // hits this batch - may exceed MAX_MATCHES
-                         __global ulong* matchIdx) {           // the first MAX_MATCHES hits' trailing indices
+                         __global BatchResults* results) {
     // The rows' characters, and the few last characters the filter lets
     // through, differ between work-items, so they're looked up here rather
     // than in constant memory, where work-items reading different entries
@@ -70,6 +100,13 @@ __kernel void searchRows(uint firstRow, uint lastRow, int firstRowStartK, int la
         sOrd[lid] = alphabetOrd[lid];
     }
     barrier(CLK_LOCAL_MEM_FENCE); // before anything returns, so every work-item reaches it
+
+    // This work-group's batch - the same for the whole work-group.
+    const uint batchIndex = get_group_id(1);
+    const LaunchBatch batch = batches[batchIndex];
+    const uint firstRow = batch.firstRow, lastRow = batch.lastRow;
+    const int firstRowStartK = batch.firstRowStartK, lastRowEndK = batch.lastRowEndK;
+    const uint seed1Start = batch.seed1Start, seed2Start = batch.seed2Start;
 
     // Every chunk of every group the batch touches, whatever the global work
     // size: that only decides how the chunks are shared out (normally one
@@ -138,9 +175,11 @@ __kernel void searchRows(uint firstRow, uint lastRow, int firstRowStartK, int la
                 for (int i = 0; i < SUFFIX_LEN; ++i)
                     MPQ_STEP(a, b, suffixKey[i], suffixOrd[i]);
                 if (HASHA_MATCHES(a, targetA)) {
-                    const int slot = atomic_inc(matchCount);
-                    if (slot < MAX_MATCHES)
-                        matchIdx[slot] = (groupStart + d) * ALPHABET_SIZE + k;
+                    const int slot = atomic_inc(&results->matchCount);
+                    if (slot < MAX_MATCHES) {
+                        results->hits[slot].trailingIdx = (groupStart + d) * ALPHABET_SIZE + k;
+                        results->hits[slot].batch = batchIndex;
+                    }
                 }
             }
         }

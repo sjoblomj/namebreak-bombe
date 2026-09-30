@@ -55,6 +55,16 @@ constexpr int rowsPerThreadOr([[maybe_unused]] int backendDefault) {
     return backendDefault;
 #endif
 }
+// And how many batches one launch searches at most
+// (SearchBackend::maxBatchesPerCall), for the backends that search several at
+// once (-DNAMEBREAK_BATCHES_PER_LAUNCH=N).
+constexpr int batchesPerLaunchOr([[maybe_unused]] int backendDefault) {
+#ifdef NAMEBREAK_BATCHES_PER_LAUNCH
+    return NAMEBREAK_BATCHES_PER_LAUNCH;
+#else
+    return backendDefault;
+#endif
+}
 
 // Turns the trailing indices of a batch's hashA hits into what runBatch
 // returns: rebuilds each hit's complete filename on the host and checks it

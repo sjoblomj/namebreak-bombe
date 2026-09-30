@@ -277,8 +277,9 @@ so a GPU build still works on a machine without that GPU:
   never been compiled.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
-  installed. CUDA's kernel ported (`search.cl`), lookup filter, row groups
-  and all - with a whole row group per work-item, which suits it best; it's
+  installed. CUDA's kernel ported (`search.cl`), lookup filter, row groups,
+  16 leading values per launch and all - with a whole row group per
+  work-item, which suits it best; it's
   compiled by the driver at runtime, once per alphabet size, suffix length
   and trailing length, so it takes an alphabet of any size - drivers cache
   the result, but a new combination's first search starts a moment later.
@@ -417,9 +418,13 @@ possibly at the very start or end of the range being searched. With the
 kernel launch searches up to `NAMEBREAK_BATCHES_PER_LAUNCH` batches (16, in
 the same file), each with its own rows and seeds, on its own row of thread
 blocks (`blockIdx.y`) - consecutive batches, of one leading value or several,
-with any pruned ones between them left out. That bounds how long any single
-launch can run for (a couple of milliseconds), since pause and abort are
-only checked *between* launches, not in the middle of one.
+with any pruned ones between them left out. The OpenCL kernel does the same
+(a row of work-groups per batch); the Metal one still searches one batch per
+launch. That bounds how long any single launch can run for (a couple of
+milliseconds), since pause and abort are only checked *between* launches,
+not in the middle of one. The host sleeps through most of each launch rather
+than spinning a CPU core while it waits (`backends/common/launch_waiter.h`):
+about a fifth of a core instead of a whole one, at the same speed.
 
 So only a batch's first and last row can be cut short. With the
 3-character window and `A..Z` from above, a batch from `XDJ` to `YKT`:

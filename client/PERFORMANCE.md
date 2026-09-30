@@ -186,10 +186,17 @@ will have grown (not measured again).
     **+6.7%** on average. 4, 8, 16 and 32 batches per launch were within
     the noise of each other; 16 makes a launch about 2.3 ms. Other
     backends keep one batch per call (the default), for now.
-  - [ ] **The same for OpenCL and Metal**: their kernels are the same shape,
-    and their gaps likely the same share - a `runBatches()` each, with a
-    batch array in a buffer (or a kernel argument), and their mutation
-    lists extended as the CUDA one was.
+  - [x] **The same for OpenCL**: a `runBatches()` with the batches in a
+    small constant buffer, written without waiting before each launch, a
+    row of work-groups per batch (`get_group_id(1)`), and hits read back
+    with the count and checked on the CPU, as CUDA's (the next item). Its
+    mutation list got the same new mutations. **Measured**, together with
+    the sleeping wait below: faster in six alternating pairs out of six,
+    about **+2.1%** (+1.9 to +2.5%, leaving out a first pair inflated by a
+    cold start), on a GPU power-capped by the heat of a long session.
+  - [ ] **The same for Metal**: a batch array in a buffer, the grid's y
+    as the batch, the hits read back with the count - and measured on a
+    Mac.
   - [x] **A cheaper hit path.** A launch of 16 leading values (4.5G
     candidates) has a hashA hit about two times in three, and each cost
     about 35 us more of GPU idle: the batches' prefixes uploaded, a second
@@ -249,9 +256,16 @@ will have grown (not measured again).
   average): its gaps are longer (median 32 us), as the CPU wakes up slower,
   but its kernels shorter. It can only change when the host looks, never
   what's found - it still waits with `cudaDeviceSynchronize`.
-  - [ ] **The same for OpenCL and Metal**, whose waits (`clFinish`,
-    `waitUntilCompleted`) may or may not spin, depending on the driver:
-    measure first.
+  - [x] **The same for OpenCL**: NVIDIA's OpenCL spins too - its blocking
+    read kept a core at 100% (**measured**). Its launches were one leading
+    value, about 0.16 ms - too short to sleep in, with a wake-up margin of
+    about 0.2 ms - so it got 16 leading values per launch first (above),
+    and then the same `LaunchWaiter`, now shared (after a `clFlush`, so the
+    launch is on its way before the host sleeps). **Measured**: 21% of a
+    core instead of 100%.
+  - [ ] **Metal**: `waitUntilCompleted` is documented as a blocking wait, so
+    it may not spin at all - measure on a Mac before changing anything; its
+    launches, one batch of 2^21 rows, are short too.
 - [ ] **Build the table faster, or less often.** Building it takes 4 ms for
   `.WAV` and 10 ms for a 17-byte suffix, and the check before every search
   0.4-1.6 ms (**measured**) - nothing next to a real range, but it's most
