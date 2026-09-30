@@ -174,6 +174,99 @@ bool runCase(SearchBackend& backend, const Case& c, const uint32_t* cryptTable, 
     return true;
 }
 
+// Several batches in one runBatches() call, as the engine hands a backend
+// several leading values at once (see SearchBackend::maxBatchesPerCall): each
+// has its own prefix, so its own seeds, and its own range, starting and ending
+// mid-row at a different point. The planted candidate is in batch
+// `plantBatch` - inside it, at its first or last candidate, or just after its
+// end, where no batch searches it with its prefix and it must not be reported.
+// A backend that used one batch's seeds or edges for another, lost track of
+// which batch a hit was in (it would report the wrong filename), or skipped a
+// batch, fails.
+struct GroupedCase {
+    int plantBatch; // -1: the last
+    enum { Inside, AtStart, AtEnd, JustAfter } where;
+};
+
+bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount, int alphabetSize, int trailingLen, const uint32_t* cryptTable,
+                    std::string& error) {
+    const std::string alphabet = kCharacters.substr(0, alphabetSize);
+    const uint64_t as = (uint64_t) alphabetSize;
+    uint64_t space = 1;
+    for (int i = 0; i < trailingLen; ++i)
+        space *= as;
+    const std::string suffix = ".WAV";
+    const int plantBatch = c.plantBatch < 0 ? batchCount - 1 : c.plantBatch;
+
+    std::vector<BatchRequest> batches(batchCount);
+    std::vector<std::string> prefixes(batchCount);
+    for (int b = 0; b < batchCount; ++b) {
+        prefixes[b] = std::string("REZ\\") + kCharacters[10 + b]; // '0', '1', ... - a different leading character each
+        BatchRequest& batch = batches[b];
+        batch.start = std::min(space - 1, space / 3 + (uint64_t) b * 7);
+        batch.count = std::min(space - batch.start, 2 * as + 5 + (uint64_t) b);
+        memcpy(batch.params.prefix, prefixes[b].c_str(), prefixes[b].size() + 1);
+        batch.params.prefixSize = (short) prefixes[b].size();
+        std::pair<uint32_t, uint32_t> seeds = mpqHashWithPrefixCache_CPU(prefixes[b].c_str(), cryptTable);
+        batch.params.seed1Start = seeds.first;
+        batch.params.seed2Start = seeds.second;
+    }
+    const BatchRequest& target = batches[plantBatch];
+    uint64_t planted = 0;
+    switch (c.where) {
+        case GroupedCase::Inside: planted = target.start + target.count / 2; break;
+        case GroupedCase::AtStart: planted = target.start; break;
+        case GroupedCase::AtEnd: planted = target.start + target.count - 1; break;
+        case GroupedCase::JustAfter: planted = target.start + target.count; break;
+    }
+    if (planted >= space)
+        return true; // the trailing space is too small for this case
+    const bool inside = c.where != GroupedCase::JustAfter;
+
+    const std::string plantedName = prefixes[plantBatch] + trailingString(planted, trailingLen, alphabet) + suffix;
+    SearchConstants constants;
+    constants.alphabet = alphabet;
+    constants.suffix = suffix;
+    constants.cryptTable = cryptTable;
+    constants.targetHashA = hashFromScratch(plantedName, cryptTable, 0x100);
+    constants.targetHashB = hashFromScratch(plantedName, cryptTable, 0x200);
+
+    // As the engine does it (searchBatches, search.cpp): all at once, or each
+    // on its own if their hits together were more than could be recorded.
+    Result result;
+    backend.beginSearch(constants);
+    BatchOutcome outcome = backend.runBatches(trailingLen, batches);
+    if (outcome.hitCount > MAX_MATCHES) {
+        for (const BatchRequest& batch : batches)
+            searchChunk(backend, trailingLen, batch.start, batch.count, batch.params, result);
+    } else {
+        result.hits = outcome.hits;
+        result.found = outcome.found;
+        result.foundFilename = outcome.foundFilename;
+    }
+    backend.endSearch();
+
+    char where[256];
+    snprintf(where, sizeof(where), " (%d batches searched together, planted in batch %d, alphabet size %d, trailing length %d)", batchCount,
+             plantBatch, alphabetSize, trailingLen);
+    for (const std::string& hit : result.hits) {
+        if (!hashAMatches(hashFromScratch(hit, cryptTable, 0x100), constants.targetHashA)) {
+            error = "reported '" + hit + "', which doesn't match the target" + where;
+            return false;
+        }
+    }
+    const bool reported = std::find(result.hits.begin(), result.hits.end(), plantedName) != result.hits.end();
+    if (inside && (!reported || !result.found || result.foundFilename != plantedName)) {
+        error = "missed the planted candidate '" + plantedName + "'" + where;
+        return false;
+    }
+    if (!inside && (reported || result.found)) {
+        error = "reported '" + plantedName + "', which is outside the searched ranges" + where;
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool selfTestBackend(SearchBackend& backend, std::string& error) {
@@ -221,6 +314,20 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             continue;
         if (!runCase(backend, c, cryptTable, error))
             return false;
+    }
+
+    // As many batches at once as the backend takes (see runGroupedCase).
+    const int batchCount = std::min(backend.maxBatchesPerCall(), (int) kCharacters.size() - 10);
+    if (batchCount > 1) {
+        const std::vector<GroupedCase> groupedCases = {
+            {0, GroupedCase::Inside},    {1, GroupedCase::Inside},  {-1, GroupedCase::Inside},
+            {-1, GroupedCase::AtStart},  {-1, GroupedCase::AtEnd},  {0, GroupedCase::AtEnd},
+            {1, GroupedCase::AtStart},   {0, GroupedCase::JustAfter}, {-1, GroupedCase::JustAfter},
+        };
+        for (const GroupedCase& c : groupedCases) {
+            if (!runGroupedCase(backend, c, batchCount, big, window, cryptTable, error))
+                return false;
+        }
     }
     return true;
 }

@@ -46,9 +46,10 @@
 
 namespace {
 
-// The backend, passed through untouched, except that it counts the
-// candidates it's asked to search - what's left of the range once the CPU
-// has pruned.
+// The backend, passed through untouched - every one of SearchBackend's
+// functions, the ones with a default too - except that it counts the
+// candidates it's asked to search: what's left of the range once the CPU has
+// pruned.
 class CountingBackend : public SearchBackend {
 public:
     explicit CountingBackend(SearchBackend& inner) : inner_(inner) {}
@@ -65,6 +66,14 @@ public:
         return inner_.runBatch(trailingLen, start, count, params);
     }
     void endSearch() override { inner_.endSearch(); }
+    // Forwarded too, or the engine would search one batch at a time through
+    // this wrapper, whatever the backend can do.
+    int maxBatchesPerCall() const override { return inner_.maxBatchesPerCall(); }
+    BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches) override {
+        for (const BatchRequest& batch : batches)
+            searched += batch.count;
+        return inner_.runBatches(trailingLen, batches);
+    }
 
 private:
     SearchBackend& inner_;

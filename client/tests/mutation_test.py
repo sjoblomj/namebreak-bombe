@@ -11,10 +11,17 @@ three checks that guard the search, on its own:
   integration        tests/search_integration_test.cpp
   stress             tests/search_stress_test.cpp
 
+A fourth, tests/search_overflow_test.cpp ("overflow"), runs on every copy
+too. It covers what happens when a launch has more hits than it can record,
+which the other three rarely or never reach, so a mutation there is expected
+to be caught by it alone; and the engine's mutations can't be caught by the
+self-test, which tests a backend without the engine. Each mutation names the
+checks that must catch it (all three, by default).
+
 In the copies, createBackend's own self-test is switched off, so that the
 integration and stress tests are judged by themselves; the self-test is run
 separately instead. Two kinds of run check the experiment itself: the
-unmodified code must pass all three checks (otherwise nothing here means
+unmodified code must pass all four checks (otherwise nothing here means
 anything, and the script stops), and so must the mutations marked harmless -
 changes that must *not* change what gets searched.
 
@@ -24,15 +31,15 @@ mutations (--list).
 Needs the GPU the backend runs on, its toolchain or driver, and CMake. It
 copies CMakeLists.txt, src/ and tests/ as they are on disk into a work
 directory, so it tests uncommitted changes too and never touches build/.
-The CUDA list takes about seven minutes on a laptop i9-12900H and RTX 3080
+The CUDA list takes about twelve minutes on a laptop i9-12900H and RTX 3080
 Ti.
 
 Run from anywhere:  python3 client/tests/mutation_test.py [--backend opencl] [options]
 or, from a configured build:  cmake --build --preset default --target run_mutation_test
                               (or run_mutation_test_opencl)
 
-Exit status: 0 if every mutation was caught by all three checks and every
-control passed them, 1 if not, 2 if the experiment couldn't be run.
+Exit status: 0 if every mutation was caught by the checks it names and every
+control passed all four, 1 if not, 2 if the experiment couldn't be run.
 
 A mutation is an exact string replacement in one file. When the code it
 targets changes, the string no longer matches and the script says so -
@@ -55,6 +62,7 @@ from pathlib import Path
 CLIENT = Path(__file__).resolve().parent.parent
 KERNEL = "src/backends/cuda/cuda_backend.cu"
 FILTER = "src/backends/common/lowbits_filter.cpp"
+ENGINE = "src/engine/search.cpp"
 CL_KERNEL = "src/backends/opencl/search.cl"
 CL_HOST = "src/backends/opencl/opencl_backend.cpp"
 MTL_KERNEL = "src/backends/metal/search.metal"
@@ -67,8 +75,10 @@ class Mutation:
     what: str
     # (file, old, new): `old` must occur exactly once in `file`.
     edits: list
-    # "caught": every check must fail. "harmless": every check must pass.
+    # "caught": every check in caught_by must fail. "harmless": every check
+    # must pass.
     expect: str = "caught"
+    caught_by: tuple = ("self-test", "integration", "stress")
 
 
 # The table builder is shared by every backend that has the filter.
@@ -112,16 +122,38 @@ CUDA_MUTATIONS = [
                "case 3: hashRowDigits<AlphabetSize, 2>(group, group1, group2, sKey, sOrd); break;")]),
     Mutation("roword", "the wrong character in a row's own hash step",
              [(KERNEL, "mpqStep(seed1, seed2, sKey[d], sOrd[d]);", "mpqStep(seed1, seed2, sKey[d], sOrd[dBegin]);")]),
-    Mutation("chunkcount", "a launch's last chunk never searched",
-             [(KERNEL, "(lastRow / AlphabetSize - firstGroup + 1) * kChunks;", "(lastRow / AlphabetSize - firstGroup + 1) * kChunks - 1;")]),
-    Mutation("lastgroup", "a launch's last row group never searched, when there's more than one",
-             [(KERNEL, "(lastRow / AlphabetSize - firstGroup + 1) * kChunks;",
-               "(lastRow / AlphabetSize - firstGroup + (lastRow / AlphabetSize > firstGroup ? 0 : 1)) * kChunks;")]),
+    Mutation("chunkcount", "a batch's last chunk never searched",
+             [(KERNEL, "(batch.lastRow / AlphabetSize - firstGroup + 1) * kChunks;", "(batch.lastRow / AlphabetSize - firstGroup + 1) * kChunks - 1;")]),
+    Mutation("lastgroup", "a batch's last row group never searched, when there's more than one",
+             [(KERNEL, "(batch.lastRow / AlphabetSize - firstGroup + 1) * kChunks;",
+               "(batch.lastRow / AlphabetSize - firstGroup + (batch.lastRow / AlphabetSize > firstGroup ? 0 : 1)) * kChunks;")]),
+    # Several batches - usually leading values - per launch (runBatches).
+    Mutation("batchseeds", "every batch of a launch searched with the first one's seeds and edges",
+             [(KERNEL, "const LaunchBatch batch = batches.batch[batchIndex];", "const LaunchBatch batch = batches.batch[0];")]),
+    Mutation("hitbatch", "every hit recorded as the launch's first batch's",
+             [(KERNEL, "bufs.matchBatch[slot] = (uint8_t) batch;", "bufs.matchBatch[slot] = 0;")]),
+    Mutation("verifybatch", "every hit verified with the launch's first batch's prefix",
+             [(KERNEL, "const BatchParams params = bufs.params[bufs.matchBatch[i]];", "const BatchParams params = bufs.params[0];")]),
+    Mutation("lastbatch", "a launch's last batch never searched, when there's more than one",
+             [(KERNEL, "(unsigned) batchCount);", "(unsigned) std::max(1, batchCount - 1));")]),
+    # The engine's side of it: the self-test tests the backend alone.
+    Mutation("noflush", "the batches left over at the end of a candidate length never searched",
+             [(ENGINE, "        if (!pending.empty()) {\n            int r = searchPending();",
+               "        if (false) {\n            int r = searchPending();")],
+             caught_by=("integration", "stress")),
+    Mutation("groupoverflow", "batches whose hits overflowed together never searched again",
+             [(ENGINE, "        for (const BatchRequest& batch : batches) {\n            int r = searchChunk(",
+               "        for (const BatchRequest& batch : batches) {\n            break;\n            int r = searchChunk(")],
+             caught_by=("overflow",)),
     # The kernel works out its chunks itself, so how many threads are
-    # launched must not change what gets searched.
+    # launched must not change what gets searched - whether one too few, or
+    # only as many as the first batch needs.
     Mutation("hostthreads", "one thread too few launched", expect="harmless",
-             edits=[(KERNEL, "const uint64_t threads = groups * kChunksPerGroup<AlphabetC::value>;",
-                     "const uint64_t threads = groups * kChunksPerGroup<AlphabetC::value> - 1;")]),
+             edits=[(KERNEL, "const uint64_t threads = maxGroups * kChunksPerGroup<AlphabetC::value>;",
+                     "const uint64_t threads = maxGroups * kChunksPerGroup<AlphabetC::value> - 1;")]),
+    Mutation("firstbatchgrid", "only as many threads as the first batch needs", expect="harmless",
+             edits=[(KERNEL, "maxGroups = std::max(maxGroups, lastRow / alphabetSize - firstRow / alphabetSize + 1);",
+                     "maxGroups = b == 0 ? lastRow / alphabetSize - firstRow / alphabetSize + 1 : maxGroups;")]),
 ]
 
 OPENCL_MUTATIONS = [
@@ -279,11 +311,12 @@ int main(int argc, char** argv) {
 }
 '''
 
-TARGETS = ["search_integration_test", "search_stress_test", "mutation_self_test_runner"]
+TARGETS = ["search_integration_test", "search_stress_test", "search_overflow_test", "mutation_self_test_runner"]
 CHECKS = [
     ("self-test", "mutation_self_test_runner"),
     ("integration", "search_integration_test"),
     ("stress", "search_stress_test"),
+    ("overflow", "search_overflow_test"),
 ]
 
 
@@ -306,8 +339,9 @@ class Outcome:
     def as_expected(self):
         if self.error or len(self.checks) != len(CHECKS):
             return False
-        want_pass = self.mutation.expect == "harmless"
-        return all(r.passed == want_pass for r in self.checks.values())
+        if self.mutation.expect == "harmless":
+            return all(r.passed for r in self.checks.values())
+        return all(not self.checks[check].passed for check in self.mutation.caught_by)
 
 
 print_lock = threading.Lock()
@@ -378,6 +412,12 @@ def summarize(check, log_text, capture_text, exit_code, timed_out):
         m = re.search(r"(\d+) case\(s\) run in [\d.]+s, (\d+) failure\(s\)", log_text)
         if m:
             return f"{m.group(2)} of {m.group(1)} cases failed"
+    elif check == "overflow":
+        if "ALL CHECKS PASSED" in log_text:
+            return "all checks passed"
+        m = re.search(r"(\d+) check\(s\) FAILED", log_text)
+        if m:
+            return f"{m.group(1)} check(s) failed"
     else:
         m = re.search(r"(\d+) case\(s\), \d+ candidates, (\d+) hits verified, [\d.]+s, (\d+) failure\(s\)", log_text)
         if m:
@@ -415,7 +455,10 @@ def run_checks(build_dir, mutation, args):
 
 
 def describe(outcome):
-    lines = [f"{outcome.mutation.name}: {outcome.mutation.what} (expected: {outcome.mutation.expect})"]
+    expected = outcome.mutation.expect
+    if expected == "caught" and outcome.mutation.caught_by != Mutation.caught_by:
+        expected += " by " + ", ".join(outcome.mutation.caught_by)
+    lines = [f"{outcome.mutation.name}: {outcome.mutation.what} (expected: {expected})"]
     if outcome.error:
         lines.append(f"    ERROR: {outcome.error}")
     for check, _ in CHECKS:
@@ -443,7 +486,7 @@ def main():
     mutations = BACKENDS[args.backend][1]
     if args.list:
         for m in mutations:
-            print(f"{m.name:<12} {m.expect:<9} {m.what}")
+            print(f"{m.name:<15} {m.expect:<9} {m.what}")
         return 0
     if args.only:
         wanted = [name.strip() for name in args.only.split(",")]
@@ -472,7 +515,7 @@ def main():
         control.checks = run_checks(build_dir, CONTROL, args)
         say(describe(control))
         if not control.as_expected():
-            raise ExperimentError("the unmodified code doesn't pass all three checks, so the experiment can't tell anything")
+            raise ExperimentError("the unmodified code doesn't pass all four checks, so the experiment can't tell anything")
         outcomes.append(control)
 
         # Each mutation is built while earlier ones are checked on the GPU.
@@ -501,10 +544,16 @@ def main():
 
     minutes = (time.monotonic() - start) / 60
     unexpected = [o for o in outcomes if not o.as_expected()]
-    print(f"\n{'mutation':<12} {'expected':<9} {'self-test':<10} {'integration':<12} {'stress':<10} result")
+    print(f"\n{'mutation':<15} {'expected':<9} {'self-test':<10} {'integration':<12} {'stress':<10} {'overflow':<9} result")
     for o in outcomes:
-        cells = ["-" if o.error else ("passed" if o.checks[c].passed else "failed") for c, _ in CHECKS]
-        print(f"{o.mutation.name:<12} {o.mutation.expect:<9} {cells[0]:<10} {cells[1]:<12} {cells[2]:<10} "
+        # A check a mutation doesn't have to fail is in parentheses.
+        cells = []
+        for c, _ in CHECKS:
+            cell = "-" if o.error else ("passed" if o.checks[c].passed else "failed")
+            if o.mutation.expect == "caught" and c not in o.mutation.caught_by and not o.error:
+                cell = f"({cell})"
+            cells.append(cell)
+        print(f"{o.mutation.name:<15} {o.mutation.expect:<9} {cells[0]:<10} {cells[1]:<12} {cells[2]:<10} {cells[3]:<9} "
               f"{'ok' if o.as_expected() else 'NOT AS EXPECTED'}")
     print(f"\n{len(outcomes)} run(s) in {minutes:.1f} minutes: {len(outcomes) - len(unexpected)} as expected, {len(unexpected)} not.")
     if unexpected:

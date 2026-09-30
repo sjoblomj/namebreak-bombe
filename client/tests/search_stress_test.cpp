@@ -15,7 +15,9 @@
 //
 // Every case runs the real runSearch() on a random range - random alphabet
 // (size, characters, order, bytes >= 0x80), prefix, suffix and candidate
-// length - and compares the complete set of hits it reports with an
+// length, and in a third of them the engine's pruning of leading characters
+// (so pruned leading values fall between the batches a backend searches
+// together) - and compares the complete set of hits it reports with an
 // independent brute force that hashes every candidate of the range from
 // scratch: any hit missing, any extra, any reported twice, or any WARNING
 // from a backend's own cross-checks, fails it. On top of the random hits,
@@ -48,6 +50,7 @@
 #include <unistd.h>
 #endif
 #include "backends/backends.h"
+#include "engine/candidate.h"
 #include "engine/limits.h"
 #include "engine/mpq_hash.h"
 #include "engine/search.h"
@@ -128,10 +131,26 @@ struct Case {
     // plantAtEdge) - or just outside the range, where it must not be reported.
     std::string planted;
     bool plantedInside = true;
+    uint64_t plantedIndex = 0;
+    // The engine's pruning of a candidate's first leadingLen characters (see
+    // runSearch): a pruned candidate is never searched, so never a hit.
+    bool pruneSymbolRuns = false, pruneUnopenedBrackets = false;
+    int maxBackslashCount = 0;
+    int leadingLen = 0;
 };
 
-// The brute force: every candidate in [first, last], hashed from scratch
-// after the prefix, on every core.
+// Whether runSearch prunes a candidate of `c` by its leading characters - the
+// same checks, from engine/candidate.h, on the part of it this test itself
+// works out is leading.
+static bool isPruned(const Case& c, const std::string& candidate) {
+    const std::string_view leading(candidate.data(), c.leadingLen);
+    return (c.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading)) ||
+           (c.maxBackslashCount != 0 && countBackslashes_CPU(leading) > c.maxBackslashCount) ||
+           (c.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, openBracketsAfter_CPU(c.prefix)));
+}
+
+// The brute force: every candidate in [first, last] that isn't pruned, hashed
+// from scratch after the prefix, on every core.
 static std::vector<std::string> bruteForce(const Case& c) {
     uint32_t prefix1 = 0x7FED7FED, prefix2 = 0xEEEEEEEE;
     for (unsigned char ch : c.prefix)
@@ -147,15 +166,19 @@ static std::vector<std::string> bruteForce(const Case& c) {
         std::vector<size_t> digit(c.len);
         for (int i = 0; i < c.len; ++i)
             digit[i] = c.alphabet.find(cand[i]);
+        bool pruned = isPruned(c, cand); // re-checked whenever a leading character changes
         for (uint64_t n = from; n < to; ++n) {
-            uint32_t seed1 = prefix1, seed2 = prefix2;
-            for (unsigned char ch : cand)
-                hashStep(seed1, seed2, ch, 0x100);
-            for (unsigned char ch : c.suffix)
-                hashStep(seed1, seed2, ch, 0x100);
-            if ((seed1 & kMatchMask) == (c.targetA & kMatchMask))
-                found[t].push_back(c.prefix + cand + c.suffix);
-            for (int i = c.len - 1; i >= 0; --i) {
+            if (!pruned) {
+                uint32_t seed1 = prefix1, seed2 = prefix2;
+                for (unsigned char ch : cand)
+                    hashStep(seed1, seed2, ch, 0x100);
+                for (unsigned char ch : c.suffix)
+                    hashStep(seed1, seed2, ch, 0x100);
+                if ((seed1 & kMatchMask) == (c.targetA & kMatchMask))
+                    found[t].push_back(c.prefix + cand + c.suffix);
+            }
+            int i = c.len - 1;
+            for (; i >= 0; --i) {
                 if (++digit[i] < c.alphabet.size()) {
                     cand[i] = c.alphabet[digit[i]];
                     break;
@@ -163,6 +186,8 @@ static std::vector<std::string> bruteForce(const Case& c) {
                 digit[i] = 0;
                 cand[i] = c.alphabet[0];
             }
+            if (i < c.leadingLen)
+                pruned = isPruned(c, cand);
         }
     };
     std::vector<std::thread> workers;
@@ -180,8 +205,11 @@ static std::vector<std::string> bruteForce(const Case& c) {
 
 static std::string describe(const Case& c) {
     char buf[512];
-    snprintf(buf, sizeof(buf), "alphabet size %zu, prefix length %zu, suffix length %zu, candidate length %d, indices %llu..%llu, target 0x%08X",
-             c.alphabet.size(), c.prefix.size(), c.suffix.size(), c.len, (unsigned long long) c.first, (unsigned long long) c.last, c.targetA);
+    snprintf(buf, sizeof(buf),
+             "alphabet size %zu, prefix length %zu, suffix length %zu, candidate length %d, indices %llu..%llu, target 0x%08X, pruning %s%s%s",
+             c.alphabet.size(), c.prefix.size(), c.suffix.size(), c.len, (unsigned long long) c.first, (unsigned long long) c.last, c.targetA,
+             c.pruneSymbolRuns ? "symbol runs " : "", c.pruneUnopenedBrackets ? "brackets " : "",
+             c.maxBackslashCount != 0 ? "backslashes" : (c.pruneSymbolRuns || c.pruneUnopenedBrackets ? "" : "none"));
     return buf;
 }
 
@@ -208,7 +236,8 @@ static int trailingLenFor(int len, int alphabetSize, int window) {
 static void plantAtEdge(Case& c, int window, uint64_t batchSize, uint64_t space, std::mt19937_64& rng) {
     if (rng() % 4 == 0 && (c.first > 0 || c.last + 1 < space)) {
         const bool before = c.first > 0 && (c.last + 1 == space || rng() % 2 == 0);
-        c.planted = c.prefix + candidateAt(before ? c.first - 1 : c.last + 1, c.len, c.alphabet) + c.suffix;
+        c.plantedIndex = before ? c.first - 1 : c.last + 1;
+        c.planted = c.prefix + candidateAt(c.plantedIndex, c.len, c.alphabet) + c.suffix;
         c.plantedInside = false;
         c.targetA = hashFromScratch(c.planted, 0x100);
         return;
@@ -236,12 +265,16 @@ static void plantAtEdge(Case& c, int window, uint64_t batchSize, uint64_t space,
     if (rowStart + as - 1 <= c.last)
         edges.push_back(rowStart + as - 1);
     const uint64_t planted = edges[rng() % edges.size()];
+    c.plantedIndex = planted;
     c.planted = c.prefix + candidateAt(planted, c.len, c.alphabet) + c.suffix;
     c.targetA = hashFromScratch(c.planted, 0x100);
 }
 
 // Runs one case; returns the number of hits it verified, or -1 if it failed.
 static long runCase(Case c, std::mt19937_64& rng) {
+    // A candidate the engine prunes is never searched, even inside the range.
+    if (isPruned(c, candidateAt(c.plantedIndex, c.len, c.alphabet)))
+        c.plantedInside = false;
     std::vector<std::string> expected = bruteForce(c);
     if (std::binary_search(expected.begin(), expected.end(), c.planted) != c.plantedInside) {
         fprintf(stderr, "TEST BUG: the brute force %s the hit planted %s the range, '%s' (%s)\n", c.plantedInside ? "doesn't have" : "has",
@@ -268,6 +301,9 @@ static long runCase(Case c, std::mt19937_64& rng) {
     req.targetHashB = c.targetB;
     req.continuous = false;
     req.outputFilePath = kMatchesFile;
+    req.pruneSymbolRuns = c.pruneSymbolRuns;
+    req.pruneUnopenedBrackets = c.pruneUnopenedBrackets;
+    req.maxBackslashCount = c.maxBackslashCount;
 
     std::vector<std::string> reported;
     OutputCapture capture;
@@ -376,6 +412,21 @@ int main(int argc, char** argv) {
         const uint64_t space = ipow(as, c.len);
         c.targetA = (uint32_t) rng();
         c.targetB = (uint32_t) rng();
+        c.leadingLen = c.len - trailingLenFor(c.len, as, window);
+        if (rng() % 3 == 0) {
+            // Random alphabets are mostly symbols, so these prune a lot of
+            // leading values - and leave many between them.
+            c.pruneSymbolRuns = rng() % 2 == 0;
+            c.pruneUnopenedBrackets = rng() % 2 == 0;
+            c.maxBackslashCount = rng() % 3 == 0 ? 1 + (int) (rng() % 2) : 0;
+            if (rng() % 4 == 0) {
+                // Brackets and backslashes are rare in a random alphabet:
+                // make sure they're in it.
+                for (char ch : {'(', ')', '[', ']', '\\'})
+                    if (c.alphabet.find(ch) == std::string::npos)
+                        c.alphabet[rng() % c.alphabet.size()] = ch;
+            }
+        }
 
         // Mostly ranges of up to a few million candidates anywhere; some tiny;
         // some straddling the boundary between two leading values (runSearch

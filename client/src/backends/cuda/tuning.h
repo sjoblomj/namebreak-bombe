@@ -25,6 +25,23 @@
 #define NAMEBREAK_ROWS_PER_LAUNCH (1u << 23)
 #endif
 
+// How many batches - each up to NAMEBREAK_ROWS_PER_LAUNCH rows of one leading
+// value - one kernel launch searches at most (SearchBackend::maxBatchesPerCall).
+// A batch of the usual 5-character window is one leading value, 49^4 rows,
+// about 0.13 ms of GPU time, and the GPU idles about 10 us between two
+// launches; several batches per launch make that a smaller share, without
+// the window growing (a wider window would leave the CPU less to prune). On
+// the RTX 3080 Ti Laptop, 16 took the GPU's idle time from 9.4% to 1.6%, and
+// search_bench from 1 to 16 gained about 6.7% (six alternating pairs); 4, 8,
+// 16 and 32 were within the noise of each other. Overridable at compile time (-DNAMEBREAK_BATCHES_PER_LAUNCH=N) so the tests
+// can exercise other groupings, and benchmarks re-sweep it.
+#ifndef NAMEBREAK_BATCHES_PER_LAUNCH
+#define NAMEBREAK_BATCHES_PER_LAUNCH 16
+#endif
+// The most NAMEBREAK_BATCHES_PER_LAUNCH can be: a launch's batches are passed
+// to the kernel as an argument, by value.
+constexpr int kMaxBatchesPerLaunch = 32;
+
 // About how many consecutive rows one thread searches (see kChunksPerGroup
 // in cuda_backend.cu): it hashes the characters they share once, then one
 // step per row. More rows per thread means less of that, but fewer threads
@@ -49,6 +66,8 @@ constexpr int kThreadsPerBlock = 256;
 static_assert(NAMEBREAK_GPU_WINDOW_CHARS >= 1 && NAMEBREAK_GPU_WINDOW_CHARS <= kMaxTrailingLen,
               "NAMEBREAK_GPU_WINDOW_CHARS must be between 1 and kMaxTrailingLen");
 static_assert(NAMEBREAK_ROWS_PER_LAUNCH >= 1, "NAMEBREAK_ROWS_PER_LAUNCH must be >= 1");
+static_assert(NAMEBREAK_BATCHES_PER_LAUNCH >= 1 && NAMEBREAK_BATCHES_PER_LAUNCH <= kMaxBatchesPerLaunch,
+              "NAMEBREAK_BATCHES_PER_LAUNCH must be between 1 and kMaxBatchesPerLaunch");
 static_assert(NAMEBREAK_ROWS_PER_THREAD >= 1, "NAMEBREAK_ROWS_PER_THREAD must be >= 1");
 static_assert(NAMEBREAK_ROWS_PER_LAUNCH <= (1u << 30), "a launch's row count must stay well within 32 bits");
 

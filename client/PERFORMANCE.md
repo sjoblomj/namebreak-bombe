@@ -153,7 +153,7 @@ will have grown (not measured again).
   cache already keeps most of a 32-128 KB table close. Reverted; the table
   stays in global memory, read with `__ldg`. (6 bits through the cache
   measured close to 7 again - within the runs' noise.)
-- [ ] **Gaps between launches (~9%, measured).** One launch per leading
+- [x] **Gaps between launches (~9%, measured).** One launch per leading
   value, synchronized and read back before the next. Measured again after
   the filter, the row groups and the 7-bit table (Nsight Systems,
   `search_bench --scale 5`): a launch - one leading value, 49^4 rows -
@@ -167,19 +167,39 @@ will have grown (not measured again).
   - [x] **Fewer, longer launches**, from a wider window: **measured** a
     wash - the gaps it recovers are paid back in pruning (see the next
     item).
-  - [ ] **Several leading values per launch**: a 2D grid over an array of
-    the unpruned leading values' seeds and prefixes, so launches get
-    longer while the CPU still prunes all 5 leading characters. Worth about
-    what window 6 gained in search rate, +5% (*estimated* from the above),
-    without its cost. It changes what a batch is (the engine hands the
-    backend several leading values at once), so it needs the same care as
-    queuing the next launch.
+  - [x] **Several leading values per launch.** The engine collects up to
+    `SearchBackend::maxBatchesPerCall()` consecutive batches - of one
+    leading value or several, with pruned ones left out - and hands them to
+    `runBatches()` together; the CUDA/HIP backend searches up to
+    `NAMEBREAK_BATCHES_PER_LAUNCH` (16) in one launch, a row of thread
+    blocks (`blockIdx.y`) per batch, whose rows, edges and seeds are a
+    by-value kernel argument (indexed loads from the constant bank - no
+    local-memory copy, and 32 registers instead of 37). A hit records its
+    batch, and `verifyMatchesKernel` rebuilds it with that batch's prefix.
+    If a launch's hits together overflow, each batch is searched again on
+    its own. **Measured**: in the timed search the GPU idles 1.6% of the
+    time instead of 9.4% (Nsight Systems; the kernels themselves ran 2%
+    faster, fewer launches' tails), and `search_bench --scale 40` was
+    faster in six alternating pairs out of six, +5.0 to +11.6%, about
+    **+6.7%** on average. 4, 8, 16 and 32 batches per launch were within
+    the noise of each other; 16 makes a launch about 2.3 ms. Other
+    backends keep one batch per call (the default), for now.
+  - [ ] **The same for OpenCL and Metal**: their kernels are the same shape,
+    and their gaps likely the same share - a `runBatches()` each, with a
+    batch array in a buffer (or a kernel argument), and their mutation
+    lists extended as the CUDA one was.
+  - [ ] **A cheaper hit path.** A launch of 16 leading values (4.5G
+    candidates) has a hashA hit about two times in three, and each costs
+    about 35 us more of GPU idle: the batches' prefixes uploaded, a
+    synchronize after `verifyMatchesKernel`, and three blocking copies.
+    Queuing the prefixes' upload before the kernel, and the readbacks
+    behind the verify kernel, would leave one wait. About 1% (*estimated*).
   - [ ] **Keep the next launch queued** while this one's results are read:
     a launch/collect pair beside `runBatch`, with two sets of result
     buffers, so the GPU never waits. It reshapes the engine's search loop
     (the split on too many hits, pause, abort, a match found with a batch
-    in flight) and needs its own tests and mutations - worth it only if
-    the gaps still matter after longer launches.
+    in flight) and needs its own tests and mutations - with 1.6% idle
+    left, worth little now.
 - [x] **Re-tune the window and launch size.** `NAMEBREAK_GPU_WINDOW_CHARS`
   (5) and `NAMEBREAK_ROWS_PER_LAUNCH` were chosen with the kernel as it was
   before the filter, whose launches took about seven times as long as now.

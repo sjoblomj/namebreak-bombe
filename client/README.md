@@ -337,17 +337,22 @@ those are hashed in full (see [The lookup
 filter](#the-lookup-filter-most-candidates-are-never-hashed)). With the real
 49-character alphabet, one leading value is 49^5 = 282,475,249 candidates:
 5,764,801 rows of 49, in 117,649 row groups of 49 rows, in 235,298 chunks of
-24 or 25 rows - one per GPU thread, in a single kernel launch.
+24 or 25 rows - one per GPU thread. The CPU collects 16 leading values that
+aren't pruned (`NAMEBREAK_BATCHES_PER_LAUNCH`), and one kernel launch
+searches them all, a row of thread blocks for each.
 
 ```mermaid
 flowchart TD
     start(["runSearch()"]) --> begin["beginSearch:<br/>build the lookup table,<br/>check it, upload it"]
     begin --> next{"next<br/>leading value"}
     next -->|"pruned"| next
-    next -->|"none left"| done(["range exhausted"])
-    next -->|"e.g. FZ00"| seed["CPU: hash it<br/>onto the prefix"]
-    seed --> kernel
-    subgraph gpu ["GPU: one launch per leading value"]
+    next -->|"none left"| rest{"any<br/>collected?"}
+    rest -->|"no"| done(["range exhausted"])
+    rest -->|"yes"| kernel
+    next -->|"e.g. FZ00"| seed["CPU: hash it<br/>onto the prefix,<br/>collect it"]
+    seed -->|"fewer than 16<br/>collected"| next
+    seed -->|"16 collected"| kernel
+    subgraph gpu ["GPU: one launch per 16 leading values"]
         kernel["filteredRowsKernel<br/>a thread per chunk of rows:<br/>a step per row, a lookup,<br/>hash only what it flags"]
         kernel -->|"hashA hits"| verify["verifyMatchesKernel<br/>hash each hit again<br/>from scratch, check hashB"]
     end
@@ -374,8 +379,13 @@ was before [the lookup filter](#the-lookup-filter-most-candidates-are-never-hash
 (about 155 G candidates/s at a window of 4, 222 at 5, 216 at 6): a window
 of 4 makes each leading value's launch so short (~25 us) that per-launch
 overhead becomes a large fraction of the runtime. The lookup filter and the
-row chunks made every launch about seven times shorter, so this is worth
-measuring again - see [PERFORMANCE.md](PERFORMANCE.md). Note the window
+row chunks made every launch about seven times shorter: a leading value took
+0.13 ms, and the GPU idled about 10 us between two launches, 9.7% of the
+time. A window of 6 would win that back, but leave the CPU a character
+fewer to prune on - a wash, measured (see [PERFORMANCE.md](PERFORMANCE.md)).
+So the window stayed at 5, and a launch searches 16 leading values instead
+(see below): the GPU now idles 1.6% of the time, and the search got about
+7% faster. Note the window
 also decides how much `prune_symbol_runs`/`prune_unopened_brackets`/`max_backslash_count`
 can see (they only examine the leading characters, see below): a larger window means fewer
 characters are pruned on, so those settings skip slightly fewer
@@ -398,18 +408,21 @@ one result for every candidate in the row. So each of those 26 candidates
 costs only one more character step plus the suffix, instead of every one
 of them separately re-hashing the whole trailing window from scratch.
 
-One kernel launch doesn't necessarily cover a whole leading value's
-trailing space at once, though - it covers at most
-`NAMEBREAK_ROWS_PER_LAUNCH` rows (8,388,608 by default, set in
-`src/backends/cuda/tuning.h`), and always a whole number of them: a launch's
-boundaries land on row boundaries, except possibly at the very start or end of the
-range being searched. That's what makes the window above a *launch-size*
-knob rather than only a per-thread-cost one - and it's also what bounds how
-long any single launch can run for, since pause and abort are only checked
-*between* launches, not in the middle of one.
+The engine hands the backend the trailing space in *batches*: each covers
+at most `NAMEBREAK_ROWS_PER_LAUNCH` rows (8,388,608 by default, set in
+`src/backends/cuda/tuning.h`) of one leading value, and always a whole
+number of them - a batch's boundaries land on row boundaries, except
+possibly at the very start or end of the range being searched. With the
+5-character window a batch is a whole leading value (5,764,801 rows). One
+kernel launch searches up to `NAMEBREAK_BATCHES_PER_LAUNCH` batches (16, in
+the same file), each with its own rows and seeds, on its own row of thread
+blocks (`blockIdx.y`) - consecutive batches, of one leading value or several,
+with any pruned ones between them left out. That bounds how long any single
+launch can run for (a couple of milliseconds), since pause and abort are
+only checked *between* launches, not in the middle of one.
 
-So only a launch's first and last row can be cut short. With the
-3-character window and `A..Z` from above, a launch from `XDJ` to `YKT`:
+So only a batch's first and last row can be cut short. With the
+3-character window and `A..Z` from above, a batch from `XDJ` to `YKT`:
 
 ```text
                  A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
@@ -496,9 +509,10 @@ implementation at runtime. Any disagreement between the two prints a
 `WARNING`, which the test suite treats as a failure.
 
 Only the first `MAX_MATCHES` (1024) hits from one launch can be recorded
-at all. If a launch somehow has more than that, its range is searched
-again as two halves (recursively, if needed), so every hit still gets
-checked against hashB rather than silently lost. With a real 32-bit hash
+at all. If a launch somehow has more than that, each of its batches is
+searched again on its own, and a batch with too many is searched again as
+two halves (recursively, if needed), so every hit still gets checked against
+hashB rather than silently lost. With a real 32-bit hash
 this essentially never happens in practice (it would take over a thousand
 collisions in a single launch), but it's handled explicitly and tested
 (`tests/search_overflow_test.cpp`).
@@ -695,27 +709,38 @@ ones are built on purpose - each a bug that silently misses (or invents)
 candidates - and run against each check on its own (the integration and
 stress tests with the self-test switched off). `tests/mutation_test.py`
 does it, a backend at a time: `cmake --build --preset default --target
-run_mutation_test` for the CUDA kernel (about seven minutes on the RTX 3080
+run_mutation_test` for the CUDA kernel (about twelve minutes on the RTX 3080
 Ti Laptop), `run_mutation_test_opencl` for the OpenCL one (about four).
 Run it after any change to a kernel - and when it
 says a mutation no longer applies, because the code it breaks has changed,
-update the mutation rather than drop it. It first checks that the unchanged
-code passes all three checks, and that a change which mustn't matter (one
-thread, or one work-group, too few or too many launched) passes them too, so
-that it can't pass by always saying "caught". Against the CUDA kernel as it
-is now, with row groups split into chunks, eighteen mutations: rows' masks cut to
-32 bits; seed1 and seed2 swapped in the lookup; a launch's last row, or
+update the mutation rather than drop it. It also runs a fourth check on
+every copy, the overflow test, which covers what the other three rarely or
+never reach: more hits in a launch than it can record. It first checks that
+the unchanged code passes all four checks, and that a change which mustn't
+matter (one thread, or one work-group, too few or too many launched) passes
+them too, so that it can't pass by always saying "caught". Against the CUDA
+kernel as it is now - row groups split into chunks, and 16 batches per
+launch - twenty-four mutations: rows' masks cut to
+32 bits; seed1 and seed2 swapped in the lookup; a batch's last row, or
 first row, one candidate short; the edges of the range ignored; the loop
 over a row's flagged candidates stopping one early; the suffix hashed one
-character short; the table built for the wrong target; and, in the
+character short; the table built for the wrong target; in the
 chunking, a chunk's first or last row skipped; the range cut one row short
 at its start or end; the first or last row's cut applied to the wrong row;
 one character too few of a group hashed; the wrong character in a row's
-own step; the last chunk, or the last group, of a launch never searched.
-Every one was caught by the self-test, by the integration test and by the
-stress test - the integration test failed 6-1007 of its 2,267 cases, the
-stress test 38-292 of its 321, and the wrong-target table stopped both at
-their first search. Against the OpenCL kernel, twenty-one: the same kinds
+own step; the last chunk, or the last group, of a batch never searched; and
+in the batching, every batch of a launch searched with the first one's
+seeds and edges; every hit recorded as, or verified with, the first
+batch's; a launch's last batch never searched; and two in the engine - the
+batches left over at the end of a candidate length never searched, and a
+launch whose hits overflowed never searched again batch by batch. Every
+kernel mutation was caught by the self-test, by the integration test and by
+the stress test - the integration test failed 6-1007 of its 2,266 cases,
+the stress test 17-315 of its 346, and the wrong-target table stopped both
+at their first search. The engine's two can't be caught by the self-test,
+which tests a backend without the engine: the first was caught by the
+integration and stress tests, and the overflow one by the overflow test
+alone - as it has to be, since the other checks never overflow a launch. Against the OpenCL kernel, twenty-one: the same kinds
 of bug in its mask, lookup, row edges, loop, suffix and chunking, plus a
 lowest-set-bit taken one too high, its own copy of the table index shifting
 one bit too far, and the kernel compiled for a table one bit narrower - with
@@ -736,7 +761,14 @@ a row group, where it had missed a chunk's last row being skipped; and it
 found that launching one thread too few went unnoticed by everything - it
 only mattered when the thread count was just past a multiple of 256 - so
 the kernel now works out its chunks itself, and how many threads are
-launched can no longer change what gets searched.
+launched can no longer change what gets searched. The latest, with 16
+batches per launch, found that no test ever reached the engine's fallback
+for a launch whose hits overflowed together - where each batch has to be
+searched again on its own. Breaking it went unnoticed by every check, so
+the overflow test now spreads a pair of colliding candidates over two
+batches of one launch (in adjacent leading values, and with a pruned one
+between them), and a stress-test build with room for a single hit per
+launch (`stress-*-overflow`) overflows launches and batches at random.
 `tests/self_test_test.cpp` does the same for the self-test on the CPU
 backends, on every `ctest` run.
 

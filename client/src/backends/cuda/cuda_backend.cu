@@ -54,9 +54,14 @@ struct BatchResults {
 struct DeviceBuffers {
     BatchResults* results;
     // matchIdx[i]: trailing index of the i-th hashA hit (only the first MAX_MATCHES
-    // hits of a launch are recorded). Written by filteredRowsKernel, consumed by
+    // hits of a launch are recorded), and matchBatch[i] which of the launch's
+    // batches it's in. Written by filteredRowsKernel, consumed by
     // verifyMatchesKernel.
     uint64_t* matchIdx;
+    uint8_t* matchBatch;
+    // The launch's batches' prefixes and seeds, for verifyMatchesKernel -
+    // uploaded only when a launch has hits.
+    BatchParams* params;
     // matches + i * MAX_FILENAME_LEN: the i-th hit's complete filename.
     // Written by verifyMatchesKernel, consumed by the host.
     char* matches;
@@ -66,6 +71,24 @@ struct DeviceBuffers {
 };
 
 static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "filteredRowsKernel needs one thread per alphabet entry to fill its shared tables");
+static_assert(kMaxBatchesPerLaunch <= 256, "DeviceBuffers::matchBatch holds a batch's index in a byte");
+
+// One batch of a launch, as filteredRowsKernel needs it: its rows
+// firstRow..lastRow of the trailing space, cut to [firstRowStartK,
+// lastRowEndK) in its first and last row (see runBatches), and the hash state
+// after its prefix.
+struct LaunchBatch {
+    uint32_t firstRow;
+    uint32_t lastRow;
+    int firstRowStartK;
+    int lastRowEndK;
+    uint32_t seed1Start;
+    uint32_t seed2Start;
+};
+// A launch's batches - a kernel argument, so passed by value.
+struct LaunchBatches {
+    LaunchBatch batch[kMaxBatchesPerLaunch];
+};
 
 // Suffix lengths 0-8 (see dispatchSuffixLen) get their own compile-time
 // instantiation of filteredRowsKernel, with the suffix loop fully unrolled;
@@ -123,7 +146,8 @@ constexpr uint32_t kChunksPerGroup = (AlphabetSize + NAMEBREAK_ROWS_PER_THREAD -
 template<int AlphabetSize, int SuffixLen>
 __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int trailingLen, uint32_t firstRow, uint32_t lastRow,
                                             int firstRowStartK, int lastRowEndK, uint32_t targetA, uint32_t seed1Start,
-                                            uint32_t seed2Start, const DeviceBuffers& bufs, const uint32_t* sKey, const uint32_t* sOrd) {
+                                            uint32_t seed2Start, uint32_t batch, const DeviceBuffers& bufs, const uint32_t* sKey,
+                                            const uint32_t* sOrd) {
     constexpr uint32_t kChunks = kChunksPerGroup<AlphabetSize>;
     // The chunk's rows, as last row characters d of `group`, cut to the
     // launch's range in its first and last group.
@@ -190,8 +214,10 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
             }
             if (hashAMatches(a, targetA)) {
                 int slot = atomicAdd(&bufs.results->matchCount, 1);
-                if (slot < MAX_MATCHES)
+                if (slot < MAX_MATCHES) {
                     bufs.matchIdx[slot] = (groupStart + d) * AlphabetSize + k;
+                    bufs.matchBatch[slot] = (uint8_t) batch;
+                }
             }
         }
     }
@@ -203,11 +229,13 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
 // characters this kernel searches. See README.md's "Design decisions"
 // section for why.
 //
-// Each thread handles one chunk (see kChunksPerGroup above - searchChunk) of
-// the rows firstRow..lastRow, and within each row every candidate whose last
-// character index k is in [kBegin, kEnd) - all of them for every row but the
-// (at most two) at the edges of the launch's range (firstRowStartK /
-// lastRowEndK). The characters its rows share - the group's - are hashed
+// A launch searches up to kMaxBatchesPerLaunch batches - usually each a whole
+// leading value's trailing space, with its own seeds - one per blockIdx.y
+// (see runBatches). Each thread handles one chunk (see kChunksPerGroup above -
+// searchChunk) of its batch's rows firstRow..lastRow, and within each row
+// every candidate whose last character index k is in [kBegin, kEnd) - all of
+// them for every row but the (at most two) at the edges of the batch's range
+// (firstRowStartK / lastRowEndK). The characters its rows share - the group's - are hashed
 // once, and each row then costs one more step, for its own last row
 // character. Then, instead of
 // hashing every candidate of the row, one lookup in this search's filter
@@ -217,22 +245,15 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint32_t chunk, int 
 // candidate that matches the target. Only those are hashed in full. README.md's
 // "The lookup filter" has why the lookup can never leave a match out.
 //
-// A hashA hit only records its trailing index (bufs.matchIdx): building the
-// filename and checking hashB happen in verifyMatchesKernel, launched only
-// when there was a hit, so none of that (printf, a 128-byte filename buffer)
-// bloats this hot kernel.
-//
-// `params` (prefix, seeds) is only ever read at constant offsets here - see
-// buildCompleteFilename (hash_kernels.cuh) for why its address must not be taken.
+// A hashA hit only records its trailing index and batch (bufs.matchIdx,
+// bufs.matchBatch): building the filename and checking hashB happen in
+// verifyMatchesKernel, launched only when there was a hit, so none of that
+// (printf, a 128-byte filename buffer) bloats this hot kernel.
 template<int AlphabetSize, int SuffixLen>
 __global__ void filteredRowsKernel(
     int trailingLen,
-    uint32_t firstRow,
-    uint32_t lastRow,
-    int firstRowStartK,
-    int lastRowEndK,
+    LaunchBatches batches,
     uint32_t targetA,
-    BatchParams params,
     DeviceBuffers bufs
 ) {
     static_assert(AlphabetSize < 64, "a row's candidates, and one past the last of them, must fit a 64-bit mask");
@@ -245,14 +266,20 @@ __global__ void filteredRowsKernel(
     }
     __syncthreads();
 
-    // Every chunk of every group the range touches, whatever the grid's size:
+    // This block's batch - the same for the whole block, so reading it from
+    // the kernel's arguments with blockIdx.y costs nothing per thread.
+    const uint32_t batchIndex = blockIdx.y;
+    const LaunchBatch batch = batches.batch[batchIndex];
+
+    // Every chunk of every group the batch touches, whatever the grid's size:
     // the number of threads launched only decides how the chunks are shared
     // out (normally one each), never which of them get searched.
-    const uint32_t firstGroup = firstRow / AlphabetSize;
-    const uint64_t chunkCount = (uint64_t) (lastRow / AlphabetSize - firstGroup + 1) * kChunks;
+    const uint32_t firstGroup = batch.firstRow / AlphabetSize;
+    const uint64_t chunkCount = (uint64_t) (batch.lastRow / AlphabetSize - firstGroup + 1) * kChunks;
     for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += (uint64_t) gridDim.x * blockDim.x) {
-        searchChunk<AlphabetSize, SuffixLen>(firstGroup + (uint32_t) (c / kChunks), (uint32_t) (c % kChunks), trailingLen, firstRow, lastRow,
-                                             firstRowStartK, lastRowEndK, targetA, params.seed1Start, params.seed2Start, bufs, sKey, sOrd);
+        searchChunk<AlphabetSize, SuffixLen>(firstGroup + (uint32_t) (c / kChunks), (uint32_t) (c % kChunks), trailingLen, batch.firstRow,
+                                             batch.lastRow, batch.firstRowStartK, batch.lastRowEndK, targetA, batch.seed1Start,
+                                             batch.seed2Start, batchIndex, bufs, sKey, sOrd);
     }
 }
 
@@ -270,12 +297,15 @@ __global__ void verifyMatchesKernel(
     int matchCount,
     uint32_t targetA,
     uint32_t targetB,
-    BatchParams params,
     DeviceBuffers bufs
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= matchCount)
         return;
+    // The hit's own batch's prefix and seeds - copied, since
+    // buildCompleteFilename (hash_kernels.cuh) needs a BatchParams whose
+    // address isn't taken.
+    const BatchParams params = bufs.params[bufs.matchBatch[i]];
 
     char candidate[MAX_CANDIDATE_LEN];
     indexToCandidate<AlphabetSize>(bufs.matchIdx[i], trailingLen, candidate);
@@ -373,6 +403,10 @@ public:
     void beginSearch(const SearchConstants& constants) override;
     BatchOutcome runBatch(int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params) override;
     void endSearch() override;
+    // NAMEBREAK_BATCHES_PER_LAUNCH (tuning.h) batches, each up to
+    // NAMEBREAK_ROWS_PER_LAUNCH rows, in one launch - see filteredRowsKernel.
+    int maxBatchesPerCall() const override { return NAMEBREAK_BATCHES_PER_LAUNCH; }
+    BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches) override;
 
 private:
     int alphabetSize_ = 0;
@@ -434,6 +468,8 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     // kernel launch.
     CUDA_CHECK(cudaMalloc(&bufs_.matches, MAX_MATCHES * MAX_FILENAME_LEN));
     CUDA_CHECK(cudaMalloc(&bufs_.matchIdx, MAX_MATCHES * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&bufs_.matchBatch, MAX_MATCHES * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&bufs_.params, kMaxBatchesPerLaunch * sizeof(BatchParams)));
     CUDA_CHECK(cudaMalloc(&bufs_.results, sizeof(BatchResults)));
     // A long-lived process (coordinator mode) runs many searches over its
     // lifetime, one per claimed range - zeroing this fresh allocation every
@@ -464,6 +500,8 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
 void CudaBackend::endSearch() {
     CUDA_CHECK(cudaFree(bufs_.matches));
     CUDA_CHECK(cudaFree(bufs_.matchIdx));
+    CUDA_CHECK(cudaFree(bufs_.matchBatch));
+    CUDA_CHECK(cudaFree(bufs_.params));
     CUDA_CHECK(cudaFree(bufs_.results));
     CUDA_CHECK(cudaFree(bufs_.filterTable));
     CUDA_CHECK(cudaFreeHost(pinnedResults_));
@@ -472,8 +510,17 @@ void CudaBackend::endSearch() {
 }
 
 BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params) {
+    return runBatches(trailingLen, {BatchRequest{startIdx, count, params}});
+}
+
+BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& requests) {
     const int alphabetSize = alphabetSize_;
+    const int batchCount = (int) requests.size();
     BatchOutcome outcome;
+    if (batchCount < 1 || batchCount > NAMEBREAK_BATCHES_PER_LAUNCH) {
+        fprintf(stderr, "INTERNAL ERROR: %d batches for one launch (1 to %d allowed) - exiting\n", batchCount, NAMEBREAK_BATCHES_PER_LAUNCH);
+        exit(1);
+    }
 
     // No pre-launch check of bufs_.results->foundFlag: beginSearch zeroes it
     // before the first batch, and a batch that finds a match reports it
@@ -483,39 +530,51 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
     // memset either. Each of those was a synchronous driver call in the gap
     // between two kernels.
 
-    // The range [startIdx, endIdx) covers rows firstRow..lastRow; only the
-    // first and last row can be partial (see filteredRowsKernel).
-    const uint64_t endIdx = startIdx + count;
-    const uint64_t firstRow = startIdx / alphabetSize;
-    const uint64_t lastRow = (endIdx - 1) / alphabetSize;
-    const uint64_t rowCount = lastRow - firstRow + 1;
-    if (lastRow > UINT32_MAX || rowCount > (1ull << 31)) {
-        fprintf(stderr, "Batch too large for the kernel's 32-bit row index (rows %llu..%llu) - exiting\n",
-                (unsigned long long) firstRow, (unsigned long long) lastRow);
-        exit(1);
+    // Each batch's range [start, start + count) covers its rows
+    // firstRow..lastRow; only the first and last row can be partial (see
+    // filteredRowsKernel).
+    LaunchBatches batches = {};
+    uint64_t maxGroups = 0;
+    for (int b = 0; b < batchCount; ++b) {
+        const uint64_t startIdx = requests[b].start;
+        const uint64_t endIdx = startIdx + requests[b].count;
+        const uint64_t firstRow = startIdx / alphabetSize;
+        const uint64_t lastRow = (endIdx - 1) / alphabetSize;
+        const uint64_t rowCount = lastRow - firstRow + 1;
+        if (requests[b].count == 0 || lastRow > UINT32_MAX || rowCount > (1ull << 31)) {
+            fprintf(stderr, "Batch too large for the kernel's 32-bit row index (rows %llu..%llu) - exiting\n",
+                    (unsigned long long) firstRow, (unsigned long long) lastRow);
+            exit(1);
+        }
+        LaunchBatch& batch = batches.batch[b];
+        batch.firstRow = (uint32_t) firstRow;
+        batch.lastRow = (uint32_t) lastRow;
+        batch.firstRowStartK = (int) (startIdx - firstRow * alphabetSize);
+        batch.lastRowEndK = (int) (endIdx - lastRow * alphabetSize); // in [1, alphabetSize]
+        batch.seed1Start = requests[b].params.seed1Start;
+        batch.seed2Start = requests[b].params.seed2Start;
+        maxGroups = std::max(maxGroups, lastRow / alphabetSize - firstRow / alphabetSize + 1);
     }
-    const int firstRowStartK = (int) (startIdx - firstRow * alphabetSize);
-    const int lastRowEndK = (int) (endIdx - lastRow * alphabetSize); // in [1, alphabetSize]
 
     bool supported = dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
         // A type alias rather than a constexpr local: MSVC treats a constexpr
         // local of this lambda read from the nested [&] lambda below as a
         // capture, so it's no longer a constant expression there (C2672).
         using AlphabetC = decltype(alphabetC);
-        // One GPU thread per chunk of every row group the range touches (see
-        // kChunksPerGroup) - about NAMEBREAK_ROWS_PER_THREAD rows each. The
-        // kernel works out the chunks itself and covers all of them whatever
-        // the grid, so this count only spreads the work. Every 32 consecutive
-        // threads form a "warp" that the hardware runs in lockstep (SIMT) -
-        // that grouping is automatic (256 threads/block = 8 warps/block here),
-        // not something chosen at this call site.
-        const uint64_t groups = lastRow / AlphabetC::value - firstRow / AlphabetC::value + 1;
-        const uint64_t threads = groups * kChunksPerGroup<AlphabetC::value>;
-        const unsigned blocks = (unsigned) ((threads + kThreadsPerBlock - 1) / kThreadsPerBlock);
+        // One row of blocks per batch (blockIdx.y), and in it one GPU thread
+        // per chunk of every row group the batch touches (see
+        // kChunksPerGroup) - about NAMEBREAK_ROWS_PER_THREAD rows each - as
+        // many as the largest batch needs. The kernel works out each batch's
+        // chunks itself and covers all of them whatever the grid, so this
+        // count only spreads the work. Every 32 consecutive threads form a
+        // "warp" that the hardware runs in lockstep (SIMT) - that grouping is
+        // automatic (256 threads/block = 8 warps/block here), not something
+        // chosen at this call site.
+        const uint64_t threads = maxGroups * kChunksPerGroup<AlphabetC::value>;
+        const dim3 blocks((unsigned) ((threads + kThreadsPerBlock - 1) / kThreadsPerBlock), (unsigned) batchCount);
         dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
             constexpr int SuffixLen = decltype(suffixC)::value;
-            filteredRowsKernel<AlphabetC::value, SuffixLen><<<blocks, kThreadsPerBlock>>>(
-                    trailingLen, (uint32_t) firstRow, (uint32_t) lastRow, firstRowStartK, lastRowEndK, targetA_, params, bufs_);
+            filteredRowsKernel<AlphabetC::value, SuffixLen><<<blocks, kThreadsPerBlock>>>(trailingLen, batches, targetA_, bufs_);
         });
     });
     if (!supported) {
@@ -535,20 +594,26 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
     outcome.hitCount = h_results.matchCount;
 
     // Hits are rare (a few per thousand batches), so everything below is the
-    // exception path - the common batch costs exactly the one copy above.
+    // exception path - the common launch costs exactly the one copy above.
     if (h_results.matchCount > MAX_MATCHES) {
         // More hits than bufs_.matchIdx can record: the excess would never reach
         // verifyMatchesKernel. Nothing from this launch has been verified, so
-        // leave it all to the engine to search again in halves.
+        // leave it all to the engine to search again in smaller pieces.
         CUDA_CHECK(cudaMemset(&bufs_.results->matchCount, 0, sizeof(int)));
         return outcome;
     }
     if (h_results.matchCount > 0) {
         const int recorded = h_results.matchCount;
 
+        // Each hit's batch's prefix, for the filename verifyMatchesKernel builds.
+        std::vector<BatchParams> params(batchCount);
+        for (int b = 0; b < batchCount; ++b)
+            params[b] = requests[b].params;
+        CUDA_CHECK(cudaMemcpy(bufs_.params, params.data(), batchCount * sizeof(BatchParams), cudaMemcpyHostToDevice));
+
         dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
             constexpr int AlphabetSize = decltype(alphabetC)::value;
-            verifyMatchesKernel<AlphabetSize><<<(recorded + 63) / 64, 64>>>(trailingLen, recorded, targetA_, targetB_, params, bufs_);
+            verifyMatchesKernel<AlphabetSize><<<(recorded + 63) / 64, 64>>>(trailingLen, recorded, targetA_, targetB_, bufs_);
         });
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -561,12 +626,12 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
         // verifyMatchesKernel is what sets foundFlag, so re-read it now.
         CUDA_CHECK(cudaMemcpy(&h_results, bufs_.results, sizeof(h_results), cudaMemcpyDeviceToHost));
 
-        // Restores the "matchCount is 0 at launch" invariant the next batch relies on.
+        // Restores the "matchCount is 0 at launch" invariant the next launch relies on.
         CUDA_CHECK(cudaMemset(&bufs_.results->matchCount, 0, sizeof(int)));
     }
 
-    // Read after this batch's own kernels have finished, so a match found by
-    // *this* batch is reported now instead of going undetected until
+    // Read after this launch's own kernels have finished, so a match found by
+    // *this* launch is reported now instead of going undetected until
     // whatever call happens to come after it, which may never come (e.g. a
     // "bounded" search whose very last batch is the one that finds it would
     // otherwise report "not found").

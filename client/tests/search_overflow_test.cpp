@@ -16,6 +16,11 @@
 //    never reported),
 //  * the fallback is announced (a "note:"), nothing is silently dropped, and
 //    the kernels never disagree with the reference hashing path,
+//  * a backend that searches several batches at once (see
+//    SearchBackend::maxBatchesPerCall) overflows when their hits *together*
+//    are too many, though no batch's alone are - and each batch must then be
+//    searched again on its own, whether their leading values are adjacent or
+//    a pruned one lies between them,
 //  * and it doesn't poison the next runSearch() call (matchCount is reset).
 //
 // Calls the real runSearch(), which does fopen("matches.txt", "a") relative
@@ -207,6 +212,105 @@ int main(int argc, char** argv) {
                 CHECK(std::find(reported.begin(), reported.end(), winner) != reported.end(), "and reported");
                 if (which == 1) // the later one: the earlier hit precedes it, so it must have been reported too
                     CHECK(reported.size() == 2 && reported[0] == c1 && reported[1] == c2, "with the earlier hit reported before it");
+                CHECK(noKernelDisagreement(log), "no kernel/reference disagreement warnings");
+            }
+        }
+    }
+
+    // Batches searched together (SearchBackend::maxBatchesPerCall): a pair in
+    // two different leading values, so in two batches of one launch, whose
+    // hits overflow MAX_MATCHES together though neither batch's alone do - each
+    // batch must then be searched again on its own. Once with the two leading
+    // values adjacent ("...(" and "...)"), once with a pruned one between them
+    // ("...(" and "...+", with "...)" - a closer nothing opened - pruned).
+    {
+        const int trailingLen = std::min(len, g_backend->windowChars());
+        const int leadingLen = len - trailingLen;
+        if (leadingLen < 1) {
+            fprintf(stderr, "TEST BUG: candidate length %d leaves no leading characters with a %d-character window\n", len, trailingLen);
+            return 1;
+        }
+        uint64_t trailSpace = 1;
+        for (int i = 0; i < trailingLen; ++i)
+            trailSpace *= alphabet.size();
+        const std::string leadingBase(leadingLen - 1, 'A');
+        auto leadingIndex = [&](const std::string& leading) {
+            uint64_t index = 0;
+            std::string err;
+            stringToIndex(leading, alphabet, index, err);
+            return index;
+        };
+        const uint64_t first = leadingIndex(leadingBase + "(") * trailSpace;
+        // hashA of the last 2 million candidates of "...(", then the first
+        // candidate of `leading` that collides with one of them.
+        const uint64_t tail = std::min<uint64_t>(2'000'000, trailSpace);
+        std::unordered_map<uint32_t, uint64_t> tailHashes;
+        for (uint64_t i = first + trailSpace - tail; i < first + trailSpace; ++i)
+            tailHashes.emplace(hashA(prefix + indexToString(i, len, alphabet) + suffix), i);
+        struct Pair { uint64_t earlier, later; uint32_t hash; };
+        auto findPair = [&](const std::string& leading, Pair& pair) {
+            const uint64_t start = leadingIndex(leading) * trailSpace;
+            for (uint64_t i = start; i < start + trailSpace && i < start + 10'000'000; ++i) {
+                const uint32_t h = hashA(prefix + indexToString(i, len, alphabet) + suffix);
+                auto it = tailHashes.find(h);
+                if (it != tailHashes.end()) {
+                    pair = {it->second, i, h};
+                    return true;
+                }
+            }
+            return false;
+        };
+        // Every hit in [lo, hi] - skipping the leading value `skipped`, if any
+        // - by brute force: normally just the pair, but it's the ground truth.
+        auto hitsIn = [&](uint64_t lo, uint64_t hi, uint32_t target, uint64_t skippedLeading) {
+            std::vector<std::string> hits;
+            for (uint64_t i = lo; i <= hi; ++i) {
+                if (i / trailSpace == skippedLeading) {
+                    i = (skippedLeading + 1) * trailSpace - 1;
+                    continue;
+                }
+                const std::string cand = indexToString(i, len, alphabet);
+                if (hashA(prefix + cand + suffix) == target)
+                    hits.push_back(cand);
+            }
+            return hits;
+        };
+        const bool grouped = g_backend->maxBatchesPerCall() > 1;
+        const std::string groupNote = "batches searched together";
+        const uint64_t none = UINT64_MAX;
+
+        struct Scenario { const char* what; std::string later; bool pruneBrackets; };
+        const Scenario scenarios[] = {
+            {"adjacent leading values", leadingBase + ")", false},
+            {"a pruned leading value between them", leadingBase + "+", true},
+        };
+        for (const Scenario& sc : scenarios) {
+            Pair pair;
+            if (!findPair(sc.later, pair)) {
+                fprintf(stderr, "TEST BUG: no hashA collision between the ends of '%s(' and '%s'\n", leadingBase.c_str(), sc.later.c_str());
+                return 1;
+            }
+            const std::string e = indexToString(pair.earlier, len, alphabet), l = indexToString(pair.later, len, alphabet);
+            printf("pair across %s: '%s' / '%s' (hashA 0x%08X)\n", sc.what, e.c_str(), l.c_str(), pair.hash);
+            const uint64_t skipped = sc.pruneBrackets ? leadingIndex(leadingBase + ")") : none;
+            const std::vector<std::string> expected = hitsIn(pair.earlier, pair.later, pair.hash, skipped);
+            if (expected.size() < 2 || expected.front() != e || expected.back() != l || hashB(prefix + e + suffix) == hashB(prefix + l + suffix)) {
+                fprintf(stderr, "TEST BUG: the pair across %s isn't as expected\n", sc.what);
+                return 1;
+            }
+            for (int which = 0; which < 2; ++which) {
+                const std::string& winner = which == 0 ? e : l;
+                printf("--- 2 hits in 2 batches, across %s; hashB selects the %s ---\n", sc.what, which == 0 ? "earlier" : "later");
+                SearchRequest req = makeRequest(pair.hash, hashB(prefix + winner + suffix), pair.earlier, pair.later);
+                req.pruneUnopenedBrackets = sc.pruneBrackets;
+                SearchResult r; std::vector<std::string> reported;
+                std::string log = runCaptured(req, r, reported);
+                CHECK(r.ok && r.found && r.filename == prefix + winner + suffix, "the hashB-matching hit is found");
+                // Reported in enumeration order, up to the found one.
+                std::vector<std::string> want(expected.begin(), std::find(expected.begin(), expected.end(), winner) + 1);
+                CHECK(reported == want, "every hit up to it reported, once each, in enumeration order");
+                if (grouped)
+                    CHECK(log.find(groupNote) != std::string::npos, "the batches were searched again one by one, announced");
                 CHECK(noKernelDisagreement(log), "no kernel/reference disagreement warnings");
             }
         }

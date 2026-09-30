@@ -320,7 +320,10 @@ list(APPEND ROW_BACKENDS cpu)
 # Each also splits the CUDA kernel's row groups differently
 # (NAMEBREAK_ROWS_PER_THREAD, see kChunksPerGroup in cuda_backend.cu): 3 rows
 # per thread (uneven chunks, cut up by the tiny launches), 1 (a thread per
-# row), and 64 (a thread per whole group). All three also make the cpu backend
+# row), and 64 (a thread per whole group) - and searches its batches
+# (NAMEBREAK_BATCHES_PER_LAUNCH, see runBatches in cuda_backend.cu) 3, 5 and
+# 32 at a time: with batches of a few rows, a launch then often spans several
+# leading values, with pruned ones between them. All three also make the cpu backend
 # split every batch, however small, across its threads, and window2 makes it
 # use its portable (non-AVX2) code.
 namebreak_test_executable(search_integration_test tests/search_integration_test.cpp namebreak_search)
@@ -329,9 +332,9 @@ foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
 endforeach()
 if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
     foreach(config IN ITEMS
-            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_ROWS_PER_THREAD=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
-            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_ROWS_PER_THREAD=1;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_CPU_NO_AVX2"
-            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_ROWS_PER_THREAD=64;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
+            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_ROWS_PER_THREAD=3;NAMEBREAK_BATCHES_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
+            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_ROWS_PER_THREAD=1;NAMEBREAK_BATCHES_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_CPU_NO_AVX2"
+            "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_ROWS_PER_THREAD=64;NAMEBREAK_BATCHES_PER_LAUNCH=32;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
         list(POP_FRONT config suffix)
         namebreak_search_library(namebreak_search_${suffix} ${config})
         namebreak_test_executable(search_integration_test_${suffix} tests/search_integration_test.cpp namebreak_search_${suffix})
@@ -356,7 +359,10 @@ endforeach()
 # backends only - `reference` ignores all of these values) mirror the
 # integration test's geometries, plus a lookup filter of a single bit
 # (NAMEBREAK_LOWBITS_FILTER_BITS=1), which lets about half of every row
-# through to be hashed in full.
+# through to be hashed in full, and small_launch's geometry with room for a
+# single hit per launch (MAX_MATCHES=1), so that batches - and batches
+# searched together - overflow all the time, and the engine's fallbacks of
+# searching them again in halves, or one by one, run on random ranges.
 set(STRESS_BACKENDS ${ROW_BACKENDS})
 set(STRESS_DEFINITIONS NAMEBREAK_HASHA_MATCH_BITS=12)
 namebreak_search_library(namebreak_search_stress ${STRESS_DEFINITIONS})
@@ -365,11 +371,12 @@ foreach(backend IN LISTS STRESS_BACKENDS ITEMS reference)
     namebreak_test(stress-${backend} search_stress_test --backend ${backend})
 endforeach()
 if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
-    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
-    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_ROWS_PER_THREAD=1 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_CPU_NO_AVX2)
-    set(STRESS_window6 NAMEBREAK_GPU_WINDOW_CHARS=6 NAMEBREAK_ROWS_PER_THREAD=64 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_ROWS_PER_THREAD=1 NAMEBREAK_BATCHES_PER_LAUNCH=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_CPU_NO_AVX2)
+    set(STRESS_window6 NAMEBREAK_GPU_WINDOW_CHARS=6 NAMEBREAK_ROWS_PER_THREAD=64 NAMEBREAK_BATCHES_PER_LAUNCH=32 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
     set(STRESS_filter1 NAMEBREAK_LOWBITS_FILTER_BITS=1)
-    foreach(variant IN ITEMS small_launch window2 window6 filter1)
+    set(STRESS_overflow MAX_MATCHES=1 NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    foreach(variant IN ITEMS small_launch window2 window6 filter1 overflow)
         namebreak_search_library(namebreak_search_stress_${variant} ${STRESS_DEFINITIONS} ${STRESS_${variant}})
         namebreak_test_executable(search_stress_test_${variant} tests/search_stress_test.cpp namebreak_search_stress_${variant})
         foreach(backend IN LISTS STRESS_BACKENDS)
@@ -407,10 +414,12 @@ add_custom_target(run_search_bench COMMAND search_bench ${SEARCH_BENCH_ARGS} WOR
 
 # Mutation testing (tests/mutation_test.py) - not a ctest test: it builds
 # a copy of the client per mutation, with a GPU kernel broken on purpose, and
-# checks that the self-test, the integration test and the stress test each
-# catch every one. About seven minutes each on the RTX 3080 Ti Laptop: `cmake
-# --build --preset default --target run_mutation_test` (the CUDA or HIP
-# kernel) or run_mutation_test_opencl, after any change to the kernel.
+# checks that the self-test, the integration test and the stress test (and,
+# for the ones only it can see, the overflow test) catch every one. About
+# twelve minutes for CUDA's list and four for OpenCL's on the RTX 3080 Ti
+# Laptop: `cmake --build --preset default --target run_mutation_test` (the
+# CUDA or HIP kernel) or run_mutation_test_opencl, after any change to the
+# kernel.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND AND WITH_OPENCL)
     add_custom_target(run_mutation_test_opencl COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mutation_test.py --backend opencl

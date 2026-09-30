@@ -32,6 +32,14 @@ struct BatchParams {
     uint32_t seed2Start;         // mpqHashWithPrefixCache_CPU / IncrementalPrefixHasher
 };
 
+// One runBatch() call's worth of work: the candidates whose trailing index is
+// in [start, start + count), after params' prefix - see runBatches.
+struct BatchRequest {
+    uint64_t start;
+    uint64_t count;
+    BatchParams params;
+};
+
 // Everything that stays the same for a whole search.
 struct SearchConstants {
     std::string alphabet;
@@ -41,7 +49,7 @@ struct SearchConstants {
     uint32_t targetHashB = 0;
 };
 
-// What one runBatch() call found.
+// What one runBatch() (or runBatches()) call found.
 struct BatchOutcome {
     // How many candidates matched hashA. If this is more than MAX_MATCHES,
     // nothing below is filled in (no hit has been checked against hashB) and
@@ -83,6 +91,19 @@ public:
     // (count > 0), each preceded by params' prefix and followed by the suffix.
     virtual BatchOutcome runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) = 0;
     virtual void endSearch() = 0;
+
+    // How many batches runBatches() takes at once. A GPU backend can search
+    // several leading values' batches in one launch, which is longer than one
+    // batch's - a launch's fixed cost, the GPU idle between two of them, then
+    // matters less. With 1 (the default) the engine only calls runBatch().
+    virtual int maxBatchesPerCall() const { return 1; }
+    // Searches every batch of `batches` (at most maxBatchesPerCall() of them,
+    // all of trailingLen characters), exactly as runBatch() would each, and
+    // reports what they found together: hitCount is their total, and if it's
+    // more than MAX_MATCHES nothing else is filled in, and the caller must
+    // search each batch again on its own. The default calls runBatch() for
+    // each.
+    virtual BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches);
 };
 
 // `backend`'s supported alphabet sizes, for a message: "42, 43 or 50".
