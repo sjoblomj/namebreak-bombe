@@ -199,6 +199,11 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
         // trailingLen is validated against kMaxTrailingLen (== 6) by runSearch
     }
     const bool rowsHaveCharacters = trailingLen > 1;
+    // If Listed, bit i: the chunk's i-th row isn't pruned - in the narrowest
+    // integer a chunk's rows fit, shifted one row on at a time, which costs
+    // less than testing bit d of the 64-bit rowMask every row.
+    using ChunkRowBits = std::conditional_t<(AlphabetSize + kChunks - 1) / kChunks <= 32, uint32_t, uint64_t>;
+    ChunkRowBits rowBits = (ChunkRowBits) (rowMask >> dBegin);
 
     for (int d = dBegin; d < dEnd; ++d) {
         uint32_t seed1 = group1;
@@ -218,9 +223,10 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
         // around every row cost about 4% more (measured with no row pruned).
         // Whole row groups are left out by the list the chunks come from.
         uint64_t mask;
-        if constexpr (Listed)
-            mask = ((rowMask >> d) & 1) ? __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]) : 0;
-        else
+        if constexpr (Listed) {
+            mask = (rowBits & 1) ? __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]) : 0;
+            rowBits >>= 1;
+        } else
             mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
         mask &= (uint64_t(1) << AlphabetSize) - 1;
         if (d == firstRowD)

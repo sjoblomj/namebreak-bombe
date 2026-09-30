@@ -143,11 +143,31 @@ will have grown (not measured again).
   bits about 1,770 G candidates/s, 7 about 1,800, 8 about 1,550, 9 about
   1,580, 10 about 390. The table's reads cost more than the divergence, so
   the default is now 7 (a 128 KB table): **+16-18%**, in every pair of runs.
-  - [ ] **Warp-cooperative verification** (collect the flagged candidates
-    of all 32 lanes with a ballot, then have each lane verify one) is still
-    possible, but now works against a table at 7 bits, where twice as many
-    candidates are flagged: worth trying only after **Where the table
-    lives**, which the sweep shows matters more.
+  - [x] **Warp-cooperative verification** (collect the flagged candidates
+    of all 32 lanes with a ballot, then have each lane verify one): tried
+    after the profile (see **Profile**), which has the verify loop at about
+    half of the kernel's instructions with most of a warp's lanes idle in
+    it. **Measured slower**, in both forms, with Nsight Compute on one
+    launch of 16 leading values (the kernel as it is: 374M instructions,
+    3.62 ms at the profiler's fixed clocks) and `search_bench --scale 40`:
+    - A queue per warp in shared memory: each row, every lane appends its
+      flagged candidates with a ballot (a round per candidate a lane has -
+      2.05 rounds a row, as a row's 32 lanes nearly always include one with
+      two), and the warp verifies them 32 at a time. 597M instructions, 5.63
+      ms; **39% slower**. A round of appending costs about 45 instructions,
+      more than verifying the candidate (about 22), and the queue's 7 KB a
+      block took L1 from the table: 22% hits instead of 58%.
+    - Just the rows in step: every lane of a warp going through the same
+      number of rows, and the verify loop gone round by the whole warp
+      (`__any_sync`) or followed by `__syncwarp()`. The rows then ran at
+      full width (2.94M table reads a launch instead of 5.61M) - but 500M
+      instructions, 4.8 ms: **17% slower**. Keeping a warp together cost
+      more (the warp-wide loop, a vote each round, bookkeeping every lane
+      executes) than the split warps' idle lanes did: 9.7G thread
+      instructions against 5.3G.
+    So the kernel's split warps are cheaper than they look. Not tried: a
+    verify loop over two or more rows' candidates together (fewer rounds,
+    at the price of choosing each candidate's row and more registers).
   - [ ] **Re-sweep on the other backends.** 7 applies to all of them (the
     table is shared). OpenCL on this GPU gains too - **measured** about
     1,453 G candidates/s against 1,325 at 8 bits (+9-10%, three pairs) - but
@@ -309,9 +329,47 @@ will have grown (not measured again).
   compiler does for constants). That would drop `SupportedAlphabetSizes`
   and its "rebuild for a new size" step, and cut compile time. A feature
   more than a speedup.
-- [ ] **Profile.** Nothing here has been checked with Nsight Compute yet:
-  whether the filtered kernel is now bound by integer throughput, L2
-  latency, or divergence would rank the items above.
+- [x] **Profile.** Nsight Compute 2025.2 (`--set full`) on single
+  launches of 16 leading values of `filteredRowsKernel<49, 4>`, walking every
+  row group and walking lists (`search_bench --scale 2`, with and without
+  `--whole`; ncu locks the clocks at the base 585 MHz, so only ratios
+  count). Reading the counters needs root unless
+  `options nvidia NVreg_RestrictProfilingToAdminUsers=0` is in
+  `/etc/modprobe.d/` (it is on the development machine now). **Measured**:
+  - **Bound by instruction issue**, not memory: the SMs are busy 80% of the
+    time, at 3.05 instructions a cycle of 4, and the top stall is "not
+    selected" (3.1 warps waiting per instruction issued - there's always
+    another warp ready), then math pipe throttle and the table lookup's
+    latency (the AND after the `LDG` of the table gets 21% of the stall
+    samples, but other warps hide it). Occupancy 93%, 30 registers, L2 59%
+    busy and all hits, L1 58% hits, DRAM idle. So what counts is how many
+    instructions are issued - and **Where the table lives** can't gain much.
+  - **Most lanes are idle**: 374M instructions a launch, 5.27G thread
+    instructions - 14 of a warp's 32 threads active on average. The rows
+    run at half width: 5.61M table reads a launch, 47.7 per warp for the
+    24 or 25 rows of each lane, so the lanes with a group's first chunk and
+    those with its second go through their rows separately; at 29
+    instructions a row that's 44% of the instructions, and the verify loop
+    most of the rest. (The source view's per-instruction counts, which come
+    from instrumenting the code, add up to 538M for this kernel - more than
+    it could issue in the time it took - so only the hardware counters are
+    quoted here.) Filling the lanes measured slower both ways it was tried:
+    see **Warp-cooperative verification**.
+  - **The list-walking kernel** (`Listed`) issued 35 instructions per row
+    where the other issues 29: the 64-bit test of a row's bit in the row
+    mask, most of its 5%. Now a chunk's row bits are shifted into a mask of
+    their own once (32 bits on CUDA, whose chunks have at most 25 rows) and
+    it moves on one bit per row. **Measured**: 333M instructions a launch
+    instead of 342M, 3.26 ms instead of 3.37; `search_bench --whole` 1.3%
+    faster on CUDA (five pairs, all faster) and 1.2% on OpenCL (four
+    pairs, all faster), and the same without `--whole`. Metal has it too.
+  - Two cheaper rows and verify rounds, **measured**: the first and last
+    row's cut applied only in a batch's first and last group (a branch per
+    chunk rather than 8 instructions per row): 378M instructions, 3.68 ms -
+    no gain. The highest flagged bit instead of the lowest (one bit scan of
+    whichever half isn't zero, and an XOR to clear it): 372M, 3.53 ms, but
+    in `search_bench` 0.4% faster and 1.6% with `--whole` - within the
+    noise, so left out.
 - [ ] **Micro-optimizations in the verify path.** The last suffix step's XOR
   and `+ 3` could be folded into the constant it's compared with. They were
   worth about a quarter of the old kernel's instructions, but they're only
