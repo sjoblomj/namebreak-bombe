@@ -127,7 +127,7 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
 #if LISTED
         const uint entry = batchGroups[c / CHUNKS_PER_GROUP];
         const uint group = entry >> ROW_FLAG_BITS;
-        // Bit d: row d isn't pruned.
+        // Bit d: row d of the group isn't pruned.
         const ulong rowMask = sRowMasks[entry & (ROW_FLAG_COUNT - 1)];
 #else
         const uint group = firstGroup + (uint) (c / CHUNKS_PER_GROUP);
@@ -164,6 +164,11 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
             MPQ_STEP(group1, group2, sKey[digit[i]], sOrd[digit[i]]);
 #endif
 
+#if LISTED
+        // Bit i: the chunk's i-th row isn't pruned - shifted on one row at a
+        // time, which costs less than testing bit d of rowMask every row.
+        ulong rowBits = rowMask >> dBegin;
+#endif
         for (int d = dBegin; d < dEnd; ++d) {
             uint seed1 = group1, seed2 = group2;
 #if TRAILING_LEN > 1
@@ -180,7 +185,8 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
             // their rows together, so skipping one would save its thread
             // nothing (as in the CUDA kernel, whose comment has more).
 #if LISTED
-            ulong mask = ((rowMask >> d) & 1ul) ? filterTable[FILTER_INDEX(seed1, seed2)] : 0ul;
+            ulong mask = (rowBits & 1ul) ? filterTable[FILTER_INDEX(seed1, seed2)] : 0ul;
+            rowBits >>= 1;
 #else
             ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];
 #endif

@@ -226,9 +226,11 @@ CUDA_MUTATIONS = [
     Mutation("rowflags", "every list entry's flags taken as none",
              [(KERNEL, "sRowMasks[entry & (kRowFlagCount - 1)]", "sRowMasks[0]")]),
     Mutation("rowbit", "a row pruned or not by the next row's bit",
-             [(KERNEL, "((rowMask >> d) & 1) ?", "((rowMask >> (d + 1)) & 1) ?")]),
+             [(KERNEL, "ChunkRowBits rowBits = (ChunkRowBits) (rowMask >> dBegin);", "ChunkRowBits rowBits = (ChunkRowBits) (rowMask >> (dBegin + 1));")]),
     # Only a launch whose batches start in different states can tell - the
     # stress test's random ranges rarely give one.
+    Mutation("rowshift", "a chunk's row bits never moved on to the next row",
+             [(KERNEL, "            rowBits >>= 1;\n", "")]),
     Mutation("sliceentry", "every batch of a launch pruned as the first one",
              [(KERNEL, "rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry,",
                "rowPruning_.groupsFor(trailingLen, requests[0].params.pruneEntry,")],
@@ -333,9 +335,11 @@ OPENCL_MUTATIONS = [
     Mutation("rowflags", "every list entry's flags taken as none",
              [(CL_KERNEL, "sRowMasks[entry & (ROW_FLAG_COUNT - 1)]", "sRowMasks[0]")]),
     Mutation("rowbit", "a row pruned or not by the next row's bit",
-             [(CL_KERNEL, "((rowMask >> d) & 1UL) ?", "((rowMask >> (d + 1)) & 1UL) ?")]),
+             [(CL_KERNEL, "ulong rowBits = rowMask >> dBegin;", "ulong rowBits = rowMask >> (dBegin + 1);")]),
     # Only a launch whose batches start in different states can tell - the
     # stress test's random ranges rarely give one.
+    Mutation("rowshift", "a chunk's row bits never moved on to the next row",
+             [(CL_KERNEL, "            rowBits >>= 1;\n", "")]),
     Mutation("sliceentry", "every batch of a launch pruned as the first one",
              [(CL_HOST, "rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry,",
                "rowPruning_.groupsFor(trailingLen, requests[0].params.pruneEntry,")],
@@ -419,7 +423,9 @@ METAL_MUTATIONS = [
     Mutation("rowflags", "every list entry's flags taken as none",
              [(MTL_KERNEL, "sRowMasks[entry & (ROW_FLAG_COUNT - 1)]", "sRowMasks[0]")]),
     Mutation("rowbit", "a row pruned or not by the next row's bit",
-             [(MTL_KERNEL, "((rowMask >> d) & 1ul) ?", "((rowMask >> (d + 1)) & 1ul) ?")]),
+             [(MTL_KERNEL, "ulong rowBits = rowMask >> dBegin;", "ulong rowBits = rowMask >> (dBegin + 1);")]),
+    Mutation("rowshift", "a chunk's row bits never moved on to the next row",
+             [(MTL_KERNEL, "            rowBits >>= 1;\n", "")]),
     Mutation("stalelists", "the lists on the GPU kept when they're cleared for another alphabet",
              [(MTL_HOST, "if (rowPruning_.generation() != groupsGeneration_) {", "if (false) {")]),
 ] + ROW_PRUNING_MUTATIONS
