@@ -152,11 +152,26 @@ will have grown (not measured again).
   cache already keeps most of a 32-128 KB table close. Reverted; the table
   stays in global memory, read with `__ldg`. (6 bits through the cache
   measured close to 7 again - within the runs' noise.)
-- [ ] **Gaps between launches (~5%, measured).** One launch per leading
-  value, synchronized and read back before the next. Either launch several
-  leading values at once (a 2D grid over an array of their seeds and
-  prefixes), or keep two launches in flight with double-buffered results.
-  *Estimated* +5%, and it makes the next item cheap.
+- [ ] **Gaps between launches (~9%, measured).** One launch per leading
+  value, synchronized and read back before the next. Measured again after
+  the filter, the row groups and the 7-bit table (Nsight Systems,
+  `search_bench --scale 5`): a launch - one leading value, 49^4 rows -
+  takes 0.13 ms, and the GPU then idles 11.6 us (median) before the next,
+  9.7% of the time. Almost all of it is the round trip: the kernel ends,
+  the host wakes, reads the 8-byte result and launches the next; the
+  host's own work in between is under a microsecond.
+  - [x] **Queue the result's copy behind the kernel**, into pinned memory,
+    instead of a blocking `cudaMemcpy` after the wait: **measured** 1.6 us
+    off the gap (10.0 us, 9.1% idle).
+  - [ ] **Fewer, longer launches**: the next item. A 6-character window and
+    a bigger `NAMEBREAK_ROWS_PER_LAUNCH` would make a launch about 1 ms,
+    and the same gap about 1% (*estimated*).
+  - [ ] **Keep the next launch queued** while this one's results are read:
+    a launch/collect pair beside `runBatch`, with two sets of result
+    buffers, so the GPU never waits. It reshapes the engine's search loop
+    (the split on too many hits, pause, abort, a match found with a batch
+    in flight) and needs its own tests and mutations - worth it only if
+    the gaps still matter after longer launches.
 - [ ] **Re-tune the window and launch size.** `NAMEBREAK_GPU_WINDOW_CHARS`
   (5) and `NAMEBREAK_ROWS_PER_LAUNCH` were chosen with the kernel as it was
   before the filter, whose launches took about seven times as long as now.

@@ -19,6 +19,9 @@
 #define cudaFree hipFree
 #define cudaMemset hipMemset
 #define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+#define cudaFreeHost hipHostFree
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 // HIP takes a __device__/__constant__ variable's address, via HIP_SYMBOL,

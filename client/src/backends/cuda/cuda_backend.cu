@@ -379,6 +379,9 @@ private:
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
     uint32_t targetB_ = 0;
+    // The batch's results, copied back into pinned host memory by a copy
+    // queued behind the kernel (see runBatch).
+    BatchResults* pinnedResults_ = nullptr;
     DeviceBuffers bufs_ = {};
 };
 
@@ -439,6 +442,7 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     // falsely report "found" immediately. It also establishes the
     // "matchCount is 0 at launch" invariant runBatch maintains from here.
     CUDA_CHECK(cudaMemset(bufs_.results, 0, sizeof(BatchResults)));
+    CUDA_CHECK(cudaMallocHost((void**) &pinnedResults_, sizeof(BatchResults)));
 
     // This search's lookup filter - it depends on the alphabet, the suffix and
     // the target, so it's built for every search. Checked against its
@@ -462,6 +466,8 @@ void CudaBackend::endSearch() {
     CUDA_CHECK(cudaFree(bufs_.matchIdx));
     CUDA_CHECK(cudaFree(bufs_.results));
     CUDA_CHECK(cudaFree(bufs_.filterTable));
+    CUDA_CHECK(cudaFreeHost(pinnedResults_));
+    pinnedResults_ = nullptr;
     bufs_ = {};
 }
 
@@ -518,14 +524,18 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
         exit(1);
     }
     CUDA_CHECK(cudaGetLastError());
+    // The results' copy is queued right behind the kernel, into pinned memory,
+    // so the GPU starts it the moment the kernel ends and one wait covers
+    // both - a blocking cudaMemcpy after the wait cost the GPU another round
+    // trip, idle, between every two launches (about 6 of the 11 us, measured).
+    CUDA_CHECK(cudaMemcpyAsync(pinnedResults_, bufs_.results, sizeof(BatchResults), cudaMemcpyDeviceToHost, 0));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    BatchResults h_results;
-    CUDA_CHECK(cudaMemcpy(&h_results, bufs_.results, sizeof(h_results), cudaMemcpyDeviceToHost));
+    BatchResults h_results = *pinnedResults_;
     outcome.hitCount = h_results.matchCount;
 
     // Hits are rare (a few per thousand batches), so everything below is the
-    // exception path - the common batch costs exactly the one cudaMemcpy above.
+    // exception path - the common batch costs exactly the one copy above.
     if (h_results.matchCount > MAX_MATCHES) {
         // More hits than bufs_.matchIdx can record: the excess would never reach
         // verifyMatchesKernel. Nothing from this launch has been verified, so
