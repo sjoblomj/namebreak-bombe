@@ -139,10 +139,19 @@ will have grown (not measured again).
     table is shared). OpenCL on this GPU gains too - **measured** about
     1,453 G candidates/s against 1,325 at 8 bits (+9-10%, three pairs) - but
     Metal on a Mac and HIP on AMD may each prefer another width.
-- [ ] **Where the table lives.** 512 KB is read through the read-only cache,
-  mostly from L2. A 6-bit table (32 KB) would fit in shared memory, if
-  blocks were long-lived enough to load it once (a grid-stride loop).
-  Measure against the above.
+- [x] **Where the table lives.** Tried: a 6-bit table (32 KB) copied into
+  each block's shared memory, with the grid capped at 116, 174 or 348
+  blocks (2, 3 or 6 per SM) so each block loads it once and walks many
+  chunks with the kernel's grid-stride loop. **Measured slower**
+  (`search_bench --scale 20`, interleaved, three runs each): 1,385, 1,220
+  and 1,480 G candidates/s, against 1,880 for the same 6-bit table read
+  through the read-only cache and 1,790-1,970 for the shipped 7 bits.
+  32 KB of shared memory per block leaves at most 3 blocks (768 threads) per
+  SM, too few to hide the hash's latency, and random 64-bit reads from
+  shared memory conflict between a warp's lanes - while the read-only
+  cache already keeps most of a 32-128 KB table close. Reverted; the table
+  stays in global memory, read with `__ldg`. (6 bits through the cache
+  measured close to 7 again - within the runs' noise.)
 - [ ] **Gaps between launches (~5%, measured).** One launch per leading
   value, synchronized and read back before the next. Either launch several
   leading values at once (a 2D grid over an array of their seeds and
