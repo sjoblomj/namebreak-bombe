@@ -164,20 +164,39 @@ will have grown (not measured again).
   - [x] **Queue the result's copy behind the kernel**, into pinned memory,
     instead of a blocking `cudaMemcpy` after the wait: **measured** 1.6 us
     off the gap (10.0 us, 9.1% idle).
-  - [ ] **Fewer, longer launches**: the next item. A 6-character window and
-    a bigger `NAMEBREAK_ROWS_PER_LAUNCH` would make a launch about 1 ms,
-    and the same gap about 1% (*estimated*).
+  - [x] **Fewer, longer launches**, from a wider window: **measured** a
+    wash - the gaps it recovers are paid back in pruning (see the next
+    item).
+  - [ ] **Several leading values per launch**: a 2D grid over an array of
+    the unpruned leading values' seeds and prefixes, so launches get
+    longer while the CPU still prunes all 5 leading characters. Worth about
+    what window 6 gained in search rate, +5% (*estimated* from the above),
+    without its cost. It changes what a batch is (the engine hands the
+    backend several leading values at once), so it needs the same care as
+    queuing the next launch.
   - [ ] **Keep the next launch queued** while this one's results are read:
     a launch/collect pair beside `runBatch`, with two sets of result
     buffers, so the GPU never waits. It reshapes the engine's search loop
     (the split on too many hits, pause, abort, a match found with a batch
     in flight) and needs its own tests and mutations - worth it only if
     the gaps still matter after longer launches.
-- [ ] **Re-tune the window and launch size.** `NAMEBREAK_GPU_WINDOW_CHARS`
+- [x] **Re-tune the window and launch size.** `NAMEBREAK_GPU_WINDOW_CHARS`
   (5) and `NAMEBREAK_ROWS_PER_LAUNCH` were chosen with the kernel as it was
   before the filter, whose launches took about seven times as long as now.
-  `NAMEBREAK_ROWS_PER_THREAD` (25) interacts with both: a smaller window
-  means fewer rows per launch, so fewer threads.
+  Measured with the fixed `search_bench` (`--scale 40`): a 6-character
+  window, with 2^23, 2^25, 2^27 or 2^29 rows per launch (the last is one
+  launch per leading value, about 7 ms). Longer launches do recover the
+  gaps - window 6 with 2^29 rows searched **+4.5 to +5.7% faster** than
+  window 5 in each of six alternating pairs - but a window one wider leaves
+  one leading character fewer for the CPU to prune: 16.45% of 4-character
+  leading values are pruned, against 20.25% of 5-character ones (and
+  12.41% against 16.45% at the real search's length of 9), so the GPU has
+  4.8% more to search. The projected rate for a real search came out even:
+  -0.3% to +0.9% per pair, about +0.3% on average. **Unchanged**: window 5,
+  2^23 rows per launch (which a window-5 launch, 49^4 rows, never reaches).
+  The gaps are still worth closing, but only in a way that keeps the
+  pruning - several leading values per launch, or the next launch queued
+  (see "Gaps between launches").
 - [ ] **Stop spinning a CPU core.** `cudaDeviceSynchronize` busy-waits: the
   running client keeps one core at 100% (**measured** with `ps`/`top`). On a
   laptop, CPU and GPU share one power and cooling budget, so that core may
