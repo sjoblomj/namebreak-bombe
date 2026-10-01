@@ -138,13 +138,14 @@ See the top-level plan/design notes for the full rationale; the short version:
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
   without brackets/backslash and with a reduced punctuation set, currently
   `size50`, `size49`, `size48`, `size47`, `size43`, `size42`, `size41`,
-  `size40`, `size30` and `size29`. The set of distinct *sizes*
-  (29/30/40/41/42/43/47/48/49/50) is compiled into namebreak's CUDA backend as
-  separate template instantiations (the same zero-cost trick already used for
-  `--prune-symbol-runs`), so picking a different alphabet costs no performance -
-  but it does mean a genuinely new *size* (not just a new named profile at an
-  existing size) requires editing its dispatch and
-  recompiling/redistributing the binary to volunteers.
+  `size40`, `size30` and `size29`. Clients of protocol 1.3 and later search
+  an alphabet of any size from 1 to 63; older ones' CUDA backend only the sizes
+  above, which it had compiled in. So a new alphabet of a new size is a new
+  `PREDEFINED_ALPHABETS` entry tagged `(1, 3)`: older clients are then given a
+  larger alphabet they know instead (see `alphabet::client_alphabet_for`), or
+  no work from that target. The client's CUDA kernel has the sizes 42 and 43
+  compiled in and takes any other at runtime, which
+  costs about 2% with `prune_whole_candidate` and nothing without it.
 - **Backslash limiting**: each target also has a `max_backslash_count` (default
   `0` = unlimited). `namebreak` discards any candidate with more `\` occurrences
   than this before spending a hash chain on it - the same style of cheap

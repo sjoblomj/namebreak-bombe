@@ -78,7 +78,11 @@ impl std::str::FromStr for Version {
 ///   `PREDEFINED_ALPHABETS` as of this version is tagged `since: (1, 0)`.
 /// - 1.1.0 - `RegisterRequest::client_release` (see `ClientReleases`).
 /// - 1.2.0 - the `size41`, `size40`, `size30` and `size29` alphabets.
-pub const PROTOCOL_VERSION: Version = Version::new(1, 2, 0);
+/// - 1.3.0 - `ClaimResponse::prune_whole_candidate`; and clients search an
+///   alphabet of any size from 1 to 63 (older ones' CUDA backend only the
+///   sizes of the alphabets above), so an alphabet of a new size is to be
+///   tagged `(1, 3)` or later.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 3, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
