@@ -135,10 +135,8 @@ public:
     }
 
     const char* name() const override { return "opencl"; }
-    // The kernel is compiled for the alphabet size at hand, so any size works.
-    std::vector<int> supportedAlphabetSizes() const override { return {}; }
     int windowChars() const override { return windowCharsOr(5); }
-    // Row indices are 32-bit in the kernel: 50^5 < 2^32 <= 50^6.
+    // Row indices are 32-bit in the kernel: 63^5 < 2^32 <= 63^6.
     int maxTrailingLen() const override { return 6; }
     uint64_t batchSize(int alphabetSize) const override { return (uint64_t) alphabetSize * rowsPerBatchOr(1u << 23); }
 

@@ -21,6 +21,7 @@
 
 #include "backends/backends.h"
 #include "common/string_util.h"
+#include "engine/limits.h"
 #include "gui/win32/about_dialog.h"
 #include "gui/win32/app_icons.h"
 
@@ -340,9 +341,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
 
     makeLabel(ps, "Alphabet:", kL1, row(1) + 3, 100);
     state.hwndAlphabet = makeEdit(ps, fields.alphabet, kE1, row(1), 150);
-    std::string backendError;
-    std::string alphabetHelp = "Every character a candidate may contain, typed out with no separators. The number of characters must be " +
-                               describeAlphabetSizes(*createBackend("", backendError)) + ".";
+    const std::string alphabetHelp = "Every character a candidate may contain, typed out with no separators - at most " +
+                                     std::to_string(MAX_ALPHABET_SIZE) + " of them.";
     addHelp(ps, kH1, row(1) + 2, alphabetHelp.c_str());
     makeLabel(ps, "Max backslash:", kL2, row(1) + 3, 110);
     state.hwndMaxBackslash = makeEdit(ps, fields.maxBackslashCount, kE2, row(1), 60);

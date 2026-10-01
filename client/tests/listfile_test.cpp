@@ -355,11 +355,6 @@ int main(int argc, char** argv) {
         fprintf(stderr, "%s - exit code 77: skipped, or failed where NAMEBREAK_REQUIRE_GPU is ON\n", error.c_str());
         return 77;
     }
-    std::vector<int> sizes = g_backend->supportedAlphabetSizes();
-    if (!sizes.empty() && std::find(sizes.begin(), sizes.end(), (int) kAlphabet.size()) == sizes.end()) {
-        fprintf(stderr, "TEST BUG: the %s backend doesn't support alphabet size %zu\n", g_backend->name(), kAlphabet.size());
-        return 1;
-    }
     buildCryptTable();
     printf("backend=%s, window=%d, %zu names in %s\n", g_backend->name(), g_backend->windowChars(), names.size(), listfile.c_str());
 

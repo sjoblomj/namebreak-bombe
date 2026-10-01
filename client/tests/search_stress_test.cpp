@@ -391,7 +391,6 @@ int main(int argc, char** argv) {
     }
     prepareCryptTable(g_cryptTable);
     const int window = g_backend->windowChars();
-    const std::vector<int> sizes = g_backend->supportedAlphabetSizes();
     // The builds that cut batches down to a few rows (see CMakeLists.txt)
     // would take minutes over the whole budget: about 100,000 batches' worth
     // at most - and cases small enough that there are still dozens of them.
@@ -407,7 +406,7 @@ int main(int argc, char** argv) {
     int cases = 0, failures = 0;
     while (candidates < budget) {
         Case c;
-        const int as = sizes.empty() ? 2 + (int) (rng() % (MAX_ALPHABET_SIZE - 1)) : sizes[rng() % sizes.size()];
+        const int as = 2 + (int) (rng() % (MAX_ALPHABET_SIZE - 1));
         std::vector<char> pool;
         for (int b = 1; b < 256; ++b)
             pool.push_back((char) b);

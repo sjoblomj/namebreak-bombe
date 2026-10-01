@@ -15,7 +15,6 @@ namespace {
 class ReferenceBackend : public SearchBackend {
 public:
     const char* name() const override { return "reference"; }
-    std::vector<int> supportedAlphabetSizes() const override { return {}; }
     int windowChars() const override { return 4; }
     // The trailing index is a uint64_t and the engine keeps the trailing
     // part within what that can index, so any length the engine asks for works.

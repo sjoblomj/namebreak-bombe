@@ -190,7 +190,7 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
 #else
             ulong mask = filterTable[FILTER_INDEX(seed1, seed2)];
 #endif
-            mask &= (1ul << ALPHABET_SIZE) - 1ul;               // ALPHABET_SIZE is at most 50
+            mask &= (1ul << ALPHABET_SIZE) - 1ul;               // ALPHABET_SIZE is at most 63
             if (d == firstRowD)
                 mask &= ~0ul << args.firstRowStartK;            // firstRowStartK is in [0, ALPHABET_SIZE)
             if (d == lastRowD)

@@ -25,7 +25,6 @@ public:
     BrokenBackend(std::unique_ptr<SearchBackend> inner, Breakage breakage) : inner_(std::move(inner)), breakage_(breakage) {}
 
     const char* name() const override { return inner_->name(); }
-    std::vector<int> supportedAlphabetSizes() const override { return inner_->supportedAlphabetSizes(); }
     int windowChars() const override { return inner_->windowChars(); }
     int maxTrailingLen() const override { return inner_->maxTrailingLen(); }
     uint64_t batchSize(int alphabetSize) const override { return inner_->batchSize(alphabetSize); }

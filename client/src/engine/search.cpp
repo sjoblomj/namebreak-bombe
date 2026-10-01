@@ -15,19 +15,6 @@
 #include "engine/limits.h"
 #include "engine/mpq_hash.h"
 
-std::string describeAlphabetSizes(const SearchBackend& backend) {
-    std::vector<int> sizes = backend.supportedAlphabetSizes();
-    if (sizes.empty())
-        return "any size from 1 to " + std::to_string(MAX_ALPHABET_SIZE);
-    std::string text;
-    for (size_t i = 0; i < sizes.size(); ++i) {
-        if (i > 0)
-            text += (i + 1 == sizes.size()) ? " or " : ", ";
-        text += std::to_string(sizes[i]);
-    }
-    return text;
-}
-
 BatchOutcome SearchBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& batches) {
     BatchOutcome total;
     for (const BatchRequest& batch : batches) {
@@ -175,13 +162,6 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         return result;
     }
     int alphabetSize = (int) req.alphabet.size();
-    std::vector<int> supportedSizes = backend.supportedAlphabetSizes();
-    if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), alphabetSize) == supportedSizes.end()) {
-        result.ok = false;
-        result.error = "Unsupported alphabet size: " + std::to_string(alphabetSize) + " (the " + backend.name() + " backend supports " +
-                       describeAlphabetSizes(backend) + ")";
-        return result;
-    }
     // 0 means unlimited (see hasForbiddenSymbolRun_CPU/countBackslashes_CPU's
     // declaration comment in candidate.h for how and where this is applied).
     if (req.maxBackslashCount < 0) {

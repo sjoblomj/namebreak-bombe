@@ -13,8 +13,8 @@
 
 namespace {
 
-// The real search's 49 characters, plus one to make 50 (MAX_ALPHABET_SIZE).
-const std::string kCharacters = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#";
+// The real search's 49 characters, plus 14 more to make 63 (MAX_ALPHABET_SIZE).
+const std::string kCharacters = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#$%*:;<=>?@^`~";
 
 struct Case {
     int alphabetSize;
@@ -390,9 +390,16 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
     uint32_t cryptTable[0x500];
     prepareCryptTable(cryptTable);
 
-    const std::vector<int> sizes = backend.supportedAlphabetSizes(); // ascending; empty means any
-    const int big = sizes.empty() ? MAX_ALPHABET_SIZE : sizes.back();
-    const int small = sizes.empty() ? 29 : sizes.front();
+    // Alphabet sizes: the largest allowed, the default alphabet's, 42 and 43
+    // (which the CUDA kernel has compiled in, rather than taking at runtime),
+    // a smaller one, and one small enough that a row group's chunks have only
+    // a few rows each.
+    const int big = MAX_ALPHABET_SIZE;
+    const int common = 49;
+    const int compiled = 42;
+    const int compiled2 = 43;
+    const int small = 29;
+    const int odd = 13;
     const int window = std::min(backend.windowChars(), backend.maxTrailingLen());
     const std::string longSuffix = "\\A LONGER.SUFFIX\xE9"; // longer than the CUDA kernel's compiled-in suffix lengths
 
@@ -429,6 +436,33 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
         {small, "REZ\\", ".WAV", window, 3, Case::InLongRange, Case::LastRowOfGroup},
         {big, "REZ\\", ".WAV", window, 20, Case::JustBefore},
         {big, "REZ\\", ".WAV", window, 20, Case::JustAfter},
+        // The sizes compiled into the CUDA kernel, and an odd small one.
+        {common, "REZ\\", ".WAV", window, 0, Case::Inside},
+        {common, "REZ\\", ".WAV", window, 48, Case::Inside},
+        {common, "REZ\\", ".WAV", window, 20, Case::AtStart},
+        {common, "REZ\\", ".WAV", window, 31, Case::AtEnd},
+        {common, "REZ\\", ".WAV", window, 20, Case::Inside, Case::FirstRowOfGroup},
+        {common, "REZ\\", ".WAV", window, 45, Case::Inside, Case::LastRowOfGroup},
+        {common, "REZ\\", ".WAV", window, 20, Case::InLongRange, Case::LastRowOfGroup},
+        {common, "REZ\\", ".WAV", window, 20, Case::JustBefore},
+        {common, "REZ\\", ".WAV", window, 20, Case::JustAfter},
+        {common, "Z\xC4\\", longSuffix, std::min(2, window), 33, Case::Inside},
+        {compiled, "REZ\\", ".WAV", window, 41, Case::Inside},
+        {compiled, "REZ\\", ".WAV", window, 20, Case::AtStart},
+        {compiled, "REZ\\", ".WAV", window, 31, Case::AtEnd},
+        {compiled, "REZ\\", ".WAV", window, 20, Case::Inside, Case::FirstRowOfGroup},
+        {compiled, "REZ\\", ".WAV", window, 40, Case::Inside, Case::LastRowOfGroup},
+        {compiled, "REZ\\", ".WAV", window, 20, Case::InLongRange, Case::LastRowOfGroup},
+        {compiled, "REZ\\", ".WAV", window, 20, Case::JustAfter},
+        {compiled2, "REZ\\", ".WAV", window, 42, Case::Inside},
+        {compiled2, "REZ\\", ".WAV", window, 20, Case::AtStart},
+        {compiled2, "REZ\\", ".WAV", window, 31, Case::AtEnd},
+        {compiled2, "REZ\\", ".WAV", window, 41, Case::Inside, Case::LastRowOfGroup},
+        {compiled2, "REZ\\", ".WAV", window, 20, Case::InLongRange, Case::LastRowOfGroup},
+        {odd, "REZ\\", ".WAV", window, 12, Case::Inside},
+        {odd, "REZ\\", ".WAV", window, 0, Case::AtStart, Case::FirstRowOfGroup},
+        {odd, "REZ\\", ".WAV", window, 5, Case::InLongRange, Case::LastRowOfGroup},
+        {odd, "REZ\\", ".WAV", window, 7, Case::JustAfter},
     };
     for (const Case& c : cases) {
         if (c.k >= c.alphabetSize)
@@ -460,7 +494,7 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             ")" + pad + "(A",                             // a '(' right after the last open bracket is closed: survives
             "AB" + pad + "(",                             // nothing: survives
         };
-        for (int size : {big, small}) {
+        for (int size : {big, common, compiled, compiled2, small}) {
             for (const std::string& trailing : pruneCases) {
                 if (!runPruneCase(backend, size, trailing, cryptTable, error))
                     return false;
@@ -478,9 +512,11 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             {0, GroupedCase::Inside, true}, {1, GroupedCase::Inside, true}, {2, GroupedCase::AtEnd, true},
             {3, GroupedCase::AtStart, true}, {-1, GroupedCase::Inside, true},
         };
-        for (const GroupedCase& c : groupedCases) {
-            if (!runGroupedCase(backend, c, batchCount, big, window, cryptTable, error))
-                return false;
+        for (int size : {big, common, compiled, compiled2}) {
+            for (const GroupedCase& c : groupedCases) {
+                if (!runGroupedCase(backend, c, batchCount, size, window, cryptTable, error))
+                    return false;
+            }
         }
     }
     return true;

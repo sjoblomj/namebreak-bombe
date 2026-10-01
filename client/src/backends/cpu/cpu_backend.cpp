@@ -127,7 +127,7 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
     };
     rehashFrom(0);
 
-    const uint64_t alphabetMask = (uint64_t(1) << as) - 1; // as is at most 50
+    const uint64_t alphabetMask = (uint64_t(1) << as) - 1; // as is at most 63
     for (uint64_t i = from; i < to; ++i) {
         const uint64_t row = ctx.rows.firstRow + i;
         const uint32_t s1 = state1[ctx.prefixDigits];
@@ -177,7 +177,6 @@ public:
     CpuBackend() : threadCount_(std::max(1u, std::thread::hardware_concurrency())) {}
 
     const char* name() const override { return "cpu"; }
-    std::vector<int> supportedAlphabetSizes() const override { return {}; }
     int windowChars() const override { return windowCharsOr(5); }
     // Row indices are 64-bit here, so any trailing length the engine keeps
     // within 64-bit indexing works.

@@ -80,9 +80,6 @@ public:
     // Short lowercase name, as in --backend <name>.
     virtual const char* name() const = 0;
 
-    // The alphabet sizes this backend can search, ascending - or empty if it
-    // can search any size from 1 to MAX_ALPHABET_SIZE.
-    virtual std::vector<int> supportedAlphabetSizes() const = 0;
     // How many trailing characters the backend should enumerate per batch -
     // the engine uses more only when a candidate is too long for the leading
     // part to be indexed in 64 bits.
@@ -119,7 +116,5 @@ public:
     virtual BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches);
 };
 
-// `backend`'s supported alphabet sizes, for a message: "42, 43 or 50".
-std::string describeAlphabetSizes(const SearchBackend& backend);
 
 #endif // NAMEBREAK_ENGINE_BACKEND_H

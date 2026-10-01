@@ -76,10 +76,8 @@ public:
     }
 
     const char* name() const override { return "metal"; }
-    // The kernel is compiled for the alphabet size at hand, so any size works.
-    std::vector<int> supportedAlphabetSizes() const override { return {}; }
     int windowChars() const override { return windowCharsOr(5); }
-    // Row indices are 32-bit in the kernel: 50^5 < 2^32 <= 50^6.
+    // Row indices are 32-bit in the kernel: 63^5 < 2^32 <= 63^6.
     int maxTrailingLen() const override { return 6; }
     // A quarter of CUDA's batch: Apple GPUs are slower, and a batch should
     // stay well under a second for pause and abort to feel immediate.

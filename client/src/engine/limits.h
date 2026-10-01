@@ -6,8 +6,11 @@
 // (e.g. backends/cuda/tuning.h) live with that backend.
 
 // Upper bound on the alphabet's character count. Must be >= the largest size
-// any backend supports (see SearchBackend::supportedAlphabetSizes).
-#define MAX_ALPHABET_SIZE 50
+// any backend supports.
+// 63: a row's candidates, one bit per last character, and one past the last
+// of them must fit a 64-bit mask (see the backends' row masks and the lookup
+// filter's table).
+#define MAX_ALPHABET_SIZE 63
 #define MAX_CANDIDATE_LEN 16
 #define MAX_FILENAME_LEN 128
 // How many hashA hits one batch can record. More than this in a single batch

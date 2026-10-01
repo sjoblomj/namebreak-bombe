@@ -44,12 +44,14 @@
 //   last character, so row r's candidate with last character k has trailing
 //   index r * alphabetSize + k. One GPU thread handles one whole row.
 
-// One hashA hit, as filteredRowsKernel records it: the candidate's trailing
-// index, and which of the launch's batches it's in.
+// One hashA hit, as filteredRowsKernel records it: the candidate's row and
+// last character, and which of the launch's batches it's in. The host works
+// out its trailing index - a multiplication by the alphabet's size the kernel
+// would otherwise do for every row with a flagged candidate.
 struct Hit {
-    uint64_t trailingIdx;
+    uint64_t row;   // the candidate's trailing index is row * alphabetSize + k
     uint32_t batch;
-    uint32_t unused;
+    uint32_t k;
 };
 
 // Everything a launch reports, in one device buffer: how many hashA hits it
@@ -68,7 +70,7 @@ struct BatchResults {
     // half of all its candidates sharing one 32-bit hashA, which only a broken
     // hash or kernel could produce - and that would fail far more than this.
     // A 64-bit count would rule it out by construction, at no measurable
-    // cost; it was left as it is. The other backends' batches (at most 50 *
+    // cost; it was left as it is. The other backends' batches (at most 63 *
     // 2^23 candidates) can't overflow theirs.
     int matchCount;
     int unused;
@@ -88,14 +90,19 @@ struct DeviceBuffers {
 
 static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "filteredRowsKernel needs one thread per alphabet entry to fill its shared tables");
 
-// One batch of a launch, as filteredRowsKernel needs it: its rows
-// firstRow..lastRow of the trailing space, cut to [firstRowStartK,
-// lastRowEndK) in its first and last row (see runBatches), the hash state
-// after its prefix, and the row groups among them to search -
-// DeviceBuffers::groups[groupsOffset .. groupsOffset + groupCount).
+// One batch of a launch, as filteredRowsKernel needs it (see runBatches): its
+// rows, from row firstRowD of row group firstGroup to row lastRowD of group
+// lastGroup (see kChunksPerGroup below for groups), cut to [firstRowStartK,
+// lastRowEndK) in its first and last row, the hash state after its prefix,
+// and the row groups among them to search -
+// DeviceBuffers::groups[groupsOffset .. groupsOffset + groupCount). The
+// divisions that split the batch's first and last row into a group and a
+// row are done here, on the host.
 struct LaunchBatch {
-    uint32_t firstRow;
-    uint32_t lastRow;
+    uint32_t firstGroup;
+    uint32_t lastGroup;
+    int firstRowD;
+    int lastRowD;
     int firstRowStartK;
     int lastRowEndK;
     uint32_t seed1Start;
@@ -122,22 +129,123 @@ __device__ __forceinline__ void mpqStep(uint32_t& seed1, uint32_t& seed2, uint32
     seed2 = ord + seed1 + seed2 + (seed2 << 5) + 3;
 }
 
-// Hashes the N characters of `row` (its digits in base AlphabetSize, most
+// Division by a number known only at runtime, as a multiplication and a
+// shift - what a compiler does for a constant divisor, and much cheaper on a
+// GPU than a division: Granlund and Montgomery's method ("Division by
+// invariant integers using multiplication", 1994), exact for every 32-bit
+// numerator. makeFastDivisor (host) works out the multiplier and shift.
+struct FastDivisor {
+    uint32_t multiplier;
+    uint32_t shift;
+};
+
+FastDivisor makeFastDivisor(uint32_t divisor) {
+    // shift = ceil(log2(divisor)); multiplier = floor(2^32 * (2^shift -
+    // divisor) / divisor) + 1, which fits 32 bits for any divisor of 1 to 2^31.
+    uint32_t shift = 0;
+    while ((uint64_t(1) << shift) < divisor)
+        ++shift;
+    const uint64_t multiplier = (uint64_t(1) << 32) * ((uint64_t(1) << shift) - divisor) / divisor + 1;
+    return FastDivisor{(uint32_t) multiplier, shift};
+}
+
+__host__ __device__ __forceinline__ uint32_t divide(uint32_t n, FastDivisor by) {
+#ifdef __CUDA_ARCH__
+    const uint32_t high = __umulhi(n, by.multiplier);
+#else
+    const uint32_t high = (uint32_t) (((uint64_t) n * by.multiplier) >> 32);
+#endif
+    return (uint32_t) (((uint64_t) high + n) >> by.shift);
+}
+
+// The alphabet's size, and what the kernel divides by - a kernel argument,
+// the same for a whole search. See kChunksPerGroup below for chunks.
+struct AlphabetShape {
+    uint32_t size;
+    uint32_t chunksPerGroup;
+    FastDivisor bySize;
+    FastDivisor byChunksPerGroup;
+};
+
+// A row *group* is the alphabetSize consecutive rows that share every row
+// character but the last: rows g * alphabetSize .. g * alphabetSize +
+// alphabetSize - 1 make up group g, and row g * alphabetSize + d is the one
+// whose last row character is d. filteredRowsKernel splits every group into
+// kChunksPerGroup(alphabetSize) chunks of consecutive rows, of about
+// NAMEBREAK_ROWS_PER_THREAD rows each (tuning.h), and gives each chunk to a
+// thread - so its rows share everything but their last row character, and
+// only that changes from one to the next. Chunk c of a group is its rows
+// d = c * alphabetSize / kChunks .. (c + 1) * alphabetSize / kChunks - 1:
+// the chunks cover every row of the group exactly once, never cross into
+// another group, differ in size by at most one row, and have at most
+// NAMEBREAK_ROWS_PER_THREAD rows.
+__host__ __device__ constexpr uint32_t kChunksPerGroup(uint32_t alphabetSize) {
+    return (alphabetSize + NAMEBREAK_ROWS_PER_THREAD - 1) / NAMEBREAK_ROWS_PER_THREAD;
+}
+
+// The alphabet's size, and what's divided by it, either compiled into the
+// kernel (FixedSize, see CompiledAlphabetSizes) or taken from `shape` at
+// runtime (FixedSize 0). A size the compiler knows saves a few instructions a
+// row - masks folded together, values it would otherwise work out again -
+// which made the kernel walking lists of row groups about 2% faster.
+template<int FixedSize>
+__device__ __forceinline__ uint32_t alphabetSizeOf(const AlphabetShape& shape) {
+    if constexpr (FixedSize != 0)
+        return FixedSize;
+    else
+        return shape.size;
+}
+template<int FixedSize>
+__device__ __forceinline__ uint32_t chunksPerGroupOf(const AlphabetShape& shape) {
+    if constexpr (FixedSize != 0)
+        return kChunksPerGroup(FixedSize);
+    else
+        return shape.chunksPerGroup;
+}
+template<int FixedSize>
+__device__ __forceinline__ uint32_t divideBySize(uint32_t n, const AlphabetShape& shape) {
+    if constexpr (FixedSize != 0)
+        return n / FixedSize;
+    else
+        return divide(n, shape.bySize);
+}
+template<int FixedSize>
+__device__ __forceinline__ uint32_t divideByChunksPerGroup(uint32_t n, const AlphabetShape& shape) {
+    if constexpr (FixedSize != 0)
+        return n / kChunksPerGroup(FixedSize);
+    else
+        return divide(n, shape.byChunksPerGroup);
+}
+
+// Makes `value` opaque to the compiler, which then keeps it in a register
+// rather than work it out again wherever it's used - which it would rather do
+// with some values of searchChunk, every row. NVIDIA's compiler only: nothing
+// has been measured on AMD's, which may not take the "r" constraint.
+template<typename T>
+__device__ __forceinline__ void keepInRegister(T& value) {
+#if defined(__HIP_PLATFORM_AMD__)
+    (void) value;
+#else
+    asm("" : "+r"(value));
+#endif
+}
+
+// Hashes the N characters of `row` (its digits in base alphabetSize, most
 // significant first - filteredRowsKernel passes it a row group) into
 // (seed1, seed2), via the block's shared tables. The lanes of a warp have
 // consecutive groups (a few lanes each), so they read the same or
 // neighbouring shared-memory entries here (no bank conflicts) - unlike the
 // __constant__ d_cryptTable, where every lane needing a different entry is
 // serialized.
-template<int AlphabetSize, int N>
-__device__ __forceinline__ void hashRowDigits(uint32_t row, uint32_t& seed1, uint32_t& seed2,
+template<int FixedSize, int N>
+__device__ __forceinline__ void hashRowDigits(uint32_t row, const AlphabetShape& shape, uint32_t& seed1, uint32_t& seed2,
                                                 const uint32_t* sKey, const uint32_t* sOrd) {
     if constexpr (N > 0) {
         unsigned digit[N];
         #pragma unroll
         for (int i = N - 1; i >= 0; --i) {
-            uint32_t q = row / AlphabetSize;
-            digit[i] = row - q * AlphabetSize;
+            uint32_t q = divideBySize<FixedSize>(row, shape);
+            digit[i] = row - q * alphabetSizeOf<FixedSize>(shape);
             row = q;
         }
         #pragma unroll
@@ -146,44 +254,34 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, uint32_t& seed1, uin
     }
 }
 
-// A row *group* is the AlphabetSize consecutive rows that share every row
-// character but the last: rows g * AlphabetSize .. g * AlphabetSize +
-// AlphabetSize - 1 make up group g, and row g * AlphabetSize + d is the one
-// whose last row character is d. filteredRowsKernel splits every group into
-// kChunksPerGroup<AlphabetSize> chunks of consecutive rows, of about
-// NAMEBREAK_ROWS_PER_THREAD rows each (tuning.h), and gives each chunk to a
-// thread - so its rows share everything but their last row character, and
-// only that changes from one to the next. Chunk c of a group is its rows
-// d = c * AlphabetSize / kChunks .. (c + 1) * AlphabetSize / kChunks - 1:
-// the chunks cover every row of the group exactly once, never cross into
-// another group, and differ in size by at most one row.
-template<int AlphabetSize>
-constexpr uint32_t kChunksPerGroup = (AlphabetSize + NAMEBREAK_ROWS_PER_THREAD - 1) / NAMEBREAK_ROWS_PER_THREAD;
-
 // One thread's work in filteredRowsKernel: chunk `chunk` of row group `group` -
 // and if Listed, only the rows whose last row character is in `rowMask` (see
 // backends/common/row_pruning.h).
-template<int AlphabetSize, int SuffixLen, bool Listed>
-__device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, uint32_t chunk, int trailingLen, uint32_t firstRow,
-                                            uint32_t lastRow, int firstRowStartK, int lastRowEndK, uint32_t targetA,
+//
+// firstRowD and lastRowD are the d of the launch's first and last row, if
+// they're in this group (-1 if not) - the rows firstRowStartK and
+// lastRowEndK cut short, and the chunk's rows with them.
+template<int FixedSize, int SuffixLen, bool Listed>
+__device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, uint32_t chunk, int trailingLen, const AlphabetShape& shape,
+                                            int firstRowD, int lastRowD, int firstRowStartK, int lastRowEndK, uint32_t targetA,
                                             uint32_t seed1Start, uint32_t seed2Start, uint32_t batch, const DeviceBuffers& bufs,
                                             const uint32_t* sKey, const uint32_t* sOrd) {
-    constexpr uint32_t kChunks = kChunksPerGroup<AlphabetSize>;
     // The chunk's rows, as last row characters d of `group`, cut to the
     // launch's range in its first and last group.
-    const uint64_t groupStart = (uint64_t) group * AlphabetSize;
-    int dBegin = (int) (chunk * AlphabetSize / kChunks);
-    int dEnd = (int) ((chunk + 1) * AlphabetSize / kChunks);
-    if (groupStart + dBegin < firstRow)
-        dBegin = (int) (firstRow - groupStart);
-    if (groupStart + dEnd > (uint64_t) lastRow + 1)
-        dEnd = (int) ((uint64_t) lastRow + 1 - groupStart);
+    const uint32_t alphabetSize = alphabetSizeOf<FixedSize>(shape);
+    const uint64_t groupStart = (uint64_t) group * alphabetSize;
+    int dBegin = (int) divideByChunksPerGroup<FixedSize>(chunk * alphabetSize, shape);
+    int dEnd = (int) divideByChunksPerGroup<FixedSize>((chunk + 1) * alphabetSize, shape);
+    if (dBegin < firstRowD)
+        dBegin = firstRowD;
+    if (lastRowD >= 0 && dEnd > lastRowD + 1)
+        dEnd = lastRowD + 1;
     if (dBegin >= dEnd)
         return;
-    // The d of the launch's first and last row, if they're in this group (-1
-    // if not) - the rows firstRowStartK and lastRowEndK cut short.
-    const int firstRowD = (group == firstRow / AlphabetSize) ? (int) (firstRow % AlphabetSize) : -1;
-    const int lastRowD = (group == lastRow / AlphabetSize) ? (int) (lastRow % AlphabetSize) : -1;
+    // Kept, rather than worked out again for every row - which the compiler
+    // did with the alphabet's size taken at runtime: 25% more instructions.
+    keepInRegister(firstRowD);
+    keepInRegister(lastRowD);
 
     // The group's characters: every row character but the last, i.e. the
     // first trailingLen - 2 characters of the candidate - none when a row has
@@ -192,24 +290,39 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
     uint32_t group1 = seed1Start;
     uint32_t group2 = seed2Start;
     switch (trailingLen - 2) {
-        case 1: hashRowDigits<AlphabetSize, 1>(group, group1, group2, sKey, sOrd); break;
-        case 2: hashRowDigits<AlphabetSize, 2>(group, group1, group2, sKey, sOrd); break;
-        case 3: hashRowDigits<AlphabetSize, 3>(group, group1, group2, sKey, sOrd); break;
-        case 4: hashRowDigits<AlphabetSize, 4>(group, group1, group2, sKey, sOrd); break;
+        case 1: hashRowDigits<FixedSize, 1>(group, shape, group1, group2, sKey, sOrd); break;
+        case 2: hashRowDigits<FixedSize, 2>(group, shape, group1, group2, sKey, sOrd); break;
+        case 3: hashRowDigits<FixedSize, 3>(group, shape, group1, group2, sKey, sOrd); break;
+        case 4: hashRowDigits<FixedSize, 4>(group, shape, group1, group2, sKey, sOrd); break;
         // trailingLen is validated against kMaxTrailingLen (== 6) by runSearch
     }
     const bool rowsHaveCharacters = trailingLen > 1;
     // If Listed, bit i: the chunk's i-th row isn't pruned - in the narrowest
     // integer a chunk's rows fit, shifted one row on at a time, which costs
     // less than testing bit d of the 64-bit rowMask every row.
-    using ChunkRowBits = std::conditional_t<(AlphabetSize + kChunks - 1) / kChunks <= 32, uint32_t, uint64_t>;
+    using ChunkRowBits = std::conditional_t<NAMEBREAK_ROWS_PER_THREAD <= 32, uint32_t, uint64_t>;
     ChunkRowBits rowBits = (ChunkRowBits) (rowMask >> dBegin);
+
+    // The candidates a row may have: those of the alphabet - and in the
+    // launch's first and last row, of its range.
+    const uint64_t alphabetMask = (uint64_t(1) << alphabetSize) - 1;
+    const uint64_t firstRowMask = alphabetMask & (~uint64_t(0) << firstRowStartK); // firstRowStartK is in [0, alphabetSize)
+    const uint64_t lastRowMask = (uint64_t(1) << lastRowEndK) - 1;                  // lastRowEndK is in [1, alphabetSize]
+
+    // A row's own step from the group's state is mpqStep with these parts
+    // the same for every row - worked out once here, and kept (as above).
+    uint32_t groupSum = group1 + group2;
+    uint32_t group2Term = group2 + (group2 << 5) + 3;
+    keepInRegister(groupSum);
+    keepInRegister(group2Term);
 
     for (int d = dBegin; d < dEnd; ++d) {
         uint32_t seed1 = group1;
         uint32_t seed2 = group2;
-        if (rowsHaveCharacters)
-            mpqStep(seed1, seed2, sKey[d], sOrd[d]);
+        if (rowsHaveCharacters) {
+            seed1 = sKey[d] ^ groupSum;
+            seed2 = sOrd[d] + seed1 + group2Term;
+        }
 
         // Bit k: the candidate with last character k is worth hashing.
         // Restricted to the launch's range in its first and last row - and to
@@ -228,11 +341,9 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
             rowBits >>= 1;
         } else
             mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
-        mask &= (uint64_t(1) << AlphabetSize) - 1;
-        if (d == firstRowD)
-            mask &= ~uint64_t(0) << firstRowStartK;          // firstRowStartK is in [0, AlphabetSize)
+        mask &= (d == firstRowD) ? firstRowMask : alphabetMask;
         if (d == lastRowD)
-            mask &= (uint64_t(1) << lastRowEndK) - 1;        // lastRowEndK is in [1, AlphabetSize]
+            mask &= lastRowMask;
 
         while (mask != 0) {
             const int k = __ffsll((long long) mask) - 1;
@@ -251,7 +362,7 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
             if (hashAMatches(a, targetA)) {
                 int slot = atomicAdd(&bufs.results->matchCount, 1);
                 if (slot < MAX_MATCHES)
-                    bufs.results->hits[slot] = Hit{(groupStart + d) * AlphabetSize + k, batch, 0};
+                    bufs.results->hits[slot] = Hit{groupStart + d, batch, (uint32_t) k};
             }
         }
     }
@@ -280,24 +391,24 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
 // candidate that matches the target. Only those are hashed in full. README.md's
 // "The lookup filter" has why the lookup can never leave a match out.
 //
-// A hashA hit only records its trailing index and batch (BatchResults): the
+// A hashA hit only records its row, last character and batch (BatchResults): the
 // host builds the filename and checks it - hashA again, from scratch, and
 // hashB - so none of that bloats this hot kernel.
-template<int AlphabetSize, int SuffixLen, bool Listed>
+template<int FixedSize, int SuffixLen, bool Listed>
 __global__ void filteredRowsKernel(
     int trailingLen,
+    AlphabetShape shape,
     LaunchBatches batches,
     uint32_t targetA,
     DeviceBuffers bufs
 ) {
-    static_assert(AlphabetSize < 64, "a row's candidates, and one past the last of them, must fit a 64-bit mask");
-    constexpr uint32_t kChunks = kChunksPerGroup<AlphabetSize>;
-    __shared__ uint32_t sKey[AlphabetSize];
-    __shared__ uint32_t sOrd[AlphabetSize];
+    static_assert(MAX_ALPHABET_SIZE < 64, "a row's candidates, and one past the last of them, must fit a 64-bit mask");
+    __shared__ uint32_t sKey[MAX_ALPHABET_SIZE];
+    __shared__ uint32_t sOrd[MAX_ALPHABET_SIZE];
     // In shared memory for the same reason as sKey: the lanes of a warp read
     // different entries.
     __shared__ uint64_t sRowMasks[kRowFlagCount];
-    if (threadIdx.x < AlphabetSize) {
+    if (threadIdx.x < alphabetSizeOf<FixedSize>(shape)) {
         sKey[threadIdx.x] = d_alphabetKey[threadIdx.x];
         sOrd[threadIdx.x] = d_alphabetOrd[threadIdx.x];
     }
@@ -314,58 +425,38 @@ __global__ void filteredRowsKernel(
     // group in the batch's list, those of them that aren't pruned - whatever
     // the grid's size: the number of threads launched only decides how the
     // chunks are shared out (normally one each), never which of them get
-    // searched.
-    const uint64_t stride = (uint64_t) gridDim.x * blockDim.x;
+    // searched. A batch has at most 2^31 rows, so fewer chunks than that.
+    const uint32_t chunks = chunksPerGroupOf<FixedSize>(shape);
+    const uint32_t stride = gridDim.x * blockDim.x;
     if constexpr (Listed) {
         const uint32_t* groups = bufs.groups + batch.groupsOffset;
-        const uint64_t chunkCount = (uint64_t) batch.groupCount * kChunks;
-        for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += stride) {
-            const uint32_t entry = __ldg(&groups[c / kChunks]);
-            searchChunk<AlphabetSize, SuffixLen, true>(entry >> kRowFlagBits, sRowMasks[entry & (kRowFlagCount - 1)], (uint32_t) (c % kChunks),
-                                                       trailingLen, batch.firstRow, batch.lastRow, batch.firstRowStartK, batch.lastRowEndK,
-                                                       targetA, batch.seed1Start, batch.seed2Start, batchIndex, bufs, sKey, sOrd);
+        const uint32_t chunkCount = batch.groupCount * chunks;
+        for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += stride) {
+            const uint32_t groupIndex = divideByChunksPerGroup<FixedSize>(c, shape);
+            const uint32_t entry = __ldg(&groups[groupIndex]);
+            const uint32_t group = entry >> kRowFlagBits;
+            searchChunk<FixedSize, SuffixLen, true>(group, sRowMasks[entry & (kRowFlagCount - 1)], c - groupIndex * chunks, trailingLen, shape,
+                                         group == batch.firstGroup ? batch.firstRowD : -1, group == batch.lastGroup ? batch.lastRowD : -1,
+                                         batch.firstRowStartK, batch.lastRowEndK, targetA, batch.seed1Start, batch.seed2Start, batchIndex,
+                                         bufs, sKey, sOrd);
         }
     } else {
-        const uint32_t firstGroup = batch.firstRow / AlphabetSize;
-        const uint64_t chunkCount = (uint64_t) (batch.lastRow / AlphabetSize - firstGroup + 1) * kChunks;
-        for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += stride) {
-            searchChunk<AlphabetSize, SuffixLen, false>(firstGroup + (uint32_t) (c / kChunks), 0, (uint32_t) (c % kChunks), trailingLen,
-                                                        batch.firstRow, batch.lastRow, batch.firstRowStartK, batch.lastRowEndK, targetA,
-                                                        batch.seed1Start, batch.seed2Start, batchIndex, bufs, sKey, sOrd);
+        const uint32_t chunkCount = (batch.lastGroup - batch.firstGroup + 1) * chunks;
+        for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += stride) {
+            const uint32_t groupIndex = divideByChunksPerGroup<FixedSize>(c, shape);
+            const uint32_t group = batch.firstGroup + groupIndex;
+            searchChunk<FixedSize, SuffixLen, false>(group, 0, c - groupIndex * chunks, trailingLen, shape, groupIndex == 0 ? batch.firstRowD : -1,
+                                          group == batch.lastGroup ? batch.lastRowD : -1, batch.firstRowStartK, batch.lastRowEndK, targetA,
+                                          batch.seed1Start, batch.seed2Start, batchIndex, bufs, sKey, sOrd);
         }
     }
 }
 
-// alphabetSize/suffix length have to be dispatched to one of a fixed set of
-// compile-time template instantiations (see filteredRowsKernel's comment
-// for why) - dispatchAlphabetSize/
-// dispatchSuffixLen call `f` with a std::integral_constant of the matching
-// value.
-//
-// The alphabet sizes this backend supports, ascending: add one here (and
-// recompile/redistribute namebreak to volunteers) to support a new size.
-// Must all be <= MAX_ALPHABET_SIZE.
-template<int... Sizes>
-struct AlphabetSizeList {};
-using SupportedAlphabetSizes = AlphabetSizeList<29, 30, 40, 41, 42, 43, 47, 48, 49, 50>;
-
-template<typename F, int... Sizes>
-bool dispatchAlphabetSizeIn(AlphabetSizeList<Sizes...>, int alphabetSize, F&& f) {
-    static_assert(((Sizes <= MAX_ALPHABET_SIZE) && ...), "an alphabet size exceeds MAX_ALPHABET_SIZE");
-    return ((alphabetSize == Sizes ? (f(std::integral_constant<int, Sizes>{}), true) : false) || ...);
-}
-
-template<int... Sizes>
-std::vector<int> alphabetSizesIn(AlphabetSizeList<Sizes...>) {
-    return {Sizes...};
-}
-
-// Returns false if `alphabetSize` isn't in SupportedAlphabetSizes.
-template<typename F>
-bool dispatchAlphabetSize(int alphabetSize, F&& f) {
-    return dispatchAlphabetSizeIn(SupportedAlphabetSizes{}, alphabetSize, f);
-}
-
+// The suffix length has to be dispatched to one of a fixed set of
+// compile-time template instantiations, so that the suffix loop is unrolled
+// with its keys as constant operands - dispatchSuffixLen calls `f` with a
+// std::integral_constant of the matching value. The alphabet's size needs no
+// such thing: what the kernel divides by it, it divides with FastDivisor.
 template<typename F>
 void dispatchSuffixLen(int suffixLen, F&& f) {
     switch (suffixLen) {
@@ -380,6 +471,38 @@ void dispatchSuffixLen(int suffixLen, F&& f) {
         case 8: f(std::integral_constant<int, 8>{}); break;
         default: f(std::integral_constant<int, kRuntimeSuffix>{}); break;
     }
+}
+
+// The alphabet sizes filteredRowsKernel has compiled in, rather than taking
+// them at runtime (see alphabetSizeOf): 42 and 43. Every other size is taken
+// at runtime. Adding one is a number here - and 20 more instantiations of the
+// kernel to compile.
+template<int... Sizes>
+struct AlphabetSizeList {};
+using CompiledAlphabetSizes = AlphabetSizeList<42, 43>;
+
+// Launches filteredRowsKernel, walking every row group or lists of them.
+template<int FixedSize, int SuffixLen>
+void launchSearch(bool listed, dim3 blocks, int trailingLen, const AlphabetShape& shape, const LaunchBatches& batches, uint32_t targetA,
+                  const DeviceBuffers& bufs) {
+    if (listed)
+        filteredRowsKernel<FixedSize, SuffixLen, true><<<blocks, kThreadsPerBlock>>>(trailingLen, shape, batches, targetA, bufs);
+    else
+        filteredRowsKernel<FixedSize, SuffixLen, false><<<blocks, kThreadsPerBlock>>>(trailingLen, shape, batches, targetA, bufs);
+}
+
+// launchSearch with the size compiled in if it's one of Sizes, and taken at
+// runtime if not.
+template<int SuffixLen, int... Sizes>
+void launchSearchFor(AlphabetSizeList<Sizes...>, bool listed, dim3 blocks, int trailingLen, const AlphabetShape& shape,
+                     const LaunchBatches& batches, uint32_t targetA, const DeviceBuffers& bufs) {
+    static_assert(((Sizes >= 1 && Sizes <= MAX_ALPHABET_SIZE) && ...), "a compiled-in alphabet size is out of range");
+    const bool compiled =
+        ((shape.size == (uint32_t) Sizes ? (launchSearch<Sizes, SuffixLen>(listed, blocks, trailingLen, shape, batches, targetA, bufs), true)
+                                         : false) ||
+         ...);
+    if (!compiled)
+        launchSearch<0, SuffixLen>(listed, blocks, trailingLen, shape, batches, targetA, bufs);
 }
 
 namespace {
@@ -400,7 +523,6 @@ public:
 #else
     const char* name() const override { return "cuda"; }
 #endif
-    std::vector<int> supportedAlphabetSizes() const override { return alphabetSizesIn(SupportedAlphabetSizes{}); }
     int windowChars() const override { return NAMEBREAK_GPU_WINDOW_CHARS; }
     int maxTrailingLen() const override { return kMaxTrailingLen; }
     // A whole number of rows (see the terminology comment above
@@ -419,6 +541,9 @@ public:
 
 private:
     int alphabetSize_ = 0;
+    // The alphabet's size, and the divisions the kernel does by it - see
+    // AlphabetShape.
+    AlphabetShape shape_ = {};
     int suffixLen_ = 0;
     uint32_t targetA_ = 0;
     // A launch's results, copied back into pinned host memory by a copy
@@ -466,6 +591,15 @@ constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
 
 void CudaBackend::beginSearch(const SearchConstants& constants) {
     alphabetSize_ = (int) constants.alphabet.size();
+    if (alphabetSize_ < 1 || alphabetSize_ > MAX_ALPHABET_SIZE) {
+        // runSearch checks the alphabet's size before it begins a search.
+        fprintf(stderr, "INTERNAL ERROR: an alphabet of %d characters (1 to %d allowed) - exiting\n", alphabetSize_, MAX_ALPHABET_SIZE);
+        exit(1);
+    }
+    shape_.size = (uint32_t) alphabetSize_;
+    shape_.chunksPerGroup = kChunksPerGroup(shape_.size);
+    shape_.bySize = makeFastDivisor(shape_.size);
+    shape_.byChunksPerGroup = makeFastDivisor(shape_.chunksPerGroup);
     suffixLen_ = (int) constants.suffix.size();
     targetA_ = constants.targetHashA;
 
@@ -579,7 +713,8 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
     // memset in the gap between two kernels.
 
     // Each batch's range [start, start + count) covers its rows
-    // firstRow..lastRow; only the first and last row can be partial (see
+    // firstRow..lastRow - passed as their groups and rows within them (see
+    // LaunchBatch); only the first and last row can be partial (see
     // filteredRowsKernel). With the whole candidate pruned, each also gets
     // the list of its row groups that survive.
     const bool listed = listed_;
@@ -597,20 +732,21 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
             exit(1);
         }
         LaunchBatch& batch = batches.batch[b];
-        batch.firstRow = (uint32_t) firstRow;
-        batch.lastRow = (uint32_t) lastRow;
+        batch.firstGroup = (uint32_t) (firstRow / alphabetSize);
+        batch.lastGroup = (uint32_t) (lastRow / alphabetSize);
+        batch.firstRowD = (int) (firstRow % alphabetSize);
+        batch.lastRowD = (int) (lastRow % alphabetSize);
         batch.firstRowStartK = (int) (startIdx - firstRow * alphabetSize);
         batch.lastRowEndK = (int) (endIdx - lastRow * alphabetSize); // in [1, alphabetSize]
         batch.seed1Start = requests[b].params.seed1Start;
         batch.seed2Start = requests[b].params.seed2Start;
         if (listed) {
-            const RowPruning::Slice groups =
-                rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry, firstRow / alphabetSize, lastRow / alphabetSize);
+            const RowPruning::Slice groups = rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry, batch.firstGroup, batch.lastGroup);
             batch.groupsOffset = groups.offset;
             batch.groupCount = groups.count;
             maxGroups = std::max<uint64_t>(maxGroups, groups.count);
         } else {
-            maxGroups = std::max(maxGroups, lastRow / alphabetSize - firstRow / alphabetSize + 1);
+            maxGroups = std::max<uint64_t>(maxGroups, batch.lastGroup - batch.firstGroup + 1);
         }
     }
     // Every row of every batch pruned: nothing to launch.
@@ -620,35 +756,20 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
         uploadGroups();
 
     const auto launched = std::chrono::steady_clock::now();
-    bool supported = dispatchAlphabetSize(alphabetSize, [&](auto alphabetC) {
-        // A type alias rather than a constexpr local: MSVC treats a constexpr
-        // local of this lambda read from the nested [&] lambda below as a
-        // capture, so it's no longer a constant expression there (C2672).
-        using AlphabetC = decltype(alphabetC);
-        // One row of blocks per batch (blockIdx.y), and in it one GPU thread
-        // per chunk of every row group the batch touches (see
-        // kChunksPerGroup) - about NAMEBREAK_ROWS_PER_THREAD rows each - as
-        // many as the largest batch needs. The kernel works out each batch's
-        // chunks itself and covers all of them whatever the grid, so this
-        // count only spreads the work. Every 32 consecutive threads form a
-        // "warp" that the hardware runs in lockstep (SIMT) - that grouping is
-        // automatic (256 threads/block = 8 warps/block here), not something
-        // chosen at this call site.
-        const uint64_t threads = maxGroups * kChunksPerGroup<AlphabetC::value>;
-        const dim3 blocks((unsigned) ((threads + kThreadsPerBlock - 1) / kThreadsPerBlock), (unsigned) batchCount);
-        dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
-            constexpr int SuffixLen = decltype(suffixC)::value;
-            if (listed)
-                filteredRowsKernel<AlphabetC::value, SuffixLen, true><<<blocks, kThreadsPerBlock>>>(trailingLen, batches, targetA_, bufs_);
-            else
-                filteredRowsKernel<AlphabetC::value, SuffixLen, false><<<blocks, kThreadsPerBlock>>>(trailingLen, batches, targetA_, bufs_);
-        });
+    // One row of blocks per batch (blockIdx.y), and in it one GPU thread per
+    // chunk of every row group the batch touches (see kChunksPerGroup) -
+    // about NAMEBREAK_ROWS_PER_THREAD rows each - as many as the largest
+    // batch needs. The kernel works out each batch's chunks itself and covers
+    // all of them whatever the grid, so this count only spreads the work.
+    // Every 32 consecutive threads form a "warp" that the hardware runs in
+    // lockstep (SIMT) - that grouping is automatic (256 threads/block = 8
+    // warps/block here), not something chosen at this call site.
+    const uint64_t threads = maxGroups * shape_.chunksPerGroup;
+    const dim3 blocks((unsigned) ((threads + kThreadsPerBlock - 1) / kThreadsPerBlock), (unsigned) batchCount);
+    dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
+        using SuffixC = decltype(suffixC);
+        launchSearchFor<SuffixC::value>(CompiledAlphabetSizes{}, listed, blocks, trailingLen, shape_, batches, targetA_, bufs_);
     });
-    if (!supported) {
-        // runSearch checks supportedAlphabetSizes() before any batch.
-        fprintf(stderr, "Unsupported alphabet size: %d\n", alphabetSize);
-        exit(1);
-    }
     CUDA_CHECK(cudaGetLastError());
     // The results' copy is queued right behind the kernel, into pinned memory,
     // so the GPU starts it the moment the kernel ends and one wait covers
@@ -697,7 +818,7 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
             fprintf(stderr, "INTERNAL ERROR: the kernel reported a hit in batch %u of a launch of %d - exiting\n", hit.batch, batchCount);
             exit(1);
         }
-        verifier_.addHits({hit.trailingIdx}, trailingLen, requests[hit.batch].params, outcome);
+        verifier_.addHits({hit.row * alphabetSize_ + hit.k}, trailingLen, requests[hit.batch].params, outcome);
     }
     return outcome;
 }

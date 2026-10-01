@@ -116,7 +116,7 @@ resume_from_last_candidate = true
 
 | Key | Required | Meaning |
 |---|---|---|
-| `alphabet` | yes | Every character a candidate may contain. Size must be one of `29, 30, 40, 41, 42, 43, 47, 48, 49, 50` (see [Compiling](#compiling) for why) and at most `MAX_ALPHABET_SIZE` (50). |
+| `alphabet` | yes | Every character a candidate may contain: any number of them from 1 to `MAX_ALPHABET_SIZE` (63). |
 | `max_backslash_count` | yes | Max `\` occurrences allowed in a candidate before it's skipped; `0` means unlimited. To forbid `\` entirely, leave it out of `alphabet` instead - `0` is "no limit", not "zero allowed". |
 | `prefix` / `suffix` | yes | The fixed parts of the filename around the candidate. |
 | `start_candidate` | no | Full filename (prefix+candidate+suffix) to begin searching from. Without it, the search starts from the beginning: in `continuous` mode the shortest candidates (as if it were just prefix+suffix - that filename itself isn't checked), in `bounded` mode, which searches only one candidate length, `lower_bound`. |
@@ -176,19 +176,19 @@ That also builds the GUI, `namebreak-gui.exe`. There's no Windows machine
 with CUDA to verify this on; the CPU-only build has been cross-compiled with
 MinGW-w64, and its tests pass under Wine.
 
-The alphabet's *size* (not its exact characters) is baked into the binary as
-a compile-time template instantiation per size, for performance - the fixed
-set of sizes this build supports (`29, 30, 40, 41, 42, 43, 47, 48, 49, 50`) is checked early
-and fails fast with a clear message if `config.conf`'s alphabet doesn't
-match one of them. Supporting a new size means adding it to
-`SupportedAlphabetSizes` in `src/backends/cuda/cuda_backend.cu` and
-recompiling.
+Every backend searches an alphabet of any size from 1 to `MAX_ALPHABET_SIZE`
+(63, as a row's candidates are a 64-bit mask, one bit each). The CUDA
+kernel takes the size at runtime, dividing by it with
+multipliers worked out on the host, the way a compiler divides by a
+constant - except for 42 and 43 (`CompiledAlphabetSizes` in
+`src/backends/cuda/cuda_backend.cu`), compiled in: a size the compiler knows saves it a few instructions a row (see
+[PERFORMANCE.md](PERFORMANCE.md)).
 
 `ctest` runs the correctness test suite: pure-CPU unit tests (among them
 `lowbits_filter_test`, of the lookup filter), plus
 end-to-end tests of every backend that compare real search results against
-an independent brute-force reference (thousands of cases: every supported
-alphabet size, every last-character position, ranges starting/ending mid-row and
+an independent brute-force reference (thousands of cases: alphabet sizes
+from 1 to 63, every last-character position, ranges starting/ending mid-row and
 crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
 0x80, the both-hashes-match path, and a seeded fuzzer), and the dense-hit
 stress tests (`stress-*`), which make one candidate in 4096 a hit and

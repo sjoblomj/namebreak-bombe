@@ -56,7 +56,7 @@ constexpr int kMaxBatchesPerLaunch = 32;
 #endif
 
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index
-// (alphabetSize^(trailingLen-1)) must fit in 32 bits: 50^5 < 2^32 <= 50^6.
+// (alphabetSize^(trailingLen-1)) must fit in 32 bits: 63^5 < 2^32 <= 63^6.
 constexpr int kMaxTrailingLen = 6;
 
 // Threads per block. Must be >= MAX_ALPHABET_SIZE: filteredRowsKernel fills its

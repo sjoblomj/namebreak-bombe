@@ -323,12 +323,45 @@ will have grown (not measured again).
   - Building it on the GPU would take microseconds, but it would be a
     second builder per backend - three, with Metal's - for what is now half
     a millisecond.
-- [ ] **Any alphabet size.** The per-candidate loop that needed the alphabet
-  size at compile time is gone; it's now only used for the row decode's
-  divisions, which could use multipliers computed on the host (as a
-  compiler does for constants). That would drop `SupportedAlphabetSizes`
-  and its "rebuild for a new size" step, and cut compile time. A feature
-  more than a speedup.
+- [x] **Any alphabet size.** The CUDA kernel had the alphabet's size
+  compiled in, one instantiation per size of a fixed list (29, 30, 40-43,
+  47-50); now it takes any size from 1 to 63 (`MAX_ALPHABET_SIZE`, raised from 50) at runtime (the other backends
+  already did). What it divides by the size - a row group's characters, a
+  chunk's rows - it divides with multipliers worked out on the host
+  (`FastDivisor`, exact for every 32-bit numerator); a batch's first and last
+  row are split into group and row on the host; and a hit records its row and
+  last character, the host working out its index - a multiplication the
+  kernel had done for every row with a flagged candidate. The default
+  alphabet's size, 49, and 42 stayed compiled in (`CompiledAlphabetSizes`): 60
+  instantiations instead of 200, and the CUDA file compiles in about 40% of
+  the time (4.1 s instead of 10.7). **Measured** (Nsight Compute, one launch of 16 leading values;
+  `search_bench --scale 40`, five pairs each, alternating with the code before;
+  `search_bench --size <n>` times other sizes):
+  - at 49, compiled in: 336M instructions instead of 374M, 3.37 ms instead of
+    3.62 (323M instead of 333M with `--whole`); **3.2% faster** (all five
+    pairs), **2.1%** with `--whole` (all five).
+  - at 50 and 42, taken at runtime: the same speed (0.6% and 0.2%
+    slower, within the noise), and **2.2-2.3% slower** with `--whole` (all
+    pairs) - a few instructions a row the compiler saves when it knows the
+    size. So 42 is compiled in too: **4% faster** than before (five pairs,
+    all faster; on a GPU hot enough to run a third slower than usual) and
+    **2%** with `--whole`. Another size is a number in
+    `CompiledAlphabetSizes`, and 20 instantiations more.
+  - Then the compiled-in sizes became 42 and 43, and 49 is taken at runtime.
+    **Measured** against the code before any of this (four pairs each): 49
+    the same speed (0.5% slower, within the noise) and **2.1% slower** with
+    `--whole` (all four pairs); 43 **4.5% faster** (all four) and **1.3%**
+    with `--whole`.
+  - The first runtime version issued 25% more instructions: with the size
+    unknown, the compiler worked the batch's first and last row out again
+    for every row (reading the batch from the kernel's arguments by
+    `blockIdx.y`, and dividing again) rather than keep them in registers -
+    and `keepInRegister`, an empty `asm` that makes a value opaque, is what
+    stopped it. The row's hash step written out with its invariant parts
+    kept the same way saved the list-walking kernel another 2-3%; the same
+    step as a select rather than an `if` lost that and more, and folding
+    the alphabet's mask into the first row's made no difference (the
+    compiler had done it already).
 - [x] **Profile.** Nsight Compute 2025.2 (`--set full`) on single
   launches of 16 leading values of `filteredRowsKernel<49, 4>`, walking every
   row group and walking lists (`search_bench --scale 2`, with and without

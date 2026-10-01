@@ -18,7 +18,11 @@
 // simply never gets handed to it - see ranges::claim_range on the server).
 // Bump this whenever this client starts depending on something the protocol
 // only guarantees from a newer version onward.
-constexpr const char* kProtocolVersion = "1.2.0";
+// 1.3.0: this client searches an alphabet of any size from 1 to
+// MAX_ALPHABET_SIZE, where older ones' CUDA backend could only search the
+// sizes it had compiled in - so an alphabet of a new size, tagged 1.3, is
+// only ever handed to this client or a newer one.
+constexpr const char* kProtocolVersion = "1.3.0";
 
 struct RegisterRequest {
     std::string username;

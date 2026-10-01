@@ -27,11 +27,12 @@
 //     once on the pruned side (must NOT be).
 //  6. pruneWholeCandidate: the same rules at every character but the last,
 //     where the backend prunes rows and row groups of its trailing part.
-//  G. Geometry, for each of the 6 supported alphabet sizes: the kernel
+//  G. Geometry, for a range of alphabet sizes: the kernel
 //     handles a *row* (every value of the last character) per thread, so
 //     ranges that start/end mid-row, sit inside one row, are row-aligned,
 //     straddle a leading-value boundary or a launch boundary, or touch the
 //     very first/last candidate, each take a different path through it.
+//  S. Small alphabets (1-13 characters), whole candidate spaces at a time.
 //  K. Every last-character position k for every alphabet size (the kernel's
 //     inner loop is fully unrolled with k as a compile-time constant, so a
 //     wrong constant at one position would only ever affect candidates with
@@ -87,7 +88,10 @@
 // The backend under test, and its window size (set in main()).
 static std::unique_ptr<SearchBackend> g_backend;
 static int g_window = 0;
-static const int kAlphabetSizes[] = {29, 30, 40, 41, 42, 43, 47, 48, 49, 50};
+// The coordinator's alphabets' sizes (29-50), and some others: any size from 1
+// to MAX_ALPHABET_SIZE can be searched. Small ones are in scenarioSmallAlphabets,
+// as the geometry cases need a few hundred candidates per leading value.
+static const int kAlphabetSizes[] = {21, 26, 29, 30, 33, 37, 40, 41, 42, 43, 45, 47, 48, 49, 50, 56, 63};
 
 static uint32_t g_cryptTable[0x500];
 static int g_cases = 0;
@@ -200,9 +204,9 @@ static uint64_t advanceBy(std::string& c, const std::string& alphabet, uint64_t 
 }
 
 static std::string alphabetOfSize(int n) {
-    static const std::string full = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"; // 49 characters
-    if (n <= 49) return full.substr(0, n);
-    return full + "#";
+    // The real 49 characters, then 14 more to make MAX_ALPHABET_SIZE (63).
+    static const std::string full = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#$%*:;<=>?@^`~";
+    return full.substr(0, n);
 }
 
 // Order of two equal-length candidates in `alphabet`'s ordering (the order a search enumerates them in).
@@ -770,6 +774,28 @@ static bool scenarioGeometry() {
 }
 
 // ---------------------------------------------------------------------------
+// Group S: small alphabets - a row of only a few candidates, row groups of a
+// few rows (one chunk each), and a single candidate per length at size 1 -
+// each whole candidate space searched, with the target at its first,
+// middle and last candidate, and nowhere.
+// ---------------------------------------------------------------------------
+static bool scenarioSmallAlphabets() {
+    bool ok = true;
+    for (int as : {1, 2, 3, 5, 7, 13}) {
+        printf("=== S: alphabet size %d ===\n", as);
+        const std::string alphabet = alphabetOfSize(as);
+        for (int len = 1; len <= g_window + 2 && ipow(as, len) <= 50'000; ++len) {
+            const uint64_t last = ipow(as, len) - 1;
+            const std::string tag = "S[as=" + std::to_string(as) + ", len=" + std::to_string(len) + "] ";
+            for (uint64_t target : {uint64_t(0), last / 2, last})
+                ok &= runIndexCase(tag + "target " + std::to_string(target), alphabet, "TEST_", ".DAT", len, 0, last, target, true);
+            ok &= runNoMatchCase(tag + "no match", alphabet, "TEST_", ".DAT", len, 0, last);
+        }
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Group K: every last-character position, every alphabet size.
 // ---------------------------------------------------------------------------
 static bool scenarioEveryLastCharacter() {
@@ -855,9 +881,6 @@ static bool scenarioPrefixSuffixLengths() {
     ok &= expectError("P: suffix of 64 characters", "TEST_", std::string(64, 'x'), alphabet);
     ok &= expectError("P: prefix 52 + suffix 60 (would overflow MAX_FILENAME_LEN)", std::string(52, 'x'), std::string(60, 'y'), alphabet);
     ok &= expectError("P: prefix of 53 characters", std::string(53, 'x'), ".DAT", alphabet);
-    std::vector<int> supportedSizes = g_backend->supportedAlphabetSizes();
-    if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), 39) == supportedSizes.end())
-        ok &= expectError("P: alphabet of an unsupported size (39)", "TEST_", ".DAT", alphabetOfSize(42).substr(0, 39));
     {
         // An empty start candidate means "from the beginning": the shortest
         // candidates, one character long - here a bounded search, so only those.
@@ -1020,7 +1043,7 @@ static bool fuzz(int iterations, uint64_t seed) {
 
     for (int it = 0; it < iterations; ++it) {
         CaseSpec c;
-        const int as = kAlphabetSizes[uni(std::size(kAlphabetSizes))];
+        const int as = 2 + (int) uni(MAX_ALPHABET_SIZE - 1);
         const bool highBytes = uni(2) == 0;
         std::vector<char> pool;
         for (int b = 0x20; b <= 0x7E; ++b) pool.push_back((char) b);
@@ -1123,13 +1146,6 @@ int main(int argc, char** argv) {
         return 77;
     }
     g_window = g_backend->windowChars();
-    std::vector<int> supportedSizes = g_backend->supportedAlphabetSizes();
-    for (int as : kAlphabetSizes) {
-        if (!supportedSizes.empty() && std::find(supportedSizes.begin(), supportedSizes.end(), as) == supportedSizes.end()) {
-            fprintf(stderr, "TEST BUG: the %s backend doesn't support alphabet size %d\n", g_backend->name(), as);
-            return 1;
-        }
-    }
 
     prepareCryptTable(g_cryptTable);
     printf("backend=%s, window=%d, batch size=%llu (49-character alphabet), MAX_MATCHES=%d\n", g_backend->name(), g_window,
@@ -1145,6 +1161,7 @@ int main(int argc, char** argv) {
     allPassed &= scenarioPruneWholeCandidate();
     allPassed &= scenarioSingleCandidate();
     allPassed &= scenarioGeometry();
+    allPassed &= scenarioSmallAlphabets();
     allPassed &= scenarioEveryLastCharacter();
     allPassed &= scenarioPrefixSuffixLengths();
     allPassed &= scenarioFound();

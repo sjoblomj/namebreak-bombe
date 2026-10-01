@@ -54,6 +54,7 @@
 #include "backends/backends.h"
 #include "engine/search.h"
 #include "engine/candidate.h"
+#include "engine/limits.h"
 
 namespace {
 
@@ -67,7 +68,6 @@ public:
     uint64_t searched = 0;
 
     const char* name() const override { return inner_.name(); }
-    std::vector<int> supportedAlphabetSizes() const override { return inner_.supportedAlphabetSizes(); }
     int windowChars() const override { return inner_.windowChars(); }
     int maxTrailingLen() const override { return inner_.maxTrailingLen(); }
     uint64_t batchSize(int alphabetSize) const override { return inner_.batchSize(alphabetSize); }
@@ -149,13 +149,14 @@ double survivingShare(const SearchRequest& req, uint64_t total, int len, int lea
 } // namespace
 
 int main(int argc, char** argv) {
-    // [--prune all|symbols|none] [noprune] [--backend <name>] [--scale <n>] -
-    // the default backend is the first that can run here (see
-    // backends/backends.h).
+    // [--prune all|symbols|none] [noprune] [--whole] [--backend <name>]
+    // [--scale <n>] [--size <n>] - the default backend is the first that can
+    // run here (see backends/backends.h).
     std::string prune = "all";
     bool whole = false;
     std::string backendName;
     uint64_t scale = 1;
+    int alphabetSize = 49;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "noprune") {
@@ -168,15 +169,22 @@ int main(int argc, char** argv) {
             backendName = argv[++i];
         } else if (arg == "--scale" && i + 1 < argc) {
             scale = std::stoull(argv[++i]);
+        } else if (arg == "--size" && i + 1 < argc) {
+            alphabetSize = std::stoi(argv[++i]);
+            if (alphabetSize < 1 || alphabetSize > MAX_ALPHABET_SIZE)
+                prune = "?";
         } else {
             prune = "?";
         }
         if (prune != "all" && prune != "symbols" && prune != "none") {
-            fprintf(stderr, "Usage: %s [--prune all|symbols|none] [noprune] [--whole] [--backend <name>] [--scale <n>]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--prune all|symbols|none] [noprune] [--whole] [--backend <name>] [--scale <n>] [--size 1-%d]\n",
+                    argv[0], MAX_ALPHABET_SIZE);
             return 1;
         }
     }
-    const std::string alphabet = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_"; // real, 49 chars
+    // The real 49 characters - or with --size, the first that many of these
+    // (14 more after the real ones, up to MAX_ALPHABET_SIZE), to time other sizes.
+    const std::string alphabet = std::string(" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#$%*:;<=>?@^`~").substr(0, alphabetSize);
     const std::string prefix = "REZ\\";
     const std::string suffix = ".WAV";
     const int candidateLen = 10;
@@ -185,8 +193,13 @@ int main(int argc, char** argv) {
     // backend's windowChars()) so this bound, and therefore this benchmark,
     // works unchanged regardless of what NAMEBREAK_GPU_WINDOW_CHARS is
     // compiled with - a fixed ~28.8B total, for direct comparability across runs.
+    // With a small alphabet, the whole length may be less than that.
     const uint64_t targetTotalCandidates = 28'800'000'000ULL * scale;
-    std::string upper = indexToString(targetTotalCandidates, candidateLen, alphabet);
+    uint64_t space = 1;
+    for (int i = 0; i < candidateLen && space <= targetTotalCandidates; ++i)
+        space *= alphabetSize;
+    std::string upper = targetTotalCandidates < space ? indexToString(targetTotalCandidates, candidateLen, alphabet)
+                                                      : std::string(candidateLen, alphabet.back());
     std::string lower(candidateLen, alphabet[0]);
 
     SearchRequest req;
@@ -215,7 +228,8 @@ int main(int argc, char** argv) {
     }
     CountingBackend backend(*realBackend);
     SearchRequest warmUp = req;
-    warmUp.upperBound = indexToString(targetTotalCandidates / scale / 100, candidateLen, alphabet);
+    const uint64_t warmUpCandidates = targetTotalCandidates / scale / 100;
+    warmUp.upperBound = warmUpCandidates < space ? indexToString(warmUpCandidates, candidateLen, alphabet) : upper;
     runSearch(backend, warmUp);
     backend.searched = 0;
 

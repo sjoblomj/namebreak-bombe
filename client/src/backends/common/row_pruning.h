@@ -34,7 +34,7 @@
 // standing for a set of characters. rowMask(flags) is the set of d allowed.
 constexpr int kRowFlagBits = 4;
 constexpr uint32_t kRowFlagCount = 1u << kRowFlagBits;
-// Group numbers must leave room for the flags: 50^4 groups (trailingLen 6)
+// Group numbers must leave room for the flags: 63^4 groups (trailingLen 6)
 // is well within this.
 constexpr uint64_t kMaxPrunableGroups = uint64_t(1) << (32 - kRowFlagBits);
 
