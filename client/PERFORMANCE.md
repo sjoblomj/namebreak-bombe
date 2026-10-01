@@ -488,13 +488,15 @@ will have grown (not measured again).
 The filter is proven, tested densely, checked before every search, and every
 backend is self-tested before use (see the README). What's still open:
 
-- [ ] **Canaries from the coordinator.** Now and then, the server hands out
+- [x] **Canaries from the coordinator.** Now and then, the server hands out
   a range with a target planted in it - the hashes of a known candidate in
   that range - indistinguishable from real work, and checks that the client
   reports it. That checks each volunteer's actual hardware, driver and
   build, continuously: bit flips (consumer GPUs have no ECC memory), a
   driver bug, a broken release, a modified client. Nothing on the client
-  side can do that. Needs a protocol and server change.
+  side can do that. *Done* - no protocol change was needed: 5% of claims, a
+  few seconds' worth each, shown per volunteer on the dashboard (see the
+  coordinator README's "Canaries").
 - [ ] **Double-checking.** Re-issue a small random sample of finished ranges
   to a different client, and compare the hashA hits both reported (not only
   "found"). A cheaper, statistical form of the above.

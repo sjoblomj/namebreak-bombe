@@ -29,7 +29,8 @@ That's the **Targets** tab. The **Volunteers** tab ranks every username that
 has claimed work or found a name by candidates searched (the sizes of its
 completed ranges, across all its hostnames - a little generous, since a range
 closed early by a find still counts in full), alongside its completed ranges,
-hostnames and names found (targets sharing a Hash A/Hash B pair are one find).
+hostnames and names found (targets sharing a Hash A/Hash B pair are one find),
+and its canaries found out of those handed to it (see below).
 The **Introduction** tab explains what namebreaking is. The open tab is kept
 in the URL's `#fragment`, so `/#volunteers` links straight to it.
 Plain HTML/CSS/JS (`server/static/dashboard.html`, embedded into the binary at
@@ -355,6 +356,25 @@ even start (bad claim data, matches file not writable), it skips reporting
 completion and lets the range's lease expire so the server reassigns it - it
 won't report success or silently drop bad work.
 
+### Canaries
+
+Now and then (`CANARY_PROBABILITY` of claims, while there's real work), a
+claim gets a canary instead: a small range, a few seconds' worth at the
+client's measured rate (`CANARY_SECONDS`), of a virtual target named
+`virtual-canary` whose hashes are those of a filename planted in that range.
+To the client it's ordinary work, so finding it checks each volunteer's actual
+hardware, driver and build: bit flips (consumer GPUs have no ECC memory), a
+driver bug, a broken release, a modified client. The canary copies a real
+target's prefix, suffix, alphabet and pruning, so it's searched the way real
+work is; the planted candidate has only letters and digits, so no pruning rule
+skips it. Its result goes in the `canaries` table (`found` or `missed`; a missed
+one is also logged as a warning). Virtual targets (`targets.is_virtual`) are
+left out of everything else - other claims, the dashboard's targets and
+ranges, `/status`, the rate estimate, and a volunteer's candidates, ranges and
+names found - and the Volunteers tab shows them only as "Canaries
+found/total". A canary still being searched isn't counted yet; one given up on
+(released or reclaimed) counts as not found.
+
 ## Server configuration (env vars)
 
 | Var | Default | Meaning |
@@ -368,6 +388,8 @@ won't report success or silently drop bad work.
 | `LEASE_SECONDS` | `21600` (6 hours) | how long a claimed range stays leased after the last sign of life from its client (the claim, then each heartbeat) |
 | `RECLAIM_INTERVAL_SECS` | `30` | how often expired leases are swept back to pending |
 | `EMA_ALPHA` | `0.3` | smoothing factor for each user's observed-rate average |
+| `CANARY_PROBABILITY` | `0.05` | chance that a claim gets a canary instead of real work; `0` turns them off |
+| `CANARY_SECONDS` | `5` | how long a canary should take, at the client's measured rate |
 
 ## Deploying to fly.io
 

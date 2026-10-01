@@ -160,7 +160,7 @@ pub async fn complete(
 
 pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, AppError> {
     let rows: Vec<(i64, String, String, Option<String>)> =
-        sqlx::query_as("SELECT id, name, status, found_filename FROM targets ORDER BY created_at ASC")
+        sqlx::query_as("SELECT id, name, status, found_filename FROM targets WHERE is_virtual = 0 ORDER BY created_at ASC")
             .fetch_all(&state.pool)
             .await?;
     let targets = rows

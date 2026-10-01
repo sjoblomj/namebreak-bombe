@@ -1,5 +1,6 @@
 mod alphabet;
 mod auth;
+mod canary;
 mod client_release;
 mod dashboard;
 mod db;

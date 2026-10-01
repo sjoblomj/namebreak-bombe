@@ -40,7 +40,7 @@ fn chunk_size(config: &RangeConfig, rate: f64, alphabet: &str, client_alphabet: 
 /// bigger one, the same first and last candidate bound every candidate of
 /// the range, plus the ones only the bigger alphabet has.
 #[allow(clippy::too_many_arguments)]
-fn to_claim_response(
+pub(crate) fn to_claim_response(
     target: &Target,
     range_id: i64,
     candidate_len: i64,
@@ -202,7 +202,7 @@ async fn insert_pending_range(
 
 /// Inserts a freshly carved range, already claimed by `user`, returning its id.
 #[allow(clippy::too_many_arguments)]
-async fn insert_claimed_range(
+pub(crate) async fn insert_claimed_range(
     tx: &mut sqlx::SqliteConnection,
     target_id: i64,
     candidate_len: i64,
@@ -713,7 +713,13 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
     // protocol version until it re-registers with a well-formed one.
     let client_version: Version = user.protocol_version.parse().unwrap_or(Version::new(1, 0, 0));
 
-    let targets = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' ORDER BY priority DESC, created_at ASC")
+    // Now and then a canary instead (see canary.rs).
+    if let Some(claim) = crate::canary::maybe_claim(&mut tx, config, user, client_version, rate, now).await? {
+        tx.commit().await?;
+        return Ok(Some(claim));
+    }
+
+    let targets = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' AND is_virtual = 0 ORDER BY priority DESC, created_at ASC")
         .fetch_all(&mut *tx)
         .await?;
 
@@ -1172,6 +1178,19 @@ pub async fn complete_range(
     }
 
     let now = now_unix();
+    // A canary's range: its result is recorded, and that's all - its
+    // claimant's rate isn't updated (it stops at the planted name), and its
+    // virtual target solves nothing else.
+    if owns_range && crate::canary::complete(&mut tx, &range, found, filename.as_deref(), now).await? {
+        sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ?, assigned_user_id = ? WHERE id = ?")
+            .bind(now)
+            .bind(user.id)
+            .bind(range_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(CompleteOutcome { target_solved: false });
+    }
     if owns_range {
         // assigned_user_id is only for the pending case, where it was cleared
         // on release - for an in_progress range it's already this user.
@@ -1208,7 +1227,7 @@ pub async fn complete_range(
     if found {
         let result = sqlx::query(
             "UPDATE targets SET status = 'solved', found_filename = ?, found_by_user_id = ?, found_at = ? \
-             WHERE status = 'active' \
+             WHERE status = 'active' AND is_virtual = 0 \
              AND hash_a = (SELECT hash_a FROM targets WHERE id = ?) \
              AND hash_b = (SELECT hash_b FROM targets WHERE id = ?)",
         )
@@ -1882,6 +1901,8 @@ mod tests {
             lease_seconds: 6 * 60 * 60,
             reclaim_interval_secs: 30,
             ema_alpha: 0.3,
+            canary_probability: 0.0,
+            canary_seconds: 5.0,
             stall_release_seconds: 24 * 60 * 60,
         }
     }
@@ -4174,5 +4195,70 @@ mod tests {
 
         let pending_status: String = sqlx::query_scalar("SELECT status FROM ranges WHERE target_id = ? AND start_index = 0").bind(target_low).fetch_one(&pool).await.unwrap();
         assert_eq!(pending_status, "pending", "the lower-priority target's leftover must be left untouched");
+    }
+
+    /// A canary is a small range of a virtual target with a name planted in
+    /// it, copying the real target's settings; its result is recorded,
+    /// found or missed, and it counts towards nothing but the volunteer's
+    /// canaries.
+    #[tokio::test]
+    async fn canaries_are_handed_out_recorded_and_kept_out_of_everything_else() {
+        let pool = test_pool().await;
+        let mut user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let real = insert_target(&pool, &lower, &upper).await;
+        let mut config = test_config(100);
+        config.canary_probability = 1.0;
+
+        // Not before the client's rate is measured: a guess could make it
+        // take far too long.
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("real work");
+        assert_eq!(claim.target_id, real);
+        sqlx::query("UPDATE ranges SET status = 'pending', assigned_user_id = NULL WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET ema_rate_per_sec = 2.0 WHERE id = ?").bind(user.id).execute(&pool).await.unwrap();
+        user.ema_rate_per_sec = Some(2.0);
+
+        let mut results = Vec::new();
+        for report_it in [true, false] {
+            let claim = claim_range(&pool, &config, &user).await.unwrap().expect("a canary");
+            assert_ne!(claim.target_id, real);
+            assert_eq!(claim.target_name, crate::canary::CANARY_TARGET_NAME);
+            assert_eq!((claim.prefix.as_str(), claim.suffix.as_str()), ("PRE", ".SUF"));
+            assert_eq!(claim.candidate_count, 10, "2/s, for canary_seconds");
+            let planted: String = sqlx::query_scalar("SELECT filename FROM canaries WHERE range_id = ?")
+                .bind(claim.range_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(claim.hash_a_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x100)));
+            assert_eq!(claim.hash_b_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x200)));
+            assert!(claim.lower_bound_filename <= planted && planted <= claim.upper_bound_filename, "{planted} in {claim:?}");
+
+            let filename = report_it.then(|| planted.clone());
+            let outcome = complete_range(&pool, &config, &user, claim.range_id, report_it, filename, 1.0, 5).await.unwrap();
+            assert!(!outcome.target_solved, "a canary isn't a real find");
+            let (result, status): (String, String) =
+                sqlx::query_as("SELECT c.result, t.status FROM canaries c JOIN targets t ON t.id = c.target_id WHERE c.range_id = ?")
+                    .bind(claim.range_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            results.push((result, status));
+        }
+        assert_eq!(results, vec![("found".into(), "solved".into()), ("missed".into(), "paused".into())]);
+
+        let ema: Option<f64> = sqlx::query_scalar("SELECT ema_rate_per_sec FROM users WHERE id = ?").bind(user.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(ema, Some(2.0), "a canary doesn't measure the client's rate");
+        let real_status: String = sqlx::query_scalar("SELECT status FROM targets WHERE id = ?").bind(real).fetch_one(&pool).await.unwrap();
+        assert_eq!(real_status, "active");
+
+        // One more canary, still being searched: not counted yet.
+        claim_range(&pool, &config, &user).await.unwrap().expect("a canary");
+        let volunteers = crate::dashboard::volunteers(&pool).await.unwrap();
+        assert_eq!(volunteers.len(), 1);
+        let v = &volunteers[0];
+        assert_eq!((v.candidates, v.ranges_completed, v.found), (0, 0, 0), "canaries count towards nothing else");
+        assert_eq!((v.canaries_found, v.canaries_total), (1, 2));
+
     }
 }

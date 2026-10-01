@@ -143,6 +143,7 @@
   }
   .volunteers-table td.num, .volunteers-table th.num { text-align: right; }
   .volunteers-table td.rank { color: var(--muted); }
+  .volunteers-table td.canary-missed { color: var(--b-hip); font-weight: 600; }
   .target-card {
     background: var(--card-bg);
     border: 1px solid var(--border);
@@ -606,11 +607,14 @@
   <div class="page-panel" id="page-volunteers" role="tabpanel" hidden>
     <div class="panel-card">
       <p class="volunteers-intro">Everyone who has searched a range or found a name, by how many candidates they've searched
-        - counting completed ranges only, across all their machines.</p>
+        - counting completed ranges only, across all their machines. Canaries are small ranges with a name planted in
+        them, now and then handed out instead of real work, to check that a volunteer's machine finds what it should; they
+        count towards nothing else.</p>
       <div class="table-scroll">
         <table class="volunteers-table">
           <thead><tr><th>#</th><th>Volunteer</th><th class="num">Candidates searched</th><th class="num">Ranges</th>
-            <th class="num">Hostnames</th><th class="num">Names found</th></tr></thead>
+            <th class="num">Hostnames</th><th class="num">Names found</th>
+            <th class="num" title="Canaries found, of those handed to the volunteer: small ranges with a name planted in them, which check that its machine finds what it should. Not counted in the other columns.">Canaries</th></tr></thead>
           <tbody id="volunteers"></tbody>
         </table>
       </div>
@@ -675,7 +679,7 @@
     if (volunteers.length === 0) {
       const tr = document.createElement('tr');
       const td = document.createElement('td');
-      td.colSpan = 6;
+      td.colSpan = 7;
       td.className = 'loading';
       td.textContent = 'No volunteers yet.';
       tr.appendChild(td);
@@ -691,6 +695,8 @@
         [fmtNum(v.ranges_completed), 'num mono'],
         [fmtNum(v.hostnames), 'num mono'],
         [fmtNum(v.found), 'num mono'],
+        [v.canaries_total > 0 ? `${fmtNum(v.canaries_found)}/${fmtNum(v.canaries_total)}` : '-',
+         v.canaries_found < v.canaries_total ? 'num mono canary-missed' : 'num mono'],
       ];
       for (const [text, className] of cells) {
         const td = document.createElement('td');

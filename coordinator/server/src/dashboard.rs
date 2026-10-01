@@ -39,11 +39,17 @@ pub struct DashboardVolunteer {
     /// Distinct names found: targets sharing a Hash A/Hash B pair are the
     /// same file, solved together by one find, so they count once.
     pub found: i64,
+    /// Canaries (see `canary.rs`) found, of those handed to it that are
+    /// over: completed, or released unfinished (the client quit or stalled).
+    /// One still being searched isn't counted yet. None of the above counts
+    /// a canary.
+    pub canaries_found: i64,
+    pub canaries_total: i64,
 }
 
 /// Every username that has claimed work or found a name, sorted by
 /// candidates searched, then names found, then username.
-async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardVolunteer>, AppError> {
+pub(crate) async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardVolunteer>, AppError> {
     #[derive(sqlx::FromRow)]
     struct CompletedRow {
         username: String,
@@ -56,13 +62,16 @@ async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardVolunteer>, 
     }
     let completed: Vec<CompletedRow> = sqlx::query_as(
         "SELECT u.username, r.candidate_len, r.start_block, r.start_index, r.end_block, r.end_index, r.alphabet \
-         FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id WHERE r.status = 'completed'",
+         FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id JOIN targets t ON t.id = r.target_id \
+         WHERE r.status = 'completed' AND t.is_virtual = 0",
     )
     .fetch_all(pool)
     .await?;
     let contributors: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT u.username FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id \
-         UNION SELECT u.username FROM targets t JOIN users u ON u.id = t.found_by_user_id",
+         JOIN targets t ON t.id = r.target_id WHERE t.is_virtual = 0 \
+         UNION SELECT u.username FROM targets t JOIN users u ON u.id = t.found_by_user_id WHERE t.is_virtual = 0 \
+         UNION SELECT u.username FROM canaries c JOIN users u ON u.id = c.user_id",
     )
     .fetch_all(pool)
     .await?;
@@ -73,11 +82,20 @@ async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardVolunteer>, 
         .collect();
     let found: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
         "SELECT u.username, COUNT(DISTINCT t.hash_a || ':' || t.hash_b) FROM targets t JOIN users u ON u.id = t.found_by_user_id \
-         WHERE t.found_filename IS NOT NULL GROUP BY u.username",
+         WHERE t.found_filename IS NOT NULL AND t.is_virtual = 0 GROUP BY u.username",
     )
     .fetch_all(pool)
     .await?
     .into_iter()
+    .collect();
+    let canaries: HashMap<String, (i64, i64)> = sqlx::query_as::<_, (String, i64, i64)>(
+        "SELECT u.username, SUM(c.result = 'found'), COUNT(*) FROM canaries c JOIN users u ON u.id = c.user_id \
+         JOIN ranges r ON r.id = c.range_id WHERE c.result != 'pending' OR r.status != 'in_progress' GROUP BY u.username",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(username, found, total)| (username, (found, total)))
     .collect();
 
     let mut by_username: HashMap<String, DashboardVolunteer> = contributors
@@ -86,6 +104,8 @@ async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardVolunteer>, 
             let volunteer = DashboardVolunteer {
                 hostnames: hostnames.get(&username).copied().unwrap_or(0),
                 found: found.get(&username).copied().unwrap_or(0),
+                canaries_found: canaries.get(&username).map_or(0, |c| c.0),
+                canaries_total: canaries.get(&username).map_or(0, |c| c.1),
                 candidates: 0,
                 ranges_completed: 0,
                 username: username.clone(),
@@ -397,6 +417,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                 found_user.username || '@' || found_user.hostname, NULLIF(found_user.backend, ''), targets.found_at, targets.alphabet_name, targets.alphabet, targets.priority, \
                 targets.description \
          FROM targets LEFT JOIN users AS found_user ON found_user.id = targets.found_by_user_id \
+         WHERE targets.is_virtual = 0 \
          ORDER BY targets.priority DESC, targets.created_at ASC",
     )
     .fetch_all(&state.pool)
@@ -415,6 +436,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                 ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
                 ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id, ranges.skip_range_id \
          FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
+         WHERE ranges.target_id IN (SELECT id FROM targets WHERE is_virtual = 0) \
          ORDER BY ranges.candidate_len, ranges.start_block, ranges.start_index",
     )
     .fetch_all(&state.pool)

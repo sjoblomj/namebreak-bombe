@@ -56,6 +56,9 @@ pub struct Target {
     /// The shortest candidate length the main sweep carves - see
     /// `AdminCreateTargetRequest::start_len` and `ranges::claim_range`.
     pub start_len: i64,
+    /// 1 for a canary's virtual target (see `canary.rs`), which takes part in
+    /// nothing but its one claim.
+    pub is_virtual: i64,
 }
 
 #[allow(dead_code)]

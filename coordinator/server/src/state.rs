@@ -42,6 +42,13 @@ pub struct RangeConfig {
     /// without this a stalled (e.g. paused) client would hold a range
     /// hostage forever. See `ranges::heartbeat_range`.
     pub stall_release_seconds: i64,
+    /// The chance that a claim is handed a canary (see `canary.rs`) instead
+    /// of real work. 0 hands out none.
+    pub canary_probability: f64,
+    /// How long a canary should take the client that's handed it, at its
+    /// measured rate - a few seconds, well under the 10 it's meant to stay
+    /// within.
+    pub canary_seconds: f64,
 }
 
 impl RangeConfig {
@@ -65,6 +72,8 @@ impl RangeConfig {
             reclaim_interval_secs: env_u64("RECLAIM_INTERVAL_SECS", 30),
             ema_alpha: env_f64("EMA_ALPHA", 0.3),
             stall_release_seconds: env_i64("STALL_RELEASE_SECONDS", 24 * 60 * 60),
+            canary_probability: env_f64("CANARY_PROBABILITY", 0.05),
+            canary_seconds: env_f64("CANARY_SECONDS", 5.0),
         }
     }
 }
