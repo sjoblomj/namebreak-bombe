@@ -9,7 +9,7 @@ use axum::response::Html;
 use axum::Json;
 use serde::Serialize;
 
-use crate::alphabet::{bound_indices_at_len, index_to_candidate, join_pos, max_supported_len, Pos};
+use crate::alphabet::{bound_indices_at_len, ceil_index, floor_index, index_to_candidate, join_pos, max_supported_len, space_size, Pos};
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Segment, SkipRange};
 use crate::ranges::{count_within, owned_spans};
@@ -179,8 +179,11 @@ pub struct DashboardTarget {
     /// Including removed ones, so the `skipped` ranges they already produced
     /// can still show their reason.
     pub skip_ranges: Vec<DashboardSkipRange>,
-    /// Ordered by candidate length, then position - the order the dashboard
-    /// lists them in, and the order `gaps` refers to.
+    /// Ordered by candidate length, then first candidate - the order the
+    /// dashboard lists them in, and the order `gaps` refers to. Not by
+    /// position, which isn't comparable between ranges in different
+    /// alphabets; candidates are, since every alphabet lists its characters
+    /// in ascending order (see `alphabet::floor_index`).
     pub ranges: Vec<DashboardRange>,
     /// Candidates not covered by any range, between two consecutive
     /// `ranges` - see `gaps_between`.
@@ -191,7 +194,7 @@ pub struct DashboardTarget {
 /// order) that no range covers. May run across candidate lengths.
 #[derive(Serialize)]
 pub struct DashboardGap {
-    /// The range this gap comes right after.
+    /// The range this gap is listed right after.
     pub after_range_id: i64,
     pub first_len: i64,
     pub first_candidate: String,
@@ -201,46 +204,77 @@ pub struct DashboardGap {
     pub count: Pos,
 }
 
-/// The gaps between consecutive ranges in `ranges` (already ordered by
-/// length, then start). Within a length, a gap is simply the space between
-/// one range's end and the next one's start; across lengths, it's the rest
-/// of the earlier length, any whole lengths in between, and the start of
-/// the later length, each limited to what the target's bounds cover at that
-/// length. Two ranges carved under different alphabets aren't comparable
-/// (an alphabet patch happened in between), so no gap is reported there.
+/// The gaps between the ranges in `ranges` (already ordered by length,
+/// then first candidate): before each range, whatever lies between it and
+/// the furthest any earlier range reaches. Within a length, that's simply
+/// the space between the two; across lengths, it's the rest of the earlier
+/// length, any whole lengths in between, and the start of the later length,
+/// each limited to what the target's bounds cover at that length.
+///
+/// Ranges in different alphabets are compared in the smaller of the two -
+/// a range carved in a bigger alphabet covers every candidate of a smaller
+/// one within it - so e.g. `skipped` rows an alphabet change wrote in one
+/// alphabet don't show gaps where ranges in another already searched. Two
+/// alphabets where neither has all of the other's characters aren't
+/// comparable (no gap is reported there), nor is a gap reported in a bigger
+/// alphabet's candidates between ranges in a smaller one.
 fn gaps_between(ranges: &[DashboardRange], lower_bound: &str, upper_bound: &str) -> Vec<DashboardGap> {
     let mut gaps = Vec::new();
+    let Some(mut reach) = ranges.first() else {
+        return gaps;
+    };
     for pair in ranges.windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        if a.alphabet != b.alphabet {
-            continue;
+        let (previous, b) = (&pair[0], &pair[1]);
+        if let Some(alphabet) = common_alphabet(&reach.alphabet, &b.alphabet) {
+            gaps.extend(gap_between(reach, b, previous.id, alphabet, lower_bound, upper_bound));
         }
-        // (length, first index, end index exclusive), one per length.
-        let mut pieces: Vec<(i64, Pos, Pos)> = Vec::new();
-        if a.candidate_len == b.candidate_len {
-            pieces.push((a.candidate_len, a.end_index, b.start_index));
-        } else {
-            for len in a.candidate_len..=b.candidate_len {
-                let (lo, hi) = bound_indices_at_len(&a.alphabet, lower_bound, upper_bound, len);
-                let from = if len == a.candidate_len { a.end_index } else { lo };
-                let to = if len == b.candidate_len { b.start_index } else { hi + 1 };
-                pieces.push((len, from, to));
-            }
+        if (b.candidate_len, &b.last_candidate) > (reach.candidate_len, &reach.last_candidate) {
+            reach = b;
         }
-        pieces.retain(|&(_, from, to)| from < to);
-        let (Some(&(first_len, first, _)), Some(&(last_len, _, last_end))) = (pieces.first(), pieces.last()) else {
-            continue;
-        };
-        gaps.push(DashboardGap {
-            after_range_id: a.id,
-            first_len,
-            first_candidate: index_to_candidate(&a.alphabet, first, first_len),
-            last_len,
-            last_candidate: index_to_candidate(&a.alphabet, last_end - 1, last_len),
-            count: pieces.iter().map(|&(_, from, to)| to - from).sum(),
-        });
     }
     gaps
+}
+
+/// Whichever of two alphabets has all of the other's characters in it -
+/// the smaller one - or `None` if neither does.
+fn common_alphabet<'a>(x: &'a str, y: &'a str) -> Option<&'a str> {
+    let within = |small: &str, big: &str| small.chars().all(|c| big.contains(c));
+    if within(x, y) {
+        Some(x)
+    } else if within(y, x) {
+        Some(y)
+    } else {
+        None
+    }
+}
+
+/// The candidates of `alphabet` after range `a`'s last and before range
+/// `b`'s first (see `gaps_between`), listed after range `after_range_id`.
+fn gap_between(a: &DashboardRange, b: &DashboardRange, after_range_id: i64, alphabet: &str, lower_bound: &str, upper_bound: &str) -> Option<DashboardGap> {
+    let a_end = floor_index(alphabet, &a.last_candidate).map_or(0, |last| last + 1);
+    let b_start = ceil_index(alphabet, &b.first_candidate).unwrap_or_else(|| space_size(alphabet, b.candidate_len));
+    // (length, first index, end index exclusive), one per length.
+    let mut pieces: Vec<(i64, Pos, Pos)> = Vec::new();
+    if a.candidate_len == b.candidate_len {
+        pieces.push((a.candidate_len, a_end, b_start));
+    } else {
+        for len in a.candidate_len..=b.candidate_len {
+            let (lo, hi) = bound_indices_at_len(alphabet, lower_bound, upper_bound, len);
+            let from = if len == a.candidate_len { a_end } else { lo };
+            let to = if len == b.candidate_len { b_start } else { hi + 1 };
+            pieces.push((len, from, to));
+        }
+    }
+    pieces.retain(|&(_, from, to)| from < to);
+    let (&(first_len, first, _), &(last_len, _, last_end)) = (pieces.first()?, pieces.last()?);
+    Some(DashboardGap {
+        after_range_id,
+        first_len,
+        first_candidate: index_to_candidate(alphabet, first, first_len),
+        last_len,
+        last_candidate: index_to_candidate(alphabet, last_end - 1, last_len),
+        count: pieces.iter().map(|&(_, from, to)| to - from).sum(),
+    })
 }
 
 /// Where the main sweep will carve next. Its stored position only moves
@@ -277,13 +311,13 @@ fn effective_sweep_position(
     }
 }
 
-/// The last range in `ranges` (ordered by length, then start) that starts
-/// before the main sweep's position - so the sweep marker goes right after
-/// it. `None` if the sweep is before every range.
-fn sweep_after_range_id(ranges: &[DashboardRange], cursor_len: i64, cursor_next_index: Pos) -> Option<i64> {
+/// The last range in `ranges` (ordered by length, then first candidate)
+/// that starts before the main sweep's position - so the sweep marker goes
+/// right after it. `None` if the sweep is before every range.
+fn sweep_after_range_id(ranges: &[DashboardRange], cursor_len: i64, cursor_candidate: &str) -> Option<i64> {
     ranges
         .iter()
-        .take_while(|r| (r.candidate_len, r.start_index) < (cursor_len, cursor_next_index))
+        .take_while(|r| (r.candidate_len, r.first_candidate.as_str()) < (cursor_len, cursor_candidate))
         .last()
         .map(|r| r.id)
 }
@@ -503,7 +537,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_by, found_by_backend, found_at, alphabet_name, alphabet, priority, description) in target_rows {
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
 
-        let ranges: Vec<DashboardRange> = range_rows
+        let mut ranges: Vec<DashboardRange> = range_rows
             .into_iter()
             .map(|row| {
                 // Each range is decoded with its OWN alphabet, not the
@@ -538,6 +572,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                 }
             })
             .collect();
+        // Stable, so ranges starting at the same candidate stay in position order.
+        ranges.sort_by(|a, b| (a.candidate_len, &a.first_candidate).cmp(&(b.candidate_len, &b.first_candidate)));
 
         let (mut stored_cursor_len, mut stored_cursor_next_index, mut cursor_alphabet, start_len) = progress_by_target
             .get(&id)
@@ -589,7 +625,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         let (cursor_candidate_len, cursor_next_index) =
             effective_sweep_position(stored_cursor_len, stored_cursor_next_index, &cursor_alphabet, &jumps, &lower_bound, &upper_bound);
         let cursor_candidate = index_to_candidate(&cursor_alphabet, cursor_next_index, cursor_candidate_len);
-        let sweep_after_range_id = sweep_after_range_id(&ranges, cursor_candidate_len, cursor_next_index);
+        let sweep_after_range_id = sweep_after_range_id(&ranges, cursor_candidate_len, &cursor_candidate);
 
         targets.push(DashboardTarget {
             id,
@@ -642,14 +678,18 @@ mod tests {
     const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
     fn range(id: i64, candidate_len: i64, start_index: Pos, end_index: Pos) -> DashboardRange {
+        range_in("letters", LETTERS, id, candidate_len, start_index, end_index)
+    }
+
+    fn range_in(alphabet_name: &str, alphabet: &str, id: i64, candidate_len: i64, start_index: Pos, end_index: Pos) -> DashboardRange {
         DashboardRange {
             id,
             status: "completed".into(),
             candidate_len,
             start_index,
             end_index,
-            first_candidate: String::new(),
-            last_candidate: String::new(),
+            first_candidate: index_to_candidate(alphabet, start_index, candidate_len),
+            last_candidate: index_to_candidate(alphabet, end_index - 1, candidate_len),
             progress_candidate: None,
             progress_percent: None,
             worker: None,
@@ -658,8 +698,8 @@ mod tests {
             lease_expires_at: None,
             completed_at: None,
             created_at: 0,
-            alphabet_name: "letters".into(),
-            alphabet: LETTERS.into(),
+            alphabet_name: alphabet_name.into(),
+            alphabet: alphabet.into(),
             priority_range_id: None,
             skip_range_id: None,
         }
@@ -689,6 +729,43 @@ mod tests {
         // Back to back across a length boundary: no gap.
         let ranges = vec![range(1, 1, 0, 26), range(2, 2, 0, 5)];
         assert!(gaps_between(&ranges, "A", "Z").is_empty());
+    }
+
+    #[test]
+    fn gaps_between_measures_from_the_furthest_reaching_range() {
+        // 0..30 reaches past 10..20, which it overlaps: nothing is missing before 30..40.
+        let ranges = vec![range(1, 2, 0, 30), range(2, 2, 10, 20), range(3, 2, 30, 40)];
+        assert!(gaps_between(&ranges, "AA", "ZZ").is_empty());
+    }
+
+    /// Ranges in a smaller alphabet ("ACE") inside ones in a bigger one
+    /// (LETTERS) - like the `skipped` rows an alphabet change used to write -
+    /// show no gaps where the bigger one's ranges searched, but do where
+    /// nothing did, counted in the smaller alphabet.
+    #[test]
+    fn gaps_between_compares_ranges_in_different_alphabets_in_the_smaller_one() {
+        const ACE: &str = "ACE";
+        let at = |alphabet: &str, candidate: &str| crate::alphabet::candidate_to_index(alphabet, candidate).unwrap();
+        let mut ranges = vec![
+            range_in("ace", ACE, 1, 2, at(ACE, "AA"), at(ACE, "AE") + 1),
+            range_in("ace", ACE, 2, 2, at(ACE, "CA"), at(ACE, "CE") + 1),
+            range_in("ace", ACE, 3, 2, at(ACE, "EA"), at(ACE, "EE") + 1),
+            range(4, 2, at(LETTERS, "AA"), at(LETTERS, "BZ") + 1),
+            range(5, 2, at(LETTERS, "CA"), at(LETTERS, "CZ") + 1),
+        ];
+        ranges.sort_by(|a, b| (a.candidate_len, &a.first_candidate).cmp(&(b.candidate_len, &b.first_candidate)));
+        assert_eq!(ranges.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 4, 2, 5, 3]);
+        assert!(gaps_between(&ranges, "AA", "ZZ").is_empty(), "letters A-C searched, then E in ACE");
+
+        // Without letters' CA-CZ, ACE's CA-CE still covers what ACE has between them.
+        ranges.retain(|r| r.id != 5);
+        assert!(gaps_between(&ranges, "AA", "ZZ").is_empty());
+
+        // Without ACE's CA-CE too, ACE's CA-CE is missing - but not letters'
+        // own D-candidates, which no range in letters is after.
+        ranges.retain(|r| r.id != 2);
+        let gaps = gaps_between(&ranges, "AA", "ZZ");
+        assert_eq!(gaps.iter().map(summary).collect::<Vec<_>>(), vec![(4, 2, "CA", 2, "CE", 3)]);
     }
 
     /// A priority or skip range span at `candidate_len`, in LETTERS.
@@ -785,8 +862,8 @@ mod tests {
     #[test]
     fn sweep_after_range_id_is_the_last_range_starting_before_the_sweep() {
         let ranges = vec![range(1, 2, 0, 10), range(2, 2, 10, 20), range(3, 3, 5, 9)];
-        assert_eq!(sweep_after_range_id(&ranges, 2, 20), Some(2));
-        assert_eq!(sweep_after_range_id(&ranges, 2, 0), None);
-        assert_eq!(sweep_after_range_id(&ranges, 4, 0), Some(3));
+        assert_eq!(sweep_after_range_id(&ranges, 2, "AU"), Some(2));
+        assert_eq!(sweep_after_range_id(&ranges, 2, "AA"), None);
+        assert_eq!(sweep_after_range_id(&ranges, 4, "AAAA"), Some(3));
     }
 }
