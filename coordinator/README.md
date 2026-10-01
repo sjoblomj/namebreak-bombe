@@ -393,7 +393,7 @@ found/total". A canary still being searched isn't counted yet; one given up on
 | `BIND_ADDR` | `0.0.0.0:8080` | listen address |
 | `TARGET_CHUNK_SECONDS` | `900` | desired wall-clock time per range |
 | `DEFAULT_RATE_PER_SEC` | `500000000` | assumed candidates/sec until a user's first completed range refines it |
-| `MIN_CHUNK_CANDIDATES` / `MAX_CHUNK_CANDIDATES` | `1000000` / `1000000000000000` | clamp on carved chunk size |
+| `MIN_CHUNK_CANDIDATES` / `MAX_CHUNK_CANDIDATES` | `1000000` / `100000000000000000` | clamp on carved chunk size |
 | `LEASE_SECONDS` | `21600` (6 hours) | how long a claimed range stays leased after the last sign of life from its client (the claim, then each heartbeat) |
 | `RECLAIM_INTERVAL_SECS` | `30` | how often expired leases are swept back to pending |
 | `EMA_ALPHA` | `0.3` | smoothing factor for each user's observed-rate average |
