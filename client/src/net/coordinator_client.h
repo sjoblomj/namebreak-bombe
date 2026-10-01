@@ -59,6 +59,12 @@ public:
     enum class CompleteOutcome { Ok, Conflict, TransientError, Error };
     CompleteOutcome complete(int64_t rangeId, const CompleteRequest& req, std::string& error);
 
+    // Tells the server this client is quitting with range `rangeId` in hand,
+    // and how far it got (see QuitRequest). Conflict (409) means the range
+    // wasn't ours any more anyway - see heartbeat().
+    enum class QuitOutcome { Ok, Conflict, Error };
+    QuitOutcome quit(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, std::string& error);
+
 private:
     std::string baseUrl_;
     std::string token_;

@@ -179,6 +179,35 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& mat
     return req;
 }
 
+// Tells the server this client is quitting with `rangeId` unfinished, so
+// that what's left of it is handed out again straight away rather than once
+// its lease expires - see QuitRequest. `lastHashAMatch` is how far the
+// search got, if it reported anything. One attempt only: the user asked to
+// quit, and if the server can't be reached the lease still runs out as
+// before.
+void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t rangeId, const std::optional<std::string>& lastHashAMatch) {
+    CoordinatorClient quitClient(args.serverUrl);
+    quitClient.setToken(token);
+    std::string err;
+    switch (quitClient.quit(rangeId, lastHashAMatch, err)) {
+        case CoordinatorClient::QuitOutcome::Ok:
+            if (lastHashAMatch)
+                printf("[coordinator] range %lld: told the coordinator it's searched up to %s - the rest goes back to be handed out\n",
+                       (long long) rangeId, lastHashAMatch->c_str());
+            else
+                printf("[coordinator] range %lld: told the coordinator - no progress to report, so the whole range goes back to be handed out\n",
+                       (long long) rangeId);
+            break;
+        case CoordinatorClient::QuitOutcome::Conflict:
+            printf("[coordinator] range %lld: no longer assigned to us - nothing to report\n", (long long) rangeId);
+            break;
+        case CoordinatorClient::QuitOutcome::Error:
+            fprintf(stderr, "[coordinator] range %lld: couldn't tell the coordinator we're quitting (%s) - its lease will expire instead\n",
+                    (long long) rangeId, err.c_str());
+            break;
+    }
+}
+
 // Runs exactly one claimed range: spawns the heartbeat thread, runs the
 // search in-process on the calling thread, then reports completion.
 // `quitRequested`/`callbacks`, if given, are as documented on runCoordinator
@@ -355,7 +384,15 @@ void runOneRange(SearchBackend& backend, const CoordinatorArgs& args, const std:
         // range, which externallyQuit (a caller-owned atomic, e.g. a GUI's
         // Quit button - see coordinator_runner.h) is not, even though it
         // reaches the same abortRequested flag runSearch() polls.
-        if (externallyQuit) {
+        if (externallyQuit && !lostOwnership && !wasPausedWhenStopped) {
+            // Ours until now, so tell the server we're done with it - see
+            // reportQuit.
+            printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
+            std::optional<std::string> latest;
+            if (haveLastHashAMatch)
+                latest = lastHashAMatch;
+            reportQuit(args, token, claim.rangeId, latest);
+        } else if (externallyQuit) {
             printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
         } else if (lostOwnership) {
             printf("[coordinator] range %lld: aborted - no longer assigned to us%s\n", (long long) claim.rangeId,

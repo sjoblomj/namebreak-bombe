@@ -35,6 +35,11 @@ std::atomic<bool> g_paused{false};
 std::atomic<bool> g_finishRangeThenPause{false};
 bool g_coordinatorMode = false;
 
+// Coordinator mode only: set by handleQuitSignal to have runCoordinator()
+// stop and return, telling the server how far the range in hand got (see
+// its quitRequested parameter), instead of the process just dying.
+std::atomic<bool> g_quitRequested{false};
+
 // The 'f' key: see g_finishRangeThenPause. Turning it on while paused
 // resumes the search too - that's the point of it: carry on, but only to the
 // end of the range in hand.
@@ -90,13 +95,33 @@ void pauseKeyListener() {
     }
 }
 
+// Coordinator mode's quit: the first time, asks runCoordinator() to stop -
+// it aborts the range in hand and tells the server how far it got, which
+// takes a moment (one HTTP request) - and the next time quits right away,
+// restoring the terminal first like the handler enableRawKeypressMode()
+// installed would have. For SIGTERM always, for SIGINT when stdin isn't a
+// terminal (no pausing then), and for the Ctrl+C that would otherwise quit
+// - see handleSigintPauseOrQuit. Signal-handler context: see there.
+void handleQuitSignal(int sig) {
+    if (!g_quitRequested.exchange(true, std::memory_order_relaxed)) {
+        static constexpr char kMsg[] =
+            "\n[quitting] telling the coordinator how far the current range got (Ctrl+C again to quit right away)\n";
+        writeStdoutSignalSafe(kMsg, sizeof(kMsg) - 1);
+        return;
+    }
+    restoreKeypressMode();
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
 // Installed as SIGINT's handler (overriding the plain restore-and-terminate
 // one enableRawKeypressMode() already installed - see platform.h) so a
 // reflexive first Ctrl+C pauses instead of losing the run outright: a pause
 // is trivially undone (press 'p', or Ctrl+C once more), a quit isn't. A
 // second Ctrl+C while already paused - however it got paused, this handler
 // or the 'p' key - actually quits, restoring the terminal first exactly
-// like the handler it replaced would have.
+// like the handler it replaced would have. In coordinator mode that quit is
+// handleQuitSignal's, which tells the server first.
 //
 // Signal-handler context: only touches an atomic and async-signal-safe
 // calls (write() via writeStdoutSignalSafe, tcsetattr via
@@ -109,6 +134,10 @@ void handleSigintPauseOrQuit(int sig) {
             "\n[paused] (Ctrl+C) finishing the current batch; no new batches will start until resumed "
             "(press 'p' to resume, or Ctrl+C again to quit)\n";
         writeStdoutSignalSafe(kMsg, sizeof(kMsg) - 1);
+        return;
+    }
+    if (g_coordinatorMode) {
+        handleQuitSignal(sig);
         return;
     }
     static constexpr char kMsg[] = "\n[quitting] (Ctrl+C again)\n";
@@ -254,7 +283,8 @@ int main(int argc, char* argv[]) {
     // stdin (cron, systemd, ...) has no keypresses to listen for, and
     // enableRawKeypressMode() would just fail anyway.
     g_coordinatorMode = mode == "coordinator";
-    if (isInteractiveTerminal() && enableRawKeypressMode()) {
+    bool interactive = isInteractiveTerminal() && enableRawKeypressMode();
+    if (interactive) {
         printf("Press 'p' to pause/resume the search. Ctrl+C pauses too - press it again to quit.\n");
         if (g_coordinatorMode)
             printf("Press 'f' to finish the current range and then pause, before claiming new work.\n");
@@ -263,8 +293,17 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef NAMEBREAK_WITH_NETWORK
-    if (mode == "coordinator")
-        return runCoordinator(cargs, &g_paused, nullptr, nullptr, &g_finishRangeThenPause);
+    if (mode == "coordinator") {
+        // Quitting tells the server how far the range in hand got - see
+        // handleQuitSignal. A SIGTERM (systemd stopping a service, say) is a
+        // quit too, and so is Ctrl+C without a terminal to pause from.
+        std::signal(SIGTERM, handleQuitSignal);
+        if (!interactive)
+            std::signal(SIGINT, handleQuitSignal);
+        int exitCode = runCoordinator(cargs, &g_paused, &g_quitRequested, nullptr, &g_finishRangeThenPause);
+        restoreKeypressMode();
+        return exitCode;
+    }
 #endif
 
     SearchRequest req;

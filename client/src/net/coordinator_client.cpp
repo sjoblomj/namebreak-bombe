@@ -90,6 +90,24 @@ CoordinatorClient::HeartbeatOutcome CoordinatorClient::heartbeat(int64_t rangeId
     return HeartbeatOutcome::Ok;
 }
 
+CoordinatorClient::QuitOutcome CoordinatorClient::quit(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, std::string& error) {
+    QuitRequest req{lastHashAMatchFilename};
+    std::string url = baseUrl_ + "/api/v1/ranges/" + std::to_string(rangeId) + "/quit";
+    HttpResponse resp = http_.post(url, {authHeader(token_)}, toJson(req));
+    if (resp.status == 0) {
+        error = "request failed: " + resp.error;
+        return QuitOutcome::Error;
+    }
+    if (resp.status == 409) {
+        return QuitOutcome::Conflict;
+    }
+    if (!resp.ok()) {
+        error = "quit failed (HTTP " + std::to_string(resp.status) + "): " + parseErrorMessage(resp.body);
+        return QuitOutcome::Error;
+    }
+    return QuitOutcome::Ok;
+}
+
 CoordinatorClient::CompleteOutcome CoordinatorClient::complete(int64_t rangeId, const CompleteRequest& req, std::string& error) {
     std::string url = baseUrl_ + "/api/v1/ranges/" + std::to_string(rangeId) + "/complete";
     HttpResponse resp = http_.post(url, {authHeader(token_)}, toJson(req));

@@ -32,9 +32,9 @@ bool isInteractiveTerminal();
 // still in raw/no-echo mode, leaving the user's shell needing `stty sane` to
 // recover. A caller is free to install its own SIGINT handler afterward to
 // customize just that signal's behavior further (see src/cli/main.cpp's main(),
-// which does this to make a first Ctrl+C pause instead of quit) - SIGTERM's
-// handler is left as this function installed it either way, since SIGTERM
-// should always just mean "terminate", never "pause". Windows: a no-op that
+// which does this to make a first Ctrl+C pause instead of quit; in
+// coordinator mode it also replaces SIGTERM's, to quit by telling the server
+// first - never to pause). Windows: a no-op that
 // always returns true - _getch() (used by readKeypressBlocking below)
 // already reads unbuffered and without echo, so there's no mode to change or
 // restore. Returns false if stdin isn't a terminal or the underlying OS call

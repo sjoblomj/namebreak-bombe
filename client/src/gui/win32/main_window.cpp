@@ -196,7 +196,7 @@ void requestQuit(HWND hwnd) {
     if (g_quitting)
         return; // already shutting down - ignore a repeat click
     const char* message = g_activeMode == "coordinator"
-                               ? "Quit namebreak? This stops searching now; the current range's lease will simply expire and get reassigned."
+                               ? "Quit namebreak? This stops searching now; the coordinator is told how far the current range got, and hands out the rest again."
                                : "Quit namebreak? This stops the search now.";
     int result = MessageBoxA(hwnd, message, "Confirm Quit", MB_YESNO | MB_ICONQUESTION);
     if (result != IDYES)

@@ -21,7 +21,8 @@
 // 1.3.0: this client searches an alphabet of any size from 1 to
 // MAX_ALPHABET_SIZE, where older ones' CUDA backend could only search the
 // sizes it had compiled in - so an alphabet of a new size, tagged 1.3, is
-// only ever handed to this client or a newer one.
+// only ever handed to this client or a newer one. It also tells the server
+// when it quits with a range in hand (see QuitRequest).
 constexpr const char* kProtocolVersion = "1.3.0";
 
 struct RegisterRequest {
@@ -99,6 +100,15 @@ struct HeartbeatResponse {
     bool rangeReleased = false;
 };
 
+// Sent when quitting with a range in hand: this client won't search any
+// more of it. The server records everything up to and including
+// lastHashAMatchFilename (as in HeartbeatRequest) as searched and hands the
+// rest out again straight away - all of it, without one - instead of once
+// the range's lease has expired.
+struct QuitRequest {
+    std::optional<std::string> lastHashAMatchFilename;
+};
+
 struct CompleteRequest {
     bool found = false;
     std::optional<std::string> filename;
@@ -108,6 +118,7 @@ struct CompleteRequest {
 
 std::string toJson(const RegisterRequest&  req);
 std::string toJson(const HeartbeatRequest& req);
+std::string toJson(const QuitRequest&      req);
 std::string toJson(const CompleteRequest&  req);
 
 // Each returns false (contents of `out` unspecified) if `body` isn't valid

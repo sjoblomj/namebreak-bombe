@@ -215,6 +215,13 @@ std::string toJson(const HeartbeatRequest& req) {
     return out;
 }
 
+std::string toJson(const QuitRequest& req) {
+    std::string out = "{\"last_hash_a_match_filename\":";
+    out += req.lastHashAMatchFilename ? escapeJsonString(*req.lastHashAMatchFilename) : "null";
+    out += "}";
+    return out;
+}
+
 std::string toJson(const CompleteRequest& req) {
     std::string out = "{";
     out += "\"found\":";
