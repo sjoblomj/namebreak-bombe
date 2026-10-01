@@ -1025,22 +1025,7 @@ pub async fn heartbeat_range(
     // nothing new *to* report) will naturally repeat itself heartbeat after
     // heartbeat. This is the only signal heartbeat_range has for "is this
     // range actually still being worked" - see last_progress_at below.
-    let mut made_progress = false;
-    if let Some(filename) = last_hash_a_match_filename {
-        if let Some(new_progress) = resolve_progress_index(&mut tx, &range, &filename).await? {
-            // Monotonic: never let a late/out-of-order heartbeat move progress backwards.
-            let floor = range.progress().unwrap_or(range.start() - 1);
-            let new_progress = new_progress.max(floor);
-            made_progress = new_progress > floor;
-            let (progress_block, progress_index) = split_pos(&range.alphabet, range.candidate_len, new_progress);
-            sqlx::query("UPDATE ranges SET progress_block = ?, progress_index = ? WHERE id = ?")
-                .bind(progress_block)
-                .bind(progress_index)
-                .bind(range_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
+    let made_progress = record_progress(&mut tx, &mut range, last_hash_a_match_filename.as_deref()).await?;
 
     // The current setting, not the range's stored lease_seconds - that's
     // whatever was in force when it was claimed.
@@ -1082,6 +1067,75 @@ pub async fn heartbeat_range(
 
     tx.commit().await?;
     Ok(HeartbeatOutcome { lease_seconds, range_released })
+}
+
+/// Records the checkpoint a client reported for `range` (see
+/// `HeartbeatRequest::last_hash_a_match_filename`), in the database and in
+/// `range` itself. Returns whether it's further than the one already
+/// recorded - progress never moves backwards, whatever order reports arrive
+/// in.
+async fn record_progress(tx: &mut sqlx::SqliteConnection, range: &mut Range, last_hash_a_match_filename: Option<&str>) -> Result<bool, AppError> {
+    let Some(filename) = last_hash_a_match_filename else {
+        return Ok(false);
+    };
+    let Some(new_progress) = resolve_progress_index(&mut *tx, range, filename).await? else {
+        return Ok(false);
+    };
+    let floor = range.progress().unwrap_or(range.start() - 1);
+    let new_progress = new_progress.max(floor);
+    let (progress_block, progress_index) = split_pos(&range.alphabet, range.candidate_len, new_progress);
+    sqlx::query("UPDATE ranges SET progress_block = ?, progress_index = ? WHERE id = ?")
+        .bind(progress_block)
+        .bind(progress_index)
+        .bind(range.id)
+        .execute(&mut *tx)
+        .await?;
+    range.progress_block = progress_block;
+    range.progress_index = Some(progress_index);
+    Ok(new_progress > floor)
+}
+
+/// A client quitting while it has `range_id`: it won't search any more of
+/// it. With a checkpoint - its last Hash A match, `last_hash_a_match_filename`,
+/// or one an earlier heartbeat reported - everything up to and including it
+/// becomes a `completed` range (credited to this client) and the rest a new
+/// `pending` one, handed out ahead of fresh carving (see
+/// `split_off_searched_portion`). A checkpoint at the very end completes the
+/// whole range. Without one, the range is simply `pending` again. Either
+/// way it's available straight away, instead of only once its lease
+/// expires. A canary's range (see canary.rs) is only released, as an
+/// expired one would be: nothing ever hands out a virtual target's work
+/// again.
+///
+/// Accepted from whoever holds the range, and from its last holder while
+/// it's pending and nobody else has claimed it - a client that lost its
+/// lease but kept searching, see `heartbeat_range`.
+pub async fn quit_range(pool: &SqlitePool, user: &User, range_id: i64, last_hash_a_match_filename: Option<&str>) -> Result<(), AppError> {
+    let mut tx = pool.begin().await?;
+    let mut range = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?")
+        .bind(range_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let owns_range = (range.status == "in_progress" && range.assigned_user_id == Some(user.id))
+        || (range.status == "pending" && range.last_assigned_user_id == Some(user.id));
+    if !owns_range {
+        return Err(AppError::Conflict("range is not currently assigned to you".into()));
+    }
+
+    record_progress(&mut tx, &mut range, last_hash_a_match_filename).await?;
+    let now = now_unix();
+    release_range(&mut tx, &range, now).await?;
+    let is_virtual: bool = sqlx::query_scalar("SELECT is_virtual FROM targets WHERE id = ?").bind(range.target_id).fetch_one(&mut *tx).await?;
+    if !is_virtual {
+        let released = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?").bind(range_id).fetch_one(&mut *tx).await?;
+        if released.status == "pending" {
+            split_off_searched_portion(&mut tx, released, now).await?;
+        }
+    }
+    tx.commit().await?;
+    tracing::info!(range_id, user_id = user.id, progress = ?range.progress(), "client quit its range");
+    Ok(())
 }
 
 /// Turns a client-reported "Hash A matches: <filename>" line into a validated
@@ -2419,6 +2473,106 @@ mod tests {
         assert_eq!(new_start, expected_start);
         assert_eq!(new_end, space_size(DEFAULT, 3));
         assert_eq!(new_worker, Some(second_user.id));
+    }
+
+    /// Every one of the target's ranges, as (status, start, end, last claimant), in order.
+    async fn range_rows(pool: &SqlitePool) -> Vec<(String, i64, i64, Option<i64>)> {
+        sqlx::query_as("SELECT status, start_index, end_index, last_assigned_user_id FROM ranges ORDER BY start_index")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A client quitting with a Hash A match: what it searched is completed,
+    /// credited to it, and the rest is pending - and the next claim gets it.
+    #[tokio::test]
+    async fn quit_completes_up_to_the_last_hash_a_match_and_requeues_the_rest() {
+        let pool = test_pool().await;
+        let first_user = insert_user(&pool, "first").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
+        let config = test_config(space_size(DEFAULT, 3));
+        let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
+
+        let match_index = space_size(DEFAULT, 3) / 2;
+        let match_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, match_index, 3));
+        quit_range(&pool, &first_user, claim.range_id, Some(&match_filename)).await.unwrap();
+
+        let end = space_size(DEFAULT, 3);
+        assert_eq!(
+            range_rows(&pool).await,
+            vec![("completed".to_string(), 0, match_index + 1, Some(first_user.id)), ("pending".to_string(), match_index + 1, end, None)]
+        );
+
+        let second_user = insert_user(&pool, "second").await;
+        let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("the remainder");
+        let (exp_lower, exp_upper) = range_bound_filenames(DEFAULT, "PRE", ".SUF", 3, match_index + 1, end);
+        assert_eq!((resumed.lower_bound_filename, resumed.upper_bound_filename), (exp_lower, exp_upper));
+    }
+
+    /// Quitting before any Hash A match: no completed part, the whole range is
+    /// pending again (the same row), and handed to the next claimer.
+    #[tokio::test]
+    async fn quit_without_a_hash_a_match_makes_the_whole_range_pending() {
+        let pool = test_pool().await;
+        let first_user = insert_user(&pool, "first").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
+        let config = test_config(space_size(DEFAULT, 3));
+        let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
+
+        quit_range(&pool, &first_user, claim.range_id, None).await.unwrap();
+
+        assert_eq!(range_rows(&pool).await, vec![("pending".to_string(), 0, space_size(DEFAULT, 3), Some(first_user.id))]);
+        let (assigned, progress): (Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT assigned_user_id, progress_index FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!((assigned, progress), (None, None));
+
+        let second_user = insert_user(&pool, "second").await;
+        let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("the whole range again");
+        assert_eq!(resumed.range_id, claim.range_id);
+    }
+
+    /// A quit that reports nothing new still keeps the checkpoint an earlier
+    /// heartbeat reported - progress never moves backwards. One at the very
+    /// last candidate completes the whole range.
+    #[tokio::test]
+    async fn quit_keeps_an_earlier_checkpoint_and_completes_a_range_searched_to_its_end() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
+        let end = space_size(DEFAULT, 3);
+        let config = test_config(end / 2);
+        let filename = |index: i64| format!("PRE{}.SUF", index_to_candidate(DEFAULT, index, 3));
+
+        let first = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        heartbeat_range(&pool, &config, &user, first.range_id, Some(filename(100))).await.unwrap();
+        quit_range(&pool, &user, first.range_id, Some(&filename(50))).await.unwrap();
+        assert_eq!(range_rows(&pool).await[..2], [("completed".to_string(), 0, 101, Some(user.id)), ("pending".to_string(), 101, end / 2, None)]);
+
+        // The pending remainder is claimed first, then quit at its very last candidate.
+        let second = claim_range(&pool, &config, &user).await.unwrap().expect("the remainder");
+        quit_range(&pool, &user, second.range_id, Some(&filename(end / 2 - 1))).await.unwrap();
+        assert_eq!(range_rows(&pool).await[1], ("completed".to_string(), 101, end / 2, Some(user.id)));
+        assert_eq!(range_rows(&pool).await.len(), 2);
+    }
+
+    /// Only the range's own client can quit it.
+    #[tokio::test]
+    async fn quit_is_refused_for_a_range_that_isnt_the_clients() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let other = insert_user(&pool, "other").await;
+        let (lower, upper) = full_bounds(DEFAULT, 3);
+        insert_target(&pool, &lower, &upper).await;
+        let config = test_config(space_size(DEFAULT, 3));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+
+        assert!(matches!(quit_range(&pool, &other, claim.range_id, None).await, Err(AppError::Conflict(_))));
+        complete_range(&pool, &config, &user, claim.range_id, false, None, 1.0, 1).await.unwrap();
+        assert!(matches!(quit_range(&pool, &user, claim.range_id, None).await, Err(AppError::Conflict(_))));
+        assert!(matches!(quit_range(&pool, &user, 9999, None).await, Err(AppError::NotFound)));
     }
 
     /// Releasing a range with real progress must *not* split it straight

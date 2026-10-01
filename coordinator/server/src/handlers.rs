@@ -5,7 +5,7 @@ use axum::Json;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
     AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
-    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
+    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, QuitRequest, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
     Version, PROTOCOL_VERSION,
 };
 
@@ -118,6 +118,16 @@ pub async fn heartbeat(
 ) -> Result<Json<HeartbeatResponse>, AppError> {
     let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename).await?;
     Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, range_released: outcome.range_released }))
+}
+
+pub async fn quit(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path(range_id): Path<i64>,
+    Json(req): Json<QuitRequest>,
+) -> Result<StatusCode, AppError> {
+    ranges::quit_range(&state.pool, &user, range_id, req.last_hash_a_match_filename.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn admin_get_client_releases(State(state): State<AppState>, _admin: AdminAuth) -> Result<Json<ClientReleases>, AppError> {

@@ -78,10 +78,11 @@ impl std::str::FromStr for Version {
 ///   `PREDEFINED_ALPHABETS` as of this version is tagged `since: (1, 0)`.
 /// - 1.1.0 - `RegisterRequest::client_release` (see `ClientReleases`).
 /// - 1.2.0 - the `size41`, `size40`, `size30` and `size29` alphabets.
-/// - 1.3.0 - `ClaimResponse::prune_whole_candidate`; and clients search an
+/// - 1.3.0 - `ClaimResponse::prune_whole_candidate`; clients search an
 ///   alphabet of any size from 1 to 63 (older ones' CUDA backend only the
 ///   sizes of the alphabets above), so an alphabet of a new size is to be
-///   tagged `(1, 3)` or later.
+///   tagged `(1, 3)` or later; and `POST /api/v1/ranges/{id}/quit` (see
+///   `QuitRequest`), which older clients never send.
 pub const PROTOCOL_VERSION: Version = Version::new(1, 3, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +193,19 @@ pub struct HeartbeatResponse {
     /// wire; a client that's locally paused already knows to stay paused and
     /// idle rather than claim a new range regardless of which one this was.
     pub range_released: bool,
+}
+
+/// Sent by a client that quits while it has a range, to `POST
+/// /api/v1/ranges/{id}/quit`: it won't search any more of it. Everything up
+/// to and including `last_hash_a_match_filename` (as in
+/// `HeartbeatRequest`) is recorded as searched, and the rest goes back to
+/// be handed out straight away - all of it, without one - rather than once
+/// the range's lease has expired. Answered with 204 No Content, or 409 if
+/// the range isn't the client's any more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuitRequest {
+    #[serde(default)]
+    pub last_hash_a_match_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

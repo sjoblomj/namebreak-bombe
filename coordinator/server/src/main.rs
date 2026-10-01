@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/claim", post(handlers::claim))
         .route("/api/v1/ranges/{id}/heartbeat", post(handlers::heartbeat))
         .route("/api/v1/ranges/{id}/complete", post(handlers::complete))
+        .route("/api/v1/ranges/{id}/quit", post(handlers::quit))
         .route("/api/v1/status", get(handlers::status))
         .route("/api/v1/alphabets", get(handlers::alphabets))
         .route("/api/v1/admin/targets", post(handlers::admin_create_target))

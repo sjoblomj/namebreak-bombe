@@ -187,6 +187,15 @@ See the top-level plan/design notes for the full rationale; the short version:
   often not checkpointed at all and the range gets fully redone (as a single
   reassigned row, same as before) - not a correctness problem, just a missed
   optimization in that case.
+- **Quitting**: a client that quits while it has a range (from protocol
+  1.3.0 on) says so with `POST /api/v1/ranges/{id}/quit`, sending its last
+  partial match like a heartbeat does. The range is split there and then:
+  everything up to and including that candidate (or an earlier heartbeat's,
+  whichever is further) becomes a `completed` range credited to the client,
+  and the rest a `pending` one, handed out ahead of fresh carving. Without
+  any partial match, the whole range simply goes back to `pending`. Either
+  way the work is available again straight away instead of once the lease
+  expires.
 - **Stopping on a find**: the same heartbeat also carries a `target_solved`
   flag, true once *any* range of that target has been completed with a match.
   A client still searching a different range of an already-solved target sees
