@@ -8,7 +8,7 @@ use namebreak_protocol::{ClaimResponse, Version};
 use sqlx::SqlitePool;
 
 use crate::alphabet::{
-    alphabet_size, bound_indices_at_len, candidate_to_index, client_alphabet_for, floor_index, index_to_candidate, max_supported_len, pattern_spans,
+    alphabet_size, bound_indices_at_len, candidate_to_index, ceil_index, client_alphabet_for, floor_index, index_to_candidate, max_supported_len, pattern_spans,
     range_bound_filenames, space_size, split_end, split_pos, strip_prefix_suffix, transition_alphabet_cursor, Pos, PREDEFINED_ALPHABETS,
 };
 use crate::error::AppError;
@@ -1804,6 +1804,33 @@ pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<
     Ok(Some(requeued))
 }
 
+/// Where the main sweep stands, as a position in `alphabet` - which needn't
+/// be the one its cursor is in (an alphabet change it hasn't caught up with
+/// yet): it has passed every shorter length, and everything before the
+/// returned position at the returned length. Its cursor carries over to a
+/// new alphabet as the first of its candidates at or after the cursor's
+/// own (see `alphabet::transition_alphabet_cursor`), which is what
+/// `ceil_index` gives.
+async fn sweep_position_in(tx: &mut sqlx::SqliteConnection, target: &Target, alphabet: &str) -> Result<(i64, Pos), AppError> {
+    let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
+        .bind(target.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    // Mirrors claim_range: a sweep below start_len jumps to the start of start_len.
+    if progress.candidate_len < target.start_len {
+        return Ok((target.start_len, bound_indices_at_len(alphabet, &target.lower_bound, &target.upper_bound, target.start_len).0));
+    }
+    let len = progress.candidate_len;
+    if len > max_supported_len(alphabet) {
+        return Ok((len, 0));
+    }
+    if progress.next() >= space_size(&progress.alphabet, len) {
+        return Ok((len, space_size(alphabet, len)));
+    }
+    let cursor = index_to_candidate(&progress.alphabet, progress.next(), len);
+    Ok((len, ceil_index(alphabet, &cursor).unwrap_or_else(|| space_size(alphabet, len))))
+}
+
 /// Re-expands every one of `target_id`'s skip ranges onto a new alphabet -
 /// called by `handlers::admin_patch_target` in the same transaction as the
 /// alphabet change, for the same reason as
@@ -1811,8 +1838,10 @@ pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<
 /// its own, so its pattern is simply matched afresh: its old-alphabet
 /// `skipped` rows carving won't pass any more are removed (the ones already
 /// passed stay, see `still_to_be_reached`), and new ones are written in the
-/// new alphabet. One whose pattern matches nothing in the new alphabet (or
-/// whose length it can't reach) is left with no segments.
+/// new alphabet - only where the sweep hasn't been yet, since what it has
+/// passed was already searched or skipped in the old one. One whose pattern
+/// matches nothing in the new alphabet (or whose length it can't reach) is
+/// left with no segments.
 ///
 /// Must run before `migrate_priority_ranges_to_new_alphabet`, while the
 /// priority ranges are still in the old alphabet the rows are compared
@@ -1830,13 +1859,20 @@ pub async fn migrate_skip_ranges_to_new_alphabet(
         .bind(new_alphabet_name)
         .fetch_all(&mut *tx)
         .await?;
+    let (sweep_len, sweep_at) = sweep_position_in(tx, &target, new_alphabet).await?;
     for skip_range in stale {
         sqlx::query("DELETE FROM skip_range_segments WHERE skip_range_id = ?").bind(skip_range.id).execute(&mut *tx).await?;
         unskip_unreached_rows(tx, &target, skip_range.id, Some(&skip_range.alphabet_name)).await?;
-        if skip_range.candidate_len <= max_supported_len(new_alphabet) {
-            if let Ok(spans) = pattern_spans(new_alphabet, &skip_range.pattern, skip_range.candidate_len) {
-                insert_segments(tx, SegmentOwner::Skip, skip_range.id, new_alphabet, skip_range.candidate_len, &spans).await?;
-                write_skipped_rows(tx, &target, skip_range.id, skip_range.candidate_len, new_alphabet_name, new_alphabet, &spans, now).await?;
+        let len = skip_range.candidate_len;
+        if len <= max_supported_len(new_alphabet) {
+            if let Ok(spans) = pattern_spans(new_alphabet, &skip_range.pattern, len) {
+                insert_segments(tx, SegmentOwner::Skip, skip_range.id, new_alphabet, len, &spans).await?;
+                let ahead = match len.cmp(&sweep_len) {
+                    std::cmp::Ordering::Less => vec![],
+                    std::cmp::Ordering::Equal => intersect_spans(&spans, &[(sweep_at, space_size(new_alphabet, len))]),
+                    std::cmp::Ordering::Greater => spans,
+                };
+                write_skipped_rows(tx, &target, skip_range.id, len, new_alphabet_name, new_alphabet, &ahead, now).await?;
             }
         }
         sqlx::query("UPDATE skip_ranges SET alphabet_name = ?, alphabet = ? WHERE id = ?")
@@ -3706,6 +3742,74 @@ mod tests {
         assert!(segments(dead_id).await.is_empty(), "nothing left to skip");
         let alphabet_name: String = sqlx::query_scalar("SELECT alphabet_name FROM skip_ranges WHERE id = ?").bind(skip_range_id).fetch_one(&pool).await.unwrap();
         assert_eq!(alphabet_name, "letters_only");
+    }
+
+    /// Moves `target_id`'s main sweep to `candidate` (in size49).
+    async fn set_sweep(pool: &SqlitePool, target_id: i64, candidate: &str) {
+        sqlx::query("UPDATE target_progress SET candidate_len = ?, next_block = 0, next_index = ? WHERE target_id = ?")
+            .bind(candidate.chars().count() as i64)
+            .bind(candidate_to_index(DEFAULT, candidate).unwrap())
+            .bind(target_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Patches `target_id`'s alphabet the way `admin_patch_target` does, as
+    /// far as its skip ranges go.
+    async fn switch_alphabet(pool: &SqlitePool, target_id: i64, name: &str, alphabet: &str) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE targets SET alphabet_name = ?, alphabet = ? WHERE id = ?").bind(name).bind(alphabet).bind(target_id).execute(&mut *tx).await.unwrap();
+        migrate_skip_ranges_to_new_alphabet(&mut tx, target_id, name, alphabet, now_unix()).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn skipped_candidates(pool: &SqlitePool, target_id: i64) -> Vec<(String, String, String)> {
+        sqlx::query_as::<_, (String, String, i64, i64, i64)>(
+            "SELECT alphabet_name, alphabet, candidate_len, start_index, end_index FROM ranges WHERE target_id = ? AND status = 'skipped' \
+             ORDER BY alphabet_name, start_index",
+        )
+        .bind(target_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(name, alphabet, len, start, end)| (name, index_to_candidate(&alphabet, start, len), index_to_candidate(&alphabet, end - 1, len)))
+        .collect()
+    }
+
+    /// Switching alphabets back and forth after the sweep has passed a skip
+    /// range's length must leave its rows as they were: writing them again
+    /// in the other alphabet showed them, on the dashboard, with gaps
+    /// between them where the original alphabet's completed ranges were.
+    #[tokio::test]
+    async fn migrate_skip_ranges_to_new_alphabet_writes_nothing_where_the_sweep_has_been() {
+        let pool = test_pool().await;
+        let target_id = insert_target(&pool, "  ", "__").await;
+        add_skip_range(&pool, target_id, "[AC]", 2).await;
+        let before = skipped_candidates(&pool, target_id).await;
+        set_sweep(&pool, target_id, "   ").await;
+
+        switch_alphabet(&pool, target_id, "size42", SIZE42).await;
+        assert_eq!(skipped_candidates(&pool, target_id).await, before);
+        switch_alphabet(&pool, target_id, "size49", DEFAULT).await;
+        assert_eq!(skipped_candidates(&pool, target_id).await, before);
+    }
+
+    /// At the length the sweep is on, only what's ahead of it is rewritten
+    /// in the new alphabet.
+    #[tokio::test]
+    async fn migrate_skip_ranges_to_new_alphabet_rewrites_only_what_is_ahead_of_the_sweep() {
+        let pool = test_pool().await;
+        let target_id = insert_target(&pool, "  ", "__").await;
+        add_skip_range(&pool, target_id, "[AC]", 2).await;
+        // '!' isn't in size42: the sweep carries over to "B(", the first
+        // size42 candidate after it.
+        set_sweep(&pool, target_id, "B!").await;
+
+        switch_alphabet(&pool, target_id, "size42", SIZE42).await;
+        let row = |name: &str, first: &str, last: &str| (name.to_string(), first.to_string(), last.to_string());
+        assert_eq!(skipped_candidates(&pool, target_id).await, vec![row("size42", "C ", "C_"), row("size49", "A ", "A_")]);
     }
 
     /// A target's max_backslash_count must reach the client via ClaimResponse

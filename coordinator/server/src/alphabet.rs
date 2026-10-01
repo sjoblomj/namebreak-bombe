@@ -162,6 +162,26 @@ pub fn floor_index(alphabet: &str, candidate: &str) -> Option<Pos> {
     })
 }
 
+/// `floor_index`'s mirror image: the position in `alphabet` of the first of
+/// its candidates at or after `candidate` - which may have characters
+/// `alphabet` doesn't, when it's a position in another alphabet. `None` if
+/// `alphabet` has no candidate that late.
+pub fn ceil_index(alphabet: &str, candidate: &str) -> Option<Pos> {
+    let chars = alphabet_chars(alphabet);
+    let (min_char, _) = min_max_chars(alphabet);
+    let candidate: Vec<char> = candidate.chars().collect();
+    let Some(first_foreign) = candidate.iter().position(|c| !chars.contains(c)) else {
+        return candidate_to_index(alphabet, &candidate.iter().collect::<String>());
+    };
+    // Raise the rightmost position that can go higher, no further right than
+    // the first foreign character, and minimise everything after it.
+    (0..=first_foreign).rev().find_map(|i| {
+        let higher = chars.iter().copied().filter(|&c| c > candidate[i]).min()?;
+        let rounded: String = candidate[..i].iter().copied().chain([higher]).chain(std::iter::repeat_n(min_char, candidate.len() - i - 1)).collect();
+        candidate_to_index(alphabet, &rounded)
+    })
+}
+
 pub fn alphabet_size(alphabet: &str) -> i64 {
     alphabet.chars().count() as i64
 }
@@ -1165,6 +1185,39 @@ mod tests {
                     }
                 }
                 None => assert!(index_to_candidate(SIZE42, 0, 3) > candidate),
+            }
+        }
+    }
+
+    #[test]
+    fn ceil_index_rounds_a_foreign_candidate_up_to_the_first_one_after_it() {
+        let x = "ACE";
+        let at = |s: &str| candidate_to_index(x, s);
+        assert_eq!(ceil_index(x, "CC"), at("CC"), "a candidate of the alphabet itself");
+        assert_eq!(ceil_index(x, "CD"), at("CE"));
+        assert_eq!(ceil_index(x, "CB"), at("CC"));
+        assert_eq!(ceil_index(x, "BE"), at("CA"), "everything after a raised position is minimised");
+        assert_eq!(ceil_index(x, "CF"), at("EA"), "nothing is higher than 'F' in the alphabet, so an earlier position is raised");
+        assert_eq!(ceil_index(x, "EF"), None, "later than every candidate of the alphabet");
+        assert_eq!(ceil_index(x, " F"), at("AA"));
+    }
+
+    #[test]
+    fn ceil_index_never_falls_short_of_the_candidate_it_was_given() {
+        // Every size49 candidate at length 3, rounded up into size42: the
+        // result is never before it, and nothing of size42 lies between them.
+        let size49 = lookup_predefined_alphabet("size49").unwrap();
+        for i in (0..space_size(size49, 3)).step_by(7) {
+            let candidate = index_to_candidate(size49, i, 3);
+            match ceil_index(SIZE42, &candidate) {
+                Some(ceil) => {
+                    let ceiled = index_to_candidate(SIZE42, ceil, 3);
+                    assert!(ceiled >= candidate, "{ceiled:?} < {candidate:?}");
+                    if ceil > 0 {
+                        assert!(index_to_candidate(SIZE42, ceil - 1, 3) < candidate, "{candidate:?} rounded too far, to {ceiled:?}");
+                    }
+                }
+                None => assert!(index_to_candidate(SIZE42, space_size(SIZE42, 3) - 1, 3) < candidate),
             }
         }
     }
