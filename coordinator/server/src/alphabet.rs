@@ -1,22 +1,33 @@
-//! Candidate <-> index math, ported from `namebreaker-cuda/cpu-utils.cpp`
-//! (`indexToCandidate` / `getLowerBound` / `getUpperBound`), plus the bound-string
-//! generation a `namebreak bounded` invocation needs.
+//! Candidate <-> index math, and the alphabets targets are searched in.
 //!
 //! Every function here takes the alphabet as a parameter rather than reading a
-//! single global constant: each target picks one of `PREDEFINED_ALPHABETS`, whose
-//! *characters* namebreak.cu accepts directly as a new CLI argument (no lookup
-//! needed on that side) - but whose *size* is restricted to a small fixed set
-//! namebreak.cu has compiled-in template instantiations for (see the comment on
-//! `indexToCandidate` in namebreak.cu and the dispatch in `runCudaBatch`), to keep
-//! that per-thread decode step a compile-time-constant division rather than a
-//! (much slower) runtime one. The set of *distinct sizes* below must stay in sync
-//! with that dispatch; adding a same-size profile needs no C++ change at all.
+//! single global constant: each target has its own - one of
+//! `PREDEFINED_ALPHABETS`, or a custom one (see `custom_alphabet`) - and a
+//! claim hands the client its characters, which it searches as they are. A
+//! client of protocol 1.3 or later searches an alphabet of any size from 1 to
+//! `MAX_ALPHABET_SIZE`; older ones only the sizes of the predefined alphabets
+//! tagged (1, 0) or (1, 2), which their CUDA backend had compiled in. So a
+//! new alphabet - predefined or custom - is kept from clients older than the
+//! version it's tagged with: they're given a larger alphabet they know that
+//! contains it, if there is one (see `client_alphabet_for`).
+
+/// The most characters an alphabet can have: the client's own
+/// `MAX_ALPHABET_SIZE` (client/src/engine/limits.h) - a row of candidates, one
+/// bit per last character, must fit its 64-bit masks. Keep the two in sync.
+pub const MAX_ALPHABET_SIZE: usize = 63;
+
+/// The protocol version from which clients search a custom alphabet (any
+/// characters, any size up to `MAX_ALPHABET_SIZE`).
+pub const CUSTOM_ALPHABETS_SINCE: (u64, u64) = (1, 3);
+
+/// What every custom alphabet's name starts with - see `custom_alphabet`.
+const CUSTOM_ALPHABET_PREFIX: &str = "custom-";
 
 /// name, characters, and the protocol MINOR version this alphabet was
 /// introduced in (see `namebreak_protocol::PROTOCOL_VERSION`'s doc comment).
-/// Sizes present here (29, 30, 40, 41, 42, 43, 47, 48, 49, 50) must match the sizes
-/// `namebreak.cu`'s `runCudaBatch` has compiled-in kernel instantiations
-/// for. `size49` is relied on elsewhere (`handlers::admin_create_target`'s
+/// Each lists its characters in ascending order (`floor_index` relies on
+/// it). An alphabet of a size not here already must be tagged (1, 3) or
+/// later: older clients can only search these sizes. `size49` is relied on elsewhere (`handlers::admin_create_target`'s
 /// fallback when `alphabet_name` is omitted) - keep that name stable even if its
 /// characters or position here ever change.
 ///
@@ -74,6 +85,11 @@ fn client_alphabet_among<'a>(
 ) -> Option<&'a str> {
     let available = |since: (u64, u64)| since <= (client_version.major, client_version.minor);
     match known.iter().find(|(name, _, _)| *name == alphabet_name) {
+        None if is_custom_alphabet_name(alphabet_name) => {
+            if available(CUSTOM_ALPHABETS_SINCE) {
+                return Some(alphabet);
+            }
+        }
         None => return Some(alphabet),
         Some(&(_, _, since)) if available(since) => return Some(alphabet),
         Some(_) => {}
@@ -83,6 +99,41 @@ fn client_alphabet_among<'a>(
         .filter(|&&(_, chars, since)| available(since) && alphabet.chars().all(|c| chars.contains(c)))
         .map(|&(_, chars, _)| chars)
         .min_by_key(|chars| alphabet_size(chars))
+}
+
+/// Whether `name` is a custom alphabet's (see `custom_alphabet`).
+pub fn is_custom_alphabet_name(name: &str) -> bool {
+    name.starts_with(CUSTOM_ALPHABET_PREFIX)
+}
+
+/// A custom alphabet: `characters`, checked and put in ascending order (as
+/// every alphabet's must be - see `floor_index`), and a name for it, which is
+/// what ranges carved in it are told apart by - `custom-<size>-<8 hex
+/// digits>`, the same for the same set of characters whatever order they
+/// were given in. Printable ASCII only (the client searches bytes, and MPQ
+/// names are ASCII), no lowercase letters (MPQ hashes a name upper-cased, so
+/// a lowercase letter only ever finds what its uppercase one does), no
+/// character twice, and 1 to `MAX_ALPHABET_SIZE` of them. The error says
+/// what's wrong.
+pub fn custom_alphabet(characters: &str) -> Result<(String, String), String> {
+    let mut chars: Vec<char> = characters.chars().collect();
+    if chars.is_empty() || chars.len() > MAX_ALPHABET_SIZE {
+        return Err(format!("a custom alphabet must have 1 to {MAX_ALPHABET_SIZE} characters (got {})", chars.len()));
+    }
+    if let Some(c) = chars.iter().find(|c| !(' '..='~').contains(*c)) {
+        return Err(format!("a custom alphabet can only have printable ASCII characters (got {c:?})"));
+    }
+    if let Some(c) = chars.iter().find(|c| c.is_ascii_lowercase()) {
+        return Err(format!("a custom alphabet can't have lowercase letters (got {c:?}) - MPQ hashes a name upper-cased"));
+    }
+    chars.sort_unstable();
+    if let Some(pair) = chars.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(format!("a custom alphabet can't have a character twice (got {:?} twice)", pair[0]));
+    }
+    let sorted: String = chars.iter().collect();
+    // FNV-1a, 32-bit: stable across builds and platforms, unlike std's hasher.
+    let hash = sorted.bytes().fold(0x811C_9DC5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    Ok((format!("{CUSTOM_ALPHABET_PREFIX}{}-{hash:08x}", chars.len()), sorted))
 }
 
 /// The position in `alphabet` of the last of its candidates at or before
@@ -686,6 +737,46 @@ mod tests {
             let unique: std::collections::HashSet<char> = chars.chars().collect();
             assert_eq!(unique.len() as i64, size, "{name} has duplicate characters, which would break the index<->candidate mapping");
         }
+    }
+
+    #[test]
+    fn custom_alphabet_is_sorted_and_named_by_its_characters() {
+        let (name, chars) = custom_alphabet("ZA0 _").unwrap();
+        assert_eq!(chars, " 0AZ_");
+        assert!(is_custom_alphabet_name(&name));
+        assert!(name.starts_with("custom-5-"), "{name}");
+        assert_eq!(custom_alphabet("_ Z0A").unwrap(), (name.clone(), chars), "the same characters in another order are the same alphabet");
+        assert_ne!(custom_alphabet(" 0AZ-").unwrap().0, name, "other characters, another name");
+        let largest: String = (b'!'..=b'_').map(|b| b as char).collect();
+        assert_eq!(largest.len(), MAX_ALPHABET_SIZE);
+        assert!(custom_alphabet(&largest).is_ok());
+    }
+
+    #[test]
+    fn custom_alphabet_refuses_what_a_client_cant_search() {
+        assert!(custom_alphabet("").is_err());
+        let too_many: String = (b' '..=b'_').map(|b| b as char).collect();
+        assert!(too_many.len() > MAX_ALPHABET_SIZE);
+        assert!(custom_alphabet(&too_many).is_err());
+        assert!(custom_alphabet("AB\u{e9}").is_err(), "not ASCII");
+        assert!(custom_alphabet("AB\t").is_err(), "not printable");
+        assert!(custom_alphabet("ABc").is_err(), "lowercase");
+        assert!(custom_alphabet("ABA").is_err(), "a character twice");
+    }
+
+    #[test]
+    fn client_alphabet_for_gives_a_custom_alphabet_only_to_clients_that_take_any() {
+        let (name, chars) = custom_alphabet("ABC").unwrap();
+        assert_eq!(client_alphabet_for(&name, &chars, Version::new(1, 3, 0)), Some(chars.as_str()));
+        // An older client gets the smallest predefined alphabet it knows with
+        // all of its characters...
+        let older = client_alphabet_for(&name, &chars, Version::new(1, 2, 0)).unwrap();
+        assert!(older != chars && chars.chars().all(|c| older.contains(c)), "{older}");
+        assert_eq!(alphabet_size(older), 29);
+        // ... and nothing if there's no such alphabet.
+        let (name, chars) = custom_alphabet("AB~").unwrap();
+        assert_eq!(client_alphabet_for(&name, &chars, Version::new(1, 2, 0)), None);
+        assert_eq!(client_alphabet_for(&name, &chars, Version::new(1, 3, 0)), Some(chars.as_str()));
     }
 
     #[test]

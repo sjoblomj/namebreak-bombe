@@ -134,6 +134,7 @@ See the top-level plan/design notes for the full rationale; the short version:
   rejected. On an alphabet change, the pattern is matched afresh against the
   new alphabet.
 - **Alphabets**: each target picks one of a small set of predefined alphabets
+  - or a custom one (`alphabet` instead of `alphabet_name`, see below)
   (`server/src/alphabet.rs`'s `PREDEFINED_ALPHABETS`, also listable via
   `GET /api/v1/alphabets`) - variations on the default 49-character set, with or
   without brackets/backslash and with a reduced punctuation set, currently
@@ -141,9 +142,9 @@ See the top-level plan/design notes for the full rationale; the short version:
   `size40`, `size30` and `size29`. Clients of protocol 1.3 and later search
   an alphabet of any size from 1 to 63; older ones' CUDA backend only the sizes
   above, which it had compiled in. So a new alphabet of a new size is a new
-  `PREDEFINED_ALPHABETS` entry tagged `(1, 3)`: older clients are then given a
-  larger alphabet they know instead (see `alphabet::client_alphabet_for`), or
-  no work from that target. The client's CUDA kernel has the sizes 42 and 43
+  `PREDEFINED_ALPHABETS` entry tagged `(1, 3)`, or a custom alphabet: older
+  clients are then given a larger alphabet they know instead (see
+  `alphabet::client_alphabet_for`), or no work from that target. The client's CUDA kernel has the sizes 42 and 43
   compiled in and takes any other at runtime, which
   costs about 2% with `prune_whole_candidate` and nothing without it.
 - **Backslash limiting**: each target also has a `max_backslash_count` (default
@@ -225,6 +226,17 @@ curl -X POST localhost:8080/api/v1/admin/targets \
   }'
 ```
 
+For a custom alphabet, give `"alphabet"` with its characters instead of
+`"alphabet_name"` - e.g. `"alphabet": " -.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'"`
+(1 to 63 of them, printable ASCII, no lowercase letters, none twice; in any
+order, as they're stored sorted). It gets a name made from its characters,
+`custom-<size>-<hash>`, which the dashboard shows. Only clients of protocol
+1.3 or later are given it as it is; an older client gets the smallest
+predefined alphabet it knows that has all of its characters - searching more
+than it needs to, never less - or no work from that target. The same goes for
+`PATCH`: `"alphabet"` changes a target to a custom alphabet the way
+`"alphabet_name"` changes it to a predefined one.
+
 `lower_bound`/`upper_bound` tighten the search to exactly that alphabetical
 range at *every* candidate length that gets searched - not just their own
 literal length. They don't need to be the same length as each other (e.g.
@@ -288,8 +300,8 @@ curl localhost:8080/api/v1/status
 ```
 
 Pause/resume a target, and/or change its priority, description,
-alphabet_name, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate,
-max_backslash_count or start_len:
+alphabet_name (or a custom alphabet), prune_symbol_runs, prune_unopened_brackets,
+prune_whole_candidate, max_backslash_count or start_len:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \

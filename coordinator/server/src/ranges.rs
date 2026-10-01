@@ -2688,6 +2688,33 @@ mod tests {
         assert_eq!(claim.alphabet, SIZE42);
     }
 
+    /// A target with a custom alphabet: a client of protocol 1.3 searches it as
+    /// it is; an older one, which can only search the predefined alphabets'
+    /// sizes, the smallest predefined alphabet that has all of its characters
+    /// - or, with none, gets no work from it.
+    #[tokio::test]
+    async fn claim_range_gives_a_custom_alphabet_only_to_clients_that_take_any() {
+        let pool = test_pool().await;
+        let (name, chars) = crate::alphabet::custom_alphabet("ABC").unwrap();
+        let (lower, upper) = full_bounds(&chars, 2);
+        insert_target_with_alphabet(&pool, &name, &chars, &lower, &upper).await;
+        let config = test_config(space_size(&chars, 2));
+
+        let new_client = insert_user_with_protocol_version(&pool, "new-client", "1.3.0").await;
+        let claim = claim_range(&pool, &config, &new_client).await.unwrap().expect("a 1.3 client takes a custom alphabet");
+        assert_eq!(claim.alphabet, chars);
+        let old_client = insert_user_with_protocol_version(&pool, "old-client", "1.2.0").await;
+        let claim = claim_range(&pool, &config, &old_client).await.unwrap().expect("size29 has A, B and C");
+        assert_eq!(claim.alphabet, crate::alphabet::lookup_predefined_alphabet("size29").unwrap());
+
+        let pool = test_pool().await;
+        let (name, chars) = crate::alphabet::custom_alphabet("AB~").unwrap();
+        let (lower, upper) = full_bounds(&chars, 2);
+        insert_target_with_alphabet(&pool, &name, &chars, &lower, &upper).await;
+        let old_client = insert_user_with_protocol_version(&pool, "old-client", "1.2.0").await;
+        assert!(claim_range(&pool, &config, &old_client).await.unwrap().is_none(), "no predefined alphabet has '~'");
+    }
+
     /// With two targets, one alphabet-incompatible and one not, an old
     /// client is transparently steered to the one it can handle - the whole
     /// point of gating per-target rather than just refusing the client

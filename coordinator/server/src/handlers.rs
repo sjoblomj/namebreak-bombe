@@ -10,7 +10,7 @@ use namebreak_protocol::{
 };
 
 use crate::alphabet::{
-    alphabet_size, bound_indices_at_len, bounds_are_valid, bounds_diverge_immediately, candidate_to_index, lookup_predefined_alphabet, max_supported_len,
+    alphabet_size, custom_alphabet, bound_indices_at_len, bounds_are_valid, bounds_diverge_immediately, candidate_to_index, lookup_predefined_alphabet, max_supported_len,
     pattern_spans, split_end, split_pos, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
@@ -204,11 +204,8 @@ pub async fn admin_create_target(
     if req.max_backslash_count < 0 {
         return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
     }
-    let alphabet_name = req.alphabet_name.as_deref().unwrap_or("size49");
-    let Some(alphabet) = lookup_predefined_alphabet(alphabet_name) else {
-        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _, _)| name).collect();
-        return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
-    };
+    let (alphabet_name, alphabet) = resolve_alphabet(req.alphabet_name.as_deref(), req.alphabet.as_deref())?;
+    let (alphabet_name, alphabet) = (alphabet_name.as_str(), alphabet.as_str());
     validate_start_len(req.start_len, alphabet)?;
 
     // Only the first `cap` characters of a bound are ever consulted (carving never
@@ -303,24 +300,44 @@ pub async fn admin_create_target(
 /// cursor is only translated onto the new alphabet lazily, the first time
 /// `ranges::claim_range` next carves fresh work for this target (see
 /// `alphabet::transition_alphabet_cursor`).
-async fn resolve_alphabet_patch(pool: &sqlx::SqlitePool, target_id: i64, alphabet_name: &str) -> Result<(String, String), AppError> {
-    let Some(alphabet) = lookup_predefined_alphabet(alphabet_name) else {
-        let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _, _)| name).collect();
-        return Err(AppError::BadRequest(format!("unknown alphabet_name '{alphabet_name}' - valid names: {}", valid.join(", "))));
-    };
+/// A target's alphabet, as (name, characters): the predefined one named
+/// `alphabet_name`, the custom one with the characters `alphabet` (see
+/// `alphabet::custom_alphabet`), or `size49` if neither is given.
+fn resolve_alphabet(alphabet_name: Option<&str>, alphabet: Option<&str>) -> Result<(String, String), AppError> {
+    match (alphabet_name, alphabet) {
+        (Some(_), Some(_)) => Err(AppError::BadRequest("give alphabet_name or alphabet, not both".into())),
+        (None, Some(characters)) => custom_alphabet(characters).map_err(AppError::BadRequest),
+        (name, None) => {
+            let name = name.unwrap_or("size49");
+            let Some(characters) = lookup_predefined_alphabet(name) else {
+                let valid: Vec<&str> = PREDEFINED_ALPHABETS.iter().map(|&(name, _, _)| name).collect();
+                return Err(AppError::BadRequest(format!("unknown alphabet_name '{name}' - valid names: {}", valid.join(", "))));
+            };
+            Ok((name.to_string(), characters.to_string()))
+        }
+    }
+}
+
+async fn resolve_alphabet_patch(
+    pool: &sqlx::SqlitePool,
+    target_id: i64,
+    alphabet_name: Option<&str>,
+    alphabet: Option<&str>,
+) -> Result<(String, String), AppError> {
+    let (alphabet_name, alphabet) = resolve_alphabet(alphabet_name, alphabet)?;
     let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_optional(pool).await?.ok_or(AppError::NotFound)?;
 
-    let cap = max_supported_len(alphabet) as usize;
+    let cap = max_supported_len(&alphabet) as usize;
     let lower_for_validation: String = target.lower_bound.chars().take(cap).collect();
     let upper_for_validation: String = target.upper_bound.chars().take(cap).collect();
-    if candidate_to_index(alphabet, &lower_for_validation).is_none() {
+    if candidate_to_index(&alphabet, &lower_for_validation).is_none() {
         return Err(AppError::BadRequest("target's lower_bound contains a character outside the new alphabet".into()));
     }
-    if candidate_to_index(alphabet, &upper_for_validation).is_none() {
+    if candidate_to_index(&alphabet, &upper_for_validation).is_none() {
         return Err(AppError::BadRequest("target's upper_bound contains a character outside the new alphabet".into()));
     }
 
-    Ok((alphabet_name.to_string(), alphabet.to_string()))
+    Ok((alphabet_name, alphabet))
 }
 
 pub async fn admin_patch_target(
@@ -338,6 +355,7 @@ pub async fn admin_patch_target(
         && req.priority.is_none()
         && req.description.is_none()
         && req.alphabet_name.is_none()
+        && req.alphabet.is_none()
         && req.prune_symbol_runs.is_none()
         && req.prune_unopened_brackets.is_none()
         && req.prune_whole_candidate.is_none()
@@ -345,7 +363,7 @@ pub async fn admin_patch_target(
         && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
-            "at least one of status, priority, description, alphabet_name, prune_symbol_runs, prune_unopened_brackets, \
+            "at least one of status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
              prune_whole_candidate, max_backslash_count or start_len must be provided"
                 .into(),
         ));
@@ -354,12 +372,11 @@ pub async fn admin_patch_target(
         return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
     }
 
-    let (alphabet_name, alphabet) = match &req.alphabet_name {
-        Some(name) => {
-            let (name, chars) = resolve_alphabet_patch(&state.pool, target_id, name).await?;
-            (Some(name), Some(chars))
-        }
-        None => (None, None),
+    let (alphabet_name, alphabet) = if req.alphabet_name.is_some() || req.alphabet.is_some() {
+        let (name, chars) = resolve_alphabet_patch(&state.pool, target_id, req.alphabet_name.as_deref(), req.alphabet.as_deref()).await?;
+        (Some(name), Some(chars))
+    } else {
+        (None, None)
     };
 
     let mut tx = state.pool.begin().await?;
@@ -593,6 +610,20 @@ mod tests {
 
     fn register_request(protocol_version: &str) -> RegisterRequest {
         RegisterRequest { username: "u".into(), hostname: "h".into(), backend: "cuda".into(), protocol_version: protocol_version.to_string(), client_release: None }
+    }
+
+    #[test]
+    fn resolve_alphabet_takes_a_predefined_or_a_custom_one_but_not_both() {
+        let (name, chars) = resolve_alphabet(None, None).unwrap();
+        assert_eq!((name.as_str(), chars.as_str()), ("size49", lookup_predefined_alphabet("size49").unwrap()));
+        let (name, chars) = resolve_alphabet(Some("size42"), None).unwrap();
+        assert_eq!((name.as_str(), chars.as_str()), ("size42", lookup_predefined_alphabet("size42").unwrap()));
+        let (name, chars) = resolve_alphabet(None, Some("ZYX")).unwrap();
+        assert!(name.starts_with("custom-3-"), "{name}");
+        assert_eq!(chars, "XYZ");
+        assert!(matches!(resolve_alphabet(Some("size49"), Some("ABC")), Err(AppError::BadRequest(_))));
+        assert!(matches!(resolve_alphabet(Some("size7"), None), Err(AppError::BadRequest(_))));
+        assert!(matches!(resolve_alphabet(None, Some("abc")), Err(AppError::BadRequest(_))));
     }
 
     #[test]

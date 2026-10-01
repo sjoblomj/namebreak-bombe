@@ -249,9 +249,19 @@ pub struct AdminCreateTargetRequest {
     /// false - more than it has to, never less.
     #[serde(default)]
     pub prune_whole_candidate: bool,
-    /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`.
+    /// One of the names from `GET /api/v1/alphabets`. Defaults to `"size49"`
+    /// unless `alphabet` is given.
     #[serde(default)]
     pub alphabet_name: Option<String>,
+    /// A custom alphabet instead of a predefined one: its characters, in any
+    /// order - 1 to 63 of them, printable ASCII, no lowercase letters, none
+    /// twice. Stored in ascending order, under a name made from them
+    /// (`custom-<size>-<hash>`). Only clients of protocol 1.3 or later are
+    /// given it as it is; older ones get the smallest predefined alphabet
+    /// they know that has all of its characters, or no work from the target.
+    /// Not together with `alphabet_name`.
+    #[serde(default)]
+    pub alphabet: Option<String>,
     /// Max '\' occurrences allowed in a candidate; 0 (the default when omitted)
     /// means unlimited.
     #[serde(default)]
@@ -303,6 +313,10 @@ pub struct AdminPatchTargetRequest {
     /// is carved for this target (see `ranges::claim_range`).
     #[serde(default)]
     pub alphabet_name: Option<String>,
+    /// See `AdminCreateTargetRequest::alphabet`: a custom alphabet instead of
+    /// `alphabet_name`, changed the same way. Not together with it.
+    #[serde(default)]
+    pub alphabet: Option<String>,
     /// See `AdminCreateTargetRequest::prune_symbol_runs`. Leave unset to
     /// leave it unchanged. Like `prune_unopened_brackets`, it's sent to
     /// clients with each claim, so a change applies to every range claimed
