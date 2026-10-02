@@ -743,8 +743,20 @@
     return Math.round(Math.max(0, Math.min(100, n))) + '%';
   }
 
+  // Orders two candidates of the same length as the search does: every
+  // alphabet lists its characters in ascending order, so comparing their
+  // character codes gives the same order as their positions - without the
+  // positions, which past 2^53 a JavaScript number can't hold exactly, and
+  // which mean nothing between two alphabets. Not localeCompare, which
+  // orders by the locale's rules instead.
+  function compareCandidates(a, b) {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  // Counts of candidates come as decimal strings (see dashboard.rs's
+  // as_decimal): past 2^53 a JavaScript number can't hold them exactly.
   function fmtNum(n) {
-    return Number(n).toLocaleString();
+    return typeof n === 'string' ? BigInt(n).toLocaleString() : Number(n).toLocaleString();
   }
 
   // A single candidate/bound string, boxed like inline code - the standard
@@ -890,7 +902,7 @@
     }
     tr.appendChild(tdRange);
 
-    const count = fmtNum(r.end_index - r.start_index);
+    const count = fmtNum(r.candidate_count);
 
     const tdCount = document.createElement('td');
     tdCount.className = 'mono col-count';
@@ -1181,7 +1193,7 @@
   // the one priority range it describes, rather than leaving readers to
   // guess whether a standalone row talks about the range above or below it.
   function priorityGapNote(t, pr) {
-    if (t.cursor_candidate_len === pr.candidate_len && t.cursor_next_index < pr.start_index) {
+    if (t.cursor_candidate_len === pr.candidate_len && t.cursor_candidate < pr.first_candidate) {
       const frag = document.createDocumentFragment();
       frag.append("Main sweep hasn't reached here yet - still at ");
       frag.appendChild(candidateChip(t.cursor_candidate));
@@ -1297,7 +1309,7 @@
     const sorted = t.priority_ranges.slice().sort((a, b) => {
       const aDone = isPriorityRangeDone(a) ? 1 : 0;
       const bDone = isPriorityRangeDone(b) ? 1 : 0;
-      return aDone - bDone || a.candidate_len - b.candidate_len || a.start_index - b.start_index;
+      return aDone - bDone || a.candidate_len - b.candidate_len || compareCandidates(a.first_candidate, b.first_candidate);
     });
     // A labeled divider row right before the first Done range - but only
     // when there's at least one still-active range above it to divide from,
@@ -1361,7 +1373,7 @@
 
       tbody.appendChild(tr);
 
-      const carved = (carvedByPriorityId.get(pr.id) || []).slice().sort((a, b) => a.start_index - b.start_index);
+      const carved = (carvedByPriorityId.get(pr.id) || []).slice().sort((a, b) => compareCandidates(a.first_candidate, b.first_candidate));
       for (const r of carved) tbody.appendChild(priorityCarvedRangeRow(r));
     }
     table.appendChild(tbody);

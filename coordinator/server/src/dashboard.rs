@@ -7,7 +7,14 @@ use std::collections::HashMap;
 use axum::extract::State;
 use axum::response::Html;
 use axum::Json;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
+
+/// A count of candidates, as a decimal string: past 2^53 a JSON number no
+/// longer reads back exactly in the dashboard's JavaScript, which would show
+/// two ranges of the same size with different counts.
+fn as_decimal<S: Serializer>(n: &Pos, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(n)
+}
 
 use crate::alphabet::{bound_indices_at_len, ceil_index, floor_index, index_to_candidate, join_pos, max_supported_len, space_size, Pos};
 use crate::error::AppError;
@@ -34,6 +41,7 @@ pub struct DashboardVolunteer {
     /// (`last_assigned_user_id`). A little generous: a range closed because
     /// its target was solved elsewhere, or because a match was found in it,
     /// counts in full even though the search stopped partway.
+    #[serde(serialize_with = "as_decimal")]
     pub candidates: Pos,
     pub ranges_completed: i64,
     /// Distinct names found: targets sharing a Hash A/Hash B pair are the
@@ -170,7 +178,6 @@ pub struct DashboardTarget {
     /// each `DashboardPriorityRange` so the dashboard can show the (never
     /// persisted - see `ranges::priority_spans_at`) gap between them.
     pub cursor_candidate_len: i64,
-    pub cursor_next_index: Pos,
     pub cursor_candidate: String,
     /// Where the main sweep's position falls among `ranges`: right after
     /// this range, or before all of them if `None`.
@@ -201,6 +208,7 @@ pub struct DashboardGap {
     pub last_len: i64,
     pub last_candidate: String,
     /// How many candidates it covers.
+    #[serde(serialize_with = "as_decimal")]
     pub count: Pos,
 }
 
@@ -328,20 +336,17 @@ pub struct DashboardPriorityRange {
     pub priority: i64,
     pub pattern: String,
     pub candidate_len: i64,
-    pub start_index: Pos,
-    pub end_index: Pos,
-    pub next_index: Pos,
     pub first_candidate: String,
-    pub last_candidate: String,
-    /// `None` once this priority range is exhausted (`next_index == end_index`)
-    /// - see `ranges::claim_priority_range_chunk`.
+    /// `None` once this priority range is exhausted (its next position is
+    /// its end) - see `ranges::claim_priority_range_chunk`.
     pub next_candidate: Option<String>,
-    pub alphabet_name: String,
     pub alphabet: String,
     /// How many candidates it owns, and how many of those it has handed out.
-    /// Not simply `end_index - start_index`, since there can be gaps between
+    /// Not simply its end minus its start, since there can be gaps between
     /// its segments (see `ranges::owned_spans`).
+    #[serde(serialize_with = "as_decimal")]
     pub candidate_count: Pos,
+    #[serde(serialize_with = "as_decimal")]
     pub handed_out_count: Pos,
     /// How many separate stretches of candidates it owns.
     pub segment_count: usize,
@@ -355,10 +360,6 @@ pub struct DashboardSkipRange {
     pub id: i64,
     pub pattern: String,
     pub reason: String,
-    pub candidate_len: i64,
-    pub alphabet_name: String,
-    /// How many candidates it matches (0 once removed).
-    pub candidate_count: Pos,
     /// Removed by an operator after it had already skipped something - see
     /// `ranges::remove_skip_range`.
     pub removed: bool,
@@ -383,7 +384,6 @@ struct RangeRow {
     assigned_at: Option<i64>,
     lease_expires_at: Option<i64>,
     completed_at: Option<i64>,
-    created_at: i64,
     alphabet_name: String,
     alphabet: String,
     priority_range_id: Option<i64>,
@@ -395,11 +395,13 @@ pub struct DashboardRange {
     pub id: i64,
     pub status: String,
     pub candidate_len: i64,
-    pub start_index: Pos,
-    pub end_index: Pos,
-    /// The actual first/last candidate strings this range covers - `end_index`
-    /// itself is exclusive (see `range_bound_filenames`), so the last candidate
-    /// is decoded from `end_index - 1`.
+    /// Its end minus its start, worked out here rather than by the
+    /// dashboard - see `as_decimal`.
+    #[serde(serialize_with = "as_decimal")]
+    pub candidate_count: Pos,
+    /// The actual first/last candidate strings this range covers - its end
+    /// is exclusive (see `range_bound_filenames`), so the last candidate is
+    /// decoded from the position before it.
     pub first_candidate: String,
     pub last_candidate: String,
     /// The candidate at the last heartbeat-reported progress index, if any -
@@ -421,7 +423,6 @@ pub struct DashboardRange {
     pub assigned_at: Option<i64>,
     pub lease_expires_at: Option<i64>,
     pub completed_at: Option<i64>,
-    pub created_at: i64,
     /// The alphabet this specific range was carved with - see
     /// `models::Range::alphabet`. Not necessarily the target's current
     /// alphabet (`DashboardTarget::alphabet_name`) if the target was patched
@@ -467,7 +468,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         "SELECT ranges.target_id, ranges.id, ranges.status, ranges.candidate_len, ranges.start_block, ranges.start_index, \
                 ranges.end_block, ranges.end_index, ranges.progress_block, ranges.progress_index, \
                 worker.username || '@' || worker.hostname AS worker, NULLIF(worker.backend, '') AS worker_backend, \
-                ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, ranges.created_at, \
+                ranges.assigned_at, ranges.lease_expires_at, ranges.completed_at, \
                 ranges.alphabet_name, ranges.alphabet, ranges.priority_range_id, ranges.skip_range_id \
          FROM ranges LEFT JOIN users AS worker ON worker.id = ranges.last_assigned_user_id \
          WHERE ranges.target_id IN (SELECT id FROM targets WHERE is_virtual = 0) \
@@ -517,7 +518,6 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     let mut skip_spans_by_target: HashMap<i64, Vec<(i64, String, Pos, Pos)>> = HashMap::new();
     for sr in all_skip_ranges {
         let spans: Vec<(Pos, Pos)> = skip_segments.get(&sr.id).into_iter().flatten().map(|s| s.span(&sr.alphabet, sr.candidate_len)).collect();
-        let candidate_count = spans.iter().map(|&(start, end)| end - start).sum();
         skip_spans_by_target
             .entry(sr.target_id)
             .or_default()
@@ -526,9 +526,6 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             id: sr.id,
             pattern: sr.pattern,
             reason: sr.reason,
-            candidate_len: sr.candidate_len,
-            alphabet_name: sr.alphabet_name,
-            candidate_count,
             removed: sr.removed_at.is_some(),
         });
     }
@@ -553,8 +550,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                     id: row.id,
                     status: row.status,
                     candidate_len: len,
-                    start_index,
-                    end_index,
+                    candidate_count: end_index - start_index,
                     first_candidate: index_to_candidate(&row.alphabet, start_index, len),
                     last_candidate: index_to_candidate(&row.alphabet, end_index - 1, len),
                     progress_candidate: progress_index.map(|p| index_to_candidate(&row.alphabet, p, len)),
@@ -564,7 +560,6 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                     assigned_at: row.assigned_at,
                     lease_expires_at: row.lease_expires_at,
                     completed_at: row.completed_at,
-                    created_at: row.created_at,
                     alphabet_name: row.alphabet_name,
                     alphabet: row.alphabet,
                     priority_range_id: row.priority_range_id,
@@ -603,14 +598,9 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                     id: pr.id,
                     priority: pr.priority,
                     candidate_len: pr.candidate_len,
-                    start_index,
-                    end_index,
-                    next_index,
                     first_candidate: index_to_candidate(&pr.alphabet, start_index, pr.candidate_len),
-                    last_candidate: index_to_candidate(&pr.alphabet, end_index - 1, pr.candidate_len),
                     next_candidate: (next_index < end_index).then(|| index_to_candidate(&pr.alphabet, next_index, pr.candidate_len)),
                     pattern: pr.pattern,
-                    alphabet_name: pr.alphabet_name,
                     alphabet: pr.alphabet,
                 }
             })
@@ -645,7 +635,6 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             alphabet,
             start_len,
             cursor_candidate_len,
-            cursor_next_index,
             cursor_candidate,
             sweep_after_range_id,
             priority_ranges,
@@ -686,8 +675,7 @@ mod tests {
             id,
             status: "completed".into(),
             candidate_len,
-            start_index,
-            end_index,
+            candidate_count: end_index - start_index,
             first_candidate: index_to_candidate(alphabet, start_index, candidate_len),
             last_candidate: index_to_candidate(alphabet, end_index - 1, candidate_len),
             progress_candidate: None,
@@ -697,7 +685,6 @@ mod tests {
             assigned_at: None,
             lease_expires_at: None,
             completed_at: None,
-            created_at: 0,
             alphabet_name: alphabet_name.into(),
             alphabet: alphabet.into(),
             priority_range_id: None,
