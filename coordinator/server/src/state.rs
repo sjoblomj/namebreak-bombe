@@ -72,7 +72,7 @@ impl RangeConfig {
             reclaim_interval_secs: env_u64("RECLAIM_INTERVAL_SECS", 30),
             ema_alpha: env_f64("EMA_ALPHA", 0.3),
             stall_release_seconds: env_i64("STALL_RELEASE_SECONDS", 24 * 60 * 60),
-            canary_probability: env_f64("CANARY_PROBABILITY", 0.05),
+            canary_probability: env_f64("CANARY_PROBABILITY", 0.33),
             canary_seconds: env_f64("CANARY_SECONDS", 5.0),
         }
     }

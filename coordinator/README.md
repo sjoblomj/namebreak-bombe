@@ -400,7 +400,7 @@ found/total". A canary still being searched isn't counted yet; one given up on
 | `LEASE_SECONDS` | `21600` (6 hours) | how long a claimed range stays leased after the last sign of life from its client (the claim, then each heartbeat) |
 | `RECLAIM_INTERVAL_SECS` | `30` | how often expired leases are swept back to pending |
 | `EMA_ALPHA` | `0.3` | smoothing factor for each user's observed-rate average |
-| `CANARY_PROBABILITY` | `0.05` | chance that a claim gets a canary instead of real work; `0` turns them off |
+| `CANARY_PROBABILITY` | `0.33` | chance that a claim gets a canary instead of real work; `0` turns them off |
 | `CANARY_SECONDS` | `5` | how long a canary should take, at the client's measured rate |
 
 ## Deploying to fly.io
