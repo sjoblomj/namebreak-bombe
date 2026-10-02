@@ -35,7 +35,7 @@ std::atomic<bool> g_paused{false};
 std::atomic<bool> g_finishRangeThenPause{false};
 bool g_coordinatorMode = false;
 
-// Coordinator mode only: set by handleQuitSignal to have runCoordinator()
+// Coordinator mode only: set by requestQuitOrQuitNow to have runCoordinator()
 // stop and return, telling the server how far the range in hand got (see
 // its quitRequested parameter), instead of the process just dying.
 std::atomic<bool> g_quitRequested{false};
@@ -102,7 +102,7 @@ void pauseKeyListener() {
 // installed would have. For SIGTERM always, for SIGINT when stdin isn't a
 // terminal (no pausing then), and for the Ctrl+C that would otherwise quit
 // - see handleSigintPauseOrQuit. Signal-handler context: see there.
-void handleQuitSignal(int sig) {
+void requestQuitOrQuitNow(int sig) {
     if (!g_quitRequested.exchange(true, std::memory_order_relaxed)) {
         static constexpr char kMsg[] =
             "\n[quitting] telling the coordinator how far the current range got (Ctrl+C again to quit right away)\n";
@@ -112,6 +112,15 @@ void handleQuitSignal(int sig) {
     restoreKeypressMode();
     std::signal(sig, SIG_DFL);
     std::raise(sig);
+}
+
+// The Windows CRT resets a signal to SIG_DFL before calling its handler
+// (which the C standard allows; glibc doesn't), so each handler puts itself
+// back first - otherwise the second Ctrl+C there would end the process
+// outright, without telling the coordinator anything.
+void handleQuitSignal(int sig) {
+    std::signal(sig, handleQuitSignal);
+    requestQuitOrQuitNow(sig);
 }
 
 // Installed as SIGINT's handler (overriding the plain restore-and-terminate
@@ -129,6 +138,7 @@ void handleQuitSignal(int sig) {
 // guaranteed reentrant-safe if this signal interrupts another stdio call
 // already in progress on the main or listener thread.
 void handleSigintPauseOrQuit(int sig) {
+    std::signal(sig, handleSigintPauseOrQuit); // see handleQuitSignal
     if (!g_paused.exchange(true, std::memory_order_relaxed)) {
         static constexpr char kMsg[] =
             "\n[paused] (Ctrl+C) finishing the current batch; no new batches will start until resumed "
@@ -137,7 +147,7 @@ void handleSigintPauseOrQuit(int sig) {
         return;
     }
     if (g_coordinatorMode) {
-        handleQuitSignal(sig);
+        requestQuitOrQuitNow(sig);
         return;
     }
     static constexpr char kMsg[] = "\n[quitting] (Ctrl+C again)\n";

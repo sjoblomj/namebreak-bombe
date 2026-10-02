@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cerrno>
+#include <csignal>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -15,7 +16,6 @@
 #include <io.h>      // _isatty, _fileno, _write
 #include <conio.h>   // _getch
 #else
-#include <csignal>
 #include <pwd.h>     // getpwuid
 #include <termios.h> // tcgetattr, tcsetattr
 #include <unistd.h>  // gethostname, isatty, fileno, geteuid, read, write
@@ -81,8 +81,20 @@ bool enableRawKeypressMode() { return true; } // _getch() needs no mode change -
 void restoreKeypressMode() {}
 
 int readKeypressBlocking() {
-    int c = _getch();
-    return c == EOF ? -1 : c;
+    for (;;) {
+        int c = _getch();
+        if (c == EOF)
+            return -1;
+        // _getch() clears ENABLE_PROCESSED_INPUT while it waits, so a Ctrl+C
+        // pressed then - nearly always, with the key listener blocked in
+        // here - arrives as an ordinary key (3) instead of as a SIGINT.
+        // Deliver it as the SIGINT it would otherwise have been.
+        if (c == 3) {
+            std::raise(SIGINT);
+            continue;
+        }
+        return c;
+    }
 }
 
 #else

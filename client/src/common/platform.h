@@ -37,9 +37,11 @@ bool isInteractiveTerminal();
 // first - never to pause). Windows: a no-op that
 // always returns true - _getch() (used by readKeypressBlocking below)
 // already reads unbuffered and without echo, so there's no mode to change or
-// restore. Returns false if stdin isn't a terminal or the underlying OS call
-// fails - callers should treat single-keypress reading as simply
-// unavailable then, not fall back to it.
+// restore. It does swallow Ctrl+C as a key, though, so
+// readKeypressBlocking raises SIGINT itself when it reads one. Returns false
+// if stdin isn't a terminal or the underlying OS call fails - callers should
+// treat single-keypress reading as simply unavailable then, not fall back
+// to it.
 bool enableRawKeypressMode();
 
 // Reads one keypress, blocking until one is available. Only meaningful after
