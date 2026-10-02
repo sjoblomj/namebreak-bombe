@@ -1,5 +1,8 @@
 # namebreak-bombe
 
+[Client for volunteers](https://github.com/sjoblomj/namebreak-bombe/releases) |
+[Dashboard for community progress](https://namebreak-coordinator.fly.dev/)
+
 A GPU-accelerated MPQ filename brute-forcer. MPQ archives (used by Blizzard
 games like StarCraft, Diablo, and Warcraft III) index their files by a pair
 of 32-bit hashes of the filename rather than storing filenames directly, so

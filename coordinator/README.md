@@ -1,5 +1,8 @@
 # namebreak coordinator
 
+[Client for volunteers](https://github.com/sjoblomj/namebreak-bombe/releases) |
+[Dashboard for community progress](https://namebreak-coordinator.fly.dev/)
+
 Distributes `namebreak` (see `../client`) across multiple volunteers'
 GPUs. A central **server** tracks a set of *targets* (a prefix/suffix + hash
 pair to search for), carves each target's candidate space into time-boxed
