@@ -83,7 +83,9 @@ impl std::str::FromStr for Version {
 ///   sizes of the alphabets above), so an alphabet of a new size is to be
 ///   tagged `(1, 3)` or later; and `POST /api/v1/ranges/{id}/quit` (see
 ///   `QuitRequest`), which older clients never send.
-pub const PROTOCOL_VERSION: Version = Version::new(1, 3, 0);
+/// - 1.4.0 - `ClaimResponse::min_backslash_count` and
+///   `ClaimResponse::prune_adjacent_backslashes`.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 4, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -152,6 +154,14 @@ pub struct ClaimResponse {
     pub prune_whole_candidate: bool,
     /// Max '\' occurrences namebreak will allow in a candidate; 0 means unlimited.
     pub max_backslash_count: i64,
+    /// Min '\' occurrences a candidate must have - see
+    /// `AdminCreateTargetRequest::min_backslash_count`.
+    #[serde(default)]
+    pub min_backslash_count: i64,
+    /// Skip candidates with two '\' next to each other - see
+    /// `AdminCreateTargetRequest::prune_adjacent_backslashes`.
+    #[serde(default)]
+    pub prune_adjacent_backslashes: bool,
     pub lower_bound_filename: String,
     pub upper_bound_filename: String,
     /// The literal alphabet characters for this range's target.
@@ -253,8 +263,9 @@ pub struct AdminCreateTargetRequest {
     /// Brackets the prefix leaves open count as opened. Defaults to false.
     #[serde(default)]
     pub prune_unopened_brackets: bool,
-    /// Apply `prune_symbol_runs`, `prune_unopened_brackets` and
-    /// `max_backslash_count` to every character of a candidate but the last,
+    /// Apply `prune_symbol_runs`, `prune_unopened_brackets`,
+    /// `max_backslash_count`, `min_backslash_count` and
+    /// `prune_adjacent_backslashes` to every character of a candidate but the last,
     /// instead of only its leading characters (those a client enumerates on
     /// the CPU - all but the last five or so). About a fifth fewer candidates
     /// are then searched, at every length, and the search gets about 10%
@@ -280,6 +291,21 @@ pub struct AdminCreateTargetRequest {
     /// means unlimited.
     #[serde(default)]
     pub max_backslash_count: i64,
+    /// Min '\' occurrences a candidate must have; 0 (the default when
+    /// omitted) means none are needed. The prefix's own don't count. At most
+    /// `max_backslash_count`, unless that's 0. A client skips a candidate
+    /// once the characters it checks (see `prune_whole_candidate`) leave too
+    /// few after them to make up the difference, even if all of those were
+    /// '\' - so without `prune_whole_candidate`, only candidates needing more
+    /// than the last five or so characters can hold. A client too old to
+    /// know it searches as if it were 0.
+    #[serde(default)]
+    pub min_backslash_count: i64,
+    /// Skip candidates with two '\' next to each other - counting a '\' the
+    /// prefix ends with, next to one the candidate starts with. Defaults to
+    /// false. A client too old to know it searches as if it were false.
+    #[serde(default)]
+    pub prune_adjacent_backslashes: bool,
     /// Higher-priority active targets have their claimable work handed out
     /// first, ahead of any lower-priority target's. Defaults to 0 when
     /// omitted, so an unset target just competes on creation order as before.
@@ -351,6 +377,16 @@ pub struct AdminPatchTargetRequest {
     /// `prune_symbol_runs`.
     #[serde(default)]
     pub max_backslash_count: Option<i64>,
+    /// See `AdminCreateTargetRequest::min_backslash_count`. Leave unset to
+    /// leave it unchanged. Applies to ranges claimed after the patch, like
+    /// `prune_symbol_runs`.
+    #[serde(default)]
+    pub min_backslash_count: Option<i64>,
+    /// See `AdminCreateTargetRequest::prune_adjacent_backslashes`. Leave
+    /// unset to leave it unchanged. Applies to ranges claimed after the
+    /// patch, like `prune_symbol_runs`.
+    #[serde(default)]
+    pub prune_adjacent_backslashes: Option<bool>,
     /// See `AdminCreateTargetRequest::start_len`. Leave unset to leave it
     /// unchanged. Raising it past where the main sweep has reached makes the
     /// sweep jump straight to the start of the new length the next time it

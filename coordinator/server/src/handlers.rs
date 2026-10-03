@@ -203,6 +203,21 @@ fn validate_start_len(start_len: i64, alphabet: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Rejects backslash counts a client couldn't search with - see
+/// `AdminCreateTargetRequest::max_backslash_count` and `min_backslash_count`.
+fn validate_backslash_counts(max_backslash_count: i64, min_backslash_count: i64) -> Result<(), AppError> {
+    if max_backslash_count < 0 {
+        return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
+    }
+    if min_backslash_count < 0 {
+        return Err(AppError::BadRequest("min_backslash_count must be >= 0 (0 means none needed)".into()));
+    }
+    if max_backslash_count != 0 && min_backslash_count > max_backslash_count {
+        return Err(AppError::BadRequest("min_backslash_count must not be more than max_backslash_count (unless that's 0, unlimited)".into()));
+    }
+    Ok(())
+}
+
 pub async fn admin_create_target(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -211,9 +226,7 @@ pub async fn admin_create_target(
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
     }
-    if req.max_backslash_count < 0 {
-        return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
-    }
+    validate_backslash_counts(req.max_backslash_count, req.min_backslash_count)?;
     let (alphabet_name, alphabet) = resolve_alphabet(req.alphabet_name.as_deref(), req.alphabet.as_deref())?;
     let (alphabet_name, alphabet) = (alphabet_name.as_str(), alphabet.as_str());
     validate_start_len(req.start_len, alphabet)?;
@@ -258,8 +271,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -272,6 +285,8 @@ pub async fn admin_create_target(
     .bind(req.prune_unopened_brackets as i64)
     .bind(req.prune_whole_candidate as i64)
     .bind(req.max_backslash_count)
+    .bind(req.min_backslash_count)
+    .bind(req.prune_adjacent_backslashes as i64)
     .bind(alphabet_name)
     .bind(alphabet)
     .bind(req.priority)
@@ -370,16 +385,15 @@ pub async fn admin_patch_target(
         && req.prune_unopened_brackets.is_none()
         && req.prune_whole_candidate.is_none()
         && req.max_backslash_count.is_none()
+        && req.min_backslash_count.is_none()
+        && req.prune_adjacent_backslashes.is_none()
         && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
-             prune_whole_candidate, max_backslash_count or start_len must be provided"
+             prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes or start_len must be provided"
                 .into(),
         ));
-    }
-    if req.max_backslash_count.is_some_and(|n| n < 0) {
-        return Err(AppError::BadRequest("max_backslash_count must be >= 0 (0 means unlimited)".into()));
     }
 
     let (alphabet_name, alphabet) = if req.alphabet_name.is_some() || req.alphabet.is_some() {
@@ -401,6 +415,15 @@ pub async fn admin_patch_target(
         return Err(AppError::Conflict("target is already solved and can no longer be modified".into()));
     }
 
+    // Like start_len below, against what the target ends up with: a new
+    // max_backslash_count against the existing min_backslash_count too.
+    if req.max_backslash_count.is_some() || req.min_backslash_count.is_some() {
+        validate_backslash_counts(
+            req.max_backslash_count.unwrap_or(target.max_backslash_count),
+            req.min_backslash_count.unwrap_or(target.min_backslash_count),
+        )?;
+    }
+
     // Checked against whatever the target ends up with, so a new alphabet
     // is checked against the existing start_len too, not just the other way
     // round. The cursor itself is only moved lazily, by ranges::claim_range.
@@ -413,7 +436,9 @@ pub async fn admin_patch_target(
          description = COALESCE(?, description), \
          alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet), \
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
-         prune_whole_candidate = COALESCE(?, prune_whole_candidate), max_backslash_count = COALESCE(?, max_backslash_count), start_len = COALESCE(?, start_len) \
+         prune_whole_candidate = COALESCE(?, prune_whole_candidate), max_backslash_count = COALESCE(?, max_backslash_count), \
+         min_backslash_count = COALESCE(?, min_backslash_count), prune_adjacent_backslashes = COALESCE(?, prune_adjacent_backslashes), \
+         start_len = COALESCE(?, start_len) \
          WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.status)
@@ -425,6 +450,8 @@ pub async fn admin_patch_target(
     .bind(req.prune_unopened_brackets.map(i64::from))
     .bind(req.prune_whole_candidate.map(i64::from))
     .bind(req.max_backslash_count)
+    .bind(req.min_backslash_count)
+    .bind(req.prune_adjacent_backslashes.map(i64::from))
     .bind(req.start_len)
     .bind(target_id)
     .execute(&mut *tx)
@@ -644,6 +671,17 @@ mod tests {
         assert!(validate_start_len(cap, alphabet).is_ok());
         assert!(matches!(validate_start_len(0, alphabet), Err(AppError::BadRequest(_))));
         assert!(matches!(validate_start_len(cap + 1, alphabet), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_backslash_counts_wants_a_min_no_more_than_a_max() {
+        assert!(validate_backslash_counts(0, 0).is_ok());
+        assert!(validate_backslash_counts(0, 5).is_ok(), "no max: any min");
+        assert!(validate_backslash_counts(2, 2).is_ok());
+        assert!(validate_backslash_counts(3, 1).is_ok());
+        assert!(matches!(validate_backslash_counts(2, 3), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_backslash_counts(-1, 0), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_backslash_counts(0, -1), Err(AppError::BadRequest(_))));
     }
 
     #[test]

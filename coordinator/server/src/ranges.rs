@@ -71,6 +71,8 @@ pub(crate) fn to_claim_response(
         prune_unopened_brackets: target.prune_unopened_brackets != 0,
         prune_whole_candidate: target.prune_whole_candidate != 0,
         max_backslash_count: target.max_backslash_count,
+        min_backslash_count: target.min_backslash_count,
+        prune_adjacent_backslashes: target.prune_adjacent_backslashes != 0,
         lower_bound_filename,
         upper_bound_filename,
         alphabet: client_alphabet.to_string(),
@@ -4035,6 +4037,28 @@ mod tests {
         sqlx::query("UPDATE targets SET prune_unopened_brackets = 1 WHERE id = ?").bind(target_id).execute(&pool).await.unwrap();
         let after = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
         assert!(after.prune_unopened_brackets);
+    }
+
+    #[tokio::test]
+    async fn claim_includes_the_targets_backslash_rules() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        let target_id = insert_target(&pool, &lower, &upper).await;
+
+        let config = test_config(space_size(DEFAULT, 2) / 2);
+        let before = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(before.min_backslash_count, 0, "none needed unless the target asks for some");
+        assert!(!before.prune_adjacent_backslashes, "off unless the target asks for it");
+
+        sqlx::query("UPDATE targets SET min_backslash_count = 2, prune_adjacent_backslashes = 1 WHERE id = ?")
+            .bind(target_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
+        assert_eq!(after.min_backslash_count, 2);
+        assert!(after.prune_adjacent_backslashes);
     }
 
     #[tokio::test]

@@ -157,13 +157,24 @@ See the top-level plan/design notes for the full rationale; the short version:
   pre-filter as `--prune-symbol-runs`'s "no 3 consecutive symbols" rule, just
   targeting one specific character instead. To forbid `\` entirely, use an
   alphabet that doesn't contain it rather than `max_backslash_count: 0` - `0` is
-  the "no limit" sentinel, not "zero allowed".
+  the "no limit" sentinel, not "zero allowed". A target can also ask for a
+  `min_backslash_count` (default `0` = none needed, at most
+  `max_backslash_count` unless that's `0`): a candidate is discarded once
+  the characters the client checks leave too few after them to make up the
+  difference - so without `prune_whole_candidate`, only those needing more
+  `\` than the last five or so characters can hold. And with
+  `prune_adjacent_backslashes` (default `false`), candidates with two `\`
+  next to each other are discarded - counting a `\` the prefix ends with.
+  The prefix's own backslashes never count towards either count. A canary
+  copies `prune_adjacent_backslashes` but not `min_backslash_count`, since
+  the candidate it plants has no `\`. Clients older than protocol 1.4
+  search as if both were off.
 - **Bracket pruning**: a target with `prune_unopened_brackets` (default
   `false`) has `namebreak` discard candidates that close a bracket never
   opened - a `)` or `]` at a point where more brackets have been closed than
   opened - `(`/`)` and `[`/`]` counted separately. Brackets left open by the
   target's prefix count as opened.
-- **Whole-candidate pruning**: by default, those three rules only look at a
+- **Whole-candidate pruning**: by default, those rules only look at a
   candidate's leading characters - all but the last five or so, which the
   client enumerates on its CPU. A target with `prune_whole_candidate`
   (default `false`) has them look at every character but the last: about a
@@ -233,6 +244,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "prune_whole_candidate": true,
     "alphabet_name": "size49",
     "max_backslash_count": 0,
+    "min_backslash_count": 0,
+    "prune_adjacent_backslashes": true,
     "priority": 0,
     "description": "From the <b>1998</b> demo listing",
     "start_len": 1
@@ -314,7 +327,8 @@ curl localhost:8080/api/v1/status
 
 Pause/resume a target, and/or change its priority, description,
 alphabet_name (or a custom alphabet), prune_symbol_runs, prune_unopened_brackets,
-prune_whole_candidate, max_backslash_count or start_len:
+prune_whole_candidate, max_backslash_count, min_backslash_count,
+prune_adjacent_backslashes or start_len:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -324,7 +338,7 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 
 Any field can be omitted to leave it unchanged (pass `"description": ""` to
 clear an existing one), but at least one must be given. A changed
-`prune_symbol_runs`/`prune_unopened_brackets`/`prune_whole_candidate`/`max_backslash_count` affects every range claimed
+`prune_symbol_runs`/`prune_unopened_brackets`/`prune_whole_candidate`/`max_backslash_count`/`min_backslash_count`/`prune_adjacent_backslashes` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
 progress finish with the old setting. Raising `start_len` past where carving
 has reached makes it jump straight to the start of the new length the next
