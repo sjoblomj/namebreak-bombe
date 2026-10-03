@@ -143,6 +143,7 @@
   }
   .volunteers-table td.num, .volunteers-table th.num { text-align: right; }
   .volunteers-table td.rank { color: var(--muted); }
+  .volunteers-table [title] { cursor: help; }
   .volunteers-table td.canary-missed { color: var(--b-hip); font-weight: 600; }
   .target-card {
     background: var(--card-bg);
@@ -618,8 +619,12 @@
         count towards nothing else.</p>
       <div class="table-scroll">
         <table class="volunteers-table">
-          <thead><tr><th>#</th><th>Volunteer</th><th class="num">Candidates searched</th><th class="num">Ranges</th>
-            <th class="num">Hostnames</th><th class="num">Names found</th>
+          <thead><tr><th title="Rank, by candidates searched, then names found, then username">#</th>
+            <th title="The username the volunteer's clients register with">Volunteer</th>
+            <th class="num" title="Candidates in the ranges the volunteer has completed, across all its machines. A range cut short because its target was solved still counts in full.">Candidates searched</th>
+            <th class="num" title="Ranges the volunteer has completed">Ranges</th>
+            <th class="num" title="How many machines (hostnames) the volunteer has run a client on">Hostnames</th>
+            <th class="num" title="Names the volunteer has found. Targets with the same Hash A and Hash B are the same file, so finding it counts once.">Names found</th>
             <th class="num" title="Canaries found, of those handed to the volunteer: small ranges with a name planted in them, which check that its machine finds what it should. Not counted in the other columns.">Canaries</th></tr></thead>
           <tbody id="volunteers"></tbody>
         </table>
@@ -692,6 +697,8 @@
       tbody.appendChild(tr);
       return;
     }
+    // Each cell explains itself the same way its column's header does.
+    const headerTitles = [...tbody.closest('table').tHead.rows[0].cells].map((th) => th.title);
     volunteers.forEach((v, i) => {
       const tr = document.createElement('tr');
       const cells = [
@@ -704,12 +711,13 @@
         [v.canaries_total > 0 ? `${fmtNum(v.canaries_found)}/${fmtNum(v.canaries_total)}` : '-',
          v.canaries_found < v.canaries_total ? 'num mono canary-missed' : 'num mono'],
       ];
-      for (const [text, className] of cells) {
+      cells.forEach(([text, className], column) => {
         const td = document.createElement('td');
         td.className = className;
         td.textContent = text;
+        td.title = headerTitles[column];
         tr.appendChild(td);
-      }
+      });
       tbody.appendChild(tr);
     });
   }
