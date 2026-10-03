@@ -29,6 +29,8 @@ void onRangeClaimed(const ClaimResponse& claim, const SearchRequest& req) {
     g_status.alphabet = req.alphabet;
     g_status.prefix = req.prefix;
     g_status.suffix = req.suffix;
+    g_status.insertFromStart = req.insertFromStart;
+    g_status.insertFromEnd = req.insertFromEnd;
     g_status.lowerBound = req.lowerBound;
     g_status.upperBound = req.upperBound;
     g_status.hasActiveRange = true;
@@ -72,6 +74,8 @@ void runLocalSearch(const SearchRequest& req, bool continuous, const std::string
             g_status.alphabet = req.alphabet;
             g_status.prefix = req.prefix;
             g_status.suffix = req.suffix;
+            g_status.insertFromStart = req.insertFromStart;
+            g_status.insertFromEnd = req.insertFromEnd;
             g_status.lowerBound = req.lowerBound;
             g_status.upperBound = req.upperBound;
         }

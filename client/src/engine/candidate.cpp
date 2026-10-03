@@ -89,15 +89,113 @@ bool pruneStep_CPU(const PruneRules& rules, PruneState& state, char c) {
     return true;
 }
 
+TailCapacity tailCapacity_CPU(const PruneRules& rules, std::string_view tail) {
+    // The most backslashes so far, by what the last character was: not a
+    // backslash, an enumerated one, or an inserted one (or the last one
+    // checked, which can't be changed either). An enumerated backslash may
+    // not follow another backslash, nor be followed by an inserted one -
+    // inserted ones next to each other, or to one checked, are counted.
+    constexpr int kNone = -1000000;
+    auto run = [&](bool afterBackslash) {
+        int other = afterBackslash ? kNone : 0, enumerated = kNone, fixed = afterBackslash ? 0 : kNone;
+        for (char c : tail) {
+            const int best = std::max({other, enumerated, fixed});
+            if (c == kFreeChar) {
+                const int canFollow = rules.adjacentBackslashes ? other : best;
+                enumerated = canFollow == kNone ? kNone : canFollow + 1;
+                other = best;
+                fixed = kNone;
+            } else if (c == '\\') {
+                const int canFollow = rules.adjacentBackslashes ? std::max(other, fixed) : best;
+                fixed = canFollow == kNone ? kNone : canFollow + 1;
+                other = enumerated = kNone;
+            } else {
+                other = best;
+                enumerated = fixed = kNone;
+            }
+        }
+        return std::max({other, enumerated, fixed});
+    };
+    return TailCapacity{run(true), run(false)};
+}
+
+bool canReachMinBackslashes_CPU(const PruneRules& rules, const PruneState& state, const TailCapacity& capacity) {
+    if (rules.minBackslashCount == 0 || state.backslashes >= rules.minBackslashCount)
+        return true;
+    return state.backslashes + (state.lastWasBackslash ? capacity.afterBackslash : capacity.otherwise) >= rules.minBackslashCount;
+}
+
 bool canReachMinBackslashes_CPU(const PruneRules& rules, const PruneState& state, int remaining) {
     if (rules.minBackslashCount == 0 || state.backslashes >= rules.minBackslashCount)
         return true;
     // With adjacentBackslashes, at most every other one of the remaining
-    // characters - not the first, if the last one was a backslash.
+    // characters - not the first, if the last one was a backslash. What
+    // tailCapacity_CPU gives for `remaining` kFreeChars.
     int most = remaining;
     if (rules.adjacentBackslashes)
         most = state.lastWasBackslash ? remaining / 2 : (remaining + 1) / 2;
     return state.backslashes + most >= rules.minBackslashCount;
+}
+
+int insertionIndex(const Insertion& ins, bool fromEnd, int len) {
+    if (!ins.any() || ins.position < 0 || ins.position > len)
+        return -1;
+    return fromEnd ? len - ins.position : ins.position;
+}
+
+std::string insertIntoCandidate(std::string_view candidate, const Insertion& fromStart, const Insertion& fromEnd) {
+    const int len = (int) candidate.size();
+    const int startAt = insertionIndex(fromStart, false, len), endAt = insertionIndex(fromEnd, true, len);
+    std::string out;
+    out.reserve(candidate.size() + fromStart.text.size() + fromEnd.text.size());
+    for (int i = 0; i <= len; ++i) {
+        if (i == startAt)
+            out += fromStart.text;
+        if (i == endAt)
+            out += fromEnd.text;
+        if (i < len)
+            out += candidate[i];
+    }
+    return out;
+}
+
+bool candidateOfFilename(const std::string& filename, const std::string& prefix, const std::string& suffix, const Insertion& fromStart,
+                         const Insertion& fromEnd, std::string& out, std::string& error) {
+    std::string withInsertions;
+    if (!getStartCandidate(filename, prefix, suffix, withInsertions, error))
+        return false;
+    if (!removeInsertions(withInsertions, fromStart, fromEnd, out)) {
+        error = "'" + filename + "' doesn't have the inserted text where a candidate of its length would";
+        return false;
+    }
+    return true;
+}
+
+bool removeInsertions(std::string_view withInsertions, const Insertion& fromStart, const Insertion& fromEnd, std::string& out) {
+    // The candidate's length, by which of the two it has.
+    for (int startIn = 0; startIn <= 1; ++startIn) {
+        for (int endIn = 0; endIn <= 1; ++endIn) {
+            const int len = (int) withInsertions.size() - startIn * (int) fromStart.text.size() - endIn * (int) fromEnd.text.size();
+            if (len < 0 || (insertionIndex(fromStart, false, len) >= 0) != (startIn == 1) || (insertionIndex(fromEnd, true, len) >= 0) != (endIn == 1))
+                continue;
+            const int startAt = insertionIndex(fromStart, false, len), endAt = insertionIndex(fromEnd, true, len);
+            std::string candidate;
+            size_t at = 0;
+            for (int i = 0; i <= len; ++i) {
+                if (i == startAt)
+                    at += fromStart.text.size();
+                if (i == endAt)
+                    at += fromEnd.text.size();
+                if (i < len)
+                    candidate += withInsertions[at++];
+            }
+            if (insertIntoCandidate(candidate, fromStart, fromEnd) != withInsertions)
+                continue;
+            out = candidate;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool stringToIndex(const std::string& str, const std::string& alphabet, uint64_t& out, std::string& error) {

@@ -31,9 +31,21 @@ __device__ __constant__ short d_suffix_size;
 __device__ __constant__ uint32_t d_alphabetKey[MAX_ALPHABET_SIZE];
 __device__ __constant__ uint32_t d_alphabetOrd[MAX_ALPHABET_SIZE];
 __device__ __constant__ uint32_t d_suffixKey[kMaxSuffixSize];
-// The row masks of this search's row pruning (RowPruning::rowMasks,
-// backends/common/row_pruning.h): the last row characters an entry of a
-// group list allows, by the entry's flags - kRowFlagCount of them.
-__device__ __constant__ uint64_t d_rowMasks[32];
+// The text inserted into the trailing part (SearchConstants::
+// trailingInsertions): up to two insertions among a row group's characters,
+// each before its last groupCharsAfter[n] trailing characters (0: none),
+// and one after a row's own character, before the candidate's last. Their
+// characters' keys and values are d_insertKey/d_insertOrd[start ..
+// start + len).
+struct TrailingInsertLayout {
+    int groupCharsAfter[2];
+    int groupStart[2];
+    int groupLen[2];
+    int rowStart;
+    int rowLen;
+};
+__device__ __constant__ TrailingInsertLayout d_insertLayout;
+__device__ __constant__ uint32_t d_insertKey[2 * kMaxInsertLen];
+__device__ __constant__ uint32_t d_insertOrd[2 * kMaxInsertLen];
 
 #endif // NAMEBREAK_BACKENDS_CUDA_HASH_KERNELS_CUH

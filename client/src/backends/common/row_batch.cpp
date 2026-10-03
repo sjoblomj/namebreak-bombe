@@ -16,9 +16,32 @@ RowRange rowRangeFor(uint64_t start, uint64_t count, int alphabetSize) {
     return range;
 }
 
+InsertLayout insertLayoutFor(const SearchConstants& constants) {
+    InsertLayout layout;
+    int groups = 0;
+    for (const TrailingInsertion& insertion : constants.trailingInsertions) {
+        const int start = (int) layout.key.size();
+        for (unsigned char ch : insertion.text) {
+            layout.ord.push_back(ch);
+            layout.key.push_back(constants.cryptTable[0x100 + ch]);
+        }
+        if (insertion.charsAfter == 1) {
+            layout.rowStart = start;
+            layout.rowLen = (int) insertion.text.size();
+        } else if (groups < 2) {
+            layout.groupCharsAfter[groups] = insertion.charsAfter;
+            layout.groupStart[groups] = start;
+            layout.groupLen[groups] = (int) insertion.text.size();
+            ++groups;
+        }
+    }
+    return layout;
+}
+
 void HitVerifier::begin(const SearchConstants& constants) {
     alphabet_ = constants.alphabet;
     suffix_ = constants.suffix;
+    insertions_ = constants.trailingInsertions;
     cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
     targetA_ = constants.targetHashA;
     targetB_ = constants.targetHashB;
@@ -37,7 +60,7 @@ void HitVerifier::addHits(const std::vector<uint64_t>& trailingIndices, int trai
                           BatchOutcome& outcome) const {
     const std::string prefix(params.prefix, params.prefixSize);
     for (uint64_t index : trailingIndices) {
-        std::string filename = prefix + indexToString(index, trailingLen, alphabet_) + suffix_;
+        std::string filename = prefix + withTrailingInsertions(indexToString(index, trailingLen, alphabet_), insertions_) + suffix_;
         uint32_t hashA = hashFromScratch(filename, 0x100);
         if (!hashAMatches(hashA, targetA_)) {
             printf("WARNING: the backend reported a hashA hit for '%s' but hashing it from scratch gives 0x%08X, not the target 0x%08X\n",

@@ -86,11 +86,17 @@ struct DeviceBuffers {
     // The row groups to search - RowPruning::arena() (backends/common/row_pruning.h),
     // of which each batch has a slice.
     const uint32_t* groups;
+    // The row masks of this search's row pruning (RowPruning::rowMasks): the
+    // last row characters an entry of a group list allows, by the entry's
+    // classes - kRowFlagCount of them, 1 KB. Read from here by each chunk,
+    // through the read-only cache: copying them into shared memory first, as
+    // sKey is, doubled the kernel's shared memory and cost a search pruning
+    // the whole candidate about 7%.
+    const uint64_t* rowMasks;
 };
 
 static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "filteredRowsKernel needs one thread per alphabet entry to fill its shared tables");
-static_assert(kThreadsPerBlock >= kRowFlagCount, "filteredRowsKernel needs one thread per row mask to fill sRowMasks");
-static_assert(sizeof(d_rowMasks) == kRowFlagCount * sizeof(uint64_t), "d_rowMasks must hold every row mask");
+static_assert(sizeof(d_insertKey) >= 2 * kMaxInsertLen * sizeof(uint32_t), "d_insertKey must hold both insertions' text");
 
 // One batch of a launch, as filteredRowsKernel needs it (see runBatches): its
 // rows, from row firstRowD of row group firstGroup to row lastRowD of group
@@ -232,14 +238,29 @@ __device__ __forceinline__ void keepInRegister(T& value) {
 #endif
 }
 
+// Hashes the text inserted before a row group's character `at` (of
+// groupDigits; groupDigits: after the last one) - see d_insertLayout. The
+// same for every thread, and once per chunk.
+__device__ __forceinline__ void hashGroupInsertions(int at, int groupDigits, uint32_t& seed1, uint32_t& seed2) {
+    #pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        if (groupDigits + 2 - d_insertLayout.groupCharsAfter[n] == at) {
+            const int start = d_insertLayout.groupStart[n], len = d_insertLayout.groupLen[n];
+            for (int i = 0; i < len; ++i)
+                mpqStep(seed1, seed2, d_insertKey[start + i], d_insertOrd[start + i]);
+        }
+    }
+}
+
 // Hashes the N characters of `row` (its digits in base alphabetSize, most
-// significant first - filteredRowsKernel passes it a row group) into
-// (seed1, seed2), via the block's shared tables. The lanes of a warp have
+// significant first - filteredRowsKernel passes it a row group) - and if
+// Inserted, the text inserted between and after them - into (seed1, seed2),
+// via the block's shared tables. The lanes of a warp have
 // consecutive groups (a few lanes each), so they read the same or
 // neighbouring shared-memory entries here (no bank conflicts) - unlike the
 // __constant__ d_cryptTable, where every lane needing a different entry is
 // serialized.
-template<int FixedSize, int N>
+template<int FixedSize, int N, bool Inserted>
 __device__ __forceinline__ void hashRowDigits(uint32_t row, const AlphabetShape& shape, uint32_t& seed1, uint32_t& seed2,
                                                 const uint32_t* sKey, const uint32_t* sOrd) {
     if constexpr (N > 0) {
@@ -251,8 +272,15 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, const AlphabetShape&
             row = q;
         }
         #pragma unroll
-        for (int i = 0; i < N; ++i)
+        for (int i = 0; i < N; ++i) {
+            if constexpr (Inserted) {
+                if (i > 0)
+                    hashGroupInsertions(i, N, seed1, seed2);
+            }
             mpqStep(seed1, seed2, sKey[digit[i]], sOrd[digit[i]]);
+        }
+        if constexpr (Inserted)
+            hashGroupInsertions(N, N, seed1, seed2);
     }
 }
 
@@ -263,7 +291,7 @@ __device__ __forceinline__ void hashRowDigits(uint32_t row, const AlphabetShape&
 // firstRowD and lastRowD are the d of the launch's first and last row, if
 // they're in this group (-1 if not) - the rows firstRowStartK and
 // lastRowEndK cut short, and the chunk's rows with them.
-template<int FixedSize, int SuffixLen, bool Listed>
+template<int FixedSize, int SuffixLen, bool Listed, bool Inserted>
 __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, uint32_t chunk, int trailingLen, const AlphabetShape& shape,
                                             int firstRowD, int lastRowD, int firstRowStartK, int lastRowEndK, uint32_t targetA,
                                             uint32_t seed1Start, uint32_t seed2Start, uint32_t batch, const DeviceBuffers& bufs,
@@ -292,10 +320,10 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
     uint32_t group1 = seed1Start;
     uint32_t group2 = seed2Start;
     switch (trailingLen - 2) {
-        case 1: hashRowDigits<FixedSize, 1>(group, shape, group1, group2, sKey, sOrd); break;
-        case 2: hashRowDigits<FixedSize, 2>(group, shape, group1, group2, sKey, sOrd); break;
-        case 3: hashRowDigits<FixedSize, 3>(group, shape, group1, group2, sKey, sOrd); break;
-        case 4: hashRowDigits<FixedSize, 4>(group, shape, group1, group2, sKey, sOrd); break;
+        case 1: hashRowDigits<FixedSize, 1, Inserted>(group, shape, group1, group2, sKey, sOrd); break;
+        case 2: hashRowDigits<FixedSize, 2, Inserted>(group, shape, group1, group2, sKey, sOrd); break;
+        case 3: hashRowDigits<FixedSize, 3, Inserted>(group, shape, group1, group2, sKey, sOrd); break;
+        case 4: hashRowDigits<FixedSize, 4, Inserted>(group, shape, group1, group2, sKey, sOrd); break;
         // trailingLen is validated against kMaxTrailingLen (== 6) by runSearch
     }
     const bool rowsHaveCharacters = trailingLen > 1;
@@ -317,6 +345,13 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
     uint32_t group2Term = group2 + (group2 << 5) + 3;
     keepInRegister(groupSum);
     keepInRegister(group2Term);
+    // The text inserted after a row's own character, if any - hashed for
+    // every row.
+    int rowInsertStart = 0, rowInsertLen = 0;
+    if constexpr (Inserted) {
+        rowInsertStart = d_insertLayout.rowStart;
+        rowInsertLen = d_insertLayout.rowLen;
+    }
 
     for (int d = dBegin; d < dEnd; ++d) {
         uint32_t seed1 = group1;
@@ -324,6 +359,10 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
         if (rowsHaveCharacters) {
             seed1 = sKey[d] ^ groupSum;
             seed2 = sOrd[d] + seed1 + group2Term;
+        }
+        if constexpr (Inserted) {
+            for (int i = 0; i < rowInsertLen; ++i)
+                mpqStep(seed1, seed2, d_insertKey[rowInsertStart + i], d_insertOrd[rowInsertStart + i]);
         }
 
         // Bit k: the candidate with last character k is worth hashing.
@@ -396,7 +435,7 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
 // A hashA hit only records its row, last character and batch (BatchResults): the
 // host builds the filename and checks it - hashA again, from scratch, and
 // hashB - so none of that bloats this hot kernel.
-template<int FixedSize, int SuffixLen, bool Listed>
+template<int FixedSize, int SuffixLen, bool Listed, bool Inserted>
 __global__ void filteredRowsKernel(
     int trailingLen,
     AlphabetShape shape,
@@ -407,15 +446,10 @@ __global__ void filteredRowsKernel(
     static_assert(MAX_ALPHABET_SIZE < 64, "a row's candidates, and one past the last of them, must fit a 64-bit mask");
     __shared__ uint32_t sKey[MAX_ALPHABET_SIZE];
     __shared__ uint32_t sOrd[MAX_ALPHABET_SIZE];
-    // In shared memory for the same reason as sKey: the lanes of a warp read
-    // different entries.
-    __shared__ uint64_t sRowMasks[kRowFlagCount];
     if (threadIdx.x < alphabetSizeOf<FixedSize>(shape)) {
         sKey[threadIdx.x] = d_alphabetKey[threadIdx.x];
         sOrd[threadIdx.x] = d_alphabetOrd[threadIdx.x];
     }
-    if (Listed && threadIdx.x < kRowFlagCount)
-        sRowMasks[threadIdx.x] = d_rowMasks[threadIdx.x];
     __syncthreads();
 
     // This block's batch - the same for the whole block, so reading it from
@@ -437,7 +471,7 @@ __global__ void filteredRowsKernel(
             const uint32_t groupIndex = divideByChunksPerGroup<FixedSize>(c, shape);
             const uint32_t entry = __ldg(&groups[groupIndex]);
             const uint32_t group = entry >> kRowFlagBits;
-            searchChunk<FixedSize, SuffixLen, true>(group, sRowMasks[entry & (kRowFlagCount - 1)], c - groupIndex * chunks, trailingLen, shape,
+            searchChunk<FixedSize, SuffixLen, true, Inserted>(group, __ldg(&bufs.rowMasks[entry & (kRowFlagCount - 1)]), c - groupIndex * chunks, trailingLen, shape,
                                          group == batch.firstGroup ? batch.firstRowD : -1, group == batch.lastGroup ? batch.lastRowD : -1,
                                          batch.firstRowStartK, batch.lastRowEndK, targetA, batch.seed1Start, batch.seed2Start, batchIndex,
                                          bufs, sKey, sOrd);
@@ -447,7 +481,7 @@ __global__ void filteredRowsKernel(
         for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < chunkCount; c += stride) {
             const uint32_t groupIndex = divideByChunksPerGroup<FixedSize>(c, shape);
             const uint32_t group = batch.firstGroup + groupIndex;
-            searchChunk<FixedSize, SuffixLen, false>(group, 0, c - groupIndex * chunks, trailingLen, shape, groupIndex == 0 ? batch.firstRowD : -1,
+            searchChunk<FixedSize, SuffixLen, false, Inserted>(group, 0, c - groupIndex * chunks, trailingLen, shape, groupIndex == 0 ? batch.firstRowD : -1,
                                           group == batch.lastGroup ? batch.lastRowD : -1, batch.firstRowStartK, batch.lastRowEndK, targetA,
                                           batch.seed1Start, batch.seed2Start, batchIndex, bufs, sKey, sOrd);
         }
@@ -483,28 +517,36 @@ template<int... Sizes>
 struct AlphabetSizeList {};
 using CompiledAlphabetSizes = AlphabetSizeList<42, 43>;
 
-// Launches filteredRowsKernel, walking every row group or lists of them.
-template<int FixedSize, int SuffixLen>
+// Launches filteredRowsKernel, walking every row group or lists of them -
+// with the text inserted into the trailing part hashed if Inserted.
+template<int FixedSize, int SuffixLen, bool Inserted>
 void launchSearch(bool listed, dim3 blocks, int trailingLen, const AlphabetShape& shape, const LaunchBatches& batches, uint32_t targetA,
                   const DeviceBuffers& bufs) {
     if (listed)
-        filteredRowsKernel<FixedSize, SuffixLen, true><<<blocks, kThreadsPerBlock>>>(trailingLen, shape, batches, targetA, bufs);
+        filteredRowsKernel<FixedSize, SuffixLen, true, Inserted><<<blocks, kThreadsPerBlock>>>(trailingLen, shape, batches, targetA, bufs);
     else
-        filteredRowsKernel<FixedSize, SuffixLen, false><<<blocks, kThreadsPerBlock>>>(trailingLen, shape, batches, targetA, bufs);
+        filteredRowsKernel<FixedSize, SuffixLen, false, Inserted><<<blocks, kThreadsPerBlock>>>(trailingLen, shape, batches, targetA, bufs);
 }
 
 // launchSearch with the size compiled in if it's one of Sizes, and taken at
-// runtime if not.
+// runtime if not. A search that inserts text into the trailing part gets a
+// kernel of its own - the insertions in every kernel cost a search without
+// any about 4% - but only with the size taken at runtime, which saves
+// compiling 40 more.
 template<int SuffixLen, int... Sizes>
-void launchSearchFor(AlphabetSizeList<Sizes...>, bool listed, dim3 blocks, int trailingLen, const AlphabetShape& shape,
+void launchSearchFor(AlphabetSizeList<Sizes...>, bool listed, bool inserted, dim3 blocks, int trailingLen, const AlphabetShape& shape,
                      const LaunchBatches& batches, uint32_t targetA, const DeviceBuffers& bufs) {
     static_assert(((Sizes >= 1 && Sizes <= MAX_ALPHABET_SIZE) && ...), "a compiled-in alphabet size is out of range");
+    if (inserted) {
+        launchSearch<0, SuffixLen, true>(listed, blocks, trailingLen, shape, batches, targetA, bufs);
+        return;
+    }
     const bool compiled =
-        ((shape.size == (uint32_t) Sizes ? (launchSearch<Sizes, SuffixLen>(listed, blocks, trailingLen, shape, batches, targetA, bufs), true)
+        ((shape.size == (uint32_t) Sizes ? (launchSearch<Sizes, SuffixLen, false>(listed, blocks, trailingLen, shape, batches, targetA, bufs), true)
                                          : false) ||
          ...);
     if (!compiled)
-        launchSearch<0, SuffixLen>(listed, blocks, trailingLen, shape, batches, targetA, bufs);
+        launchSearch<0, SuffixLen, false>(listed, blocks, trailingLen, shape, batches, targetA, bufs);
 }
 
 namespace {
@@ -518,6 +560,8 @@ public:
             (void) cudaFreeHost(pinnedResults_);
         if (groups_)
             (void) cudaFree(groups_);
+        if (rowMasks_)
+            (void) cudaFree(rowMasks_);
     }
 
 #ifdef NAMEBREAK_HIP
@@ -567,6 +611,7 @@ private:
     // lists are.
     RowPruning rowPruning_;
     uint32_t* groups_ = nullptr;
+    uint64_t* rowMasks_ = nullptr; // DeviceBuffers::rowMasks, allocated by the first search that prunes the whole candidate
     size_t groupsCapacity_ = 0;
     size_t groupsUploaded_ = 0;
     uint64_t groupsGeneration_ = 0;
@@ -575,6 +620,9 @@ private:
     // lists of row groups: only then - a kernel that walks every group
     // measured about 5% faster than one walking a list of them all.
     bool listed_ = false;
+    // Whether this search inserts text into the trailing part, and gets the
+    // kernel that hashes it.
+    bool inserted_ = false;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -624,6 +672,25 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
         CUDA_CHECK(cudaMemcpyToSymbol(d_alphabetKey, h_alphabetKey, sizeof(h_alphabetKey)));
         CUDA_CHECK(cudaMemcpyToSymbol(d_alphabetOrd, h_alphabetOrd, sizeof(h_alphabetOrd)));
         CUDA_CHECK(cudaMemcpyToSymbol(d_suffixKey, h_suffixKey, sizeof(h_suffixKey)));
+
+        // The text inserted into the trailing part - see d_insertLayout.
+        const InsertLayout inserted = insertLayoutFor(constants);
+        inserted_ = !constants.trailingInsertions.empty();
+        TrailingInsertLayout layout = {};
+        uint32_t h_insertKey[2 * kMaxInsertLen] = {0};
+        uint32_t h_insertOrd[2 * kMaxInsertLen] = {0};
+        for (int n = 0; n < 2; ++n) {
+            layout.groupCharsAfter[n] = inserted.groupCharsAfter[n];
+            layout.groupStart[n] = inserted.groupStart[n];
+            layout.groupLen[n] = inserted.groupLen[n];
+        }
+        layout.rowStart = inserted.rowStart;
+        layout.rowLen = inserted.rowLen;
+        std::copy(inserted.key.begin(), inserted.key.end(), h_insertKey);
+        std::copy(inserted.ord.begin(), inserted.ord.end(), h_insertOrd);
+        CUDA_CHECK(cudaMemcpyToSymbol(d_insertLayout, &layout, sizeof(layout)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_insertKey, h_insertKey, sizeof(h_insertKey)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_insertOrd, h_insertOrd, sizeof(h_insertOrd)));
     }
 
     // Allocated once per search and reused for every batch, instead of
@@ -645,7 +712,10 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     listed_ = constants.trailingRules.any();
     if (listed_) {
         rowPruning_.begin(constants);
-        CUDA_CHECK(cudaMemcpyToSymbol(d_rowMasks, rowPruning_.rowMasks(), kRowFlagCount * sizeof(uint64_t)));
+        if (!rowMasks_)
+            CUDA_CHECK(cudaMalloc(&rowMasks_, kRowFlagCount * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpy(rowMasks_, rowPruning_.rowMasks(), kRowFlagCount * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        bufs_.rowMasks = rowMasks_;
     }
 
     // This search's lookup filter - it depends on the alphabet, the suffix and
@@ -770,7 +840,7 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
     const dim3 blocks((unsigned) ((threads + kThreadsPerBlock - 1) / kThreadsPerBlock), (unsigned) batchCount);
     dispatchSuffixLen(suffixLen_, [&](auto suffixC) {
         using SuffixC = decltype(suffixC);
-        launchSearchFor<SuffixC::value>(CompiledAlphabetSizes{}, listed, blocks, trailingLen, shape_, batches, targetA_, bufs_);
+        launchSearchFor<SuffixC::value>(CompiledAlphabetSizes{}, listed, inserted_, blocks, trailingLen, shape_, batches, targetA_, bufs_);
     });
     CUDA_CHECK(cudaGetLastError());
     // The results' copy is queued right behind the kernel, into pinned memory,

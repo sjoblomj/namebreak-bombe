@@ -5,6 +5,8 @@
 #include <optional>
 #include <string>
 
+#include "engine/candidate.h"
+
 // Wire types for the coordinator's HTTP API - field-for-field the same shape
 // as coordinator/protocol/src/lib.rs, since this talks to that same,
 // unmodified Rust server. Only the request/response shapes the client
@@ -23,7 +25,8 @@
 // sizes it had compiled in - so an alphabet of a new size, tagged 1.3, is
 // only ever handed to this client or a newer one. It also tells the server
 // when it quits with a range in hand (see QuitRequest).
-// 1.4.0: ClaimResponse's min_backslash_count and prune_adjacent_backslashes.
+// 1.4.0: ClaimResponse's min_backslash_count, prune_adjacent_backslashes,
+// and the text inserted into candidates (insert_from_start_text and so on).
 constexpr const char* kProtocolVersion = "1.4.0";
 
 struct RegisterRequest {
@@ -74,6 +77,10 @@ struct ClaimResponse {
     int64_t minBackslashCount = 0;
     // Optional in the response (false when absent).
     bool pruneAdjacentBackslashes = false;
+    // Optional in the response (nothing inserted when absent or empty) - as
+    // insert_from_start_text/_position and insert_from_end_text/_position.
+    Insertion insertFromStart;
+    Insertion insertFromEnd;
     std::string lowerBoundFilename;
     std::string upperBoundFilename;
     std::string alphabet;

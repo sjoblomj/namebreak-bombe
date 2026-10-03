@@ -30,6 +30,7 @@ public:
         targetA_ = constants.targetHashA;
         targetB_ = constants.targetHashB;
         rules_ = constants.trailingRules;
+        insertions_ = constants.trailingInsertions;
     }
 
     BatchOutcome runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) override;
@@ -57,6 +58,7 @@ private:
     uint32_t targetA_ = 0;
     uint32_t targetB_ = 0;
     PruneRules rules_;
+    std::vector<TrailingInsertion> insertions_;
 };
 
 BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) {
@@ -74,27 +76,30 @@ BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_
     }
 
     for (uint64_t n = 0; n < count; ++n) {
-        // Pruned: every trailing character but the last, checked from
-        // where the leading characters left off - and the last one, if even
-        // a backslash there would leave too few.
+        // The trailing part, with the text inserted into it.
+        std::string trailing;
+        for (int i = 0; i < trailingLen; ++i)
+            trailing += alphabet_[digit[i]];
+        const std::string expanded = withTrailingInsertions(trailing, insertions_);
+
+        // Pruned: every character of it but the last, checked from where
+        // the leading characters left off - and the last one, if even a
+        // backslash there would leave too few.
         bool pruned = false;
         if (rules_.any()) {
             PruneState state = params.pruneEntry;
-            for (int i = 0; i + 1 < trailingLen && !pruned; ++i)
-                pruned = !pruneStep_CPU(rules_, state, alphabet_[digit[i]]);
+            for (size_t i = 0; i + 1 < expanded.size() && !pruned; ++i)
+                pruned = !pruneStep_CPU(rules_, state, expanded[i]);
             pruned = pruned || !canReachMinBackslashes_CPU(rules_, state, 1);
         }
         uint32_t seed1 = params.seed1Start, seed2 = params.seed2Start;
-        for (int i = 0; i < trailingLen; ++i)
-            step(seed1, seed2, (unsigned char) alphabet_[digit[i]], 0x100);
+        for (unsigned char ch : expanded)
+            step(seed1, seed2, ch, 0x100);
         for (unsigned char ch : suffix_)
             step(seed1, seed2, ch, 0x100);
 
         if (!pruned && hashAMatches(seed1, targetA_) && ++outcome.hitCount <= MAX_MATCHES) {
-            std::string filename = prefix;
-            for (int i = 0; i < trailingLen; ++i)
-                filename += alphabet_[digit[i]];
-            filename += suffix_;
+            const std::string filename = prefix + expanded + suffix_;
             // The same cross-check HitVerifier does for the other backends:
             // hashing the complete filename from scratch must agree with
             // the prefix-state path that found it.

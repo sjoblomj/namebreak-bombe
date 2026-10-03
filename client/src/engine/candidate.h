@@ -70,14 +70,58 @@ struct PruneState {
 // Steps `state` over `c`; false if `c` breaks one of `rules` (`state` is
 // then no longer meaningful).
 bool pruneStep_CPU(const PruneRules& rules, PruneState& state, char c);
+// What the characters of a candidate not checked yet can add to its
+// backslashes, at most: afterBackslash if the last character checked was
+// one, otherwise otherwise. See tailCapacity_CPU.
+struct TailCapacity {
+    int afterBackslash = 0;
+    int otherwise = 0;
+};
+// Stands for a character still to be enumerated in a tail (tailCapacity_CPU),
+// as opposed to inserted text, which is fixed.
+constexpr char kFreeChar = '\0';
+// The capacity of `tail`: kFreeChar for each character still to be
+// enumerated - as many of them backslashes as can be - and the text
+// inserted between them as it is. With rules.adjacentBackslashes, a
+// backslash enumerated may not be next to another (inserted ones are
+// counted wherever they are).
+TailCapacity tailCapacity_CPU(const PruneRules& rules, std::string_view tail);
 // Whether a candidate in `state` can still have rules.minBackslashCount
-// backslashes, with `remaining` characters still to come - as many of them
-// backslashes as can be (every other one, with rules.adjacentBackslashes).
+// backslashes, with what's still to come able to add `capacity` of them.
 // Unlike pruneStep_CPU's rules, this one is about characters not checked:
 // it's asked once, after the last character that is. Once false, it stays
 // false for every character added, so asking it after fewer characters
 // prunes no more than asking it after more.
+bool canReachMinBackslashes_CPU(const PruneRules& rules, const PruneState& state, const TailCapacity& capacity);
+// The same, with `remaining` characters still to be enumerated and nothing
+// inserted between them.
 bool canReachMinBackslashes_CPU(const PruneRules& rules, const PruneState& state, int remaining);
+
+// A fixed text inserted into every candidate long enough for it - see
+// SearchRequest::insertFromStart and insertFromEnd.
+struct Insertion {
+    std::string text; // empty: nothing inserted
+    int position = 0; // how many of the candidate's characters come before it (from the start) or after it (from the end)
+    bool any() const { return !text.empty(); }
+};
+// Where `ins` goes in a candidate of `len` characters: the index of the
+// character it goes before (`len`: after the last one), or -1 if the
+// candidate is shorter than its position, and it isn't inserted.
+int insertionIndex(const Insertion& ins, bool fromEnd, int len);
+// `candidate` with `fromStart` and `fromEnd` inserted, wherever it's long
+// enough for them. Both are placed on the candidate's own characters; where
+// they meet, fromStart's text comes first.
+std::string insertIntoCandidate(std::string_view candidate, const Insertion& fromStart, const Insertion& fromEnd);
+// The opposite: the candidate `withInsertions` (what's between a filename's
+// prefix and suffix) was made from - false if it doesn't hold the text
+// inserted where a candidate of its length would. Only one length can fit:
+// a candidate gets an insertion exactly when it's at least as long as the
+// insertion's position.
+bool removeInsertions(std::string_view withInsertions, const Insertion& fromStart, const Insertion& fromEnd, std::string& out);
+// getStartCandidate, then removeInsertions: the candidate a filename a
+// search reported (or would report) was made from.
+bool candidateOfFilename(const std::string& filename, const std::string& prefix, const std::string& suffix, const Insertion& fromStart,
+                         const Insertion& fromEnd, std::string& out, std::string& error);
 // Whether a character counts towards a symbol run - neither alphanumeric
 // (A-Z, 0-9) nor a space.
 bool isRunSymbol_CPU(char c);

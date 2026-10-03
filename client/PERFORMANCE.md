@@ -429,8 +429,8 @@ will have grown (not measured again).
   hashed anyway), and the host can't drop the hits it would leave out
   without dropping a real match too. For each state the leading characters
   leave (32 occur in a real search), the host lists the row groups that
-  survive, with a flag per group for the rows' own last characters its
-  characters rule out (`backends/common/row_pruning.h`); the GPU kernels
+  survive, with a bit per class of the rows' own last characters its
+  characters leave (`backends/common/row_pruning.h`); the GPU kernels
   walk their batch's list, and a pruned row inside a surviving group gets
   no candidates - skipping it wouldn't save its lane anything, as the warp
   steps through its rows together. See the README's "Design decisions".

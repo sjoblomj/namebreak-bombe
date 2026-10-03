@@ -39,8 +39,10 @@ static inline void mpqHashStepCPU(unsigned char ch, const uint32_t* cryptTable, 
 }
 
 IncrementalPrefixHasher::IncrementalPrefixHasher(std::pair<uint32_t, uint32_t> baseState, int leadingLen,
-                                                  std::string alphabet, const uint32_t* cryptTable)
-    : alphabet_(std::move(alphabet)), cryptTable_(cryptTable), leadingLen_(leadingLen) {
+                                                  std::string alphabet, const uint32_t* cryptTable, std::vector<std::string> insertBefore)
+    : insertBefore_(std::move(insertBefore)), alphabet_(std::move(alphabet)), cryptTable_(cryptTable), leadingLen_(leadingLen) {
+    if (insertBefore_.empty())
+        insertBefore_.assign(leadingLen_ + 1, std::string());
     leading_.assign(leadingLen_, alphabet_.empty() ? '\0' : alphabet_[0]);
     digitIndex_.assign(leadingLen_, 0);
     stack_.reserve(leadingLen_ + 1);
@@ -56,11 +58,8 @@ void IncrementalPrefixHasher::reset(uint64_t leadingIdx) {
     }
 
     stack_.resize(1); // keep only stack_[0] (the base state), rebuild the rest
-    for (int i = 0; i < leadingLen_; ++i) {
-        uint32_t seed1 = stack_.back().first, seed2 = stack_.back().second;
-        mpqHashStepCPU((unsigned char) leading_[i], cryptTable_, seed1, seed2);
-        stack_.emplace_back(seed1, seed2);
-    }
+    for (int i = 0; i < leadingLen_; ++i)
+        stack_.push_back(stepFrom(i));
 }
 
 void IncrementalPrefixHasher::advance() {
@@ -88,9 +87,21 @@ void IncrementalPrefixHasher::advance() {
     // incremented, or wrapped to 0; anything after it was reset to 0 by the
     // carry above) and needs re-hashing from stack_[rebuildFrom] onward.
     stack_.resize(rebuildFrom + 1);
-    for (int i = rebuildFrom; i < leadingLen_; ++i) {
-        uint32_t seed1 = stack_.back().first, seed2 = stack_.back().second;
-        mpqHashStepCPU((unsigned char) leading_[i], cryptTable_, seed1, seed2);
-        stack_.emplace_back(seed1, seed2);
-    }
+    for (int i = rebuildFrom; i < leadingLen_; ++i)
+        stack_.push_back(stepFrom(i));
+}
+
+std::pair<uint32_t, uint32_t> IncrementalPrefixHasher::stepFrom(int i) const {
+    uint32_t seed1 = stack_[i].first, seed2 = stack_[i].second;
+    for (char c : insertBefore_[i])
+        mpqHashStepCPU((unsigned char) c, cryptTable_, seed1, seed2);
+    mpqHashStepCPU((unsigned char) leading_[i], cryptTable_, seed1, seed2);
+    return {seed1, seed2};
+}
+
+std::pair<uint32_t, uint32_t> IncrementalPrefixHasher::state() const {
+    uint32_t seed1 = stack_.back().first, seed2 = stack_.back().second;
+    for (char c : insertBefore_[leadingLen_])
+        mpqHashStepCPU((unsigned char) c, cryptTable_, seed1, seed2);
+    return {seed1, seed2};
 }

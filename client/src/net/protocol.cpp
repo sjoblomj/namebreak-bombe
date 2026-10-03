@@ -205,6 +205,20 @@ bool getOptionalInt64(const std::map<std::string, JsonValue>& obj, const std::st
     return obj.find(key) == obj.end() || getInt64(obj, key, out);
 }
 
+// An insertion, as `name`_text and `name`_position - nothing inserted if
+// the text is missing or empty.
+bool getOptionalInsertion(const std::map<std::string, JsonValue>& obj, const std::string& name, Insertion& out) {
+    out = Insertion();
+    auto text = obj.find(name + "_text");
+    if (text == obj.end() || text->second.isNull())
+        return true;
+    int64_t position = 0;
+    if (!getString(obj, name + "_text", out.text) || !getOptionalInt64(obj, name + "_position", position) || position < 0 || position > 9999)
+        return false;
+    out.position = (int) position;
+    return true;
+}
+
 } // namespace
 
 std::string toJson(const RegisterRequest& req) {
@@ -262,6 +276,8 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getInt64( obj, "max_backslash_count", out.maxBackslashCount) &&
            getOptionalInt64(obj, "min_backslash_count", out.minBackslashCount) &&
            getOptionalBool(obj, "prune_adjacent_backslashes", out.pruneAdjacentBackslashes) &&
+           getOptionalInsertion(obj, "insert_from_start", out.insertFromStart) &&
+           getOptionalInsertion(obj, "insert_from_end", out.insertFromEnd) &&
            getString(obj, "lower_bound_filename", out.lowerBoundFilename) &&
            getString(obj, "upper_bound_filename", out.upperBoundFilename) &&
            getString(obj, "alphabet", out.alphabet) &&

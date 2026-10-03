@@ -119,6 +119,8 @@ public:
         CL_CHECK(err);
         rowMasks_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, kRowFlagCount * sizeof(cl_ulong), nullptr, &err);
         CL_CHECK(err);
+        inserted_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, 2 * 2 * kMaxInsertLen * sizeof(cl_uint), nullptr, &err);
+        CL_CHECK(err);
     }
 
     ~OpenClBackend() override {
@@ -126,7 +128,7 @@ public:
             clReleaseKernel(entry.second.kernel);
             clReleaseProgram(entry.second.program);
         }
-        for (cl_mem buffer : {results_, batches_, alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_, filterTable_, rowMasks_})
+        for (cl_mem buffer : {results_, batches_, alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_, filterTable_, rowMasks_, inserted_})
             clReleaseMemObject(buffer);
         if (groups_)
             clReleaseMemObject(groups_);
@@ -174,11 +176,16 @@ private:
     // This search's lookup filter: kLowBitsFilterEntries entries, see
     // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
     cl_mem filterTable_ = nullptr;
+    // The text inserted into the trailing part: each character's key, then
+    // its value (see search.cl's `inserted`), and where each insertion is -
+    // compiled into the kernel (insertMacros_).
+    cl_mem inserted_ = nullptr;
+    std::string insertMacros_;
     // Compiled once per (alphabet size, suffix length, trailing length,
-    // LISTED) and kept for the backend's lifetime - a coordinator client
-    // searches range after range of the same shape, and each compile takes a
-    // moment.
-    std::map<std::tuple<int, int, int, bool>, CompiledKernel> kernels_;
+    // LISTED, insertMacros_) and kept for the backend's lifetime - a
+    // coordinator client searches range after range of the same shape, and
+    // each compile takes a moment.
+    std::map<std::tuple<int, int, int, bool, std::string>, CompiledKernel> kernels_;
     bool announcedDevice_ = false;
 
     HitVerifier verifier_;
@@ -242,6 +249,22 @@ void OpenClBackend::beginSearch(const SearchConstants& constants) {
     CL_CHECK(clEnqueueWriteBuffer(queue_, alphabetOrd_, CL_TRUE, 0, ord.size() * sizeof(cl_uint), ord.data(), 0, nullptr, nullptr));
     CL_CHECK(clEnqueueWriteBuffer(queue_, suffixKey_, CL_TRUE, 0, suffixKey.size() * sizeof(cl_uint), suffixKey.data(), 0, nullptr, nullptr));
     CL_CHECK(clEnqueueWriteBuffer(queue_, suffixOrd_, CL_TRUE, 0, suffixOrd.size() * sizeof(cl_uint), suffixOrd.data(), 0, nullptr, nullptr));
+    {
+        const InsertLayout layout = insertLayoutFor(constants);
+        std::vector<cl_uint> inserted(2 * 2 * kMaxInsertLen, 0);
+        for (size_t i = 0; i < layout.key.size(); ++i) {
+            inserted[2 * i] = layout.key[i];
+            inserted[2 * i + 1] = layout.ord[i];
+        }
+        CL_CHECK(clEnqueueWriteBuffer(queue_, inserted_, CL_TRUE, 0, inserted.size() * sizeof(cl_uint), inserted.data(), 0, nullptr, nullptr));
+        insertMacros_.clear();
+        for (int n = 0; n < 2; ++n) {
+            insertMacros_ += " -DGROUP_INSERT" + std::to_string(n) + "_AFTER=" + std::to_string(layout.groupCharsAfter[n]) + " -DGROUP_INSERT" +
+                             std::to_string(n) + "_START=" + std::to_string(layout.groupStart[n]) + " -DGROUP_INSERT" + std::to_string(n) +
+                             "_LEN=" + std::to_string(layout.groupLen[n]);
+        }
+        insertMacros_ += " -DROW_INSERT_START=" + std::to_string(layout.rowStart) + " -DROW_INSERT_LEN=" + std::to_string(layout.rowLen);
+    }
     listed_ = constants.trailingRules.any();
     if (listed_) {
         rowPruning_.begin(constants);
@@ -270,7 +293,7 @@ void OpenClBackend::beginSearch(const SearchConstants& constants) {
 }
 
 const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, bool listed) {
-    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen, listed);
+    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen, listed, insertMacros_);
     auto found = kernels_.find(key);
     if (found != kernels_.end())
         return found->second;
@@ -284,7 +307,7 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, b
                                 " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
                                 " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits) +
                                 " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread) + " -DROW_FLAG_BITS=" + std::to_string(kRowFlagBits) +
-                                " -DLISTED=" + (listed ? "1" : "0");
+                                " -DLISTED=" + (listed ? "1" : "0") + insertMacros_;
     if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
         size_t size = 0;
         clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);
@@ -395,6 +418,7 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_mem), &results_));
     CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_mem), &groups_)); // null (allowed) until a search has lists
     CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &rowMasks_));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_mem), &inserted_));
 
     // One row of work-groups per batch (dimension 1), and in it a work-item
     // per chunk of every row group the batch searches (see CHUNKS_PER_GROUP

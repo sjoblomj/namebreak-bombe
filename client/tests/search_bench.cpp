@@ -27,6 +27,10 @@
 // candidates that survive the rules, estimated too - over the share of all
 // candidates of this length that survive them.
 //
+// --insert-from-start/--insert-from-end <text>,<position> insert text into
+// every candidate (SearchRequest::insertFromStart/insertFromEnd), to time
+// what it costs where it lands - see the README's "Inserted text".
+//
 // Creating the backend (for CUDA, the GPU context, and its self-test) and a
 // first, small warm-up search happen before the clock starts: a fast GPU
 // covers the default range in a few hundredths of a second, which that
@@ -157,6 +161,16 @@ int main(int argc, char** argv) {
     std::string backendName;
     uint64_t scale = 1;
     int alphabetSize = 49;
+    Insertion insertFromStart, insertFromEnd;
+    // "<text>,<position>", split at the last comma.
+    auto parseInsertion = [](const std::string& value, Insertion& out) {
+        const size_t comma = value.rfind(',');
+        if (comma == std::string::npos || comma == 0)
+            return false;
+        out.text = value.substr(0, comma);
+        out.position = std::stoi(value.substr(comma + 1));
+        return true;
+    };
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "noprune") {
@@ -169,6 +183,9 @@ int main(int argc, char** argv) {
             backendName = argv[++i];
         } else if (arg == "--scale" && i + 1 < argc) {
             scale = std::stoull(argv[++i]);
+        } else if ((arg == "--insert-from-start" || arg == "--insert-from-end") && i + 1 < argc) {
+            if (!parseInsertion(argv[++i], arg == "--insert-from-start" ? insertFromStart : insertFromEnd))
+                prune = "?";
         } else if (arg == "--size" && i + 1 < argc) {
             alphabetSize = std::stoi(argv[++i]);
             if (alphabetSize < 1 || alphabetSize > MAX_ALPHABET_SIZE)
@@ -177,7 +194,9 @@ int main(int argc, char** argv) {
             prune = "?";
         }
         if (prune != "all" && prune != "symbols" && prune != "none") {
-            fprintf(stderr, "Usage: %s [--prune all|symbols|none] [noprune] [--whole] [--backend <name>] [--scale <n>] [--size 1-%d]\n",
+            fprintf(stderr,
+                    "Usage: %s [--prune all|symbols|none] [noprune] [--whole] [--backend <name>] [--scale <n>] [--size 1-%d]\n"
+                    "       [--insert-from-start <text>,<position>] [--insert-from-end <text>,<position>]\n",
                     argv[0], MAX_ALPHABET_SIZE);
             return 1;
         }
@@ -215,6 +234,8 @@ int main(int argc, char** argv) {
     req.pruneSymbolRuns = prune != "none";
     req.pruneUnopenedBrackets = prune == "all";
     req.pruneWholeCandidate = whole;
+    req.insertFromStart = insertFromStart;
+    req.insertFromEnd = insertFromEnd;
     req.continuous = false;
 
     uint64_t matchCount = 0;

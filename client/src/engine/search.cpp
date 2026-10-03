@@ -38,6 +38,18 @@ BatchOutcome SearchBackend::runBatches(int trailingLen, const std::vector<BatchR
     return total;
 }
 
+std::string withTrailingInsertions(const std::string& trailing, const std::vector<TrailingInsertion>& insertions) {
+    const int trailingLen = (int) trailing.size();
+    std::string out;
+    for (int i = 0; i < trailingLen; ++i) {
+        for (const TrailingInsertion& insertion : insertions)
+            if (trailingLen - insertion.charsAfter == i)
+                out += insertion.text;
+        out += trailing[i];
+    }
+    return out;
+}
+
 namespace {
 
 // Searches the trailing indices [startIdx, startIdx + count) (count > 0) with
@@ -175,6 +187,19 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
                        std::to_string(req.minBackslashCount);
         return result;
     }
+    for (const Insertion* insertion : {&req.insertFromStart, &req.insertFromEnd}) {
+        if (!insertion->any())
+            continue;
+        const bool printable = std::all_of(insertion->text.begin(), insertion->text.end(), [](char c) { return c >= 0x20 && c <= 0x7E; });
+        if (insertion->position < 0 || (int) insertion->text.size() > kMaxInsertLen || !printable) {
+            result.ok = false;
+            result.error = "an insertion must have a position >= 0, and printable ASCII text of at most " + std::to_string(kMaxInsertLen) +
+                           " characters - got '" + insertion->text + "' at " + std::to_string(insertion->position);
+            return result;
+        }
+    }
+    // Inserted text can end up in the extended prefix, the suffix, or both.
+    const int insertedSize = (int) (req.insertFromStart.text.size() + req.insertFromEnd.text.size());
 
     // Compare lower/upper using the same alphabet ordering the rest of the search
     // relies on, rather than raw string comparison (which would break if the
@@ -234,16 +259,18 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     printf("backend: %s, windowChars: %d, maxSafeIndexLen: %d (max leading/prefix-extension length: %d)\n",
            backend.name(), windowChars, maxSafeIndexLen, maxLeadingLen);
 
-    if (prefix_size + maxLeadingLen >= kMaxPrefixSize || suffix_size >= kMaxSuffixSize) {
+    if (prefix_size + maxLeadingLen + insertedSize >= kMaxPrefixSize || suffix_size + insertedSize >= kMaxSuffixSize) {
         result.ok = false;
-        result.error = "prefix (up to " + std::to_string(prefix_size + maxLeadingLen) + " once extended by leading candidate characters) or suffix (" +
-                        std::to_string(suffix_size) + ") too long for the search's buffers (max: " + std::to_string(kMaxPrefixSize) + " each)";
+        result.error = "prefix (up to " + std::to_string(prefix_size + maxLeadingLen + insertedSize) +
+                        " once extended by leading candidate characters and inserted text) or suffix (up to " + std::to_string(suffix_size + insertedSize) +
+                        " with inserted text) too long for the search's buffers (max: " + std::to_string(kMaxPrefixSize) + " each)";
         return result;
     }
-    if (prefix_size + suffix_size + MAX_CANDIDATE_LEN >= MAX_FILENAME_LEN) {
+    if (prefix_size + suffix_size + MAX_CANDIDATE_LEN + insertedSize >= MAX_FILENAME_LEN) {
         result.ok = false;
         result.error = "prefix (" + std::to_string(prefix_size) + ") + suffix (" + std::to_string(suffix_size) + ") + candidate (up to " +
-                        std::to_string(MAX_CANDIDATE_LEN) + ") would exceed MAX_FILENAME_LEN (" + std::to_string(MAX_FILENAME_LEN) + ")";
+                        std::to_string(MAX_CANDIDATE_LEN) + ") + inserted text (" + std::to_string(insertedSize) + ") would exceed MAX_FILENAME_LEN (" +
+                        std::to_string(MAX_FILENAME_LEN) + ")";
         return result;
     }
 
@@ -277,6 +304,10 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     printf("maxBackslashCount: %d%s (%s)\n", req.maxBackslashCount, req.maxBackslashCount == 0 ? " (unlimited)" : "", pruneScope);
     printf("minBackslashCount: %d (%s)\n", req.minBackslashCount, pruneScope);
     printf("pruneAdjacentBackslashes: %s (%s)\n", req.pruneAdjacentBackslashes ? "true" : "false", pruneScope);
+    if (req.insertFromStart.any())
+        printf("insertFromStart: '%s' at %d\n", req.insertFromStart.text.c_str(), req.insertFromStart.position);
+    if (req.insertFromEnd.any())
+        printf("insertFromEnd: '%s' at %d from the end\n", req.insertFromEnd.text.c_str(), req.insertFromEnd.position);
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
@@ -326,7 +357,11 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     constants.targetHashB = req.targetHashB;
     if (req.pruneWholeCandidate)
         constants.trailingRules = rules;
-    backend.beginSearch(constants);
+    // The backend's search begins with the first candidate length's
+    // insertions - and begins again whenever another length has them
+    // elsewhere in its trailing part, or after its last character (see
+    // the start of the `while` loop below).
+    bool begun = false;
 
     bool found_match = false;
     bool aborted = false;
@@ -409,6 +444,51 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             break;
         }
 
+        // Where this length's insertions go (see req.insertFromStart): into
+        // the leading part, hashed on the CPU with it (leadingInsert[i]:
+        // before leading character i, or after the last one); into the
+        // trailing part, for the backend; or after the candidate's last
+        // character, as part of the suffix. The backend's search begins
+        // again if they go elsewhere in the trailing part or the suffix than
+        // for the previous length - only ever at the shortest lengths, where
+        // the leading part is short too.
+        std::vector<std::string> leadingInsert(leadingLen + 1);
+        SearchConstants lengthConstants = constants;
+        lengthConstants.trailingInsertions.clear();
+        std::string suffixInsert;
+        {
+            auto place = [&](int at, const std::string& text) {
+                std::vector<TrailingInsertion>& trailing = lengthConstants.trailingInsertions;
+                if (at < 0)
+                    return;
+                if (at <= leadingLen)
+                    leadingInsert[at] += text;
+                else if (at == candidateLen)
+                    suffixInsert += text;
+                else if (!trailing.empty() && trailing.back().charsAfter == candidateLen - at)
+                    trailing.back().text += text;
+                else
+                    trailing.push_back({candidateLen - at, text});
+            };
+            place(insertionIndex(req.insertFromStart, false, candidateLen), req.insertFromStart.text);
+            place(insertionIndex(req.insertFromEnd, true, candidateLen), req.insertFromEnd.text);
+            std::vector<TrailingInsertion>& trailing = lengthConstants.trailingInsertions;
+            if (trailing.size() == 2 && trailing[0].charsAfter < trailing[1].charsAfter)
+                std::swap(trailing[0], trailing[1]);
+        }
+        lengthConstants.suffix = suffixInsert + req.suffix;
+        const bool leadingHasInsertions = std::any_of(leadingInsert.begin(), leadingInsert.end(), [](const std::string& t) { return !t.empty(); });
+        if (!begun || lengthConstants.suffix != constants.suffix || lengthConstants.trailingInsertions != constants.trailingInsertions) {
+            if (begun)
+                backend.endSearch();
+            constants = lengthConstants;
+            backend.beginSearch(constants);
+            begun = true;
+        }
+        // What the trailing part, inserted text and all, can add to the
+        // backslashes req.minBackslashCount asks for.
+        const TailCapacity trailingCapacity = tailCapacity_CPU(rules, withTrailingInsertions(std::string(trailingLen, kFreeChar), constants.trailingInsertions));
+
         std::string start_full = makeBoundString(start_candidate, candidateLen);
         std::string end_full   = makeBoundString(upperBoundLimit, candidateLen);
 
@@ -438,7 +518,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         // mpq_hash.h) instead of a full from-scratch re-hash of the whole
         // leading string - the thing that makes leadingLen > 0 being the
         // common case (see windowChars above) affordable.
-        IncrementalPrefixHasher leadingHasher(prefixBaseState, leadingLen, req.alphabet, h_cryptTable);
+        IncrementalPrefixHasher leadingHasher(prefixBaseState, leadingLen, req.alphabet, h_cryptTable, leadingInsert);
         leadingHasher.reset(startLeadingIdx);
 
         // Batches not searched yet, up to maxBatchesPerCall of them - searched
@@ -455,7 +535,16 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             if (leadingIdx != startLeadingIdx) {
                 leadingHasher.advance();
             }
-            const std::string& leading = leadingHasher.leading();
+            // The leading characters, with the text inserted between them.
+            std::string expandedLeading;
+            if (leadingHasInsertions) {
+                for (int i = 0; i < leadingLen; ++i) {
+                    expandedLeading += leadingInsert[i];
+                    expandedLeading += leadingHasher.leading()[i];
+                }
+                expandedLeading += leadingInsert[leadingLen];
+            }
+            const std::string& leading = leadingHasInsertions ? expandedLeading : leadingHasher.leading();
 
             // The pruning rules (req.pruneSymbolRuns and the rest) examine `leading` -
             // the CPU-computed first leadingLen characters of the candidate
@@ -467,8 +556,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             // even one of those candidates would have cost individually.
             // The state it leaves is where the backend carries on, if it
             // prunes the trailing characters too (req.pruneWholeCandidate).
-            // And whether the trailingLen characters after it could still
-            // make up the backslashes req.minBackslashCount asks for.
+            // And whether the trailing part after it could still make up the
+            // backslashes req.minBackslashCount asks for.
             PruneState pruneEntry = candidateStart;
             bool pruned = false;
             for (char c : leading) {
@@ -477,7 +566,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
                     break;
                 }
             }
-            if (pruned || !canReachMinBackslashes_CPU(rules, pruneEntry, trailingLen))
+            if (pruned || !canReachMinBackslashes_CPU(rules, pruneEntry, trailingCapacity))
                 continue;
 
             // Handed to every runBatch call below; see BatchParams.
@@ -545,7 +634,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     }
 breakfree:
 
-    backend.endSearch();
+    if (begun)
+        backend.endSearch();
     fclose(fout);
 
     result.aborted = aborted;

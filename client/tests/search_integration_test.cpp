@@ -28,6 +28,8 @@
 //  6. pruneWholeCandidate: the same rules at every character but the last,
 //     where the backend prunes rows and row groups of its trailing part.
 //  7. minBackslashCount and pruneAdjacentBackslashes, both ways.
+//  8. insertFromStart and insertFromEnd: every place text can go, and the
+//     rules across it.
 //  G. Geometry, for a range of alphabet sizes: the kernel
 //     handles a *row* (every value of the last character) per thread, so
 //     ranges that start/end mid-row, sit inside one row, are row-aligned,
@@ -69,10 +71,12 @@
 #include <fstream>
 #include <memory>
 #include <random>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #ifndef _WIN32
@@ -171,9 +175,65 @@ static int trailingLenFor(int candidateLen, int alphabetSize) {
 // whose checked characters leave too few after them for that many
 // backslashes, even if all that may be are - every other one, with
 // pruneAdjacentBackslashes.
+// The most backslashes `tail` can hold, by brute force (unlike
+// tailCapacity_CPU): each kFreeChar a character still to be enumerated,
+// which may be a backslash unless, with `adjacent`, it would touch another
+// (afterBackslash: the character before the tail is one); inserted ones are
+// counted as they are.
+static int bruteCapacity(const std::string& tail, bool adjacent, bool afterBackslash) {
+    static std::map<std::tuple<std::string, bool, bool>, int> memo;
+    const auto key = std::make_tuple(tail, adjacent, afterBackslash);
+    auto it = memo.find(key);
+    if (it != memo.end())
+        return it->second;
+    std::vector<int> free;
+    for (int i = 0; i < (int) tail.size(); ++i)
+        if (tail[i] == kFreeChar)
+            free.push_back(i);
+    int best = -1;
+    for (uint32_t m = 0; m < (1u << free.size()); ++m) {
+        std::string t = tail;
+        for (size_t j = 0; j < free.size(); ++j)
+            t[free[j]] = (m >> j & 1) ? '\\' : 'X';
+        bool ok = true;
+        for (size_t j = 0; j < free.size() && adjacent; ++j) {
+            const int i = free[j];
+            if (t[i] == '\\' && ((i == 0 ? afterBackslash : t[i - 1] == '\\') || (i + 1 < (int) t.size() && t[i + 1] == '\\')))
+                ok = false;
+        }
+        if (ok)
+            best = std::max(best, (int) std::count(t.begin(), t.end(), '\\'));
+    }
+    memo.emplace(key, best);
+    return best;
+}
+
+// The rules look at the candidate with the text inserted into it - but for
+// text after its last character, which is part of the suffix.
 static bool isPruned(const std::string& candidate, int leadingLen, bool pruneSymbolRuns, int maxBackslashCount, bool pruneUnopenedBrackets,
-                     const std::string& prefix, bool pruneWholeCandidate = false, int minBackslashCount = 0, bool pruneAdjacentBackslashes = false) {
-    std::string_view leading(candidate.data(), pruneWholeCandidate ? candidate.size() - 1 : leadingLen);
+                     const std::string& prefix, bool pruneWholeCandidate = false, int minBackslashCount = 0, bool pruneAdjacentBackslashes = false,
+                     const Insertion& fromStart = {}, const Insertion& fromEnd = {}) {
+    const int len = (int) candidate.size();
+    const int startAt = insertionIndex(fromStart, false, len), endAt = insertionIndex(fromEnd, true, len);
+    // The candidate with that text, kFreeChar in `layout` where a character
+    // was enumerated; and how much of it comes before its leading part ends.
+    std::string expanded, layout;
+    size_t leadingEnd = 0;
+    for (int i = 0; i < len; ++i) {
+        if (i == startAt) {
+            expanded += fromStart.text;
+            layout += fromStart.text;
+        }
+        if (i == endAt) {
+            expanded += fromEnd.text;
+            layout += fromEnd.text;
+        }
+        if (i == leadingLen)
+            leadingEnd = expanded.size();
+        expanded += candidate[i];
+        layout += kFreeChar;
+    }
+    std::string_view leading(expanded.data(), pruneWholeCandidate ? expanded.size() - 1 : leadingEnd);
     if (pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
         return true;
     if (maxBackslashCount != 0 && countBackslashes_CPU(leading) > maxBackslashCount)
@@ -184,10 +244,9 @@ static bool isPruned(const std::string& candidate, int leadingLen, bool pruneSym
     const std::string withPrefixEnd = (prefix.empty() ? std::string() : prefix.substr(prefix.size() - 1)) + std::string(leading);
     if (pruneAdjacentBackslashes && withPrefixEnd.find("\\\\") != std::string::npos)
         return true;
-    const int unchecked = (int) (candidate.size() - leading.size());
     const bool endsWithBackslash = !withPrefixEnd.empty() && withPrefixEnd.back() == '\\';
-    const int mostToCome = !pruneAdjacentBackslashes ? unchecked : endsWithBackslash ? unchecked / 2 : (unchecked + 1) / 2;
-    if (minBackslashCount != 0 && countBackslashes_CPU(leading) + mostToCome < minBackslashCount)
+    if (minBackslashCount != 0 &&
+        countBackslashes_CPU(leading) + bruteCapacity(layout.substr(leading.size()), pruneAdjacentBackslashes, endsWithBackslash) < minBackslashCount)
         return true;
     return false;
 }
@@ -248,6 +307,7 @@ struct CaseSpec {
     bool pruneWholeCandidate = false;
     int minBackslashCount = 0;
     bool pruneAdjacentBackslashes = false;
+    Insertion insertFromStart, insertFromEnd;
     uint32_t targetHashA = 0x12345678;
     uint32_t targetHashB = 0xDEADBEEF;
     // A candidate the reference must contain in its match set (a sanity check
@@ -259,6 +319,11 @@ struct CaseSpec {
     // The case enables pruning and must exercise both pruned and surviving values.
     bool requireBothPrunedAndChecked = false;
 };
+
+// The filename of candidate `cand` of `c`, with the text inserted into it.
+static std::string nameOf(const CaseSpec& c, const std::string& cand) {
+    return c.prefix + insertIntoCandidate(cand, c.insertFromStart, c.insertFromEnd) + c.suffix;
+}
 
 static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = false) {
     ++g_cases;
@@ -275,11 +340,11 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
         while (true) {
             ++total;
             if (isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate,
-                         c.minBackslashCount, c.pruneAdjacentBackslashes)) {
+                         c.minBackslashCount, c.pruneAdjacentBackslashes, c.insertFromStart, c.insertFromEnd)) {
                 ++pruned;
             } else {
                 ++checked;
-                if (hashA(c.prefix + cand + c.suffix) == c.targetHashA)
+                if (hashA(nameOf(c, cand)) == c.targetHashA)
                     referenceMatches.insert(cand);
             }
             if (cand == c.upper) break;
@@ -327,12 +392,16 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
     req.pruneWholeCandidate = c.pruneWholeCandidate;
     req.minBackslashCount = c.minBackslashCount;
     req.pruneAdjacentBackslashes = c.pruneAdjacentBackslashes;
+    req.insertFromStart = c.insertFromStart;
+    req.insertFromEnd = c.insertFromEnd;
     req.continuous = false;
 
     std::set<std::string> reported;
     std::vector<std::string> reportedInOrder;
     auto onPartialMatch = [&](const std::string& filename) {
-        std::string cand = removePrefixAndSuffix(filename, c.prefix, c.suffix);
+        std::string cand, error;
+        if (!candidateOfFilename(filename, c.prefix, c.suffix, c.insertFromStart, c.insertFromEnd, cand, error))
+            cand = "<" + filename + ": " + error + ">";
         reported.insert(cand);
         reportedInOrder.push_back(cand);
     };
@@ -368,7 +437,7 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
         if (c.expectFound.empty()) {
             if (result.found) fail("runSearch() reported found=true ('" + result.filename + "') but nothing should have matched hashB");
         } else {
-            std::string expectedName = c.prefix + c.expectFound + c.suffix;
+            std::string expectedName = nameOf(c, c.expectFound);
             if (!result.found) fail("runSearch() reported found=false, expected '" + expectedName + "'");
             else if (result.filename != expectedName) fail("runSearch() found '" + result.filename + "', expected '" + expectedName + "'");
         }
@@ -719,6 +788,7 @@ struct BackslashRules {
     int minCount = 0;
     bool adjacent = false;
     bool whole = false;
+    Insertion fromStart, fromEnd;
 };
 static bool backslashCase(const std::string& what, const std::string& alphabet, const std::string& prefix, BackslashRules rules, int len,
                           uint64_t first, uint64_t last, const std::vector<WholeTarget>& targets, bool somethingPruned = true) {
@@ -732,14 +802,17 @@ static bool backslashCase(const std::string& what, const std::string& alphabet, 
         c.minBackslashCount = rules.minCount;
         c.pruneAdjacentBackslashes = rules.adjacent;
         c.pruneWholeCandidate = rules.whole;
+        c.insertFromStart = rules.fromStart;
+        c.insertFromEnd = rules.fromEnd;
         c.lower = indexToString(first, len, alphabet);
         c.upper = indexToString(last, len, alphabet);
         const std::string target = indexToString(t.index, len, alphabet);
-        c.targetHashA = hashA(prefix + target + c.suffix);
+        c.targetHashA = hashA(nameOf(c, target));
         c.requireBothPrunedAndChecked = somethingPruned;
         const std::string label = "7: " + what + ", target '" + target + "' " + (t.survives ? "survives" : "is pruned (must NOT be found)");
         const int leadingLen = len - trailingLenFor(len, (int) alphabet.size());
-        if (isPruned(target, leadingLen, false, rules.maxCount, false, prefix, rules.whole, rules.minCount, rules.adjacent) == t.survives) {
+        if (isPruned(target, leadingLen, false, rules.maxCount, false, prefix, rules.whole, rules.minCount, rules.adjacent, rules.fromStart,
+                     rules.fromEnd) == t.survives) {
             fprintf(stderr, "TEST BUG in '%s': the reference disagrees about the target\n", label.c_str());
             ++g_failures;
             ok = false;
@@ -747,7 +820,7 @@ static bool backslashCase(const std::string& what, const std::string& alphabet, 
         }
         if (t.survives) {
             c.mustBeFound = target;
-            c.targetHashB = hashB(prefix + target + c.suffix);
+            c.targetHashB = hashB(nameOf(c, target));
             c.expectFound = target;
         }
         ok &= runCase(label, c);
@@ -856,6 +929,113 @@ static bool scenarioBackslashRules() {
     const uint64_t next = group + as * as;
     ok &= backslashCase("minBackslashCount, every other one, row groups", alphabet, "TEST_", twoApart, len, group, next + 60,
                         {{group, false}, {group + as - 1, false}, {group + as, true}, {next - 1, true}, {next, false}, {next + 5, false}});
+    return ok;
+}
+
+// 8: insertFromStart and insertFromEnd. First every place text can go - in
+// the leading part, between a row group's characters, after them, after a
+// row's own character, after the last character, or nowhere - for both, at
+// a few lengths around the window: a target planted on either side of a
+// leading-value boundary must be found, with both hashes. Then the rules
+// across inserted text.
+static bool scenarioInsertions() {
+    printf("=== 8: insertFromStart and insertFromEnd ===\n");
+    bool ok = true;
+    const std::string alphabet = alphabetOfSize(43);
+    const uint64_t as = alphabet.size();
+    for (int len : {g_window, g_window + 1, g_window + 2}) {
+        const int trailingLen = trailingLenFor(len, (int) as);
+        const uint64_t T = ipow(as, trailingLen);
+        const uint64_t space = ipow(as, len);
+        // Straddling a leading-value boundary where there is one.
+        const uint64_t middle = space > T ? 2 * T : space / 2;
+        const uint64_t first = middle > 300 ? middle - 300 : 0, last = std::min(space - 1, middle + 300);
+        for (int position = 0; position <= len + 1; ++position) {
+            for (int fromEnd = 0; fromEnd <= 1; ++fromEnd) {
+                for (const char* text : {"\\", "_X_"}) {
+                    for (uint64_t target : {first + 17, last - 5}) {
+                        CaseSpec c;
+                        c.alphabet = alphabet;
+                        c.prefix = "TEST\\";
+                        c.suffix = ".DAT";
+                        (fromEnd ? c.insertFromEnd : c.insertFromStart) = Insertion{text, position};
+                        c.lower = indexToString(first, len, alphabet);
+                        c.upper = indexToString(last, len, alphabet);
+                        const std::string planted = indexToString(target, len, alphabet);
+                        c.targetHashA = hashA(nameOf(c, planted));
+                        c.targetHashB = hashB(nameOf(c, planted));
+                        c.mustBeFound = planted;
+                        c.expectFound = planted;
+                        ok &= runCase("8: len " + std::to_string(len) + ", '" + text + "' at " + std::to_string(position) +
+                                          (fromEnd ? " from the end" : " from the start") + ", target '" + planted + "'",
+                                      c);
+                    }
+                }
+            }
+        }
+        // Both at once, meeting and apart.
+        for (int startAt : {1, len / 2, len - 1}) {
+            for (int endAt : {1, len / 2, len - 1}) {
+                CaseSpec c;
+                c.alphabet = alphabet;
+                c.prefix = "TEST_";
+                c.suffix = ".DAT";
+                c.insertFromStart = Insertion{"(S", startAt};
+                c.insertFromEnd = Insertion{"E)", endAt};
+                c.lower = indexToString(first, len, alphabet);
+                c.upper = indexToString(last, len, alphabet);
+                const std::string planted = indexToString(first + 123 % (last - first + 1), len, alphabet);
+                c.targetHashA = hashA(nameOf(c, planted));
+                c.targetHashB = hashB(nameOf(c, planted));
+                c.mustBeFound = planted;
+                c.expectFound = planted;
+                ok &= runCase("8: len " + std::to_string(len) + ", both, at " + std::to_string(startAt) + " and " + std::to_string(endAt) +
+                                  " from the end",
+                              c);
+            }
+        }
+    }
+
+    // The rules see inserted text as it is: a backslash inserted at 3 is
+    // next to one the candidate has at 2, or at 3, with
+    // pruneAdjacentBackslashes - both at the leading characters only (with a
+    // leading part long enough to hold them) and at every one but the last.
+    const std::string backslashSecond = "A\\ &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV"; // 'A' = 0, '\\' = 1
+    for (int whole = 0; whole <= 1; ++whole) {
+        const int len = whole ? std::max(g_window + 1, 5) : g_window + 4;
+        const std::string mode = whole ? "every character but the last" : "leading characters";
+        BackslashRules adjacent;
+        adjacent.adjacent = true;
+        adjacent.whole = whole == 1;
+        adjacent.fromStart = Insertion{"\\", 3};
+        uint64_t index = 0;
+        std::string error;
+        // "AAAV..." survives, "AA\\A..." - and the inserted backslash - not.
+        stringToIndex("AA\\" + std::string(len - 3, 'A'), backslashSecond, index, error);
+        ok &= backslashCase("an inserted backslash after the candidate's, " + mode, backslashSecond, "TEST_", adjacent, len, index - 200,
+                            index + 200, {{index - 1, true}, {index - 150, true}, {index, false}, {index + 150, false}});
+        // "AAAAV..." survives, "AAA\\A..." - after the inserted backslash - not.
+        stringToIndex("AAA\\" + std::string(len - 4, 'A'), backslashSecond, index, error);
+        ok &= backslashCase("an inserted backslash before the candidate's, " + mode, backslashSecond, "TEST_", adjacent, len, index - 40,
+                            index + 40, {{index - 1, true}, {index - 30, true}, {index, false}, {index + 30, false}});
+    }
+    // At least three backslashes, one of them inserted: a row with one more
+    // before the last character survives, one with none doesn't.
+    {
+        const std::string backslashFirst = "\\A &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV"; // '\\' = 0, 'A' = 1
+        const uint64_t bs = backslashFirst.size();
+        const int len = std::max(g_window + 1, 5);
+        BackslashRules three;
+        three.minCount = 3;
+        three.whole = true;
+        three.fromStart = Insertion{"\\", 1};
+        uint64_t row = 0;
+        std::string error;
+        stringToIndex("B" + std::string(len - 2, 'A'), backslashFirst, row, error);
+        row *= bs;
+        ok &= backslashCase("minBackslashCount, counting an inserted backslash", backslashFirst, "TEST_", three, len, row - 60, row + bs + 60,
+                            {{row - 1, true}, {row, false}, {row + bs - 1, false}, {row + bs, false}});
+    }
     return ok;
 }
 
@@ -1255,26 +1435,39 @@ static bool fuzz(int iterations, uint64_t seed) {
         if (uni(2) == 0) c.pruneWholeCandidate = true;
         if (!highBytes && uni(4) == 0) c.pruneAdjacentBackslashes = true;
         if (!highBytes && uni(4) == 0) c.minBackslashCount = std::min(1 + (int) uni(3), c.maxBackslashCount != 0 ? c.maxBackslashCount : 3);
+        // Text inserted anywhere, made of what the rules care about. Its
+        // length counts against the prefix's and suffix's room.
+        static const char* const texts[] = {"\\", "(", ")", "!!", "\\A\\", "]X["};
+        for (Insertion* insertion : {&c.insertFromStart, &c.insertFromEnd}) {
+            const std::string text = texts[uni(6)];
+            if (uni(3) == 0 && pl + (int) text.size() + 4 < kMaxPrefixSize - maxSafeIndexLen && sl + (int) text.size() + 4 < kMaxSuffixSize &&
+                pl + sl + MAX_CANDIDATE_LEN + 2 * (int) text.size() < MAX_FILENAME_LEN)
+                *insertion = Insertion{text, (int) uni(len + 2)};
+        }
+        if (c.insertFromStart.text.size() + c.insertFromEnd.text.size() + pl >= (size_t) (kMaxPrefixSize - maxSafeIndexLen))
+            c.insertFromEnd = Insertion();
 
         // Plant a target at a random position in the range (or none).
         if (uni(10) < 8) {
             std::string planted = lower;
             advanceBy(planted, c.alphabet, uni(steps + 1));
-            c.targetHashA = hashA(c.prefix + planted + c.suffix);
+            c.targetHashA = hashA(nameOf(c, planted));
             int leadingLen = len - trailingLenFor(len, as);
             bool survives = !isPruned(planted, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix,
-                                      c.pruneWholeCandidate, c.minBackslashCount, c.pruneAdjacentBackslashes);
+                                      c.pruneWholeCandidate, c.minBackslashCount, c.pruneAdjacentBackslashes, c.insertFromStart, c.insertFromEnd);
             if (survives) c.mustBeFound = planted;
             if (uni(2) == 0) {
-                c.targetHashB = hashB(c.prefix + planted + c.suffix);
+                c.targetHashB = hashB(nameOf(c, planted));
                 if (survives) c.expectFound = planted;
             }
         }
-        char label[240];
+        char label[320];
         snprintf(label, sizeof(label),
-                 "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d minbs=%d adjacent=%d brackets=%d whole=%d high=%d",
+                 "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d minbs=%d adjacent=%d brackets=%d whole=%d high=%d "
+                 "insert '%s'@%d, '%s'@-%d",
                  (unsigned long long) seed, it, as, len, (unsigned long long) n, pl, sl, c.pruneSymbolRuns, c.maxBackslashCount,
-                 c.minBackslashCount, c.pruneAdjacentBackslashes, c.pruneUnopenedBrackets, c.pruneWholeCandidate, highBytes);
+                 c.minBackslashCount, c.pruneAdjacentBackslashes, c.pruneUnopenedBrackets, c.pruneWholeCandidate, highBytes,
+                 c.insertFromStart.text.c_str(), c.insertFromStart.position, c.insertFromEnd.text.c_str(), c.insertFromEnd.position);
         // An entirely-pruned range is a legitimate outcome here; skip the reference's "nothing survived" TEST BUG check for those.
         {
             int leadingLen = len - trailingLenFor(len, as);
@@ -1282,7 +1475,7 @@ static bool fuzz(int iterations, uint64_t seed) {
             bool anySurvives = false;
             for (uint64_t i = 0; i <= steps && !anySurvives; ++i) {
                 if (!isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate,
-                              c.minBackslashCount, c.pruneAdjacentBackslashes))
+                              c.minBackslashCount, c.pruneAdjacentBackslashes, c.insertFromStart, c.insertFromEnd))
                     anySurvives = true;
                 stepCandidate(cand, c.alphabet);
             }
@@ -1332,6 +1525,7 @@ int main(int argc, char** argv) {
     allPassed &= scenarioPrefixBackslashes();
     allPassed &= scenarioPruneWholeCandidate();
     allPassed &= scenarioBackslashRules();
+    allPassed &= scenarioInsertions();
     allPassed &= scenarioSingleCandidate();
     allPassed &= scenarioGeometry();
     allPassed &= scenarioSmallAlphabets();

@@ -60,12 +60,14 @@ std::vector<std::string> readLastLines(const std::string& path, size_t maxLines)
 // on the same file is possible - malformed alphabet, etc.); callers should
 // treat that as "no usable progress signal yet" rather than a hard error.
 double matchProgressFraction(const std::string& matchFilename, const std::string& prefix, const std::string& suffix,
-                             const std::string& alphabet, const std::string& lowerBound, const std::string& upperBound) {
-    std::string candidate = removePrefixAndSuffix(matchFilename, prefix, suffix);
+                             const Insertion& insertFromStart, const Insertion& insertFromEnd, const std::string& alphabet,
+                             const std::string& lowerBound, const std::string& upperBound) {
+    std::string candidate, error;
+    if (!candidateOfFilename(matchFilename, prefix, suffix, insertFromStart, insertFromEnd, candidate, error))
+        return -1.0;
     if (candidate.length() != lowerBound.length() || lowerBound.length() != upperBound.length())
         return -1.0;
     uint64_t lowerIdx = 0, upperIdx = 0, matchIdx = 0;
-    std::string error;
     if (!stringToIndex(lowerBound, alphabet, lowerIdx, error) || !stringToIndex(upperBound, alphabet, upperIdx, error) ||
         !stringToIndex(candidate, alphabet, matchIdx, error))
         return -1.0;

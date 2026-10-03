@@ -45,6 +45,17 @@ struct BatchRequest {
     BatchParams params;
 };
 
+// Text inserted into a candidate's trailing part (SearchRequest::
+// insertFromStart and insertFromEnd), before its last charsAfter characters
+// - from 1, between a row's last character and the candidate's last, to
+// trailingLen - 1, after its first. Counted from the end so that it doesn't
+// depend on the trailing length.
+struct TrailingInsertion {
+    int charsAfter = 0;
+    std::string text;
+    bool operator==(const TrailingInsertion& o) const { return charsAfter == o.charsAfter && text == o.text; }
+};
+
 // Everything that stays the same for a whole search.
 struct SearchConstants {
     std::string alphabet;
@@ -58,7 +69,18 @@ struct SearchConstants {
     // searched. Every backend searches exactly what they allow, so that a
     // search covers the same candidates whichever backend runs it.
     PruneRules trailingRules;
+    // Text inserted into every candidate's trailing part: at most two, at
+    // different places, the one with the most characters after it first.
+    // The rules check it as they do the characters around it. (Text
+    // inserted after a candidate's last character is part of `suffix`; text
+    // inserted into its leading part, of each batch's BatchParams::prefix.)
+    std::vector<TrailingInsertion> trailingInsertions;
 };
+
+// A trailing part of `trailing` (trailingLen characters) with `insertions`
+// inserted - what a candidate's trailing part is between its prefix and its
+// suffix.
+std::string withTrailingInsertions(const std::string& trailing, const std::vector<TrailingInsertion>& insertions);
 
 // What one runBatch() (or runBatches()) call found.
 struct BatchOutcome {

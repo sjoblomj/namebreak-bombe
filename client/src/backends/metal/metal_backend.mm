@@ -65,11 +65,12 @@ public:
         suffixOrd_ = [device_ newBufferWithLength:kMaxSuffixSize * sizeof(uint32_t) options:shared];
         filterTable_ = [device_ newBufferWithLength:kLowBitsFilterEntries * sizeof(uint64_t) options:shared];
         rowMasks_ = [device_ newBufferWithLength:kRowFlagCount * sizeof(uint64_t) options:shared];
+        inserted_ = [device_ newBufferWithLength:2 * 2 * kMaxInsertLen * sizeof(uint32_t) options:shared];
         // Bound to the kernel even when it doesn't read it (LISTED 0), so it
         // always exists; grown when a search's lists need more.
         groups_ = [device_ newBufferWithLength:sizeof(uint32_t) options:shared];
         if (!queue_ || !matchCount_ || !matchIdx_ || !alphabetKey_ || !alphabetOrd_ || !suffixKey_ || !suffixOrd_ || !filterTable_ ||
-            !rowMasks_ || !groups_) {
+            !rowMasks_ || !groups_ || !inserted_) {
             fprintf(stderr, "Metal: couldn't allocate the search's buffers\n");
             exit(1);
         }
@@ -98,11 +99,16 @@ private:
     // This search's lookup filter: kLowBitsFilterEntries entries, see
     // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
     id<MTLBuffer> filterTable_;
+    // The text inserted into the trailing part: each character's key, then
+    // its value (see search.metal's `inserted`), and where each insertion is
+    // - compiled into the kernel.
+    id<MTLBuffer> inserted_;
+    InsertLayout insertLayout_;
     // Compiled once per (alphabet size, suffix length, trailing length,
-    // LISTED) and kept for the backend's lifetime - a coordinator client
-    // searches range after range of the same shape, and each compile takes a
-    // moment.
-    std::map<std::tuple<int, int, int, bool>, id<MTLComputePipelineState>> pipelines_;
+    // LISTED, where the inserted text goes) and kept for the backend's
+    // lifetime - a coordinator client searches range after range of the same
+    // shape, and each compile takes a moment.
+    std::map<std::tuple<int, int, int, bool, std::vector<int>>, id<MTLComputePipelineState>> pipelines_;
     bool announcedDevice_ = false;
 
     HitVerifier verifier_;
@@ -163,6 +169,13 @@ void MetalBackend::beginSearch(const SearchConstants& constants) {
         suffixOrd[i] = (unsigned char) constants.suffix[i];
         suffixKey[i] = constants.cryptTable[0x100 + suffixOrd[i]];
     }
+    insertLayout_ = insertLayoutFor(constants);
+    auto* inserted = static_cast<uint32_t*>(inserted_.contents);
+    std::fill(inserted, inserted + 2 * 2 * kMaxInsertLen, 0u);
+    for (size_t i = 0; i < insertLayout_.key.size(); ++i) {
+        inserted[2 * i] = insertLayout_.key[i];
+        inserted[2 * i + 1] = insertLayout_.ord[i];
+    }
     // Establishes the "matchCount is 0 at launch" invariant runBatch keeps.
     *static_cast<int32_t*>(matchCount_.contents) = 0;
     listed_ = constants.trailingRules.any();
@@ -214,7 +227,10 @@ void MetalBackend::uploadGroups() {
 }
 
 id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen, bool listed) {
-    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen, listed);
+    const InsertLayout& l = insertLayout_;
+    const std::vector<int> insertKey = {l.groupCharsAfter[0], l.groupStart[0], l.groupLen[0], l.groupCharsAfter[1],
+                                        l.groupStart[1],      l.groupLen[1],   l.rowStart,    l.rowLen};
+    const auto key = std::make_tuple(alphabetSize_, suffixLen_, trailingLen, listed, insertKey);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end())
         return found->second;
@@ -231,6 +247,14 @@ id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen, bool list
             @"ROWS_PER_THREAD": @(kRowsPerThread),
             @"ROW_FLAG_BITS": @(kRowFlagBits),
             @"LISTED": @(listed ? 1 : 0),
+            @"GROUP_INSERT0_AFTER": @(l.groupCharsAfter[0]),
+            @"GROUP_INSERT0_START": @(l.groupStart[0]),
+            @"GROUP_INSERT0_LEN": @(l.groupLen[0]),
+            @"GROUP_INSERT1_AFTER": @(l.groupCharsAfter[1]),
+            @"GROUP_INSERT1_START": @(l.groupStart[1]),
+            @"GROUP_INSERT1_LEN": @(l.groupLen[1]),
+            @"ROW_INSERT_START": @(l.rowStart),
+            @"ROW_INSERT_LEN": @(l.rowLen),
         };
         NSError* error = nil;
         id<MTLLibrary> library = [device_ newLibraryWithSource:@(kSearchKernelSource) options:options error:&error];
@@ -301,6 +325,7 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
         [encoder setBuffer:filterTable_ offset:0 atIndex:7];
         [encoder setBuffer:groups_ offset:0 atIndex:8];
         [encoder setBuffer:rowMasks_ offset:0 atIndex:9];
+        [encoder setBuffer:inserted_ offset:0 atIndex:10];
         // A thread per chunk of every row group the batch searches (see
         // CHUNKS_PER_GROUP in search.metal), rounded up to whole threadgroups.
         // The kernel works out the chunks itself and covers all of them

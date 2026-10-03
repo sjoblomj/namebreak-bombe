@@ -39,6 +39,17 @@ struct SearchRequest {
     // Skip candidates with two backslashes next to each other - including a
     // backslash at the candidate's start right after one `prefix` ends with.
     bool pruneAdjacentBackslashes = false;
+    // Fixed text inserted into every candidate at least as long as its
+    // position: before the candidate's character at that index from the
+    // start (its length: after the last one), and before the last
+    // `position` characters from the end. Both are placed on the
+    // candidate's own characters - where they meet, insertFromStart's text
+    // comes first. The bounds and the start candidate are without them; the
+    // filenames reported have them. The rules below check inserted text like
+    // the characters around it - but text inserted after a candidate's last
+    // character, which is part of the suffix.
+    Insertion insertFromStart;
+    Insertion insertFromEnd;
     // false: the rules above (pruneSymbolRuns, pruneUnopenedBrackets,
     // maxBackslashCount, minBackslashCount, pruneAdjacentBackslashes) look
     // only at a candidate's leading characters, which the engine enumerates

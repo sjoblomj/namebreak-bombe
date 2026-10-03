@@ -19,25 +19,29 @@
 // group g holds rows g * alphabetSize .. g * alphabetSize + alphabetSize - 1,
 // the first trailingLen - 2 characters of a candidate being g's digits, and
 // the row's own last character d the next. Whether a candidate breaks a rule
-// at those characters - every one but its last, which is never checked -
-// depends only on them and on the state the leading characters left
-// (BatchParams::pruneEntry). So does whether the last could still make up
-// the backslashes the rules ask for (canReachMinBackslashes_CPU). So for each such state there's a fixed list of
-// the groups that survive, and for each of those, which of its rows do: a
+// at those characters, and the text inserted between them
+// (SearchConstants::trailingInsertions) - every one but its last character,
+// which is never checked - depends only on them and on the state the
+// leading characters left (BatchParams::pruneEntry). So does whether the
+// last could still make up the backslashes the rules ask for
+// (canReachMinBackslashes_CPU). So for each such state there's a fixed list
+// of the groups that survive, and for each of those, which of its rows do: a
 // kernel walks the list instead of every group, so that a pruned group costs
 // it nothing at all. Leaving the pruned ones out on the GPU instead would
 // cost nearly as much as searching them: a warp waits for its slowest lane.
 //
-// An entry of a list is (group << kRowFlagBits) | flags, sorted by group,
-// where flags say which characters the rows' own last character d may not
-// be - one bit per rule the group's characters have used up (the symbol run
-// is at 2, no ')' or no ']' is open, the backslashes are all used or the
-// last character was one, or d must be a backslash for there to be enough),
-// each standing for a set of characters. rowMask(flags) is the set of d
-// allowed.
-constexpr int kRowFlagBits = 5;
+// An entry of a list is (group << kRowFlagBits) | classes, sorted by group,
+// where bit c of classes says whether the rows whose own last character d is
+// of class c (rowClass) survive: the rules tell characters apart only by
+// those seven classes, so every character of one gives the same verdict.
+// rowMasks()[classes] is the set of d allowed.
+constexpr int kRowFlagBits = 7;
 constexpr uint32_t kRowFlagCount = 1u << kRowFlagBits;
-// Group numbers must leave room for the flags: 63^4 groups (trailingLen 6)
+// Which of the kRowFlagBits classes a character is of, as far as the rules
+// go: 0 a letter, digit or space; 1 any other symbol but these: 2 '(', 3 ')',
+// 4 '[', 5 ']', 6 '\\'.
+int rowClass(char c);
+// Group numbers must leave room for the classes: 63^4 groups (trailingLen 6)
 // is within this.
 constexpr uint64_t kMaxPrunableGroups = uint64_t(1) << (32 - kRowFlagBits);
 
@@ -49,10 +53,10 @@ public:
         uint32_t count;
     };
 
-    // Called by beginSearch. The lists depend on the alphabet and the rules
-    // alone - not the target, the prefix or the suffix - so they're kept for
-    // the next search if those are the same, and the backend need not upload
-    // them again.
+    // Called by beginSearch. The lists depend on the alphabet, the rules and
+    // the text inserted into the trailing part alone - not the target, the
+    // prefix or the suffix - so they're kept for the next search if those are
+    // the same, and the backend need not upload them again.
     void begin(const SearchConstants& constants);
 
     // The surviving groups, among firstGroup..lastGroup, of a batch of
@@ -70,13 +74,15 @@ public:
     // change must upload all of it again.
     uint64_t generation() const { return generation_; }
 
-    // The rows' last characters d allowed by an entry's flags - kRowFlagCount
-    // masks, bit d for alphabet position d, never past the alphabet.
+    // The rows' last characters d allowed by an entry's classes -
+    // kRowFlagCount masks, bit d for alphabet position d, never past the
+    // alphabet.
     const uint64_t* rowMasks() const { return rowMasks_; }
 
 private:
     std::string alphabet_;
     PruneRules rules_;
+    std::vector<TrailingInsertion> insertions_;
     bool begun_ = false;
     uint64_t generation_ = 0;
     uint64_t rowMasks_[kRowFlagCount] = {};
@@ -84,6 +90,10 @@ private:
     // (trailingLen, and the entry state reduced to what can matter - see
     // groupsFor) -> where its list is in arena_.
     std::map<std::tuple<int, int, int, int, int, bool>, Slice> lists_;
+
+    // The text inserted before trailing character i (1 .. trailingLen - 1),
+    // or "".
+    const std::string& insertedBefore(int trailingLen, int i) const;
 };
 
 #endif // NAMEBREAK_BACKENDS_COMMON_ROW_PRUNING_H

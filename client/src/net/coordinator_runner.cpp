@@ -173,6 +173,8 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& mat
     req.pruneUnopenedBrackets = claim.pruneUnopenedBrackets;
     req.pruneWholeCandidate = claim.pruneWholeCandidate;
     req.pruneAdjacentBackslashes = claim.pruneAdjacentBackslashes;
+    req.insertFromStart = claim.insertFromStart;
+    req.insertFromEnd = claim.insertFromEnd;
     req.continuous = false; // a coordinator range is always run "bounded"
     req.outputFilePath = matchesFilePath(matchesDir, claim.targetName);
     if (!hexToU32(claim.hashAHex, req.targetHashA) || !hexToU32(claim.hashBHex, req.targetHashB)) {

@@ -43,8 +43,12 @@ public:
     // extend by the leading characters. `alphabet` and `cryptTable` must
     // outlive this object; both are copied/referenced as given elsewhere in
     // this codebase (small, process-lifetime data).
+    //
+    // `insertBefore`, if given, has leadingLen + 1 entries: text hashed
+    // before each leading character, and after the last one (see
+    // SearchRequest::insertFromStart) - none, if empty.
     IncrementalPrefixHasher(std::pair<uint32_t, uint32_t> baseState, int leadingLen,
-                             std::string alphabet, const uint32_t* cryptTable);
+                             std::string alphabet, const uint32_t* cryptTable, std::vector<std::string> insertBefore = {});
 
     // One-time full hash to (re)start at a specific leading value - the only
     // O(leadingLen) operation this class performs. Must be called once
@@ -61,18 +65,22 @@ public:
     // The current leading characters (leadingLen of them).
     const std::string& leading() const { return leading_; }
 
-    // Hash state after the fixed part followed by the current leading value -
-    // what mpqHashWithPrefixCache_CPU(prefix + leading()) would return.
-    std::pair<uint32_t, uint32_t> state() const { return stack_.back(); }
+    // Hash state after the fixed part followed by the current leading value
+    // (and the text inserted into it) - what
+    // mpqHashWithPrefixCache_CPU(prefix + leading()) would return.
+    std::pair<uint32_t, uint32_t> state() const;
 
 private:
+    // stack_[i + 1] from stack_[i]: insertBefore_[i], then leading_[i].
+    std::pair<uint32_t, uint32_t> stepFrom(int i) const;
+    std::vector<std::string> insertBefore_;
     std::string alphabet_;
     const uint32_t* cryptTable_;
     int leadingLen_;
     std::string leading_;
     std::vector<int> digitIndex_;
-    // stack_[k] = hash state after the fixed part + leading_[0..k-1];
-    // stack_[0] = baseState, stack_[leadingLen_] = state().
+    // stack_[k] = hash state after the fixed part + leading_[0..k-1] (and
+    // the text inserted before each); stack_[0] = baseState.
     std::vector<std::pair<uint32_t, uint32_t>> stack_;
 };
 

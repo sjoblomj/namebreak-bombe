@@ -41,6 +41,8 @@ struct SetupDialogFields {
     bool pruneUnopenedBrackets = false;
     bool pruneWholeCandidate = false;
     bool pruneAdjacentBackslashes = false;
+    std::string insertFromStart; // "text, position", or empty
+    std::string insertFromEnd;
 
     // Result: "coordinator" | "bounded" | "continuous", set only if OK was
     // pressed (see showSetupDialog's return value).

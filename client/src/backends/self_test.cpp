@@ -384,6 +384,80 @@ bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& t
     return true;
 }
 
+// Text inserted into the trailing part (SearchConstants::trailingInsertions),
+// with two backslashes next to each other pruned and the whole candidate
+// pruned: a candidate planted at `trailing` must be reported, as a filename
+// with the text, exactly when its characters and the text, all but the last
+// character, have no two backslashes next to each other. The range reaches
+// two row groups either side, so a backend that hashed the text in the wrong
+// place, or not at all, misses it - and one that checked the rows' own last
+// characters without the text after them reports a pruned one.
+bool runInsertCase(SearchBackend& backend, int alphabetSize, const std::string& trailing, const std::vector<TrailingInsertion>& insertions,
+                   const uint32_t* cryptTable, std::string& error) {
+    // With a backslash, in place of the last character.
+    std::string alphabet = kCharacters.substr(0, alphabetSize);
+    alphabet.back() = '\\';
+    const uint64_t as = (uint64_t) alphabetSize;
+    const int trailingLen = (int) trailing.size();
+    uint64_t space = 1, planted = 0;
+    for (char c : trailing) {
+        space *= as;
+        planted = planted * as + alphabet.find(c);
+    }
+    const std::string prefix = "REZ_";
+    const std::string suffix = ".WAV";
+    const std::string expanded = withTrailingInsertions(trailing, insertions);
+    const std::string plantedName = prefix + expanded + suffix;
+
+    SearchConstants constants;
+    constants.alphabet = alphabet;
+    constants.suffix = suffix;
+    constants.cryptTable = cryptTable;
+    constants.targetHashA = hashFromScratch(plantedName, cryptTable, 0x100);
+    constants.targetHashB = hashFromScratch(plantedName, cryptTable, 0x200);
+    constants.trailingRules.adjacentBackslashes = true;
+    constants.trailingInsertions = insertions;
+
+    BatchParams params;
+    memcpy(params.prefix, prefix.c_str(), prefix.size() + 1);
+    params.prefixSize = (short) prefix.size();
+    std::pair<uint32_t, uint32_t> seeds = mpqHashWithPrefixCache_CPU(prefix.c_str(), cryptTable);
+    params.seed1Start = seeds.first;
+    params.seed2Start = seeds.second;
+
+    // What the rule says, worked out here one character at a time.
+    PruneState state = params.pruneEntry;
+    bool survives = true;
+    for (size_t i = 0; i + 1 < expanded.size() && survives; ++i)
+        survives = pruneStep_CPU(constants.trailingRules, state, expanded[i]);
+
+    const uint64_t reach = 2 * as * as + 7;
+    const uint64_t start = planted - std::min(planted, reach);
+    const uint64_t end = std::min(space, planted + reach);
+    Result result;
+    const uint64_t batchSize = backend.batchSize(alphabetSize);
+    backend.beginSearch(constants);
+    for (uint64_t i = start; i < end && !result.found;) {
+        const uint64_t chunkEnd = std::min(end, (i / batchSize + 1) * batchSize);
+        searchChunk(backend, trailingLen, i, chunkEnd - i, params, result);
+        i = chunkEnd;
+    }
+    backend.endSearch();
+
+    const std::string where = " (text inserted into the trailing part, alphabet size " + std::to_string(alphabetSize) + ", trailing length " +
+                              std::to_string(trailingLen) + ")";
+    const bool reported = std::find(result.hits.begin(), result.hits.end(), plantedName) != result.hits.end();
+    if (survives && (!reported || !result.found || result.foundFilename != plantedName)) {
+        error = "missed the planted candidate '" + plantedName + "'" + where;
+        return false;
+    }
+    if (!survives && (reported || result.found)) {
+        error = "reported '" + plantedName + "', which has two backslashes next to each other" + where;
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool selfTestBackend(SearchBackend& backend, std::string& error) {
@@ -499,6 +573,29 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
                 if (!runPruneCase(backend, size, trailing, cryptTable, error))
                     return false;
             }
+        }
+    }
+
+    // Text inserted into the trailing part (see runInsertCase): after the
+    // row's own last character, after the row group's characters, after its
+    // first one, and two at once - each with a backslash right before it in
+    // the candidate (pruned) and without (survives).
+    if (window >= 3) {
+        std::vector<int> places = {1, 2, window - 1};
+        places.erase(std::unique(places.begin(), places.end()), places.end());
+        for (int size : {big, common, compiled, small}) {
+            for (int charsAfter : places) {
+                std::string plain(window, 'A');
+                plain[0] = 'B';
+                std::string beside = plain;
+                beside[window - charsAfter - 1] = '\\';
+                for (const std::string& trailing : {plain, beside}) {
+                    if (!runInsertCase(backend, size, trailing, {{charsAfter, "\\"}}, cryptTable, error))
+                        return false;
+                }
+            }
+            if (window >= 4 && !runInsertCase(backend, size, std::string(window, 'C'), {{window - 1, "(S"}, {1, "E)"}}, cryptTable, error))
+                return false;
         }
     }
 

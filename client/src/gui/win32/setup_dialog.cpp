@@ -59,6 +59,7 @@ struct SetupDialogState {
     HWND hwndUsername = nullptr, hwndHostname = nullptr, hwndServerUrl = nullptr, hwndPollInterval = nullptr;
     HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr, hwndPruneBrackets = nullptr,
          hwndPruneWhole = nullptr, hwndPruneAdjacent = nullptr;
+    HWND hwndInsertFromStart = nullptr, hwndInsertFromEnd = nullptr;
     HWND hwndAlphabet = nullptr, hwndMaxBackslash = nullptr, hwndMinBackslash = nullptr, hwndPrefix = nullptr, hwndSuffix = nullptr, hwndStartCandidate = nullptr,
          hwndLowerBound = nullptr, hwndUpperBound = nullptr, hwndHashA = nullptr, hwndHashB = nullptr;
     // Tooltip strings must outlive the tooltip (it keeps pointers, not
@@ -161,6 +162,8 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         state->fields->pruneUnopenedBrackets = SendMessage(state->hwndPruneBrackets, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->pruneWholeCandidate = SendMessage(state->hwndPruneWhole, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->pruneAdjacentBackslashes = SendMessage(state->hwndPruneAdjacent, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                        state->fields->insertFromStart = getField(state->hwndInsertFromStart);
+                        state->fields->insertFromEnd = getField(state->hwndInsertFromEnd);
                         bool continuous = SendMessage(state->hwndContinuousRadio, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->mode = continuous ? "continuous" : "bounded";
                     }
@@ -407,6 +410,18 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     addHelp(ps, kH2, row(7) + 2,
             "Skip candidates with two backslashes next to each other - counting one the prefix ends with. Real filenames never have "
             "those. Makes the search faster.");
+
+    makeLabel(ps, "Insert from start:", kL1, row(8) + 3, 104);
+    state.hwndInsertFromStart = makeEdit(ps, fields.insertFromStart, kE1, row(8), 150);
+    addHelp(ps, kH1, row(8) + 2,
+            "Optional. Text inserted into every candidate, and the position it goes at, counted from the start - for example \\, 3 "
+            "puts a backslash after the candidate's first three characters. A candidate shorter than the position gets nothing "
+            "inserted. The bounds and the start candidate are without it; the matches have it.");
+    makeLabel(ps, "Insert from end:", kL2, row(8) + 3, 110);
+    state.hwndInsertFromEnd = makeEdit(ps, fields.insertFromEnd, kE2, row(8), 120);
+    addHelp(ps, kH2, row(8) + 2,
+            "Optional. Like Insert from start, counted from the end - for example \\, 4 puts a backslash before the candidate's last "
+            "four characters.");
 
     // --- Buttons ---
     CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 512, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout, hInstance,

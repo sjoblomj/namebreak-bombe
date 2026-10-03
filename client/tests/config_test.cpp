@@ -129,6 +129,59 @@ int main() {
     check(backslashRulesOf("lots", "").rfind("<error:", 0) == 0, "min_backslash_count not a number: an error");
     check(backslashRulesOf("", "sometimes").rfind("<error:", 0) == 0, "prune_adjacent_backslashes not a boolean: an error");
 
+    printf("--- insert_from_start and insert_from_end ---\n");
+    auto insertionsOf = [](const std::string& fromStart, const std::string& fromEnd) {
+        ConfigFile config = makeConfig("", "");
+        if (!fromStart.empty())
+            config.search["insert_from_start"] = fromStart;
+        if (!fromEnd.empty())
+            config.search["insert_from_end"] = fromEnd;
+        SearchRequest req;
+        std::string error;
+        if (!buildSearchRequest(config, true, req, error))
+            return std::string("<error: ") + error + ">";
+        return "[" + req.insertFromStart.text + "]@" + std::to_string(req.insertFromStart.position) + " [" + req.insertFromEnd.text + "]@" +
+               std::to_string(req.insertFromEnd.position);
+    };
+    check(insertionsOf("", "") == "[]@0 []@0", "not given: nothing inserted");
+    check(insertionsOf("\\, 3", "_X_,0") == "[\\]@3 [_X_]@0", "text, position");
+    check(insertionsOf("A,B, 2", "") == "[A,B]@2 []@0", "the last comma separates");
+    check(insertionsOf("\" A \", 1", "") == "[ A ]@1 []@0", "quoted text keeps its spaces");
+    check(insertionsOf("\\", "").rfind("<error:", 0) == 0, "no position: an error");
+    check(insertionsOf("\\, -1", "").rfind("<error:", 0) == 0, "a negative position: an error");
+    check(insertionsOf(", 3", "").rfind("<error:", 0) == 0, "no text: an error");
+
+    // The start candidate and the last match are filenames with the text;
+    // the bounds are without it.
+    {
+        ConfigFile config = makeConfig("REZ\\M\\MM.WAV", "");
+        config.search["insert_from_start"] = "\\, 1";
+        check(startOf(config, true) == "MMM", "start_candidate with the inserted text: the candidate without it");
+        config.search["start_candidate"] = "REZ\\MMM.WAV";
+        check(startOf(config, true).rfind("<error:", 0) == 0, "start_candidate without the text where it goes: an error");
+        config.search["start_candidate"] = "REZ\\M\\MM.WAV";
+        config.search["resume_from_last_candidate"] = "true";
+        writeMatches("REZ\\Q\\QQ.WAV");
+        check(startOf(config, true) == "QQQ", "resumes from the last match, without the inserted text");
+    }
+
+    printf("--- insertIntoCandidate and removeInsertions ---\n");
+    {
+        const Insertion fromStart{"(S", 2}, fromEnd{"E)", 1};
+        check(insertIntoCandidate("ABCD", fromStart, fromEnd) == "AB(SCE)D", "both inside");
+        check(insertIntoCandidate("AB", fromStart, fromEnd) == "AE)B(S", "from the start at the very end, from the end before the last");
+        check(insertIntoCandidate("A", fromStart, fromEnd) == "E)A", "too short for from the start");
+        check(insertIntoCandidate("AB", Insertion{"X", 1}, Insertion{"Y", 1}) == "AXYB", "where they meet, from the start first");
+        bool roundTrips = true;
+        for (const std::string candidate : {"", "A", "AB", "ABC", "ABCD", "ABCDEFG"}) {
+            std::string back;
+            roundTrips &= removeInsertions(insertIntoCandidate(candidate, fromStart, fromEnd), fromStart, fromEnd, back) && back == candidate;
+        }
+        check(roundTrips, "removeInsertions undoes insertIntoCandidate, at every length");
+        std::string back;
+        check(!removeInsertions("ABCD", fromStart, fromEnd, back), "without the text where a candidate of its length has it: false");
+    }
+
     std::filesystem::remove_all(kDir);
     if (g_failures) {
         fprintf(stderr, "%d check(s) FAILED\n", g_failures);

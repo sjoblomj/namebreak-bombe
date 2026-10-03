@@ -142,6 +142,8 @@ struct Case {
     // Pruned once the characters after those checked are too few for this
     // many backslashes, even if every one that may be is one.
     int minBackslashCount = 0;
+    // Text inserted into every candidate long enough for it.
+    Insertion insertFromStart, insertFromEnd;
     int leadingLen = 0;
     // How many of a candidate's first characters the rules look at.
     int checkedLen() const { return pruneWholeCandidate ? len - 1 : leadingLen; }
@@ -150,19 +152,68 @@ struct Case {
 // Whether runSearch prunes a candidate of `c` - the same checks, from
 // engine/candidate.h, on the part of it this test itself works out they
 // look at.
+// The filename of candidate `cand` of `c`, with the text inserted into it.
+static std::string nameOf(const Case& c, const std::string& cand) {
+    return c.prefix + insertIntoCandidate(cand, c.insertFromStart, c.insertFromEnd) + c.suffix;
+}
+
+// The most backslashes the characters after those checked can add, by brute
+// force: each still to be enumerated may be one unless, with
+// pruneAdjacentBackslashes, it would touch another (afterBackslash: the
+// last character checked is one); inserted ones count as they are.
+static int mostToCome(const Case& c, const std::string& layout, bool afterBackslash) {
+    std::vector<int> free;
+    for (int i = 0; i < (int) layout.size(); ++i)
+        if (layout[i] == kFreeChar)
+            free.push_back(i);
+    int best = -1;
+    for (uint32_t m = 0; m < (1u << free.size()); ++m) {
+        std::string t = layout;
+        for (size_t j = 0; j < free.size(); ++j)
+            t[free[j]] = (m >> j & 1) ? '\\' : 'X';
+        bool ok = true;
+        for (size_t j = 0; j < free.size() && c.pruneAdjacentBackslashes; ++j) {
+            const int i = free[j];
+            if (t[i] == '\\' && ((i == 0 ? afterBackslash : t[i - 1] == '\\') || (i + 1 < (int) t.size() && t[i + 1] == '\\')))
+                ok = false;
+        }
+        if (ok)
+            best = std::max(best, (int) std::count(t.begin(), t.end(), '\\'));
+    }
+    return best;
+}
+
 static bool isPruned(const Case& c, const std::string& candidate) {
-    const std::string_view leading(candidate.data(), c.checkedLen());
+    // The candidate with the text inserted into it - but after its last
+    // character, which is part of the suffix - and kFreeChar in `layout`
+    // where a character is enumerated. The rules look at as much of it as
+    // comes before candidate character checkedLen().
+    const int startAt = insertionIndex(c.insertFromStart, false, c.len), endAt = insertionIndex(c.insertFromEnd, true, c.len);
+    std::string expanded, layout;
+    size_t checkedEnd = 0;
+    for (int i = 0; i < c.len; ++i) {
+        for (const auto& [at, text] : {std::make_pair(startAt, &c.insertFromStart.text), std::make_pair(endAt, &c.insertFromEnd.text)}) {
+            if (at == i) {
+                expanded += *text;
+                layout += *text;
+            }
+        }
+        if (i == c.checkedLen())
+            checkedEnd = expanded.size();
+        expanded += candidate[i];
+        layout += kFreeChar;
+    }
+    const std::string_view leading(expanded.data(), checkedEnd);
     // The checked characters, after the prefix's last one - a backslash it
     // ends with is next to one the candidate starts with.
     const std::string withPrefixEnd = (c.prefix.empty() ? std::string() : c.prefix.substr(c.prefix.size() - 1)) + std::string(leading);
     const bool endsWithBackslash = !withPrefixEnd.empty() && withPrefixEnd.back() == '\\';
-    const int unchecked = c.len - c.checkedLen();
-    const int mostToCome = !c.pruneAdjacentBackslashes ? unchecked : endsWithBackslash ? unchecked / 2 : (unchecked + 1) / 2;
+    const int toCome = c.minBackslashCount != 0 ? mostToCome(c, layout.substr(checkedEnd), endsWithBackslash) : 0;
     return (c.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading)) ||
            (c.maxBackslashCount != 0 && countBackslashes_CPU(leading) > c.maxBackslashCount) ||
            (c.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, openBracketsAfter_CPU(c.prefix))) ||
            (c.pruneAdjacentBackslashes && withPrefixEnd.find("\\\\") != std::string::npos) ||
-           (c.minBackslashCount != 0 && countBackslashes_CPU(leading) + mostToCome < c.minBackslashCount);
+           (c.minBackslashCount != 0 && countBackslashes_CPU(leading) + toCome < c.minBackslashCount);
 }
 
 // The brute force: every candidate in [first, last] that isn't pruned, hashed
@@ -186,12 +237,12 @@ static std::vector<std::string> bruteForce(const Case& c) {
         for (uint64_t n = from; n < to; ++n) {
             if (!pruned) {
                 uint32_t seed1 = prefix1, seed2 = prefix2;
-                for (unsigned char ch : cand)
+                for (unsigned char ch : insertIntoCandidate(cand, c.insertFromStart, c.insertFromEnd))
                     hashStep(seed1, seed2, ch, 0x100);
                 for (unsigned char ch : c.suffix)
                     hashStep(seed1, seed2, ch, 0x100);
                 if ((seed1 & kMatchMask) == (c.targetA & kMatchMask))
-                    found[t].push_back(c.prefix + cand + c.suffix);
+                    found[t].push_back(nameOf(c, cand));
             }
             int i = c.len - 1;
             for (; i >= 0; --i) {
@@ -230,7 +281,11 @@ static std::string describe(const Case& c) {
              c.pruneSymbolRuns || c.pruneUnopenedBrackets || c.maxBackslashCount != 0 || c.minBackslashCount != 0 || c.pruneAdjacentBackslashes ? ""
                                                                                                                                      : "none ",
              c.pruneWholeCandidate ? "(whole candidate)" : "(leading characters)");
-    return buf;
+    std::string out = buf;
+    for (const auto& [name, insertion] : {std::make_pair("from the start", &c.insertFromStart), std::make_pair("from the end", &c.insertFromEnd)})
+        if (insertion->any())
+            out += ", inserting " + std::to_string(insertion->text.size()) + " characters at " + std::to_string(insertion->position) + " " + name;
+    return out;
 }
 
 // runSearch()'s split of a candidate into leading and trailing characters
@@ -257,7 +312,7 @@ static void plantAtEdge(Case& c, int window, uint64_t batchSize, uint64_t space,
     if (rng() % 4 == 0 && (c.first > 0 || c.last + 1 < space)) {
         const bool before = c.first > 0 && (c.last + 1 == space || rng() % 2 == 0);
         c.plantedIndex = before ? c.first - 1 : c.last + 1;
-        c.planted = c.prefix + candidateAt(c.plantedIndex, c.len, c.alphabet) + c.suffix;
+        c.planted = nameOf(c, candidateAt(c.plantedIndex, c.len, c.alphabet));
         c.plantedInside = false;
         c.targetA = hashFromScratch(c.planted, 0x100);
         return;
@@ -286,7 +341,7 @@ static void plantAtEdge(Case& c, int window, uint64_t batchSize, uint64_t space,
         edges.push_back(rowStart + as - 1);
     const uint64_t planted = edges[rng() % edges.size()];
     c.plantedIndex = planted;
-    c.planted = c.prefix + candidateAt(planted, c.len, c.alphabet) + c.suffix;
+    c.planted = nameOf(c, candidateAt(planted, c.len, c.alphabet));
     c.targetA = hashFromScratch(c.planted, 0x100);
 }
 
@@ -326,6 +381,8 @@ static long runCase(Case c, std::mt19937_64& rng) {
     req.maxBackslashCount = c.maxBackslashCount;
     req.minBackslashCount = c.minBackslashCount;
     req.pruneAdjacentBackslashes = c.pruneAdjacentBackslashes;
+    req.insertFromStart = c.insertFromStart;
+    req.insertFromEnd = c.insertFromEnd;
     req.pruneWholeCandidate = c.pruneWholeCandidate;
 
     std::vector<std::string> reported;
@@ -453,6 +510,19 @@ int main(int argc, char** argv) {
                 for (char ch : {'(', ')', '[', ']', '\\'})
                     if (c.alphabet.find(ch) == std::string::npos)
                         c.alphabet[rng() % c.alphabet.size()] = ch;
+            }
+        }
+        if (rng() % 3 == 0) {
+            // Text inserted anywhere a candidate of this length can have it,
+            // or past it - made of what the rules care about.
+            static const char kInsertable[] = "\\()[]!A_";
+            for (Insertion* insertion : {&c.insertFromStart, &c.insertFromEnd}) {
+                if (rng() % 2 != 0)
+                    continue;
+                insertion->text.clear();
+                for (int i = 1 + (int) (rng() % 3); i > 0; --i)
+                    insertion->text += kInsertable[rng() % (sizeof(kInsertable) - 1)];
+                insertion->position = (int) (rng() % (c.len + 2));
             }
         }
 

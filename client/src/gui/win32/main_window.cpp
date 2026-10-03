@@ -223,6 +223,7 @@ void requestQuit(HWND hwnd) {
 void updateUiFromSharedState() {
     std::string targetName, outputFilePath, statusText;
     std::string alphabet, prefix, suffix, lowerBound, upperBound;
+    Insertion insertFromStart, insertFromEnd;
     bool hasActiveRange, rangeJustFinished;
     {
         std::lock_guard<std::mutex> lock(g_status.mutex);
@@ -232,6 +233,8 @@ void updateUiFromSharedState() {
         alphabet = g_status.alphabet;
         prefix = g_status.prefix;
         suffix = g_status.suffix;
+        insertFromStart = g_status.insertFromStart;
+        insertFromEnd = g_status.insertFromEnd;
         lowerBound = g_status.lowerBound;
         upperBound = g_status.upperBound;
         hasActiveRange = g_status.hasActiveRange;
@@ -271,7 +274,7 @@ void updateUiFromSharedState() {
         // this naturally freezes/resumes with no extra bookkeeping.
         double fraction = 0.0;
         if (!matchLines.empty()) {
-            double f = matchProgressFraction(matchLines.back(), prefix, suffix, alphabet, lowerBound, upperBound);
+            double f = matchProgressFraction(matchLines.back(), prefix, suffix, insertFromStart, insertFromEnd, alphabet, lowerBound, upperBound);
             if (f >= 0.0)
                 fraction = f;
         }

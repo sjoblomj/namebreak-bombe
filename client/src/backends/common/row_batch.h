@@ -66,6 +66,23 @@ constexpr int batchesPerLaunchOr([[maybe_unused]] int backendDefault) {
 #endif
 }
 
+// The text inserted into the trailing part (SearchConstants::
+// trailingInsertions), as a GPU kernel hashes it: up to two insertions among
+// a row group's characters, each before the last groupCharsAfter[n]
+// trailing characters (0: none), and one after a row's own character, before
+// the candidate's last (rowLen 0: none). Their characters' crypt-table keys
+// and values are key/ord[start .. start + len).
+struct InsertLayout {
+    int groupCharsAfter[2] = {0, 0};
+    int groupStart[2] = {0, 0};
+    int groupLen[2] = {0, 0};
+    int rowStart = 0;
+    int rowLen = 0;
+    std::vector<uint32_t> key;
+    std::vector<uint32_t> ord;
+};
+InsertLayout insertLayoutFor(const SearchConstants& constants);
+
 // Turns the trailing indices of a batch's hashA hits into what runBatch
 // returns: rebuilds each hit's complete filename on the host and checks it
 // against hashB. Also hashes every filename from scratch, as a cross-check
@@ -84,6 +101,7 @@ private:
 
     std::string alphabet_;
     std::string suffix_;
+    std::vector<TrailingInsertion> insertions_;
     std::vector<uint32_t> cryptTable_;
     uint32_t targetA_ = 0;
     uint32_t targetB_ = 0;

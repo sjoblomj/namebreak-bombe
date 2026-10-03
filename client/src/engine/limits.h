@@ -28,6 +28,8 @@
 constexpr int kMaxPrefixSize = 64;
 // Capacity of a backend's copy of the suffix, including the terminating NUL.
 constexpr int kMaxSuffixSize = 64;
+// The longest text SearchRequest::insertFromStart or insertFromEnd may insert.
+constexpr int kMaxInsertLen = 16;
 
 static_assert(MAX_MATCHES >= 1, "MAX_MATCHES must be at least 1 (a one-candidate range can have one hit)");
 

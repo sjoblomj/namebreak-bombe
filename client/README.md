@@ -130,6 +130,7 @@ resume_from_last_candidate = true
 | `prune_unopened_brackets` | no (default `false`) | Skip candidates that close a bracket never opened: reading left to right, a `)` at a point where more `)` than `(` have been seen, or likewise a `]` with `[`. The two kinds are counted separately (how they nest within each other isn't checked). Brackets left open by `prefix` count as opened, so a candidate may close those - see [Design decisions](#design-decisions). |
 | `min_backslash_count` | no (default `0`) | Min `\` occurrences a candidate must have; `0` means none needed. Like `max_backslash_count`, the prefix's own don't count, and it must not be more than `max_backslash_count` (unless that's `0`). A candidate is skipped once the characters checked (see `prune_whole_candidate`) leave too few after them to make up the difference, even if every one were a `\` (every other one, with `prune_adjacent_backslashes`) - so without `prune_whole_candidate`, only candidates that need more `\` than the last five or so characters can hold. |
 | `prune_adjacent_backslashes` | no (default `false`) | Skip candidates with two `\` next to each other - including a `\` at the very start of the candidate when `prefix` ends with one. |
+| `insert_from_start` / `insert_from_end` | no | Text inserted into every candidate, as `text, position` (e.g. `\, 3`; quote the text if it has leading or trailing spaces, `" A ", 3`; at most 16 characters): after the candidate's first `position` characters, or before its last `position`. A candidate shorter than the position gets nothing inserted; both are placed on the candidate's own characters, and where they meet `insert_from_start` comes first. `lower_bound`, `upper_bound` and the length a search covers are without them; the filenames it reports, `start_candidate` and the matches file it resumes from are with them. The pruning rules check inserted text like the candidate's own characters, except text inserted after its last character, which is part of the suffix. See [Inserted text](#inserted-text) for what it costs. |
 | `prune_whole_candidate` | no (default `false`) | Apply `prune_symbol_runs`, `prune_unopened_brackets`, `max_backslash_count`, `min_backslash_count` and `prune_adjacent_backslashes` to every character of a candidate but the last, instead of only to its leading characters (all but the last five or so). About a fifth fewer candidates are searched, and a search is about 10% faster on a GPU - see [Design decisions](#design-decisions). |
 
 `[coordinator]` keys (`coordinator` mode only) are `server_url` (required),
@@ -826,10 +827,10 @@ searches a range three row groups long, and finds a candidate a few rows
 into it, in the last row of a group.
 Pruning the whole candidate (see [Design
 decisions](#design-decisions)) added mutations of its own: in the host's
-lists of row groups (none left out, a flag or a row mask wrong, a batch's
+lists of row groups (none left out, a class or a row mask wrong, a batch's
 slice one group short at either end, lists cleared without the backend
 noticing), in each kernel's walk of them (the wrong offset, count, group
-or flags, a row's bit taken from the next row), in each backend's upload
+or classes, a row's bit taken from the next row), in each backend's upload
 and state, in the CPU backend's row walk, and in the engine (the backend
 never told, or every batch started as if there were no leading
 characters). Their first run found two gaps, both in how a launch's
@@ -916,14 +917,16 @@ groups out of what it searches:
   whether the last character was one). For
   each such state (32 occur in a real search: 470 KB of list each, 15 MB
   in all), the host
-  lists the row groups that survive, and for each, which of its rows do: a
-  flag for each rule its characters have used up (no symbol, no `)`, no
-  `]`, no `\` allowed next - or nothing but a `\`, when `min_backslash_count`
-  needs one there and in the last character both), which stands for a set
-  of the rows' own last characters (`backends/common/row_pruning.h`). A
-  group that can't reach `min_backslash_count` whatever follows isn't
-  listed. A list depends only on the
-  alphabet, the rules, the trailing length and that state, so it's built the
+  lists the row groups that survive, and for each, which of its rows do:
+  the rules tell characters apart only by seven classes (letters, digits
+  and space; other symbols; `(`, `)`, `[`, `]` and `\`), so a bit for each
+  class the rows' own last character may be of stands for a set of them
+  (`backends/common/row_pruning.h`). That covers text inserted after it
+  too (`insert_from_end` at 1), which decides which of those characters
+  survive. A group none of whose rows survive - one that can't reach
+  `min_backslash_count` whatever follows, say - isn't listed. A list
+  depends only on the alphabet, the rules, the text inserted into the
+  trailing part, the trailing length and that state, so it's built the
   first time a batch needs it, uploaded once, and kept for the next search.
 - The GPU kernels walk the batch's list instead of every row group, so a
   pruned group costs nothing. A pruned row, inside a group that isn't,
@@ -956,3 +959,35 @@ It changes which candidates a search covers, so it's a setting - and every
 client searching a target has to agree on it, which is why a target has
 it: a client too old to know it searches as if it were off, more than it
 has to, never less.
+
+### Inserted text
+
+`insert_from_start` and `insert_from_end` add fixed text to every candidate
+long enough for it. Where a candidate length puts that text decides what it
+costs - the engine works it out once per length:
+
+- In the leading part (`insert_from_start` on all but the shortest
+  candidates, `insert_from_end` five or more from the end): hashed on the
+  CPU with the leading characters, by `IncrementalPrefixHasher`. Nothing on
+  the GPU - within the noise, measured.
+- Between a row group's characters, or after them (`insert_from_end` at 2
+  to 4): hashed with them, once per thread. A `\` at 2 cost about 4%.
+- After the candidate's last character (`insert_from_end` at 0): part of the
+  suffix for that length, like a longer suffix - a `\` about 4%.
+- After a row's own character, before the candidate's last (`insert_from_end`
+  at 1): a hash step for every row and inserted character, in the kernel's
+  inner loop - a `\` cost about 16%, two characters about 28%.
+
+(Measured with `search_bench --insert-from-end '\,1'` and so on, CUDA, on
+the RTX 3080 Ti Laptop.) A search with text in the trailing part gets a
+kernel of its own, compiled with it - CUDA's with the alphabet's size taken
+at runtime, OpenCL's and Metal's with the text's place compiled in - so a
+search without any runs exactly as fast as before the setting existed.
+
+Text inside the trailing part reaches the backend as part of the search's
+constants (`SearchConstants::trailingInsertions`), counted from the end so
+that it doesn't depend on the trailing length. A length that puts it
+anywhere else in the trailing part, or after the last character, than the
+length before (only ever the shortest ones) begins the backend's search
+again. The bounds, and the positions the coordinator hands out, stay
+without it.

@@ -26,6 +26,26 @@ bool parseBool(const std::string& s, bool& out) {
     return false;
 }
 
+// An insertion as `insert_from_start`/`insert_from_end` give it: its text,
+// a comma, and its position - "\, 3", or with the text quoted when it has
+// leading or trailing spaces: "" A ", 3". The last comma is the separator,
+// so the text may have commas of its own. Empty: none.
+bool parseInsertion(const std::string& s, Insertion& out) {
+    out = Insertion();
+    if (trim(s).empty())
+        return true;
+    const size_t comma = s.rfind(',');
+    if (comma == std::string::npos)
+        return false;
+    const std::string text = unquote(trim(s.substr(0, comma)));
+    const std::string position = trim(s.substr(comma + 1));
+    if (text.empty() || position.empty() || position.find_first_not_of("0123456789") != std::string::npos || position.size() > 4)
+        return false;
+    out.text = text;
+    out.position = std::stoi(position);
+    return true;
+}
+
 // Inverse of unquote() above: wraps `s` in "..." only if writing it plain
 // would lose meaningful leading/trailing whitespace when re-read.
 std::string quoteIfNeeded(const std::string& s) {
@@ -149,7 +169,8 @@ bool lastUsableMatch(const SearchRequest& req, std::string& out) {
     if (lines.empty())
         return false;
     std::string candidate, error;
-    if (!getStartCandidate(trim(lines.back()), req.prefix, req.suffix, candidate, error) || candidate.empty() ||
+    if (!candidateOfFilename(trim(lines.back()), req.prefix, req.suffix, req.insertFromStart, req.insertFromEnd, candidate, error) ||
+        candidate.empty() ||
         candidate.find_first_not_of(req.alphabet) != std::string::npos) {
         fprintf(stderr, "resume_from_last_candidate: ignoring the last line of %s ('%s'), which isn't a candidate of this search\n",
                 req.outputFilePath.c_str(), lines.back().c_str());
@@ -260,6 +281,8 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     std::string pruneWholeStr = r.getOptional("prune_whole_candidate", "false");
     std::string minBackslashStr = r.getOptional("min_backslash_count", "0");
     std::string pruneAdjacentStr = r.getOptional("prune_adjacent_backslashes", "false");
+    std::string insertFromStartStr = r.getOptional("insert_from_start", "");
+    std::string insertFromEndStr = r.getOptional("insert_from_end", "");
     std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
 
     std::string unknown = r.firstUnknownKey();
@@ -296,6 +319,14 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
         error = "invalid prune_adjacent_backslashes: '" + pruneAdjacentStr + "' (expected true/false)";
         return false;
     }
+    if (!parseInsertion(insertFromStartStr, out.insertFromStart)) {
+        error = "invalid insert_from_start: '" + insertFromStartStr + "' (expected text, position)";
+        return false;
+    }
+    if (!parseInsertion(insertFromEndStr, out.insertFromEnd)) {
+        error = "invalid insert_from_end: '" + insertFromEndStr + "' (expected text, position)";
+        return false;
+    }
     bool resume = false;
     if (!parseBool(resumeStr, resume)) {
         error = "invalid resume_from_last_candidate: '" + resumeStr + "' (expected true/false)";
@@ -323,7 +354,7 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     // length only, so an empty one would leave nothing to search.
     if (startFilename.empty()) {
         out.startCandidate = continuous ? "" : out.lowerBound;
-    } else if (!getStartCandidate(startFilename, prefix, suffix, out.startCandidate, error)) {
+    } else if (!candidateOfFilename(startFilename, prefix, suffix, out.insertFromStart, out.insertFromEnd, out.startCandidate, error)) {
         error = "invalid start_candidate: " + error;
         return false;
     }
@@ -331,8 +362,8 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     if (resume) {
         std::string lastMatch;
         if (lastUsableMatch(out, lastMatch) && isLaterInSearchOrder(lastMatch, out.startCandidate, out.alphabet)) {
-            printf("Resuming from the last match in %s: %s%s%s\n", out.outputFilePath.c_str(), prefix.c_str(), lastMatch.c_str(),
-                   suffix.c_str());
+            printf("Resuming from the last match in %s: %s%s%s\n", out.outputFilePath.c_str(), prefix.c_str(),
+                   insertIntoCandidate(lastMatch, out.insertFromStart, out.insertFromEnd).c_str(), suffix.c_str());
             out.startCandidate = lastMatch;
         }
     }

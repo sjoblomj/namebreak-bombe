@@ -73,6 +73,8 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         fields.pruneUnopenedBrackets = get(config.search, "prune_unopened_brackets", "false") == "true";
         fields.pruneWholeCandidate = get(config.search, "prune_whole_candidate", "false") == "true";
         fields.pruneAdjacentBackslashes = get(config.search, "prune_adjacent_backslashes", "false") == "true";
+        fields.insertFromStart = get(config.search, "insert_from_start", "");
+        fields.insertFromEnd = get(config.search, "insert_from_end", "");
         fields.initialTab = (loaded && (config.mode == "bounded" || config.mode == "continuous")) ? kTabLocalSearch : kTabCoordinator;
         fields.initialContinuous = loaded && config.mode == "continuous";
 
@@ -103,7 +105,9 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
                                             {"prune_symbol_runs", fields.pruneSymbolRuns ? "true" : "false"},
                                             {"prune_unopened_brackets", fields.pruneUnopenedBrackets ? "true" : "false"},
                                             {"prune_whole_candidate", fields.pruneWholeCandidate ? "true" : "false"},
-                                            {"prune_adjacent_backslashes", fields.pruneAdjacentBackslashes ? "true" : "false"}},
+                                            {"prune_adjacent_backslashes", fields.pruneAdjacentBackslashes ? "true" : "false"},
+                                            {"insert_from_start", fields.insertFromStart},
+                                            {"insert_from_end", fields.insertFromEnd}},
                                            writeError);
         }
         if (!writeOk) {

@@ -75,6 +75,14 @@ struct BatchContext {
     uint32_t seed2Start;
     const PruneRules* rules;   // SearchConstants::trailingRules
     PruneState pruneEntry;     // BatchParams::pruneEntry
+    // The text inserted before shared character i (SearchConstants::
+    // trailingInsertions), prefixDigits + 1 of them - the last after every
+    // shared character, before the last character - as characters, crypt-
+    // table keys and values; and what the last character can add to the
+    // backslashes (canReachMinBackslashes_CPU).
+    const std::vector<std::string>* inserted;
+    const std::vector<std::vector<uint32_t>>* insertedKey;
+    TailCapacity lastCapacity;
 };
 
 void record(ThreadHits& found, int batch, uint64_t trailingIndex) {
@@ -109,36 +117,55 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
     state2[0] = ctx.seed2Start;
     // And, when the whole candidate is pruned, the rules' state after the
     // first d of them - a row is searched only if none of its characters
-    // breaks a rule (valid[prefixDigits]), and its last character could
-    // still make up the backslashes the rules ask for.
+    // breaks a rule (valid[prefixDigits]), nor the text inserted between
+    // them, and its last character could still make up the backslashes the
+    // rules ask for (rowValid). Text inserted before shared character d is
+    // taken in with it, and the text after the last one in rowS1/rowS2.
     const bool pruning = ctx.rules->any();
     std::vector<PruneState> pruneState(ctx.prefixDigits + 1);
     std::vector<char> valid(ctx.prefixDigits + 1, 1);
     pruneState[0] = ctx.pruneEntry;
+    const std::vector<std::string>& inserted = *ctx.inserted;
+    const std::vector<std::vector<uint32_t>>& insertedKey = *ctx.insertedKey;
+    auto stepInserted = [&](int at, uint32_t& s1, uint32_t& s2, PruneState& prune, char& ok) {
+        for (size_t i = 0; i < inserted[at].size(); ++i) {
+            mpqStep(s1, s2, insertedKey[at][i], (unsigned char) inserted[at][i]);
+            if (pruning)
+                ok = ok && pruneStep_CPU(*ctx.rules, prune, inserted[at][i]);
+        }
+    };
+    uint32_t rowS1 = 0, rowS2 = 0;
+    bool rowValid = true;
     auto rehashFrom = [&](int d) {
         for (; d < ctx.prefixDigits; ++d) {
             state1[d + 1] = state1[d];
             state2[d + 1] = state2[d];
+            pruneState[d + 1] = pruneState[d];
+            valid[d + 1] = valid[d];
+            stepInserted(d, state1[d + 1], state2[d + 1], pruneState[d + 1], valid[d + 1]);
             mpqStep(state1[d + 1], state2[d + 1], ctx.key[digit[d]], ctx.ord[digit[d]]);
-            if (pruning) {
-                pruneState[d + 1] = pruneState[d];
-                valid[d + 1] = valid[d] && pruneStep_CPU(*ctx.rules, pruneState[d + 1], ctx.alphabet[digit[d]]);
-            }
+            if (pruning)
+                valid[d + 1] = valid[d + 1] && pruneStep_CPU(*ctx.rules, pruneState[d + 1], ctx.alphabet[digit[d]]);
         }
+        rowS1 = state1[ctx.prefixDigits];
+        rowS2 = state2[ctx.prefixDigits];
+        PruneState rowPrune = pruneState[ctx.prefixDigits];
+        char ok = valid[ctx.prefixDigits];
+        stepInserted(ctx.prefixDigits, rowS1, rowS2, rowPrune, ok);
+        rowValid = ok && canReachMinBackslashes_CPU(*ctx.rules, rowPrune, ctx.lastCapacity);
     };
     rehashFrom(0);
 
     const uint64_t alphabetMask = (uint64_t(1) << as) - 1; // as is at most 63
     for (uint64_t i = from; i < to; ++i) {
         const uint64_t row = ctx.rows.firstRow + i;
-        const uint32_t s1 = state1[ctx.prefixDigits];
-        const uint32_t s2 = state2[ctx.prefixDigits];
+        const uint32_t s1 = rowS1;
+        const uint32_t s2 = rowS2;
 
         // Bit k: the candidate with last character k is worth hashing.
         // Restricted to the alphabet - which the table never exceeds anyway,
         // but a stray bit must not index past key/ord - and to the batch's
         // range in its first and last row. None, in a pruned row.
-        const bool rowValid = valid[ctx.prefixDigits] && canReachMinBackslashes_CPU(*ctx.rules, pruneState[ctx.prefixDigits], 1);
         uint64_t mask = rowValid ? ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask : 0;
         if (i == 0)
             mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;       // firstRowStartK is in [0, as)
@@ -199,6 +226,8 @@ public:
         alphabet_ = constants.alphabet;
         targetA_ = constants.targetHashA;
         rules_ = constants.trailingRules;
+        insertions_ = constants.trailingInsertions;
+        cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
         std::fill(std::begin(key_), std::end(key_), 0);
         std::fill(std::begin(ord_), std::end(ord_), 0);
         for (int k = 0; k < alphabetSize_; ++k) {
@@ -228,6 +257,8 @@ private:
     std::string alphabet_;
     uint32_t targetA_ = 0;
     PruneRules rules_;
+    std::vector<TrailingInsertion> insertions_;
+    std::vector<uint32_t> cryptTable_;
     uint32_t key_[MAX_ALPHABET_SIZE] = {};
     uint32_t ord_[MAX_ALPHABET_SIZE] = {};
     std::vector<uint64_t> table_;
@@ -241,6 +272,16 @@ BatchOutcome CpuBackend::runBatch(int trailingLen, uint64_t start, uint64_t coun
 
 BatchOutcome CpuBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& requests) {
     const int batchCount = (int) requests.size();
+    // The text inserted before each of the trailingLen - 1 characters a row
+    // shares, and after them (see BatchContext::inserted).
+    std::vector<std::string> inserted(std::max(1, trailingLen));
+    std::vector<std::vector<uint32_t>> insertedKey(inserted.size());
+    for (const TrailingInsertion& insertion : insertions_) {
+        inserted[trailingLen - insertion.charsAfter] = insertion.text;
+        for (unsigned char ch : insertion.text)
+            insertedKey[trailingLen - insertion.charsAfter].push_back(cryptTable_[0x100 + ch]);
+    }
+    const TailCapacity lastCapacity = tailCapacity_CPU(rules_, std::string(1, kFreeChar));
     std::vector<BatchContext> contexts(batchCount);
     uint64_t totalRows = 0, totalCount = 0;
     for (int b = 0; b < batchCount; ++b) {
@@ -260,6 +301,9 @@ BatchOutcome CpuBackend::runBatches(int trailingLen, const std::vector<BatchRequ
         ctx.seed2Start = requests[b].params.seed2Start;
         ctx.rules = &rules_;
         ctx.pruneEntry = requests[b].params.pruneEntry;
+        ctx.inserted = &inserted;
+        ctx.insertedKey = &insertedKey;
+        ctx.lastCapacity = lastCapacity;
         totalRows += ctx.rows.rowCount;
         totalCount += requests[b].count;
     }

@@ -42,6 +42,8 @@ struct SharedStatus {
     std::string alphabet;
     std::string prefix;
     std::string suffix;
+    Insertion insertFromStart;
+    Insertion insertFromEnd;
     std::string lowerBound; // candidate-only (no prefix/suffix)
     std::string upperBound; // candidate-only
     bool hasActiveRange = false;

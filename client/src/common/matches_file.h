@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "engine/candidate.h"
+
 // The files a search appends its Hash-A matches to, one full filename per
 // line: all of them live in one directory (config.conf's `matches_dir`,
 // default kDefaultMatchesDir, relative to the current working directory
@@ -27,6 +29,7 @@ std::vector<std::string> readLastLines(const std::string& path, size_t maxLines)
 // suffix line from a matches file) sits between `lowerBound` and
 // `upperBound`, or -1.0 if it can't be computed - see matches_file.cpp.
 double matchProgressFraction(const std::string& matchFilename, const std::string& prefix, const std::string& suffix,
-                             const std::string& alphabet, const std::string& lowerBound, const std::string& upperBound);
+                             const Insertion& insertFromStart, const Insertion& insertFromEnd, const std::string& alphabet,
+                             const std::string& lowerBound, const std::string& upperBound);
 
 #endif // NAMEBREAK_COMMON_MATCHES_FILE_H

@@ -16,6 +16,8 @@
 //   LISTED         1 if the search prunes the whole candidate: the batch then
 //                  searches the row groups of its list (see below), 0 if
 //                  every group it touches
+//   GROUP_INSERTn_AFTER/_START/_LEN, ROW_INSERT_START/_LEN  where the text
+//                  inserted into the trailing part goes, as in search.cl
 //
 // Rows are every value of the candidate's last character, for one
 // combination of the other trailing characters (see the terminology in
@@ -28,7 +30,7 @@
 // rebuilds and checks those.
 //
 // With LISTED, the batch searches the row groups of its list - those the
-// search's pruning leaves - and of each, the rows its entry's flags allow
+// search's pruning leaves - and of each, the rows its entry's classes allow
 // (see backends/common/row_pruning.h). Without it, every group it touches,
 // every row of them - as the CUDA and OpenCL kernels do, where walking a list
 // of every group measured 5-6% slower.
@@ -55,10 +57,31 @@ using namespace metal;
 // group exactly once and never cross into another.
 #define CHUNKS_PER_GROUP ((ALPHABET_SIZE + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD)
 
-// An entry of a row groups' list: the group, shifted past its flags
+// An entry of a row groups' list: the group, shifted past its classes
 // (ROW_FLAG_BITS, given by the host: kRowFlagBits in
 // backends/common/row_pruning.h).
 #define ROW_FLAG_COUNT (1 << ROW_FLAG_BITS)
+
+#ifndef GROUP_INSERT0_AFTER
+#define GROUP_INSERT0_AFTER 0
+#define GROUP_INSERT0_START 0
+#define GROUP_INSERT0_LEN 0
+#define GROUP_INSERT1_AFTER 0
+#define GROUP_INSERT1_START 0
+#define GROUP_INSERT1_LEN 0
+#define ROW_INSERT_START 0
+#define ROW_INSERT_LEN 0
+#endif
+// The group character an insertion goes before - TRAILING_LEN - 2: after
+// the last one; TRAILING_LEN, never reached: none.
+#define GROUP_INSERT0_AT (TRAILING_LEN - GROUP_INSERT0_AFTER)
+#define GROUP_INSERT1_AT (TRAILING_LEN - GROUP_INSERT1_AFTER)
+// Hashes `len` characters of `inserted` from `start`.
+#define HASH_INSERTED(seed1, seed2, start, len)                                                  \
+    do {                                                                                         \
+        for (int n_ = 0; n_ < (len); ++n_)                                                       \
+            MPQ_STEP(seed1, seed2, inserted[2 * ((start) + n_)], inserted[2 * ((start) + n_) + 1]); \
+    } while (0)
 
 // Must match RowArgs in metal_backend.mm.
 struct RowArgs {
@@ -90,27 +113,20 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
                        device ulong* matchIdx [[buffer(6)]],          // the first MAX_MATCHES hits' trailing indices
                        device const ulong* filterTable [[buffer(7)]], // this search's lookup filter
                        device const uint* groups [[buffer(8)]],       // the row groups' lists (RowPruning::arena)
-                       constant ulong* rowMasks [[buffer(9)]],        // the rows an entry's flags allow (RowPruning::rowMasks)
+                       device const ulong* rowMasks [[buffer(9)]],    // the rows an entry's classes allow (RowPruning::rowMasks)
+                       constant uint* inserted [[buffer(10)]],        // the inserted text's characters: key, value, key, ...
                        uint t [[thread_position_in_grid]],
                        uint lid [[thread_position_in_threadgroup]],
-                       uint threadgroupSize [[threads_per_threadgroup]],
                        uint threads [[threads_per_grid]]) {
     // The rows' characters, and the few last characters the filter lets
     // through, differ between threads, so they're looked up here rather than
     // in constant memory.
     threadgroup uint sKey[ALPHABET_SIZE];
     threadgroup uint sOrd[ALPHABET_SIZE];
-#if LISTED
-    threadgroup ulong sRowMasks[ROW_FLAG_COUNT];
-#endif
     if (lid < ALPHABET_SIZE) {
         sKey[lid] = alphabetKey[lid];
         sOrd[lid] = alphabetOrd[lid];
     }
-#if LISTED
-    for (uint i = lid; i < ROW_FLAG_COUNT; i += threadgroupSize) // a threadgroup may have fewer threads
-        sRowMasks[i] = rowMasks[i];
-#endif
     threadgroup_barrier(mem_flags::mem_threadgroup); // before anything returns, so every thread reaches it
 
     // Every chunk of every group the batch touches - or with LISTED, of every
@@ -129,7 +145,9 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
         const uint entry = batchGroups[c / CHUNKS_PER_GROUP];
         const uint group = entry >> ROW_FLAG_BITS;
         // Bit d: row d of the group isn't pruned.
-        const ulong rowMask = sRowMasks[entry & (ROW_FLAG_COUNT - 1)];
+        // Read from device memory, as the CUDA and OpenCL kernels do: copying
+        // all ROW_FLAG_COUNT into threadgroup memory first cost them about 7%.
+        const ulong rowMask = rowMasks[entry & (ROW_FLAG_COUNT - 1)];
 #else
         const uint group = firstGroup + (uint) (c / CHUNKS_PER_GROUP);
 #endif
@@ -161,8 +179,17 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
             rest = q;
         }
 #pragma unroll
-        for (int i = 0; i < TRAILING_LEN - 2; ++i)
+        for (int i = 0; i < TRAILING_LEN - 2; ++i) {
+            if (i == GROUP_INSERT0_AT)
+                HASH_INSERTED(group1, group2, GROUP_INSERT0_START, GROUP_INSERT0_LEN);
+            if (i == GROUP_INSERT1_AT)
+                HASH_INSERTED(group1, group2, GROUP_INSERT1_START, GROUP_INSERT1_LEN);
             MPQ_STEP(group1, group2, sKey[digit[i]], sOrd[digit[i]]);
+        }
+        if (TRAILING_LEN - 2 == GROUP_INSERT0_AT)
+            HASH_INSERTED(group1, group2, GROUP_INSERT0_START, GROUP_INSERT0_LEN);
+        if (TRAILING_LEN - 2 == GROUP_INSERT1_AT)
+            HASH_INSERTED(group1, group2, GROUP_INSERT1_START, GROUP_INSERT1_LEN);
 #endif
 
 #if LISTED
@@ -176,6 +203,7 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
             // The row's own last row character. (With TRAILING_LEN 1 a row has
             // no characters of its own, and there's only row 0.)
             MPQ_STEP(seed1, seed2, sKey[d], sOrd[d]);
+            HASH_INSERTED(seed1, seed2, ROW_INSERT_START, ROW_INSERT_LEN);
 #endif
 
             // Bit k: the candidate with last character k is worth hashing.
