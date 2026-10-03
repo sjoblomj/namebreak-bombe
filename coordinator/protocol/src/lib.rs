@@ -375,6 +375,10 @@ pub struct AdminCreateTargetResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdminPatchTargetRequest {
+    /// A new name for the target. Leave unset to leave it unchanged; it
+    /// can't be blank, the same as when creating one.
+    #[serde(default)]
+    pub name: Option<String>,
     /// "active" or "paused". Leave unset to change only `priority`.
     #[serde(default)]
     pub status: Option<String>,

@@ -406,12 +406,16 @@ pub async fn admin_patch_target(
     Path(target_id): Path<i64>,
     Json(req): Json<AdminPatchTargetRequest>,
 ) -> Result<StatusCode, AppError> {
+    if req.name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+        return Err(AppError::BadRequest("name can't be blank".into()));
+    }
     if let Some(status) = &req.status {
         if status != "active" && status != "paused" {
             return Err(AppError::BadRequest("status must be 'active' or 'paused'".into()));
         }
     }
-    if req.status.is_none()
+    if req.name.is_none()
+        && req.status.is_none()
         && req.priority.is_none()
         && req.description.is_none()
         && req.alphabet_name.is_none()
@@ -427,7 +431,7 @@ pub async fn admin_patch_target(
         && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
-            "at least one of status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
+            "at least one of name, status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
              prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start, \
              insert_from_end or start_len must be provided"
                 .into(),
@@ -476,7 +480,7 @@ pub async fn admin_patch_target(
     }
 
     let result = sqlx::query(
-        "UPDATE targets SET status = COALESCE(?, status), priority = COALESCE(?, priority), \
+        "UPDATE targets SET name = COALESCE(?, name), status = COALESCE(?, status), priority = COALESCE(?, priority), \
          description = COALESCE(?, description), \
          alphabet_name = COALESCE(?, alphabet_name), alphabet = COALESCE(?, alphabet), \
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
@@ -485,6 +489,7 @@ pub async fn admin_patch_target(
          start_len = COALESCE(?, start_len) \
          WHERE id = ? AND status != 'solved'",
     )
+    .bind(&req.name)
     .bind(&req.status)
     .bind(req.priority)
     .bind(&req.description)

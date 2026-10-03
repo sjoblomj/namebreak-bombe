@@ -343,7 +343,7 @@ Check progress:
 curl localhost:8080/api/v1/status
 ```
 
-Pause/resume a target, and/or change its priority, description,
+Pause/resume a target, and/or change its name, priority, description,
 alphabet_name (or a custom alphabet), prune_symbol_runs, prune_unopened_brackets,
 prune_whole_candidate, max_backslash_count, min_backslash_count,
 prune_adjacent_backslashes, insert_from_start, insert_from_end or start_len:
