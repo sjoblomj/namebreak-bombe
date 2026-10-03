@@ -12,7 +12,9 @@
 //! copies a real target's prefix, suffix, alphabet and pruning, so that it
 //! searches the way the client's real work does; the planted candidate has
 //! only letters and digits, which no pruning rule skips - but for
-//! `min_backslash_count`, which a canary leaves at 0. Its target takes
+//! `min_backslash_count`, which a canary leaves at 0. (Text the target
+//! inserts, which the canary inserts too, could break a rule whatever is
+//! around it - but then every candidate of the target does as well.) Its target takes
 //! part in nothing but this one claim - not other claims, the dashboard's
 //! targets, `/status`, nor a volunteer's candidates, ranges or names found -
 //! and its result is kept in `canaries` (see `complete`).
@@ -91,22 +93,25 @@ pub async fn maybe_claim(
         .fetch_all(&mut *tx)
         .await?;
     let Some(template) =
-        templates.into_iter().find(|t| client_alphabet_for(&t.alphabet_name, &t.alphabet, client_version) == Some(t.alphabet.as_str()))
+        templates.into_iter().find(|t| {
+            client_alphabet_for(&t.alphabet_name, &t.alphabet, client_version) == Some(t.alphabet.as_str()) && t.insertions().searchable_by(client_version)
+        })
     else {
         return Ok(None);
     };
     let Some(canary) = plan(&template.alphabet, (rate * config.canary_seconds).max(1.0) as Pos) else {
         return Ok(None);
     };
-    let filename = format!("{}{}{}", template.prefix, canary.planted, template.suffix);
+    let filename = format!("{}{}{}", template.prefix, template.insertions().insert(&canary.planted), template.suffix);
 
     let first = index_to_candidate(&template.alphabet, canary.start, canary.len);
     let last = index_to_candidate(&template.alphabet, canary.end - 1, canary.len);
     let target_id: i64 = sqlx::query_scalar(
         "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, \
-         prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, priority, \
-         start_len, created_at, is_virtual) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'active', 0, ?, ?, 1) RETURNING id",
+         prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start_text, \
+         insert_from_start_position, insert_from_end_text, insert_from_end_position, alphabet_name, alphabet, status, priority, start_len, \
+         created_at, is_virtual) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1) RETURNING id",
     )
     .bind(CANARY_TARGET_NAME)
     .bind(&template.prefix)
@@ -120,6 +125,10 @@ pub async fn maybe_claim(
     .bind(template.prune_whole_candidate)
     .bind(template.max_backslash_count)
     .bind(template.prune_adjacent_backslashes)
+    .bind(&template.insert_from_start_text)
+    .bind(template.insert_from_start_position)
+    .bind(&template.insert_from_end_text)
+    .bind(template.insert_from_end_position)
     .bind(&template.alphabet_name)
     .bind(&template.alphabet)
     .bind(canary.len)

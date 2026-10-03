@@ -405,6 +405,103 @@ pub fn strip_prefix_suffix<'a>(filename: &'a str, prefix: &str, suffix: &str) ->
     filename.strip_prefix(prefix)?.strip_suffix(suffix)
 }
 
+/// The text a target inserts into every candidate long enough for it - see
+/// `AdminCreateTargetRequest::insert_from_start` and `insert_from_end`: each
+/// its text and position. The client's `insertIntoCandidate` and
+/// `removeInsertions` (client/src/engine/candidate.cpp) must agree.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Insertions<'a> {
+    pub from_start: Option<(&'a str, i64)>,
+    pub from_end: Option<(&'a str, i64)>,
+}
+
+/// The protocol version (MAJOR, MINOR) from which clients insert a target's
+/// text. An older one would search the candidates without it - missing the
+/// target while reporting every range done - so it gets no work from a
+/// target that has any.
+pub const INSERTIONS_SINCE: (u64, u64) = (1, 4);
+
+impl<'a> Insertions<'a> {
+    pub fn any(&self) -> bool {
+        self.from_start.is_some() || self.from_end.is_some()
+    }
+
+    /// Whether a client of `version` inserts the text - see INSERTIONS_SINCE.
+    pub fn searchable_by(&self, version: namebreak_protocol::Version) -> bool {
+        !self.any() || (version.major, version.minor) >= INSERTIONS_SINCE
+    }
+
+    /// Where each goes in a candidate of `len` characters: the index of the
+    /// character it goes before (`len`: after the last), or None if the
+    /// candidate is shorter than its position.
+    fn indices(&self, len: usize) -> (Option<usize>, Option<usize>) {
+        let at = |insertion: Option<(&str, i64)>, from_end: bool| {
+            let (_, position) = insertion?;
+            let position = usize::try_from(position).ok().filter(|&p| p <= len)?;
+            Some(if from_end { len - position } else { position })
+        };
+        (at(self.from_start, false), at(self.from_end, true))
+    }
+
+    /// `candidate` with the text inserted, wherever it's long enough for it;
+    /// where the two meet, `from_start`'s comes first.
+    pub fn insert(&self, candidate: &str) -> String {
+        let chars: Vec<char> = candidate.chars().collect();
+        let (start_at, end_at) = self.indices(chars.len());
+        let mut out = String::new();
+        for i in 0..=chars.len() {
+            if start_at == Some(i) {
+                out.push_str(self.from_start.expect("has an index").0);
+            }
+            if end_at == Some(i) {
+                out.push_str(self.from_end.expect("has an index").0);
+            }
+            if let Some(&c) = chars.get(i) {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The candidate `with_insertions` (what's between a filename's prefix and
+    /// suffix) was made from, or None if it doesn't have the text where a
+    /// candidate of its length would. Only one length can fit: a candidate
+    /// gets an insertion exactly when it's at least as long as its position.
+    pub fn remove(&self, with_insertions: &str) -> Option<String> {
+        let total = with_insertions.chars().count();
+        let start_len = self.from_start.map_or(0, |(text, _)| text.chars().count());
+        let end_len = self.from_end.map_or(0, |(text, _)| text.chars().count());
+        for (has_start, has_end) in [(false, false), (true, false), (false, true), (true, true)] {
+            let Some(len) = total.checked_sub(usize::from(has_start) * start_len + usize::from(has_end) * end_len) else {
+                continue;
+            };
+            let (start_at, end_at) = self.indices(len);
+            if start_at.is_some() != has_start || end_at.is_some() != has_end {
+                continue;
+            }
+            let chars: Vec<char> = with_insertions.chars().collect();
+            let mut at = 0;
+            let mut candidate = String::new();
+            for i in 0..=len {
+                if start_at == Some(i) {
+                    at += start_len;
+                }
+                if end_at == Some(i) {
+                    at += end_len;
+                }
+                if i < len {
+                    candidate.push(chars[at]);
+                    at += 1;
+                }
+            }
+            if self.insert(&candidate) == with_insertions {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
 /// Cap on how many separate stretches of candidates (see `pattern_spans`) a
 /// single skip- or priority-range pattern may cover. Each one is stored as
 /// its own segment row that `ranges::claim_range` looks through when it
@@ -731,6 +828,23 @@ pub fn range_bound_filenames(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn insertions_go_where_a_candidate_long_enough_has_them_and_come_back_out() {
+        let both = Insertions { from_start: Some(("(S", 2)), from_end: Some(("E)", 1)) };
+        assert_eq!(both.insert("ABCD"), "AB(SCE)D");
+        // Only from the end, past what a one-character candidate has.
+        assert_eq!(both.insert("AB"), "AE)B(S");
+        assert_eq!(both.insert("A"), "E)A");
+        for candidate in ["", "A", "AB", "ABC", "ABCD", "ABCDEFG"] {
+            assert_eq!(both.remove(&both.insert(candidate)).as_deref(), Some(candidate), "{candidate}");
+        }
+        assert_eq!(both.remove("ABCD"), None, "no text where a candidate of its length would have it");
+        assert_eq!(Insertions::default().insert("ABC"), "ABC");
+        assert!(Insertions::default().searchable_by(namebreak_protocol::Version::new(1, 3, 0)));
+        assert!(!both.searchable_by(namebreak_protocol::Version::new(1, 3, 0)));
+        assert!(both.searchable_by(namebreak_protocol::Version::new(1, 4, 0)));
+    }
+
     use super::*;
     use namebreak_protocol::Version;
 

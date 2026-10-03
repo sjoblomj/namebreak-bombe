@@ -11,7 +11,7 @@ use namebreak_protocol::{
 
 use crate::alphabet::{
     alphabet_size, custom_alphabet, bound_indices_at_len, bounds_are_valid, bounds_diverge_immediately, candidate_to_index, lookup_predefined_alphabet, max_supported_len,
-    pattern_spans, split_end, split_pos, PREDEFINED_ALPHABETS,
+    pattern_spans, split_end, split_pos, MAX_CANDIDATE_LEN, PREDEFINED_ALPHABETS,
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::client_release;
@@ -218,6 +218,36 @@ fn validate_backslash_counts(max_backslash_count: i64, min_backslash_count: i64)
     Ok(())
 }
 
+/// The longest text an insertion may have - the client's `kMaxInsertLen`
+/// (client/src/engine/limits.h). Keep the two in sync.
+const MAX_INSERT_LEN: usize = 16;
+
+/// Rejects text inserted into candidates (see
+/// `AdminCreateTargetRequest::insert_from_start`) a client couldn't search
+/// with: 1 to MAX_INSERT_LEN printable ASCII characters, at a position from
+/// 0 to MAX_CANDIDATE_LEN - and, together with the prefix and suffix, room
+/// in the client's buffers (client/src/engine/limits.h: 64 characters for
+/// the prefix extended by the candidate's leading characters, 64 for the
+/// suffix, 128 for a whole filename).
+fn validate_insertions(prefix: &str, suffix: &str, from_start: &Option<(String, i64)>, from_end: &Option<(String, i64)>) -> Result<(), AppError> {
+    for (name, insertion) in [("insert_from_start", from_start), ("insert_from_end", from_end)] {
+        if let Some((text, position)) = insertion {
+            if text.is_empty() || text.len() > MAX_INSERT_LEN || !text.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+                return Err(AppError::BadRequest(format!("{name} must insert 1 to {MAX_INSERT_LEN} printable ASCII characters")));
+            }
+            if !(0..=MAX_CANDIDATE_LEN).contains(position) {
+                return Err(AppError::BadRequest(format!("{name}'s position must be between 0 and {MAX_CANDIDATE_LEN}")));
+            }
+        }
+    }
+    let inserted = [from_start, from_end].iter().filter_map(|i| i.as_ref()).map(|(text, _)| text.len()).sum::<usize>();
+    let max_len = MAX_CANDIDATE_LEN as usize;
+    if inserted > 0 && (prefix.len() + max_len + inserted >= 64 || suffix.len() + inserted >= 64 || prefix.len() + suffix.len() + max_len + inserted >= 128) {
+        return Err(AppError::BadRequest("the prefix or suffix is too long for a client to fit the inserted text too".into()));
+    }
+    Ok(())
+}
+
 pub async fn admin_create_target(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -227,6 +257,7 @@ pub async fn admin_create_target(
         return Err(AppError::BadRequest("name is required".into()));
     }
     validate_backslash_counts(req.max_backslash_count, req.min_backslash_count)?;
+    validate_insertions(&req.prefix, &req.suffix, &req.insert_from_start, &req.insert_from_end)?;
     let (alphabet_name, alphabet) = resolve_alphabet(req.alphabet_name.as_deref(), req.alphabet.as_deref())?;
     let (alphabet_name, alphabet) = (alphabet_name.as_str(), alphabet.as_str());
     validate_start_len(req.start_len, alphabet)?;
@@ -271,8 +302,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start_text, insert_from_start_position, insert_from_end_text, insert_from_end_position, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -287,6 +318,10 @@ pub async fn admin_create_target(
     .bind(req.max_backslash_count)
     .bind(req.min_backslash_count)
     .bind(req.prune_adjacent_backslashes as i64)
+    .bind(req.insert_from_start.as_ref().map(|(text, _)| text))
+    .bind(req.insert_from_start.as_ref().map_or(0, |&(_, position)| position))
+    .bind(req.insert_from_end.as_ref().map(|(text, _)| text))
+    .bind(req.insert_from_end.as_ref().map_or(0, |&(_, position)| position))
     .bind(alphabet_name)
     .bind(alphabet)
     .bind(req.priority)
@@ -387,11 +422,14 @@ pub async fn admin_patch_target(
         && req.max_backslash_count.is_none()
         && req.min_backslash_count.is_none()
         && req.prune_adjacent_backslashes.is_none()
+        && req.insert_from_start.is_none()
+        && req.insert_from_end.is_none()
         && req.start_len.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
-             prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes or start_len must be provided"
+             prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start, \
+             insert_from_end or start_len must be provided"
                 .into(),
         ));
     }
@@ -423,6 +461,12 @@ pub async fn admin_patch_target(
             req.min_backslash_count.unwrap_or(target.min_backslash_count),
         )?;
     }
+
+    // The insertions the target ends up with, checked together.
+    let stored = |text: &Option<String>, position: i64| text.clone().map(|text| (text, position));
+    let insert_from_start = req.insert_from_start.clone().unwrap_or_else(|| stored(&target.insert_from_start_text, target.insert_from_start_position));
+    let insert_from_end = req.insert_from_end.clone().unwrap_or_else(|| stored(&target.insert_from_end_text, target.insert_from_end_position));
+    validate_insertions(&target.prefix, &target.suffix, &insert_from_start, &insert_from_end)?;
 
     // Checked against whatever the target ends up with, so a new alphabet
     // is checked against the existing start_len too, not just the other way
@@ -457,6 +501,20 @@ pub async fn admin_patch_target(
     .execute(&mut *tx)
     .await?;
     debug_assert!(result.rows_affected() > 0, "target existed and wasn't solved per the check above");
+    // Set outright rather than COALESCEd above, since `null` removes one.
+    if req.insert_from_start.is_some() || req.insert_from_end.is_some() {
+        sqlx::query(
+            "UPDATE targets SET insert_from_start_text = ?, insert_from_start_position = ?, insert_from_end_text = ?, insert_from_end_position = ? \
+             WHERE id = ?",
+        )
+        .bind(insert_from_start.as_ref().map(|(text, _)| text))
+        .bind(insert_from_start.as_ref().map_or(0, |&(_, position)| position))
+        .bind(insert_from_end.as_ref().map(|(text, _)| text))
+        .bind(insert_from_end.as_ref().map_or(0, |&(_, position)| position))
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     // Priority and skip ranges are translated eagerly, in the same
     // transaction as the alphabet change itself - see
@@ -671,6 +729,22 @@ mod tests {
         assert!(validate_start_len(cap, alphabet).is_ok());
         assert!(matches!(validate_start_len(0, alphabet), Err(AppError::BadRequest(_))));
         assert!(matches!(validate_start_len(cap + 1, alphabet), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_insertions_wants_short_printable_text_at_a_position_a_candidate_can_have() {
+        let some = |text: &str, position: i64| Some((text.to_string(), position));
+        assert!(validate_insertions("REZ\\", ".WAV", &None, &None).is_ok());
+        assert!(validate_insertions("REZ\\", ".WAV", &some("\\", 3), &some("_X", 0)).is_ok());
+        assert!(validate_insertions("REZ\\", ".WAV", &some("\\", MAX_CANDIDATE_LEN), &None).is_ok());
+        assert!(matches!(validate_insertions("REZ\\", ".WAV", &some("", 3), &None), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_insertions("REZ\\", ".WAV", &some("\t", 3), &None), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_insertions("REZ\\", ".WAV", &some(&"A".repeat(17), 3), &None), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_insertions("REZ\\", ".WAV", &None, &some("A", -1)), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_insertions("REZ\\", ".WAV", &None, &some("A", MAX_CANDIDATE_LEN + 1)), Err(AppError::BadRequest(_))));
+        // No room left in the client's buffers for it.
+        assert!(matches!(validate_insertions(&"P".repeat(40), ".WAV", &some(&"A".repeat(10), 1), &None), Err(AppError::BadRequest(_))));
+        assert!(validate_insertions(&"P".repeat(40), ".WAV", &None, &None).is_ok(), "only with inserted text");
     }
 
     #[test]

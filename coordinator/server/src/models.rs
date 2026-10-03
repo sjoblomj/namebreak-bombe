@@ -44,6 +44,11 @@ pub struct Target {
     pub max_backslash_count: i64,
     pub min_backslash_count: i64,
     pub prune_adjacent_backslashes: i64,
+    /// See `AdminCreateTargetRequest::insert_from_start` - None: nothing.
+    pub insert_from_start_text: Option<String>,
+    pub insert_from_start_position: i64,
+    pub insert_from_end_text: Option<String>,
+    pub insert_from_end_position: i64,
     pub alphabet_name: String,
     pub alphabet: String,
     pub status: String,
@@ -248,6 +253,17 @@ impl Segment {
 
 /// Stores a `u32` hash in an `i64` column without sign issues (always non-negative,
 /// well within i64's range).
+impl Target {
+    /// The text inserted into the target's candidates - see
+    /// `AdminCreateTargetRequest::insert_from_start`.
+    pub fn insertions(&self) -> crate::alphabet::Insertions<'_> {
+        crate::alphabet::Insertions {
+            from_start: self.insert_from_start_text.as_deref().map(|text| (text, self.insert_from_start_position)),
+            from_end: self.insert_from_end_text.as_deref().map(|text| (text, self.insert_from_end_position)),
+        }
+    }
+}
+
 pub fn u32_to_i64(v: u32) -> i64 {
     v as i64
 }

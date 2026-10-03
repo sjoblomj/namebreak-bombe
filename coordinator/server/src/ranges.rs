@@ -73,6 +73,10 @@ pub(crate) fn to_claim_response(
         max_backslash_count: target.max_backslash_count,
         min_backslash_count: target.min_backslash_count,
         prune_adjacent_backslashes: target.prune_adjacent_backslashes != 0,
+        insert_from_start_text: target.insert_from_start_text.clone(),
+        insert_from_start_position: target.insert_from_start_position,
+        insert_from_end_text: target.insert_from_end_text.clone(),
+        insert_from_end_position: target.insert_from_end_position,
         lower_bound_filename,
         upper_bound_filename,
         alphabet: client_alphabet.to_string(),
@@ -736,6 +740,11 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         let Some(target_client_alphabet) = client_alphabet_for(&target.alphabet_name, &target.alphabet, client_version) else {
             continue;
         };
+        // Nor does a client too old to insert the target's text into its
+        // candidates (see alphabet::INSERTIONS_SINCE).
+        if !target.insertions().searchable_by(client_version) {
+            continue;
+        }
 
         // 1) Reuse this target's own oldest pending range this client can
         // search, if it has one - either a fresh chunk nobody's claimed yet,
@@ -1155,10 +1164,15 @@ async fn resolve_progress_index(
         .fetch_one(&mut *tx)
         .await?;
 
-    let Some(candidate) = strip_prefix_suffix(filename, &target.prefix, &target.suffix) else {
+    let Some(with_insertions) = strip_prefix_suffix(filename, &target.prefix, &target.suffix) else {
         tracing::warn!(range_id = range.id, filename, "heartbeat match filename doesn't match target's prefix/suffix, ignoring");
         return Ok(None);
     };
+    let Some(candidate) = target.insertions().remove(with_insertions) else {
+        tracing::warn!(range_id = range.id, filename, "heartbeat match filename doesn't have the target's inserted text where it should, ignoring");
+        return Ok(None);
+    };
+    let candidate = candidate.as_str();
     if candidate.chars().count() as i64 != range.candidate_len {
         tracing::warn!(range_id = range.id, filename, "heartbeat match candidate length doesn't match range, ignoring");
         return Ok(None);
@@ -2885,6 +2899,46 @@ mod tests {
         // '~' is in no alphabet at all: ignored.
         heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE ~.SUF".into())).await.unwrap();
         assert_eq!(progress(pool.clone()).await.as_deref(), Some(" Z"));
+    }
+
+    /// A target that inserts text into its candidates goes only to clients of
+    /// protocol 1.4 and later, with the text in the claim: an older one would
+    /// search the candidates without it, and miss the target while reporting
+    /// every range done. A heartbeat's filename, which has the text, gives
+    /// the range's progress all the same.
+    #[tokio::test]
+    async fn a_target_with_inserted_text_goes_only_to_clients_that_insert_it() {
+        let pool = test_pool().await;
+        let (lower, upper) = full_bounds(SIZE42, 2);
+        let target_id = insert_target_with_alphabet(&pool, "size42", SIZE42, &lower, &upper).await;
+        sqlx::query(
+            "UPDATE targets SET insert_from_start_text = '\\', insert_from_start_position = 1, insert_from_end_text = '_', \
+             insert_from_end_position = 0 WHERE id = ?",
+        )
+        .bind(target_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let config = test_config(42); // the whole ' ?' block: "  " to " _"
+
+        let old_client = insert_user_with_protocol_version(&pool, "old-client", "1.3.0").await;
+        assert!(claim_range(&pool, &config, &old_client).await.unwrap().is_none(), "no work for a client that wouldn't insert the text");
+
+        let new_client = insert_user_with_protocol_version(&pool, "new-client", "1.4.0").await;
+        let claim = claim_range(&pool, &config, &new_client).await.unwrap().expect("work for a 1.4 client");
+        assert_eq!((claim.insert_from_start_text.as_deref(), claim.insert_from_start_position), (Some("\\"), 1));
+        assert_eq!((claim.insert_from_end_text.as_deref(), claim.insert_from_end_position), (Some("_"), 0));
+        assert_eq!(claim.lower_bound_filename, "PRE  .SUF", "bounds are without the text");
+
+        let progress = |pool: SqlitePool| async move {
+            let range: Range = sqlx::query_as("SELECT * FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
+            range.progress().map(|p| crate::alphabet::index_to_candidate(SIZE42, p, 2))
+        };
+        heartbeat_range(&pool, &config, &new_client, claim.range_id, Some("PRE \\A_.SUF".into())).await.unwrap();
+        assert_eq!(progress(pool.clone()).await.as_deref(), Some(" A"));
+        // Without the text where a two-character candidate has it: ignored.
+        heartbeat_range(&pool, &config, &new_client, claim.range_id, Some("PRE B.SUF".into())).await.unwrap();
+        assert_eq!(progress(pool.clone()).await.as_deref(), Some(" A"));
     }
 
     /// The other side of the same gate: once a target's alphabet is one the

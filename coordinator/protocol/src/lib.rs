@@ -83,8 +83,9 @@ impl std::str::FromStr for Version {
 ///   sizes of the alphabets above), so an alphabet of a new size is to be
 ///   tagged `(1, 3)` or later; and `POST /api/v1/ranges/{id}/quit` (see
 ///   `QuitRequest`), which older clients never send.
-/// - 1.4.0 - `ClaimResponse::min_backslash_count` and
-///   `ClaimResponse::prune_adjacent_backslashes`.
+/// - 1.4.0 - `ClaimResponse::min_backslash_count`,
+///   `ClaimResponse::prune_adjacent_backslashes`, and the text inserted into
+///   candidates (`ClaimResponse::insert_from_start_text` and so on).
 pub const PROTOCOL_VERSION: Version = Version::new(1, 4, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +163,22 @@ pub struct ClaimResponse {
     /// `AdminCreateTargetRequest::prune_adjacent_backslashes`.
     #[serde(default)]
     pub prune_adjacent_backslashes: bool,
+    /// Text inserted into every candidate at least `insert_from_start_position`
+    /// characters long, after its first that many - see
+    /// `AdminCreateTargetRequest::insert_from_start`. None: nothing. Flat
+    /// rather than a tuple, for the client's flat JSON parser. A client too
+    /// old to know it can't find the target, which is why a target that has
+    /// it gets no clients older than protocol 1.4 (see `ranges::claim_range`).
+    #[serde(default)]
+    pub insert_from_start_text: Option<String>,
+    #[serde(default)]
+    pub insert_from_start_position: i64,
+    /// The same, before a candidate's last `insert_from_end_position`
+    /// characters - see `AdminCreateTargetRequest::insert_from_end`.
+    #[serde(default)]
+    pub insert_from_end_text: Option<String>,
+    #[serde(default)]
+    pub insert_from_end_position: i64,
     pub lower_bound_filename: String,
     pub upper_bound_filename: String,
     /// The literal alphabet characters for this range's target.
@@ -306,6 +323,20 @@ pub struct AdminCreateTargetRequest {
     /// false. A client too old to know it searches as if it were false.
     #[serde(default)]
     pub prune_adjacent_backslashes: bool,
+    /// Text inserted into every candidate at least as long as the position,
+    /// after its first that many characters - `["\\", 3]` puts a backslash
+    /// after the third. 1 to 16 printable ASCII characters, at a position from
+    /// 0 to 16. Where it meets `insert_from_end`, it comes first. The bounds
+    /// (and every position the server works with) are without it; the
+    /// filenames clients report have it. The pruning rules check it like the
+    /// candidate's own characters - but text inserted after a candidate's last
+    /// character, which is part of the suffix. Defaults to none.
+    #[serde(default)]
+    pub insert_from_start: Option<(String, i64)>,
+    /// Like `insert_from_start`, before a candidate's last `position`
+    /// characters - `["\\", 4]` puts a backslash before the last four.
+    #[serde(default)]
+    pub insert_from_end: Option<(String, i64)>,
     /// Higher-priority active targets have their claimable work handed out
     /// first, ahead of any lower-priority target's. Defaults to 0 when
     /// omitted, so an unset target just competes on creation order as before.
@@ -325,6 +356,16 @@ pub struct AdminCreateTargetRequest {
 
 fn default_start_len() -> i64 {
     1
+}
+
+/// For a field that's left out (None, through `#[serde(default)]`), given as
+/// `null` (Some(None)) or given a value (Some(Some(value))).
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +428,16 @@ pub struct AdminPatchTargetRequest {
     /// patch, like `prune_symbol_runs`.
     #[serde(default)]
     pub prune_adjacent_backslashes: Option<bool>,
+    /// See `AdminCreateTargetRequest::insert_from_start`. Leave unset to leave
+    /// it unchanged; pass `null` to remove it. Applies to ranges claimed after
+    /// the patch - the progress of ranges already in progress is then lost if
+    /// they report filenames made with the old one.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub insert_from_start: Option<Option<(String, i64)>>,
+    /// See `AdminCreateTargetRequest::insert_from_end`, changed like
+    /// `insert_from_start`.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub insert_from_end: Option<Option<(String, i64)>>,
     /// See `AdminCreateTargetRequest::start_len`. Leave unset to leave it
     /// unchanged. Raising it past where the main sweep has reached makes the
     /// sweep jump straight to the start of the new length the next time it

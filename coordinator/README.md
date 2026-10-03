@@ -174,6 +174,23 @@ See the top-level plan/design notes for the full rationale; the short version:
   opened - a `)` or `]` at a point where more brackets have been closed than
   opened - `(`/`)` and `[`/`]` counted separately. Brackets left open by the
   target's prefix count as opened.
+- **Inserted text**: a target can insert fixed text into every candidate
+  long enough for it - `insert_from_start: ["\\", 3]` puts a backslash
+  after a candidate's first three characters, `insert_from_end: ["\\", 4]`
+  before its last four (1 to 16 printable ASCII characters, at a position
+  from 0 to 16). A candidate shorter than the position gets nothing
+  inserted; where the two meet, `insert_from_start` comes first. Bounds,
+  ranges, positions and counts are all without it - the text only changes
+  what a candidate hashes as - while the filenames clients report (their
+  heartbeats' progress checkpoints, names found) have it; the server takes it
+  back out to read progress. The pruning rules check it like the
+  candidate's own characters, except text inserted after a candidate's last
+  character, which counts as part of the suffix. Unlike the pruning
+  settings, a client too old to know it couldn't just search more: it would
+  miss the target. So a target with inserted text gets no clients older than
+  protocol 1.4 (`alphabet::INSERTIONS_SINCE`). Canaries insert it too. Where
+  it lands in a candidate decides what it costs a client - see the client
+  README's "Inserted text".
 - **Whole-candidate pruning**: by default, those rules only look at a
   candidate's leading characters - all but the last five or so, which the
   client enumerates on its CPU. A target with `prune_whole_candidate`
@@ -246,6 +263,7 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "max_backslash_count": 0,
     "min_backslash_count": 0,
     "prune_adjacent_backslashes": true,
+    "insert_from_end": ["\\", 4],
     "priority": 0,
     "description": "From the <b>1998</b> demo listing",
     "start_len": 1
@@ -328,7 +346,7 @@ curl localhost:8080/api/v1/status
 Pause/resume a target, and/or change its priority, description,
 alphabet_name (or a custom alphabet), prune_symbol_runs, prune_unopened_brackets,
 prune_whole_candidate, max_backslash_count, min_backslash_count,
-prune_adjacent_backslashes or start_len:
+prune_adjacent_backslashes, insert_from_start, insert_from_end or start_len:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -337,10 +355,13 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 ```
 
 Any field can be omitted to leave it unchanged (pass `"description": ""` to
-clear an existing one), but at least one must be given. A changed
+clear an existing one, and `"insert_from_start": null` to remove that), but at
+least one must be given. A changed
 `prune_symbol_runs`/`prune_unopened_brackets`/`prune_whole_candidate`/`max_backslash_count`/`min_backslash_count`/`prune_adjacent_backslashes` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
-progress finish with the old setting. Raising `start_len` past where carving
+progress finish with the old setting. So does a changed `insert_from_start` or
+`insert_from_end`, except that the progress such a range reports, with the old
+text, is then ignored. Raising `start_len` past where carving
 has reached makes it jump straight to the start of the new length the next
 time it carves, leaving the rest of the shorter lengths uncarved (shown as a
 gap on the dashboard). Lowering it never moves carving back, so lengths it
