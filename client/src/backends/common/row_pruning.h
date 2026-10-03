@@ -21,7 +21,8 @@
 // the row's own last character d the next. Whether a candidate breaks a rule
 // at those characters - every one but its last, which is never checked -
 // depends only on them and on the state the leading characters left
-// (BatchParams::pruneEntry). So for each such state there's a fixed list of
+// (BatchParams::pruneEntry). So does whether the last could still make up
+// the backslashes the rules ask for (canReachMinBackslashes_CPU). So for each such state there's a fixed list of
 // the groups that survive, and for each of those, which of its rows do: a
 // kernel walks the list instead of every group, so that a pruned group costs
 // it nothing at all. Leaving the pruned ones out on the GPU instead would
@@ -30,12 +31,14 @@
 // An entry of a list is (group << kRowFlagBits) | flags, sorted by group,
 // where flags say which characters the rows' own last character d may not
 // be - one bit per rule the group's characters have used up (the symbol run
-// is at 2, no ')' or no ']' is open, the backslashes are all used), each
-// standing for a set of characters. rowMask(flags) is the set of d allowed.
-constexpr int kRowFlagBits = 4;
+// is at 2, no ')' or no ']' is open, the backslashes are all used or the
+// last character was one, or d must be a backslash for there to be enough),
+// each standing for a set of characters. rowMask(flags) is the set of d
+// allowed.
+constexpr int kRowFlagBits = 5;
 constexpr uint32_t kRowFlagCount = 1u << kRowFlagBits;
 // Group numbers must leave room for the flags: 63^4 groups (trailingLen 6)
-// is well within this.
+// is within this.
 constexpr uint64_t kMaxPrunableGroups = uint64_t(1) << (32 - kRowFlagBits);
 
 class RowPruning {
@@ -80,7 +83,7 @@ private:
     std::vector<uint32_t> arena_;
     // (trailingLen, and the entry state reduced to what can matter - see
     // groupsFor) -> where its list is in arena_.
-    std::map<std::tuple<int, int, int, int, int>, Slice> lists_;
+    std::map<std::tuple<int, int, int, int, int, bool>, Slice> lists_;
 };
 
 #endif // NAMEBREAK_BACKENDS_COMMON_ROW_PRUNING_H

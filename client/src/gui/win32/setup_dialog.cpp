@@ -42,6 +42,7 @@ constexpr int kIdSetupPruneCheckbox = 305;
 constexpr int kIdSetupAbout = 306;
 constexpr int kIdSetupPruneBracketsCheckbox = 307;
 constexpr int kIdSetupPruneWholeCheckbox = 308;
+constexpr int kIdSetupPruneAdjacentCheckbox = 309;
 
 // Marker stored in a help "?" control's GWLP_USERDATA so SetupPageWndProc can
 // tell it apart from an ordinary label when coloring it.
@@ -57,8 +58,8 @@ struct SetupDialogState {
     HWND hwndPageSearch = nullptr;
     HWND hwndUsername = nullptr, hwndHostname = nullptr, hwndServerUrl = nullptr, hwndPollInterval = nullptr;
     HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr, hwndPruneBrackets = nullptr,
-         hwndPruneWhole = nullptr;
-    HWND hwndAlphabet = nullptr, hwndMaxBackslash = nullptr, hwndPrefix = nullptr, hwndSuffix = nullptr, hwndStartCandidate = nullptr,
+         hwndPruneWhole = nullptr, hwndPruneAdjacent = nullptr;
+    HWND hwndAlphabet = nullptr, hwndMaxBackslash = nullptr, hwndMinBackslash = nullptr, hwndPrefix = nullptr, hwndSuffix = nullptr, hwndStartCandidate = nullptr,
          hwndLowerBound = nullptr, hwndUpperBound = nullptr, hwndHashA = nullptr, hwndHashB = nullptr;
     // Tooltip strings must outlive the tooltip (it keeps pointers, not
     // copies); a deque never moves existing elements as it grows.
@@ -128,6 +129,7 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     } else {
                         std::string alphabet = getField(state->hwndAlphabet);
                         std::string maxBackslash = getField(state->hwndMaxBackslash);
+                        std::string minBackslash = getField(state->hwndMinBackslash);
                         std::string prefix = getField(state->hwndPrefix);
                         std::string suffix = getField(state->hwndSuffix);
                         std::string startCandidate = getField(state->hwndStartCandidate);
@@ -147,6 +149,7 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         }
                         state->fields->alphabet = alphabet;
                         state->fields->maxBackslashCount = maxBackslash;
+                        state->fields->minBackslashCount = minBackslash.empty() ? "0" : minBackslash;
                         state->fields->prefix = prefix;
                         state->fields->suffix = suffix;
                         state->fields->startCandidate = startCandidate;
@@ -157,6 +160,7 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         state->fields->pruneSymbolRuns = SendMessage(state->hwndPrune, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->pruneUnopenedBrackets = SendMessage(state->hwndPruneBrackets, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->pruneWholeCandidate = SendMessage(state->hwndPruneWhole, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                        state->fields->pruneAdjacentBackslashes = SendMessage(state->hwndPruneAdjacent, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         bool continuous = SendMessage(state->hwndContinuousRadio, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         state->fields->mode = continuous ? "continuous" : "bounded";
                     }
@@ -362,6 +366,11 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     addHelp(ps, kH1, row(3) + 2,
             "Optional. The full filename (prefix + candidate + suffix) to begin searching from, to resume a long search where it left "
             "off. Leave blank to start from the beginning.");
+    makeLabel(ps, "Min backslash:", kL2, row(3) + 3, 110);
+    state.hwndMinBackslash = makeEdit(ps, fields.minBackslashCount, kE2, row(3), 60);
+    addHelp(ps, kE2 + 68, row(3) + 2,
+            "Optional. The fewest backslashes a candidate may contain without being skipped. 0 (or blank) means none are needed. "
+            "Backslashes in the prefix don't count.");
 
     makeLabel(ps, "Lower bound:", kL1, row(4) + 3, 100);
     state.hwndLowerBound = makeEdit(ps, fields.lowerBound, kE1, row(4), 150);
@@ -390,9 +399,14 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     state.hwndPruneWhole =
         makeCheckbox(ps, "Prune the whole candidate", kL1, row(7) + 1, 190, kIdSetupPruneWholeCheckbox, fields.pruneWholeCandidate);
     addHelp(ps, kH1, row(7) + 2,
-            "Apply the two rules above, and Max backslash, to every character of a candidate but the last - not only to the "
+            "Apply the pruning rules, and Max and Min backslash, to every character of a candidate but the last - not only to the "
             "characters before the last five or so, which the CPU goes through. About a fifth fewer candidates are searched, and "
             "the search is about 10% faster on a GPU.");
+    state.hwndPruneAdjacent = makeCheckbox(ps, "Prune adjacent backslashes", kL2, row(7) + 1, 190, kIdSetupPruneAdjacentCheckbox,
+                                           fields.pruneAdjacentBackslashes);
+    addHelp(ps, kH2, row(7) + 2,
+            "Skip candidates with two backslashes next to each other - counting one the prefix ends with. Real filenames never have "
+            "those. Makes the search faster.");
 
     // --- Buttons ---
     CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 512, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout, hInstance,

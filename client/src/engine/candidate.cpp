@@ -79,10 +79,25 @@ bool pruneStep_CPU(const PruneRules& rules, PruneState& state, char c) {
         state.open.square++;
     } else if (c == ']' && --state.open.square < 0 && rules.unopenedBrackets) {
         return false;
-    } else if (c == '\\' && ++state.backslashes > rules.maxBackslashCount && rules.maxBackslashCount != 0) {
-        return false;
+    } else if (c == '\\') {
+        if (state.lastWasBackslash && rules.adjacentBackslashes)
+            return false;
+        if (++state.backslashes > rules.maxBackslashCount && rules.maxBackslashCount != 0)
+            return false;
     }
+    state.lastWasBackslash = c == '\\';
     return true;
+}
+
+bool canReachMinBackslashes_CPU(const PruneRules& rules, const PruneState& state, int remaining) {
+    if (rules.minBackslashCount == 0 || state.backslashes >= rules.minBackslashCount)
+        return true;
+    // With adjacentBackslashes, at most every other one of the remaining
+    // characters - not the first, if the last one was a backslash.
+    int most = remaining;
+    if (rules.adjacentBackslashes)
+        most = state.lastWasBackslash ? remaining / 2 : (remaining + 1) / 2;
+    return state.backslashes + most >= rules.minBackslashCount;
 }
 
 bool stringToIndex(const std::string& str, const std::string& alphabet, uint64_t& out, std::string& error) {

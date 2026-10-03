@@ -61,6 +61,7 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         fields.pollIntervalSecs = get(config.coordinator, "poll_interval_secs", "30");
         fields.alphabet = get(config.search, "alphabet", "");
         fields.maxBackslashCount = get(config.search, "max_backslash_count", "0");
+        fields.minBackslashCount = get(config.search, "min_backslash_count", "0");
         fields.prefix = get(config.search, "prefix", "");
         fields.suffix = get(config.search, "suffix", "");
         fields.startCandidate = get(config.search, "start_candidate", "");
@@ -71,6 +72,7 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         fields.pruneSymbolRuns = get(config.search, "prune_symbol_runs", "false") == "true";
         fields.pruneUnopenedBrackets = get(config.search, "prune_unopened_brackets", "false") == "true";
         fields.pruneWholeCandidate = get(config.search, "prune_whole_candidate", "false") == "true";
+        fields.pruneAdjacentBackslashes = get(config.search, "prune_adjacent_backslashes", "false") == "true";
         fields.initialTab = (loaded && (config.mode == "bounded" || config.mode == "continuous")) ? kTabLocalSearch : kTabCoordinator;
         fields.initialContinuous = loaded && config.mode == "continuous";
 
@@ -90,6 +92,7 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
             writeOk = ensureConfigForMode(configPath, fields.mode, "search",
                                            {{"alphabet", fields.alphabet},
                                             {"max_backslash_count", fields.maxBackslashCount},
+                                            {"min_backslash_count", fields.minBackslashCount},
                                             {"prefix", fields.prefix},
                                             {"suffix", fields.suffix},
                                             {"start_candidate", fields.startCandidate},
@@ -99,7 +102,8 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
                                             {"hash_b", fields.hashB},
                                             {"prune_symbol_runs", fields.pruneSymbolRuns ? "true" : "false"},
                                             {"prune_unopened_brackets", fields.pruneUnopenedBrackets ? "true" : "false"},
-                                            {"prune_whole_candidate", fields.pruneWholeCandidate ? "true" : "false"}},
+                                            {"prune_whole_candidate", fields.pruneWholeCandidate ? "true" : "false"},
+                                            {"prune_adjacent_backslashes", fields.pruneAdjacentBackslashes ? "true" : "false"}},
                                            writeError);
         }
         if (!writeOk) {

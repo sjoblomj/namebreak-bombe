@@ -258,6 +258,8 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     std::string pruneStr = r.getOptional("prune_symbol_runs", "false");
     std::string pruneBracketsStr = r.getOptional("prune_unopened_brackets", "false");
     std::string pruneWholeStr = r.getOptional("prune_whole_candidate", "false");
+    std::string minBackslashStr = r.getOptional("min_backslash_count", "0");
+    std::string pruneAdjacentStr = r.getOptional("prune_adjacent_backslashes", "false");
     std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
 
     std::string unknown = r.firstUnknownKey();
@@ -272,6 +274,12 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
         error = "invalid max_backslash_count: " + maxBackslashStr;
         return false;
     }
+    try {
+        out.minBackslashCount = std::stoi(minBackslashStr);
+    } catch (const std::exception&) {
+        error = "invalid min_backslash_count: " + minBackslashStr;
+        return false;
+    }
     if (!parseBool(pruneStr, out.pruneSymbolRuns)) {
         error = "invalid prune_symbol_runs: '" + pruneStr + "' (expected true/false)";
         return false;
@@ -282,6 +290,10 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     }
     if (!parseBool(pruneWholeStr, out.pruneWholeCandidate)) {
         error = "invalid prune_whole_candidate: '" + pruneWholeStr + "' (expected true/false)";
+        return false;
+    }
+    if (!parseBool(pruneAdjacentStr, out.pruneAdjacentBackslashes)) {
+        error = "invalid prune_adjacent_backslashes: '" + pruneAdjacentStr + "' (expected true/false)";
         return false;
     }
     bool resume = false;

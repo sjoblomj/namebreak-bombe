@@ -169,6 +169,12 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         result.error = "maxBackslashCount must be >= 0 (0 means unlimited), got " + std::to_string(req.maxBackslashCount);
         return result;
     }
+    if (req.minBackslashCount < 0 || (req.maxBackslashCount != 0 && req.minBackslashCount > req.maxBackslashCount)) {
+        result.ok = false;
+        result.error = "minBackslashCount must be >= 0 and at most maxBackslashCount (unless that's 0, unlimited), got " +
+                       std::to_string(req.minBackslashCount);
+        return result;
+    }
 
     // Compare lower/upper using the same alphabet ordering the rest of the search
     // relies on, rather than raw string comparison (which would break if the
@@ -269,6 +275,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     printf("pruneSymbolRuns: %s (%s)\n", req.pruneSymbolRuns ? "true" : "false", pruneScope);
     printf("pruneUnopenedBrackets: %s (%s)\n", req.pruneUnopenedBrackets ? "true" : "false", pruneScope);
     printf("maxBackslashCount: %d%s (%s)\n", req.maxBackslashCount, req.maxBackslashCount == 0 ? " (unlimited)" : "", pruneScope);
+    printf("minBackslashCount: %d (%s)\n", req.minBackslashCount, pruneScope);
+    printf("pruneAdjacentBackslashes: %s (%s)\n", req.pruneAdjacentBackslashes ? "true" : "false", pruneScope);
 
     uint32_t h_cryptTable[0x500];
     prepareCryptTable(h_cryptTable);
@@ -281,13 +289,17 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     // The pruning rules, and their state before a candidate's first
     // character: brackets req.prefix leaves open are a candidate's to close
     // (see req.pruneUnopenedBrackets), and neither the prefix's symbols nor
-    // its backslashes count.
+    // its backslashes count - but a backslash it ends with does, for one
+    // next to it (see req.pruneAdjacentBackslashes).
     PruneRules rules;
     rules.symbolRuns = req.pruneSymbolRuns;
     rules.unopenedBrackets = req.pruneUnopenedBrackets;
     rules.maxBackslashCount = req.maxBackslashCount;
+    rules.minBackslashCount = req.minBackslashCount;
+    rules.adjacentBackslashes = req.pruneAdjacentBackslashes;
     PruneState candidateStart;
     candidateStart.open = openBracketsAfter_CPU(req.prefix);
+    candidateStart.lastWasBackslash = !req.prefix.empty() && req.prefix.back() == '\\';
 
     std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
     if (!outputDir.empty()) {
@@ -445,7 +457,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             }
             const std::string& leading = leadingHasher.leading();
 
-            // req.pruneSymbolRuns/req.pruneUnopenedBrackets/req.maxBackslashCount examine `leading` -
+            // The pruning rules (req.pruneSymbolRuns and the rest) examine `leading` -
             // the CPU-computed first leadingLen characters of the candidate
             // (see README.md's "Design decisions" section for why checking it
             // here, instead of in the backend, is worth doing). A prune here
@@ -455,6 +467,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
             // even one of those candidates would have cost individually.
             // The state it leaves is where the backend carries on, if it
             // prunes the trailing characters too (req.pruneWholeCandidate).
+            // And whether the trailingLen characters after it could still
+            // make up the backslashes req.minBackslashCount asks for.
             PruneState pruneEntry = candidateStart;
             bool pruned = false;
             for (char c : leading) {
@@ -463,7 +477,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
                     break;
                 }
             }
-            if (pruned)
+            if (pruned || !canReachMinBackslashes_CPU(rules, pruneEntry, trailingLen))
                 continue;
 
             // Handed to every runBatch call below; see BatchParams.

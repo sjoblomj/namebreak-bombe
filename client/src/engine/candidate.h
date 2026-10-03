@@ -44,28 +44,40 @@ OpenBrackets openBracketsAfter_CPU(std::string_view s);
 // undo that.
 bool hasUnopenedBracket_CPU(std::string_view s, OpenBrackets openBefore);
 
-// The same three rules as a state machine, one character at a time - how
-// the engine checks a candidate's leading characters, and how a backend
-// prunes its trailing ones when a search prunes the whole candidate
+// The rules as a state machine, one character at a time - how the engine
+// checks a candidate's leading characters, and how a backend prunes its
+// trailing ones when a search prunes the whole candidate
 // (SearchRequest::pruneWholeCandidate). Stepping over a string gives the
 // same verdict as the functions above: the symbol run starts at the
 // candidate's first character, backslashes are counted from it, and
-// brackets start from those the prefix leaves open.
+// brackets start from those the prefix leaves open. Two backslashes next to
+// each other include one the prefix ends with.
 struct PruneRules {
-    bool symbolRuns = false;       // hasForbiddenSymbolRun_CPU
-    bool unopenedBrackets = false; // hasUnopenedBracket_CPU
-    int maxBackslashCount = 0;     // countBackslashes_CPU; 0 means unlimited
-    bool any() const { return symbolRuns || unopenedBrackets || maxBackslashCount != 0; }
+    bool symbolRuns = false;          // hasForbiddenSymbolRun_CPU
+    bool unopenedBrackets = false;    // hasUnopenedBracket_CPU
+    int maxBackslashCount = 0;        // countBackslashes_CPU; 0 means unlimited
+    int minBackslashCount = 0;        // canReachMinBackslashes_CPU; 0 means none needed
+    bool adjacentBackslashes = false; // no "\\" anywhere
+    bool any() const { return symbolRuns || unopenedBrackets || maxBackslashCount != 0 || minBackslashCount != 0 || adjacentBackslashes; }
 };
 // What the rules need to know about the characters so far.
 struct PruneState {
     int symbolRun = 0; // how many non-alphanumeric, non-space characters in a row, up to 2
     OpenBrackets open;
     int backslashes = 0;
+    bool lastWasBackslash = false;
 };
 // Steps `state` over `c`; false if `c` breaks one of `rules` (`state` is
 // then no longer meaningful).
 bool pruneStep_CPU(const PruneRules& rules, PruneState& state, char c);
+// Whether a candidate in `state` can still have rules.minBackslashCount
+// backslashes, with `remaining` characters still to come - as many of them
+// backslashes as can be (every other one, with rules.adjacentBackslashes).
+// Unlike pruneStep_CPU's rules, this one is about characters not checked:
+// it's asked once, after the last character that is. Once false, it stays
+// false for every character added, so asking it after fewer characters
+// prunes no more than asking it after more.
+bool canReachMinBackslashes_CPU(const PruneRules& rules, const PruneState& state, int remaining);
 // Whether a character counts towards a symbol run - neither alphanumeric
 // (A-Z, 0-9) nor a space.
 bool isRunSymbol_CPU(char c);

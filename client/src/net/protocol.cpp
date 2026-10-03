@@ -200,6 +200,11 @@ bool getOptionalBool(const std::map<std::string, JsonValue>& obj, const std::str
     return obj.find(key) == obj.end() || getBool(obj, key, out);
 }
 
+// Like getInt64, but a missing key leaves `out` untouched instead of failing.
+bool getOptionalInt64(const std::map<std::string, JsonValue>& obj, const std::string& key, int64_t& out) {
+    return obj.find(key) == obj.end() || getInt64(obj, key, out);
+}
+
 } // namespace
 
 std::string toJson(const RegisterRequest& req) {
@@ -255,6 +260,8 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getOptionalBool(obj, "prune_unopened_brackets", out.pruneUnopenedBrackets) &&
            getOptionalBool(obj, "prune_whole_candidate", out.pruneWholeCandidate) &&
            getInt64( obj, "max_backslash_count", out.maxBackslashCount) &&
+           getOptionalInt64(obj, "min_backslash_count", out.minBackslashCount) &&
+           getOptionalBool(obj, "prune_adjacent_backslashes", out.pruneAdjacentBackslashes) &&
            getString(obj, "lower_bound_filename", out.lowerBoundFilename) &&
            getString(obj, "upper_bound_filename", out.upperBoundFilename) &&
            getString(obj, "alphabet", out.alphabet) &&

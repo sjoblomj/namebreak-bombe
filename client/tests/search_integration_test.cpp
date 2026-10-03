@@ -27,6 +27,7 @@
 //     once on the pruned side (must NOT be).
 //  6. pruneWholeCandidate: the same rules at every character but the last,
 //     where the backend prunes rows and row groups of its trailing part.
+//  7. minBackslashCount and pruneAdjacentBackslashes, both ways.
 //  G. Geometry, for a range of alphabet sizes: the kernel
 //     handles a *row* (every value of the last character) per thread, so
 //     ranges that start/end mid-row, sit inside one row, are row-aligned,
@@ -166,15 +167,27 @@ static int trailingLenFor(int candidateLen, int alphabetSize) {
 }
 
 // With pruneWholeCandidate the rules look at every character but the last
-// instead of the leading ones only.
+// instead of the leading ones only. minBackslashCount prunes a candidate
+// whose checked characters leave too few after them for that many
+// backslashes, even if all that may be are - every other one, with
+// pruneAdjacentBackslashes.
 static bool isPruned(const std::string& candidate, int leadingLen, bool pruneSymbolRuns, int maxBackslashCount, bool pruneUnopenedBrackets,
-                     const std::string& prefix, bool pruneWholeCandidate = false) {
+                     const std::string& prefix, bool pruneWholeCandidate = false, int minBackslashCount = 0, bool pruneAdjacentBackslashes = false) {
     std::string_view leading(candidate.data(), pruneWholeCandidate ? candidate.size() - 1 : leadingLen);
     if (pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading))
         return true;
     if (maxBackslashCount != 0 && countBackslashes_CPU(leading) > maxBackslashCount)
         return true;
     if (pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, openBracketsAfter_CPU(prefix)))
+        return true;
+    // A backslash the prefix ends with is next to one the candidate starts with.
+    const std::string withPrefixEnd = (prefix.empty() ? std::string() : prefix.substr(prefix.size() - 1)) + std::string(leading);
+    if (pruneAdjacentBackslashes && withPrefixEnd.find("\\\\") != std::string::npos)
+        return true;
+    const int unchecked = (int) (candidate.size() - leading.size());
+    const bool endsWithBackslash = !withPrefixEnd.empty() && withPrefixEnd.back() == '\\';
+    const int mostToCome = !pruneAdjacentBackslashes ? unchecked : endsWithBackslash ? unchecked / 2 : (unchecked + 1) / 2;
+    if (minBackslashCount != 0 && countBackslashes_CPU(leading) + mostToCome < minBackslashCount)
         return true;
     return false;
 }
@@ -233,6 +246,8 @@ struct CaseSpec {
     int maxBackslashCount = 0;
     bool pruneUnopenedBrackets = false;
     bool pruneWholeCandidate = false;
+    int minBackslashCount = 0;
+    bool pruneAdjacentBackslashes = false;
     uint32_t targetHashA = 0x12345678;
     uint32_t targetHashB = 0xDEADBEEF;
     // A candidate the reference must contain in its match set (a sanity check
@@ -259,7 +274,8 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
         const uint64_t kMaxRange = 20'000'000;
         while (true) {
             ++total;
-            if (isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate)) {
+            if (isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate,
+                         c.minBackslashCount, c.pruneAdjacentBackslashes)) {
                 ++pruned;
             } else {
                 ++checked;
@@ -286,7 +302,9 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
     };
     if (c.requireBothPrunedAndChecked && (pruned == 0 || checked == 0))
         return testBug("pruning is enabled but the range doesn't exercise both pruned and surviving values");
-    if (!c.requireBothPrunedAndChecked && (c.pruneSymbolRuns || c.maxBackslashCount != 0 || c.pruneUnopenedBrackets) == false && pruned != 0)
+    if (!c.requireBothPrunedAndChecked &&
+        (c.pruneSymbolRuns || c.maxBackslashCount != 0 || c.pruneUnopenedBrackets || c.minBackslashCount != 0 || c.pruneAdjacentBackslashes) == false &&
+        pruned != 0)
         return testBug("pruning is disabled but the reference pruned something");
     if (checked == 0)
         return testBug("nothing survived to be checked at all");
@@ -307,6 +325,8 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
     req.pruneSymbolRuns = c.pruneSymbolRuns;
     req.pruneUnopenedBrackets = c.pruneUnopenedBrackets;
     req.pruneWholeCandidate = c.pruneWholeCandidate;
+    req.minBackslashCount = c.minBackslashCount;
+    req.pruneAdjacentBackslashes = c.pruneAdjacentBackslashes;
     req.continuous = false;
 
     std::set<std::string> reported;
@@ -688,6 +708,154 @@ static bool scenarioPruneWholeCandidate() {
     row = index * as;
     ok &= wholeCandidateCase("maxBackslashCount, a pruned row", backslashAlphabet, "TEST\\", false, false, 1, len, row - 60, row + as + 60,
                              {{row - 1, true}, {row, false}, {row + as - 1, false}, {row + as, true}});
+    return ok;
+}
+
+// 7: minBackslashCount and pruneAdjacentBackslashes, at the leading
+// characters only and at every character but the last. Like
+// wholeCandidateCase, the reference must agree with `targets` first.
+struct BackslashRules {
+    int maxCount = 0;
+    int minCount = 0;
+    bool adjacent = false;
+    bool whole = false;
+};
+static bool backslashCase(const std::string& what, const std::string& alphabet, const std::string& prefix, BackslashRules rules, int len,
+                          uint64_t first, uint64_t last, const std::vector<WholeTarget>& targets, bool somethingPruned = true) {
+    bool ok = true;
+    for (const WholeTarget& t : targets) {
+        CaseSpec c;
+        c.alphabet = alphabet;
+        c.prefix = prefix;
+        c.suffix = ".DAT";
+        c.maxBackslashCount = rules.maxCount;
+        c.minBackslashCount = rules.minCount;
+        c.pruneAdjacentBackslashes = rules.adjacent;
+        c.pruneWholeCandidate = rules.whole;
+        c.lower = indexToString(first, len, alphabet);
+        c.upper = indexToString(last, len, alphabet);
+        const std::string target = indexToString(t.index, len, alphabet);
+        c.targetHashA = hashA(prefix + target + c.suffix);
+        c.requireBothPrunedAndChecked = somethingPruned;
+        const std::string label = "7: " + what + ", target '" + target + "' " + (t.survives ? "survives" : "is pruned (must NOT be found)");
+        const int leadingLen = len - trailingLenFor(len, (int) alphabet.size());
+        if (isPruned(target, leadingLen, false, rules.maxCount, false, prefix, rules.whole, rules.minCount, rules.adjacent) == t.survives) {
+            fprintf(stderr, "TEST BUG in '%s': the reference disagrees about the target\n", label.c_str());
+            ++g_failures;
+            ok = false;
+            continue;
+        }
+        if (t.survives) {
+            c.mustBeFound = target;
+            c.targetHashB = hashB(prefix + target + c.suffix);
+            c.expectFound = target;
+        }
+        ok &= runCase(label, c);
+    }
+    return ok;
+}
+
+static bool scenarioBackslashRules() {
+    printf("=== 7: minBackslashCount and pruneAdjacentBackslashes ===\n");
+    bool ok = true;
+    const std::string alphabet = "\\A &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV"; // '\\' = 0, 'A' = 1, ' ' = 2
+    const uint64_t as = alphabet.size();
+    const uint64_t T = ipow(as, g_window);
+    uint64_t index = 0;
+    std::string error;
+
+    // Leading characters only. Two leading characters: "\\\\" (leading
+    // value 0) has two backslashes next to each other, "\\A" (1) doesn't.
+    BackslashRules adjacent;
+    adjacent.adjacent = true;
+    ok &= backslashCase("adjacent backslashes, leading characters", alphabet, "TEST_", adjacent, g_window + 2, T - 200, T + 200,
+                        {{T - 100, false}, {T - 1, false}, {T, true}, {T + 100, true}});
+    // A backslash the prefix ends with is next to a leading "\\" (leading
+    // value 0), not to "A" (1).
+    ok &= backslashCase("adjacent backslashes, the prefix's last one", alphabet, "TEST\\", adjacent, g_window + 1, T - 200, T + 200,
+                        {{T - 100, false}, {T - 1, false}, {T, true}, {T + 100, true}});
+    // At least window + 1 backslashes in window + 1 characters: only a
+    // leading "\\" (leading value 0) leaves enough characters after it.
+    BackslashRules most;
+    most.minCount = g_window + 1;
+    ok &= backslashCase("minBackslashCount, leading characters", alphabet, "TEST_", most, g_window + 1, T - 200, T + 200,
+                        {{T - 100, true}, {T - 1, true}, {T, false}, {T + 100, false}});
+    // ... and with adjacent backslashes forbidden, about half of that: after
+    // a backslash, every other trailing character from the second can be
+    // one; after anything else, every other one from the first. Which
+    // leading values that tells apart depends on whether the window is odd.
+    BackslashRules half;
+    half.minCount = (g_window + 1) / 2 + 1;
+    half.adjacent = true;
+    if (g_window % 2 == 0) {
+        // "\\" (leading value 0) leaves room for g_window / 2 more, "A" (1) for no more.
+        ok &= backslashCase("minBackslashCount, every other one", alphabet, "TEST_", half, g_window + 1, T - 200, T + 200,
+                            {{T - 100, true}, {T - 1, true}, {T, false}, {T + 100, false}});
+    } else {
+        // "\\V" (leading value as - 1) leaves room for (g_window + 1) / 2 more,
+        // "A\\" (as) for one fewer.
+        ok &= backslashCase("minBackslashCount, every other one", alphabet, "TEST_", half, g_window + 2, as * T - 200, as * T + 200,
+                            {{as * T - 100, true}, {as * T - 1, true}, {as * T, false}, {as * T + 100, false}});
+    }
+
+    // Every character but the last. At least 5 characters, so that rows and
+    // row groups have characters of their own.
+    const int len = std::max(g_window + 1, 5);
+    BackslashRules wholeAdjacent = adjacent;
+    wholeAdjacent.whole = true;
+    // Rows "A...A\\\\" are pruned, "A...A\\A" and "A...A\\ " not - nor
+    // is "A...AA\\" followed by a backslash, as the last character isn't
+    // checked.
+    stringToIndex(std::string(len - 3, 'A') + "\\\\", alphabet, index, error);
+    uint64_t row = index * as;
+    ok &= backslashCase("adjacent backslashes, a pruned row", alphabet, "TEST_", wholeAdjacent, len, row - 60, row + as + 60,
+                        {{row - 1, true}, {row, false}, {row + as - 1, false}, {row + as, true}});
+    stringToIndex(std::string(len - 2, 'A') + "\\", alphabet, index, error);
+    ok &= backslashCase("adjacent backslashes, the last character unchecked", alphabet, "TEST_", wholeAdjacent, len, index * as - 60,
+                        index * as + 60, {{index * as - 1, true}, {index * as, true}, {index * as + 1, true}}, false);
+    // With no leading characters at all, the prefix's backslash goes to the
+    // backend as the state its rows start from: candidates starting with
+    // "\\" are pruned, those starting with " " right after them not.
+    if (g_window >= 2) {
+        const std::string backslashSecond = "A\\ &'()+,-.0123456789BCDEFGHIJKLMNOPQRSTUV"; // 'A' = 0, '\\' = 1, ' ' = 2
+        const uint64_t space = 2 * (T / as);
+        ok &= backslashCase("adjacent backslashes, the prefix's last one, no leading characters", backslashSecond, "TEST\\", wholeAdjacent,
+                            g_window, space - 60, space + 60, {{space - 1, false}, {space - 20, false}, {space, true}, {space + 50, true}});
+    }
+
+    // At least two: the rows of a row group with none - "B" followed by "A"s
+    // - are pruned, but for the one that ends in a backslash, where the last
+    // character could be another.
+    BackslashRules two;
+    two.minCount = 2;
+    two.whole = true;
+    stringToIndex("B" + std::string(len - 3, 'A'), alphabet, index, error);
+    uint64_t group = index * as * as;
+    ok &= backslashCase("minBackslashCount, rows a backslash short", alphabet, "TEST_", two, len, group - 60, group + as * as + 60,
+                        {{group - 1, true}, {group, true}, {group + as - 1, true}, {group + as, false}, {group + 2 * as + 3, false},
+                         {group + as * as - 1, false}, {group + as * as, true}});
+    // At least three: a row group with none - "B...BAVV" - can't have enough
+    // at all; one with two - "B...B\\\\" - has, whatever follows; one with
+    // one - "B...B\\A" - only in its rows that end in another.
+    BackslashRules three = two;
+    three.minCount = 3;
+    stringToIndex(std::string(len - 4, 'B') + "\\\\", alphabet, index, error);
+    group = index * as * as;
+    ok &= backslashCase("minBackslashCount, row groups too few", alphabet, "TEST_", three, len, group - as * as, group + 2 * as * as - 1,
+                        {{group - as * as + as + 7, false}, {group, true}, {group + as * as - 1, true}, {group + as * as, true},
+                         {group + as * as + as, false}, {group + 2 * as * as - 1, false}});
+    // At least two with no two next to each other: in the row group
+    // "A...A\\", the rows that add another backslash are pruned, the others
+    // not. In the next one, "A...AA", a backslash in the row leaves no room
+    // for another in the last character, so all its rows are pruned - though
+    // without the adjacency rule, those ending in a backslash would do.
+    BackslashRules twoApart = two;
+    twoApart.adjacent = true;
+    stringToIndex(std::string(len - 3, 'A') + "\\", alphabet, index, error);
+    group = index * as * as;
+    const uint64_t next = group + as * as;
+    ok &= backslashCase("minBackslashCount, every other one, row groups", alphabet, "TEST_", twoApart, len, group, next + 60,
+                        {{group, false}, {group + as - 1, false}, {group + as, true}, {next - 1, true}, {next, false}, {next + 5, false}});
     return ok;
 }
 
@@ -1085,6 +1253,8 @@ static bool fuzz(int iterations, uint64_t seed) {
         if (!highBytes && uni(4) == 0) c.maxBackslashCount = 1 + (int) uni(3);
         if (uni(3) == 0) c.pruneUnopenedBrackets = true;
         if (uni(2) == 0) c.pruneWholeCandidate = true;
+        if (!highBytes && uni(4) == 0) c.pruneAdjacentBackslashes = true;
+        if (!highBytes && uni(4) == 0) c.minBackslashCount = std::min(1 + (int) uni(3), c.maxBackslashCount != 0 ? c.maxBackslashCount : 3);
 
         // Plant a target at a random position in the range (or none).
         if (uni(10) < 8) {
@@ -1093,24 +1263,26 @@ static bool fuzz(int iterations, uint64_t seed) {
             c.targetHashA = hashA(c.prefix + planted + c.suffix);
             int leadingLen = len - trailingLenFor(len, as);
             bool survives = !isPruned(planted, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix,
-                                      c.pruneWholeCandidate);
+                                      c.pruneWholeCandidate, c.minBackslashCount, c.pruneAdjacentBackslashes);
             if (survives) c.mustBeFound = planted;
             if (uni(2) == 0) {
                 c.targetHashB = hashB(c.prefix + planted + c.suffix);
                 if (survives) c.expectFound = planted;
             }
         }
-        char label[200];
-        snprintf(label, sizeof(label), "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d brackets=%d whole=%d high=%d",
+        char label[240];
+        snprintf(label, sizeof(label),
+                 "Z[seed %llu, iteration %d] as=%d len=%d n=%llu prefix=%d suffix=%d prune=%d bs=%d minbs=%d adjacent=%d brackets=%d whole=%d high=%d",
                  (unsigned long long) seed, it, as, len, (unsigned long long) n, pl, sl, c.pruneSymbolRuns, c.maxBackslashCount,
-                 c.pruneUnopenedBrackets, c.pruneWholeCandidate, highBytes);
+                 c.minBackslashCount, c.pruneAdjacentBackslashes, c.pruneUnopenedBrackets, c.pruneWholeCandidate, highBytes);
         // An entirely-pruned range is a legitimate outcome here; skip the reference's "nothing survived" TEST BUG check for those.
         {
             int leadingLen = len - trailingLenFor(len, as);
             std::string cand = lower;
             bool anySurvives = false;
             for (uint64_t i = 0; i <= steps && !anySurvives; ++i) {
-                if (!isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate))
+                if (!isPruned(cand, leadingLen, c.pruneSymbolRuns, c.maxBackslashCount, c.pruneUnopenedBrackets, c.prefix, c.pruneWholeCandidate,
+                              c.minBackslashCount, c.pruneAdjacentBackslashes))
                     anySurvives = true;
                 stepCandidate(cand, c.alphabet);
             }
@@ -1159,6 +1331,7 @@ int main(int argc, char** argv) {
     allPassed &= scenarioPruneUnopenedBrackets();
     allPassed &= scenarioPrefixBackslashes();
     allPassed &= scenarioPruneWholeCandidate();
+    allPassed &= scenarioBackslashRules();
     allPassed &= scenarioSingleCandidate();
     allPassed &= scenarioGeometry();
     allPassed &= scenarioSmallAlphabets();

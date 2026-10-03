@@ -229,6 +229,7 @@ id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen, bool list
             @"HASHA_MATCH_MASK": @(kHashAMatchMask),
             @"FILTER_BITS": @(kLowBitsFilterBits),
             @"ROWS_PER_THREAD": @(kRowsPerThread),
+            @"ROW_FLAG_BITS": @(kRowFlagBits),
             @"LISTED": @(listed ? 1 : 0),
         };
         NSError* error = nil;

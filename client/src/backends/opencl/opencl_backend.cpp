@@ -283,7 +283,8 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, b
                                 " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES) +
                                 " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
                                 " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits) +
-                                " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread) + " -DLISTED=" + (listed ? "1" : "0");
+                                " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread) + " -DROW_FLAG_BITS=" + std::to_string(kRowFlagBits) +
+                                " -DLISTED=" + (listed ? "1" : "0");
     if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
         size_t size = 0;
         clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);

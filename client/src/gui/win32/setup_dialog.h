@@ -29,6 +29,7 @@ struct SetupDialogFields {
     // Local Search tab - see SearchRequest/buildSearchRequest.
     std::string alphabet;
     std::string maxBackslashCount = "0";
+    std::string minBackslashCount = "0";
     std::string prefix;
     std::string suffix;
     std::string startCandidate;
@@ -39,6 +40,7 @@ struct SetupDialogFields {
     bool pruneSymbolRuns = false;
     bool pruneUnopenedBrackets = false;
     bool pruneWholeCandidate = false;
+    bool pruneAdjacentBackslashes = false;
 
     // Result: "coordinator" | "bounded" | "continuous", set only if OK was
     // pressed (see showSetupDialog's return value).

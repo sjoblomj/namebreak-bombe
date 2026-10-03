@@ -56,8 +56,8 @@ using namespace metal;
 #define CHUNKS_PER_GROUP ((ALPHABET_SIZE + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD)
 
 // An entry of a row groups' list: the group, shifted past its flags
-// (kRowFlagBits in backends/common/row_pruning.h).
-#define ROW_FLAG_BITS 4
+// (ROW_FLAG_BITS, given by the host: kRowFlagBits in
+// backends/common/row_pruning.h).
 #define ROW_FLAG_COUNT (1 << ROW_FLAG_BITS)
 
 // Must match RowArgs in metal_backend.mm.
@@ -93,6 +93,7 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
                        constant ulong* rowMasks [[buffer(9)]],        // the rows an entry's flags allow (RowPruning::rowMasks)
                        uint t [[thread_position_in_grid]],
                        uint lid [[thread_position_in_threadgroup]],
+                       uint threadgroupSize [[threads_per_threadgroup]],
                        uint threads [[threads_per_grid]]) {
     // The rows' characters, and the few last characters the filter lets
     // through, differ between threads, so they're looked up here rather than
@@ -107,8 +108,8 @@ kernel void searchRows(constant RowArgs& args [[buffer(0)]],
         sOrd[lid] = alphabetOrd[lid];
     }
 #if LISTED
-    if (lid < ROW_FLAG_COUNT)
-        sRowMasks[lid] = rowMasks[lid];
+    for (uint i = lid; i < ROW_FLAG_COUNT; i += threadgroupSize) // a threadgroup may have fewer threads
+        sRowMasks[i] = rowMasks[i];
 #endif
     threadgroup_barrier(mem_flags::mem_threadgroup); // before anything returns, so every thread reaches it
 

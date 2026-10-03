@@ -63,8 +63,8 @@
 #define CHUNKS_PER_GROUP ((ALPHABET_SIZE + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD)
 
 // An entry of a row groups' list: the group, shifted past its flags
-// (kRowFlagBits in backends/common/row_pruning.h).
-#define ROW_FLAG_BITS 4
+// (ROW_FLAG_BITS, given by the host: kRowFlagBits in
+// backends/common/row_pruning.h).
 #define ROW_FLAG_COUNT (1 << ROW_FLAG_BITS)
 
 // These three must match their namesakes in opencl_backend.cpp.
@@ -122,8 +122,8 @@ __kernel void searchRows(uint targetA,
         sOrd[lid] = alphabetOrd[lid];
     }
 #if LISTED
-    if (lid < ROW_FLAG_COUNT)
-        sRowMasks[lid] = rowMasks[lid];
+    for (uint i = lid; i < ROW_FLAG_COUNT; i += get_local_size(0)) // a work-group may have fewer work-items
+        sRowMasks[i] = rowMasks[i];
 #endif
     barrier(CLK_LOCAL_MEM_FENCE); // before anything returns, so every work-item reaches it
 

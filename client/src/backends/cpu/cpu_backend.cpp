@@ -109,7 +109,8 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
     state2[0] = ctx.seed2Start;
     // And, when the whole candidate is pruned, the rules' state after the
     // first d of them - a row is searched only if none of its characters
-    // breaks a rule (valid[prefixDigits]).
+    // breaks a rule (valid[prefixDigits]), and its last character could
+    // still make up the backslashes the rules ask for.
     const bool pruning = ctx.rules->any();
     std::vector<PruneState> pruneState(ctx.prefixDigits + 1);
     std::vector<char> valid(ctx.prefixDigits + 1, 1);
@@ -137,7 +138,8 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
         // Restricted to the alphabet - which the table never exceeds anyway,
         // but a stray bit must not index past key/ord - and to the batch's
         // range in its first and last row. None, in a pruned row.
-        uint64_t mask = valid[ctx.prefixDigits] ? ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask : 0;
+        const bool rowValid = valid[ctx.prefixDigits] && canReachMinBackslashes_CPU(*ctx.rules, pruneState[ctx.prefixDigits], 1);
+        uint64_t mask = rowValid ? ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask : 0;
         if (i == 0)
             mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;       // firstRowStartK is in [0, as)
         if (i == ctx.rows.rowCount - 1)

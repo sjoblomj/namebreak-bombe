@@ -161,6 +161,7 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& mat
     SearchRequest req;
     req.alphabet = claim.alphabet;
     req.maxBackslashCount = (int) claim.maxBackslashCount;
+    req.minBackslashCount = (int) claim.minBackslashCount;
     req.prefix = claim.prefix;
     req.suffix = claim.suffix;
     req.lowerBound = removePrefixAndSuffix(claim.lowerBoundFilename, req.prefix, req.suffix);
@@ -171,6 +172,7 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& mat
     req.pruneSymbolRuns = claim.pruneSymbolRuns;
     req.pruneUnopenedBrackets = claim.pruneUnopenedBrackets;
     req.pruneWholeCandidate = claim.pruneWholeCandidate;
+    req.pruneAdjacentBackslashes = claim.pruneAdjacentBackslashes;
     req.continuous = false; // a coordinator range is always run "bounded"
     req.outputFilePath = matchesFilePath(matchesDir, claim.targetName);
     if (!hexToU32(claim.hashAHex, req.targetHashA) || !hexToU32(claim.hashBHex, req.targetHashB)) {

@@ -128,7 +128,9 @@ resume_from_last_candidate = true
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex (`0x` prefix optional). |
 | `prune_symbol_runs` | no (default `false`) | Skip candidates containing 3+ consecutive non-alphanumeric, non-space characters (real MPQ filenames essentially never have runs like that) - see [Design decisions](#design-decisions). |
 | `prune_unopened_brackets` | no (default `false`) | Skip candidates that close a bracket never opened: reading left to right, a `)` at a point where more `)` than `(` have been seen, or likewise a `]` with `[`. The two kinds are counted separately (how they nest within each other isn't checked). Brackets left open by `prefix` count as opened, so a candidate may close those - see [Design decisions](#design-decisions). |
-| `prune_whole_candidate` | no (default `false`) | Apply `prune_symbol_runs`, `prune_unopened_brackets` and `max_backslash_count` to every character of a candidate but the last, instead of only to its leading characters (all but the last five or so). About a fifth fewer candidates are searched, and a search is about 10% faster on a GPU - see [Design decisions](#design-decisions). |
+| `min_backslash_count` | no (default `0`) | Min `\` occurrences a candidate must have; `0` means none needed. Like `max_backslash_count`, the prefix's own don't count, and it must not be more than `max_backslash_count` (unless that's `0`). A candidate is skipped once the characters checked (see `prune_whole_candidate`) leave too few after them to make up the difference, even if every one were a `\` (every other one, with `prune_adjacent_backslashes`) - so without `prune_whole_candidate`, only candidates that need more `\` than the last five or so characters can hold. |
+| `prune_adjacent_backslashes` | no (default `false`) | Skip candidates with two `\` next to each other - including a `\` at the very start of the candidate when `prefix` ends with one. |
+| `prune_whole_candidate` | no (default `false`) | Apply `prune_symbol_runs`, `prune_unopened_brackets`, `max_backslash_count`, `min_backslash_count` and `prune_adjacent_backslashes` to every character of a candidate but the last, instead of only to its leading characters (all but the last five or so). About a fifth fewer candidates are searched, and a search is about 10% faster on a GPU - see [Design decisions](#design-decisions). |
 
 `[coordinator]` keys (`coordinator` mode only) are `server_url` (required),
 plus optional `username`, `hostname` (auto-detected and interactively
@@ -890,7 +892,10 @@ only ever examine a candidate's leading characters (everything except the
 trailing window). For `prune_unopened_brackets` that is still exact as far as
 it goes: once the leading characters have closed a bracket nobody opened,
 nothing in the trailing window can change that - it just never looks at a
-stray closer that only appears in the trailing window.
+stray closer that only appears in the trailing window. The same goes for
+`prune_adjacent_backslashes`, added later, and `min_backslash_count` asks
+of the leading characters only whether the trailing window could still
+hold the backslashes they lack.
 
 Those measurements were of the kernel as it was before the lookup filter,
 when a check had to be paid on every candidate - and a check in the kernel
@@ -907,13 +912,17 @@ groups out of what it searches:
 
 - Whether a candidate breaks a rule at a trailing character depends only on
   the trailing characters before it and on the state the leading ones left
-  - the symbol run so far, the brackets open, the backslashes used. For
+  - the symbol run so far, the brackets open, the backslashes used (and
+  whether the last character was one). For
   each such state (32 occur in a real search: 470 KB of list each, 15 MB
   in all), the host
   lists the row groups that survive, and for each, which of its rows do: a
   flag for each rule its characters have used up (no symbol, no `)`, no
-  `]`, no `\` allowed next), which stands for a set of the rows' own last
-  characters (`backends/common/row_pruning.h`). A list depends only on the
+  `]`, no `\` allowed next - or nothing but a `\`, when `min_backslash_count`
+  needs one there and in the last character both), which stands for a set
+  of the rows' own last characters (`backends/common/row_pruning.h`). A
+  group that can't reach `min_backslash_count` whatever follows isn't
+  listed. A list depends only on the
   alphabet, the rules, the trailing length and that state, so it's built the
   first time a batch needs it, uploaded once, and kept for the next search.
 - The GPU kernels walk the batch's list instead of every row group, so a
@@ -925,7 +934,8 @@ groups out of what it searches:
   the whole candidate gets the kernel that walks every group, as before -
   the kernels are compiled both ways. The CPU backend checks its rows as it
   walks them, and skips the pruned ones.
-- A candidate's last character is never checked. Skipping one would save
+- A candidate's last character is never checked - for `min_backslash_count`,
+  it's assumed to be a `\` if it may be one. Skipping one would save
   nothing - its row is hashed anyway, and at most a few of its candidates
   get past the lookup filter - so every candidate a row has is searched,
   whatever its last character. That the last character is left out is part

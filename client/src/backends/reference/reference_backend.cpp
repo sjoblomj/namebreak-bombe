@@ -75,12 +75,14 @@ BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_
 
     for (uint64_t n = 0; n < count; ++n) {
         // Pruned: every trailing character but the last, checked from
-        // where the leading characters left off.
+        // where the leading characters left off - and the last one, if even
+        // a backslash there would leave too few.
         bool pruned = false;
         if (rules_.any()) {
             PruneState state = params.pruneEntry;
             for (int i = 0; i + 1 < trailingLen && !pruned; ++i)
                 pruned = !pruneStep_CPU(rules_, state, alphabet_[digit[i]]);
+            pruned = pruned || !canReachMinBackslashes_CPU(rules_, state, 1);
         }
         uint32_t seed1 = params.seed1Start, seed2 = params.seed2Start;
         for (int i = 0; i < trailingLen; ++i)

@@ -23,7 +23,8 @@
 // sizes it had compiled in - so an alphabet of a new size, tagged 1.3, is
 // only ever handed to this client or a newer one. It also tells the server
 // when it quits with a range in hand (see QuitRequest).
-constexpr const char* kProtocolVersion = "1.3.0";
+// 1.4.0: ClaimResponse's min_backslash_count and prune_adjacent_backslashes.
+constexpr const char* kProtocolVersion = "1.4.0";
 
 struct RegisterRequest {
     std::string username;
@@ -69,6 +70,10 @@ struct ClaimResponse {
     // Optional in the response (false when absent).
     bool pruneWholeCandidate = false;
     int64_t maxBackslashCount = 0;
+    // Optional in the response (0 when absent).
+    int64_t minBackslashCount = 0;
+    // Optional in the response (false when absent).
+    bool pruneAdjacentBackslashes = false;
     std::string lowerBoundFilename;
     std::string upperBoundFilename;
     std::string alphabet;

@@ -29,10 +29,20 @@ struct SearchRequest {
     // hasUnopenedBracket_CPU (candidate.h). Brackets opened in `prefix`
     // count as open, so a candidate may close those.
     bool pruneUnopenedBrackets = false;
-    // false: the three rules above (pruneSymbolRuns, pruneUnopenedBrackets,
-    // maxBackslashCount) look only at a candidate's leading characters, which
-    // the engine enumerates on the CPU. true: at every character but the
-    // last - the backend skips the rows of its trailing part that break one
+    // Skip candidates with fewer backslashes than this (0: none needed). Like
+    // maxBackslashCount, the prefix's own don't count. Checked as "can the
+    // characters not checked yet still make up the difference?", so a
+    // candidate is only skipped once its checked characters leave too few
+    // after them (see canReachMinBackslashes_CPU in candidate.h). At most
+    // maxBackslashCount, unless that's 0.
+    int minBackslashCount = 0;
+    // Skip candidates with two backslashes next to each other - including a
+    // backslash at the candidate's start right after one `prefix` ends with.
+    bool pruneAdjacentBackslashes = false;
+    // false: the rules above (pruneSymbolRuns, pruneUnopenedBrackets,
+    // maxBackslashCount, minBackslashCount, pruneAdjacentBackslashes) look
+    // only at a candidate's leading characters, which the engine enumerates
+    // on the CPU. true: at every character but the last - the backend skips the rows of its trailing part that break one
     // (see README.md's "Design decisions"). A candidate's last character is
     // never checked: skipping one costs a GPU as much as searching it.
     bool pruneWholeCandidate = false;

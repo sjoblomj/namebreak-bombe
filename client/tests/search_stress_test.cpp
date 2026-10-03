@@ -137,8 +137,11 @@ struct Case {
     // runSearch) - or, with pruneWholeCandidate, of every character but its
     // last, which the backend does for its trailing part: a pruned candidate
     // is never searched, so never a hit.
-    bool pruneSymbolRuns = false, pruneUnopenedBrackets = false, pruneWholeCandidate = false;
+    bool pruneSymbolRuns = false, pruneUnopenedBrackets = false, pruneWholeCandidate = false, pruneAdjacentBackslashes = false;
     int maxBackslashCount = 0;
+    // Pruned once the characters after those checked are too few for this
+    // many backslashes, even if every one that may be is one.
+    int minBackslashCount = 0;
     int leadingLen = 0;
     // How many of a candidate's first characters the rules look at.
     int checkedLen() const { return pruneWholeCandidate ? len - 1 : leadingLen; }
@@ -149,9 +152,17 @@ struct Case {
 // look at.
 static bool isPruned(const Case& c, const std::string& candidate) {
     const std::string_view leading(candidate.data(), c.checkedLen());
+    // The checked characters, after the prefix's last one - a backslash it
+    // ends with is next to one the candidate starts with.
+    const std::string withPrefixEnd = (c.prefix.empty() ? std::string() : c.prefix.substr(c.prefix.size() - 1)) + std::string(leading);
+    const bool endsWithBackslash = !withPrefixEnd.empty() && withPrefixEnd.back() == '\\';
+    const int unchecked = c.len - c.checkedLen();
+    const int mostToCome = !c.pruneAdjacentBackslashes ? unchecked : endsWithBackslash ? unchecked / 2 : (unchecked + 1) / 2;
     return (c.pruneSymbolRuns && hasForbiddenSymbolRun_CPU(leading)) ||
            (c.maxBackslashCount != 0 && countBackslashes_CPU(leading) > c.maxBackslashCount) ||
-           (c.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, openBracketsAfter_CPU(c.prefix)));
+           (c.pruneUnopenedBrackets && hasUnopenedBracket_CPU(leading, openBracketsAfter_CPU(c.prefix))) ||
+           (c.pruneAdjacentBackslashes && withPrefixEnd.find("\\\\") != std::string::npos) ||
+           (c.minBackslashCount != 0 && countBackslashes_CPU(leading) + mostToCome < c.minBackslashCount);
 }
 
 // The brute force: every candidate in [first, last] that isn't pruned, hashed
@@ -211,10 +222,13 @@ static std::vector<std::string> bruteForce(const Case& c) {
 static std::string describe(const Case& c) {
     char buf[512];
     snprintf(buf, sizeof(buf),
-             "alphabet size %zu, prefix length %zu, suffix length %zu, candidate length %d, indices %llu..%llu, target 0x%08X, pruning %s%s%s%s",
+             "alphabet size %zu, prefix length %zu, suffix length %zu, candidate length %d, indices %llu..%llu, target 0x%08X, pruning %s%s%s%s%s%s%s",
              c.alphabet.size(), c.prefix.size(), c.suffix.size(), c.len, (unsigned long long) c.first, (unsigned long long) c.last, c.targetA,
              c.pruneSymbolRuns ? "symbol runs " : "", c.pruneUnopenedBrackets ? "brackets " : "",
-             c.maxBackslashCount != 0 ? "backslashes " : (c.pruneSymbolRuns || c.pruneUnopenedBrackets ? "" : "none "),
+             c.maxBackslashCount != 0 ? "max-backslashes " : "", c.minBackslashCount != 0 ? "min-backslashes " : "",
+             c.pruneAdjacentBackslashes ? "adjacent-backslashes " : "",
+             c.pruneSymbolRuns || c.pruneUnopenedBrackets || c.maxBackslashCount != 0 || c.minBackslashCount != 0 || c.pruneAdjacentBackslashes ? ""
+                                                                                                                                     : "none ",
              c.pruneWholeCandidate ? "(whole candidate)" : "(leading characters)");
     return buf;
 }
@@ -310,6 +324,8 @@ static long runCase(Case c, std::mt19937_64& rng) {
     req.pruneSymbolRuns = c.pruneSymbolRuns;
     req.pruneUnopenedBrackets = c.pruneUnopenedBrackets;
     req.maxBackslashCount = c.maxBackslashCount;
+    req.minBackslashCount = c.minBackslashCount;
+    req.pruneAdjacentBackslashes = c.pruneAdjacentBackslashes;
     req.pruneWholeCandidate = c.pruneWholeCandidate;
 
     std::vector<std::string> reported;
@@ -425,6 +441,9 @@ int main(int argc, char** argv) {
             c.pruneSymbolRuns = rng() % 2 == 0;
             c.pruneUnopenedBrackets = rng() % 2 == 0;
             c.maxBackslashCount = rng() % 3 == 0 ? 1 + (int) (rng() % 2) : 0;
+            c.pruneAdjacentBackslashes = rng() % 3 == 0;
+            if (rng() % 3 == 0)
+                c.minBackslashCount = std::min(1 + (int) (rng() % 3), c.maxBackslashCount != 0 ? c.maxBackslashCount : 3);
             // Half of them at every character but the last, which the
             // backend prunes rows and row groups for.
             c.pruneWholeCandidate = rng() % 2 == 0;

@@ -89,6 +89,8 @@ struct DeviceBuffers {
 };
 
 static_assert(kThreadsPerBlock >= MAX_ALPHABET_SIZE, "filteredRowsKernel needs one thread per alphabet entry to fill its shared tables");
+static_assert(kThreadsPerBlock >= kRowFlagCount, "filteredRowsKernel needs one thread per row mask to fill sRowMasks");
+static_assert(sizeof(d_rowMasks) == kRowFlagCount * sizeof(uint64_t), "d_rowMasks must hold every row mask");
 
 // One batch of a launch, as filteredRowsKernel needs it (see runBatches): its
 // rows, from row firstRowD of row group firstGroup to row lastRowD of group

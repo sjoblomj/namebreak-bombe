@@ -111,6 +111,24 @@ int main() {
     check(wholeOf("false") == "false", "false: leading characters only");
     check(wholeOf("sometimes").rfind("<error:", 0) == 0, "not a boolean: an error");
 
+    printf("--- min_backslash_count and prune_adjacent_backslashes ---\n");
+    auto backslashRulesOf = [](const std::string& minCount, const std::string& adjacent) {
+        ConfigFile config = makeConfig("", "");
+        if (!minCount.empty())
+            config.search["min_backslash_count"] = minCount;
+        if (!adjacent.empty())
+            config.search["prune_adjacent_backslashes"] = adjacent;
+        SearchRequest req;
+        std::string error;
+        if (!buildSearchRequest(config, true, req, error))
+            return std::string("<error: ") + error + ">";
+        return std::to_string(req.minBackslashCount) + (req.pruneAdjacentBackslashes ? " adjacent" : "");
+    };
+    check(backslashRulesOf("", "") == "0", "not given: no minimum, adjacent backslashes allowed");
+    check(backslashRulesOf("2", "true") == "2 adjacent", "given: read");
+    check(backslashRulesOf("lots", "").rfind("<error:", 0) == 0, "min_backslash_count not a number: an error");
+    check(backslashRulesOf("", "sometimes").rfind("<error:", 0) == 0, "prune_adjacent_backslashes not a boolean: an error");
+
     std::filesystem::remove_all(kDir);
     if (g_failures) {
         fprintf(stderr, "%d check(s) FAILED\n", g_failures);
