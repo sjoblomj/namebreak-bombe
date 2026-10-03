@@ -22,7 +22,7 @@ coordinator/
 ```
 
 Visit the server's base URL in a browser (`GET /`) for a live dashboard - every
-target with its bound filenames, its ranges, each range's status and who worked on it (from
+target with its bound filenames, prefix, suffix, pruning rules and insertions, its ranges, each range's status and who worked on it (from
 `last_assigned_user_id`, which - unlike `assigned_user_id` - is never cleared on
 reclaim), and a solved target's find called out with a prominent banner. If a
 range was reassigned partway through (see progress checkpointing below), each

@@ -189,6 +189,12 @@
     font-size: 12px;
     margin-top: 4px;
   }
+  .target-settings {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 4px;
+  }
+  .target-settings [title] { cursor: help; }
   .target-skip {
     color: var(--muted);
     font-size: 12px;
@@ -1487,6 +1493,75 @@
     return tableScroll;
   }
 
+  // "Label: a  ·  b  ·  c" for the settings under a target's hashes. Each
+  // part is a string, a Node, or an array of those, appended together.
+  function settingsLine(label, parts) {
+    const line = document.createElement('div');
+    line.className = 'target-settings';
+    line.append(label + ': ');
+    parts.forEach((part, i) => {
+      if (i > 0) line.append('  ·  ');
+      line.append(...[part].flat());
+    });
+    return line;
+  }
+
+  // Text with an explanation on hover.
+  function hint(text, tooltip) {
+    const span = document.createElement('span');
+    span.textContent = text;
+    span.title = tooltip;
+    return span;
+  }
+
+  // An affix or inserted text, boxed like a candidate - or "none" for an
+  // empty one, which would otherwise be an empty box.
+  function literalOrNone(text) {
+    return text ? candidateChip(text) : 'none';
+  }
+
+  function backslashes(n) {
+    return n === 1 ? '1 backslash' : `${n} backslashes`;
+  }
+
+  function characters(n) {
+    return n === 1 ? '1 character' : `${n} characters`;
+  }
+
+  // Prefix/suffix, the pruning rules and the insertions - what ranges
+  // claimed from now on are searched with (see DashboardTarget).
+  function targetSettings(t) {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(settingsLine('Prefix', [literalOrNone(t.prefix), ['Suffix: ', literalOrNone(t.suffix)]]));
+
+    const rules = [];
+    if (t.prune_symbol_runs) rules.push(hint('symbol runs', 'Skips candidates with 3+ consecutive non-alphanumeric, non-space characters'));
+    if (t.prune_unopened_brackets) rules.push(hint('unopened brackets', 'Skips candidates closing a ) or ] that was never opened'));
+    if (t.prune_adjacent_backslashes) rules.push(hint('adjacent backslashes', 'Skips candidates with two \\ next to each other'));
+    if (t.max_backslash_count > 0) rules.push(`more than ${backslashes(t.max_backslash_count)}`);
+    if (t.min_backslash_count > 0) rules.push(hint(t.min_backslash_count === 1 ? 'no backslashes' : `fewer than ${backslashes(t.min_backslash_count)}`, "The prefix's own backslashes don't count"));
+    if (rules.length === 0) {
+      rules.push('none');
+    } else if (t.prune_whole_candidate) {
+      rules.push(hint('on the whole candidate', 'Checked on every character but the last'));
+    } else {
+      rules.push(hint('on leading characters', 'Checked on all but the last five or so characters'));
+    }
+    frag.appendChild(settingsLine('Pruning', rules));
+
+    const insertions = [];
+    if (t.insert_from_start) {
+      const [text, position] = t.insert_from_start;
+      insertions.push([candidateChip(text), position === 0 ? ' at the start' : ` after the first ${characters(position)}`]);
+    }
+    if (t.insert_from_end) {
+      const [text, position] = t.insert_from_end;
+      insertions.push([candidateChip(text), position === 0 ? ' at the end' : ` before the last ${characters(position)}`]);
+    }
+    if (insertions.length > 0) frag.appendChild(settingsLine('Inserting', insertions));
+    return frag;
+  }
+
   function targetCard(t) {
     const card = document.createElement('div');
     card.className = 'target-card' + (t.status === 'solved' ? ' solved' : '');
@@ -1511,6 +1586,7 @@
     hashes.className = 'target-hashes mono';
     hashes.textContent = `Hash A: ${t.hash_a_hex}  ·  Hash B: ${t.hash_b_hex}`;
     card.appendChild(hashes);
+    card.appendChild(targetSettings(t));
 
     if (t.alphabet_name) {
       const alphaLine = document.createElement('div');

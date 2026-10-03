@@ -18,7 +18,7 @@ fn as_decimal<S: Serializer>(n: &Pos, serializer: S) -> Result<S::Ok, S::Error> 
 
 use crate::alphabet::{bound_indices_at_len, ceil_index, floor_index, index_to_candidate, join_pos, max_supported_len, space_size, Pos};
 use crate::error::AppError;
-use crate::models::{i64_to_u32, PriorityRange, Segment, SkipRange};
+use crate::models::{i64_to_u32, PriorityRange, Segment, SkipRange, Target};
 use crate::ranges::{count_within, owned_spans};
 use crate::state::AppState;
 
@@ -149,6 +149,20 @@ pub struct DashboardTarget {
     /// Shown just below the target's name - see `models::Target::hash_a`/`hash_b`.
     pub hash_a_hex: String,
     pub hash_b_hex: String,
+    /// Shown below the hashes, with the settings below.
+    pub prefix: String,
+    pub suffix: String,
+    /// The pruning rules and insertions ranges claimed from now on are
+    /// searched with - see `AdminCreateTargetRequest`'s fields of the same
+    /// names. Ranges already in progress may have been claimed with others.
+    pub prune_symbol_runs: bool,
+    pub prune_unopened_brackets: bool,
+    pub prune_whole_candidate: bool,
+    pub max_backslash_count: i64,
+    pub min_backslash_count: i64,
+    pub prune_adjacent_backslashes: bool,
+    pub insert_from_start: Option<(String, i64)>,
+    pub insert_from_end: Option<(String, i64)>,
     pub found_filename: Option<String>,
     pub found_by: Option<String>,
     /// The backend `found_by` searches with ("cuda", "cpu", ...) - see
@@ -458,6 +472,15 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     .fetch_all(&state.pool)
     .await?;
 
+    // The rest of each target's settings, which don't fit in target_rows
+    // above - it's already at sqlx's 16-column tuple limit.
+    let mut settings_by_target: HashMap<i64, Target> = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE is_virtual = 0")
+        .fetch_all(&state.pool)
+        .await?
+        .into_iter()
+        .map(|target| (target.id, target))
+        .collect();
+
     // The dashboard renders every target unconditionally, so there's no
     // filtering benefit to a per-target `WHERE target_id = ?` on the child
     // tables below - fetch each one whole (1 query apiece, independent of
@@ -532,6 +555,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
 
     let mut targets = Vec::with_capacity(target_rows.len());
     for (id, name, status, lower_bound, upper_bound, hash_a, hash_b, found_filename, found_by, found_by_backend, found_at, alphabet_name, alphabet, priority, description) in target_rows {
+        // Deleted since target_rows was read - leave it out, as the next refresh will.
+        let Some(settings) = settings_by_target.remove(&id) else { continue };
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
 
         let mut ranges: Vec<DashboardRange> = range_rows
@@ -625,6 +650,16 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             upper_bound,
             hash_a_hex: format!("0x{:08X}", i64_to_u32(hash_a)),
             hash_b_hex: format!("0x{:08X}", i64_to_u32(hash_b)),
+            prefix: settings.prefix,
+            suffix: settings.suffix,
+            prune_symbol_runs: settings.prune_symbol_runs != 0,
+            prune_unopened_brackets: settings.prune_unopened_brackets != 0,
+            prune_whole_candidate: settings.prune_whole_candidate != 0,
+            max_backslash_count: settings.max_backslash_count,
+            min_backslash_count: settings.min_backslash_count,
+            prune_adjacent_backslashes: settings.prune_adjacent_backslashes != 0,
+            insert_from_start: settings.insert_from_start_text.map(|text| (text, settings.insert_from_start_position)),
+            insert_from_end: settings.insert_from_end_text.map(|text| (text, settings.insert_from_end_position)),
             found_filename,
             found_by,
             found_by_backend,
