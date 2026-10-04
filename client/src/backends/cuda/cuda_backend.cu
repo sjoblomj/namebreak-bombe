@@ -80,8 +80,8 @@ constexpr int kHitsReadWithCount = MAX_MATCHES < 16 ? MAX_MATCHES : 16;
 
 struct DeviceBuffers {
     BatchResults* results;
-    // This search's lookup filter: kLowBitsFilterEntries entries, see
-    // buildLowBitsFilterTable (backends/common/lowbits_filter.h).
+    // This search's lookup filter: lowBitsFilterEntries(kCudaLowBitsFilterBits)
+    // entries, see buildLowBitsFilterTable (backends/common/lowbits_filter.h).
     uint64_t* filterTable;
     // The row groups to search - RowPruning::arena() (backends/common/row_pruning.h),
     // of which each batch has a slice.
@@ -123,7 +123,7 @@ struct LaunchBatches {
     LaunchBatch batch[kMaxBatchesPerLaunch];
 };
 
-// Suffix lengths 0-8 (see dispatchSuffixLen) get their own compile-time
+// Suffix lengths 0-12 (see dispatchSuffixLen) get their own compile-time
 // instantiation of filteredRowsKernel, with the suffix loop fully unrolled;
 // anything longer falls back to kRuntimeSuffix.
 constexpr int kRuntimeSuffix = -1;
@@ -353,9 +353,11 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
         rowInsertLen = d_insertLayout.rowLen;
     }
 
-    for (int d = dBegin; d < dEnd; ++d) {
-        uint32_t seed1 = group1;
-        uint32_t seed2 = group2;
+    // A row's state: the group's, one step on for the row's own character d
+    // (and the text inserted after it, if any).
+    auto rowState = [&](int d, uint32_t& seed1, uint32_t& seed2) {
+        seed1 = group1;
+        seed2 = group2;
         if (rowsHaveCharacters) {
             seed1 = sKey[d] ^ groupSum;
             seed2 = sOrd[d] + seed1 + group2Term;
@@ -364,47 +366,78 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
             for (int i = 0; i < rowInsertLen; ++i)
                 mpqStep(seed1, seed2, d_insertKey[rowInsertStart + i], d_insertOrd[rowInsertStart + i]);
         }
-
-        // Bit k: the candidate with last character k is worth hashing.
-        // Restricted to the launch's range in its first and last row - and to
-        // the alphabet, which the table never exceeds anyway, but a stray bit
-        // must not be able to index past sKey. The table doesn't change during
-        // a launch, so it's read through the read-only data path (__ldg).
-        //
-        // A row the pruning leaves out (not in rowMask) gets no candidates:
-        // the lanes of a warp step through their rows together, so skipping
-        // one would save its lane nothing but idle time - while a branch
-        // around every row cost about 4% more (measured with no row pruned).
-        // Whole row groups are left out by the list the chunks come from.
-        uint64_t mask;
-        if constexpr (Listed) {
-            mask = (rowBits & 1) ? __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]) : 0;
-            rowBits >>= 1;
-        } else
-            mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2)]);
+    };
+    // Bit k: the candidate of row d with last character k is worth hashing -
+    // the row's table entry, restricted to the launch's range in its first and
+    // last row, and to the alphabet, which the table never exceeds anyway, but
+    // a stray bit must not be able to index past sKey. The table doesn't
+    // change during a launch, so it's read through the read-only data path
+    // (__ldg).
+    auto rowCandidates = [&](int d, uint32_t seed1, uint32_t seed2) {
+        uint64_t mask = __ldg(&bufs.filterTable[lowBitsFilterIndex(seed1, seed2, kCudaLowBitsFilterBits)]);
         mask &= (d == firstRowD) ? firstRowMask : alphabetMask;
         if (d == lastRowD)
             mask &= lastRowMask;
+        return mask;
+    };
 
-        while (mask != 0) {
-            const int k = __ffsll((long long) mask) - 1;
-            mask &= mask - 1;
-            uint32_t a = seed1, b = seed2;
-            mpqStep(a, b, sKey[k], sOrd[k]);
-            if constexpr (SuffixLen == kRuntimeSuffix) {
-                const int n = d_suffix_size;
-                for (int i = 0; i < n; ++i)
-                    mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
-            } else {
-                #pragma unroll
-                for (int i = 0; i < SuffixLen; ++i)
-                    mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
-            }
-            if (hashAMatches(a, targetA)) {
-                int slot = atomicAdd(&bufs.results->matchCount, 1);
-                if (slot < MAX_MATCHES)
-                    bufs.results->hits[slot] = Hit{groupStart + d, batch, (uint32_t) k};
-            }
+    // First the rows, noting only which of them have candidates worth
+    // hashing (bit i: the chunk's i-th row) - then those candidates, one per
+    // round of the loop below. A warp goes round a loop as many times as its
+    // busiest lane needs: hashing each row's candidates right after its
+    // lookup took as many rounds as the busiest lane's candidates in *each
+    // row*, about twice a row, where this takes as many as its candidates in
+    // the whole chunk.
+    //
+    // A row the pruning leaves out (not in rowMask) gets no candidates: the
+    // lanes of a warp step through their rows together, so skipping one would
+    // save its lane nothing but idle time - while a branch around every row
+    // cost about 4% more (measured with no row pruned). Whole row groups are
+    // left out by the list the chunks come from.
+    ChunkRowBits flaggedRows = 0;
+    for (int d = dBegin; d < dEnd; ++d) {
+        uint32_t seed1, seed2;
+        rowState(d, seed1, seed2);
+        uint64_t mask;
+        if constexpr (Listed) {
+            mask = (rowBits & 1) ? rowCandidates(d, seed1, seed2) : 0;
+            rowBits >>= 1;
+        } else
+            mask = rowCandidates(d, seed1, seed2);
+        flaggedRows |= (ChunkRowBits) (mask != 0) << (d - dBegin);
+    }
+
+    // The flagged rows' candidates: a lane that has hashed its row's takes
+    // the next flagged row, and works its state and candidates out again.
+    uint64_t mask = 0;
+    uint32_t seed1 = 0, seed2 = 0;
+    int d = 0;
+    while ((flaggedRows | mask) != 0) {
+        if (mask == 0) {
+            d = dBegin + __ffsll((long long) flaggedRows) - 1;
+            flaggedRows &= flaggedRows - 1;
+            rowState(d, seed1, seed2);
+            mask = rowCandidates(d, seed1, seed2);
+            if (mask == 0)
+                continue; // can't happen: the same row's candidates as above
+        }
+        const int k = __ffsll((long long) mask) - 1;
+        mask &= mask - 1;
+        uint32_t a = seed1, b = seed2;
+        mpqStep(a, b, sKey[k], sOrd[k]);
+        if constexpr (SuffixLen == kRuntimeSuffix) {
+            const int n = d_suffix_size;
+            for (int i = 0; i < n; ++i)
+                mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < SuffixLen; ++i)
+                mpqStep(a, b, d_suffixKey[i], (unsigned char) d_suffix[i]);
+        }
+        if (hashAMatches(a, targetA)) {
+            int slot = atomicAdd(&bufs.results->matchCount, 1);
+            if (slot < MAX_MATCHES)
+                bufs.results->hits[slot] = Hit{groupStart + d, batch, (uint32_t) k};
         }
     }
 }
@@ -428,7 +461,7 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
 // hashing every candidate of the row, one lookup in this search's filter
 // table (bufs.filterTable, see backends/common/lowbits_filter.h) gives the set
 // of last characters whose hashA has the target's low bits - on average
-// alphabetSize / 2^kLowBitsFilterBits of them, and always including any
+// alphabetSize / 2^kCudaLowBitsFilterBits of them, and always including any
 // candidate that matches the target. Only those are hashed in full. README.md's
 // "The lookup filter" has why the lookup can never leave a match out.
 //
@@ -505,6 +538,10 @@ void dispatchSuffixLen(int suffixLen, F&& f) {
         case 6: f(std::integral_constant<int, 6>{}); break;
         case 7: f(std::integral_constant<int, 7>{}); break;
         case 8: f(std::integral_constant<int, 8>{}); break;
+        case 9: f(std::integral_constant<int, 9>{}); break;
+        case 10: f(std::integral_constant<int, 10>{}); break;
+        case 11: f(std::integral_constant<int, 11>{}); break;
+        case 12: f(std::integral_constant<int, 12>{}); break;
         default: f(std::integral_constant<int, kRuntimeSuffix>{}); break;
     }
 }
@@ -722,9 +759,9 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     // the target, so it's built for every search. Checked against its
     // definition before it's used, and read back after the upload to make
     // sure the GPU has exactly what was checked.
-    const std::vector<uint64_t> table = buildLowBitsFilterTable(constants);
+    const std::vector<uint64_t> table = buildLowBitsFilterTable(constants, kCudaLowBitsFilterBits);
     std::string error;
-    if (!checkLowBitsFilterTable(table, constants, kFilterEntriesCheckedPerSearch, 2, std::random_device{}(), error))
+    if (!checkLowBitsFilterTable(table, constants, kFilterEntriesCheckedPerSearch, 2, std::random_device{}(), error, kCudaLowBitsFilterBits))
         refuseFilterTable("failed its check", error);
     const size_t tableBytes = table.size() * sizeof(uint64_t);
     CUDA_CHECK(cudaMalloc(&bufs_.filterTable, tableBytes));

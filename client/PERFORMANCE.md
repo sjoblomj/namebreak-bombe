@@ -15,8 +15,10 @@ that changes the window by its projection for a real search) and the whole
 `stress-*` tests above all, since every item below touches code that could
 silently drop candidates.
 
-Where things stand: the CUDA backend searches 1,434-1,467 G candidates/s
-with a hot GPU, and up to about 1,700 with a cool one (**measured**), from
+Where things stand (before **Verify a chunk's candidates after its rows**,
+which added another 14-35%, see there): the CUDA backend searches
+1,434-1,467 G candidates/s with a hot GPU, and up to about 1,700 with a
+cool one (**measured**), from
 209-218 before the lookup filter and 1,088-1,124 with the filter but one row
 per thread. The OpenCL backend, with the filter and row groups too, searches
 about 1,300-1,460, from 202-205 before the filter and 1,082-1,086 with it
@@ -165,13 +167,54 @@ will have grown (not measured again).
       more (the warp-wide loop, a vote each round, bookkeeping every lane
       executes) than the split warps' idle lanes did: 9.7G thread
       instructions against 5.3G.
-    So the kernel's split warps are cheaper than they look. Not tried: a
-    verify loop over two or more rows' candidates together (fewer rounds,
-    at the price of choosing each candidate's row and more registers).
+    So the kernel's split warps are cheaper than they look. Not tried then:
+    a verify loop over two or more rows' candidates together - now done,
+    see **Verify a chunk's candidates after its rows**.
   - [ ] **Re-sweep on the other backends.** 7 applies to all of them (the
     table is shared). OpenCL on this GPU gains too - **measured** about
     1,453 G candidates/s against 1,325 at 8 bits (+9-10%, three pairs) - but
     Metal on a Mac and HIP on AMD may each prefer another width.
+- [x] **Verify a chunk's candidates after its rows.** Each lane's rows are
+  looked up first, noting only which have flagged candidates (a bit per
+  row); a second loop then hashes them one candidate per round, a lane that
+  runs out of one row's taking its next flagged row (its state and mask
+  worked out again). A warp's verify rounds go from the sum over its rows of
+  the busiest lane's candidates (about two a row) to the busiest lane's
+  candidates in the whole chunk - no ballots, shared memory or warp syncs,
+  unlike the warp-cooperative tries above. It pays most where a candidate
+  costs most, with a long suffix: one of the coordinator's active targets
+  has `\BWUNIN.EXE` (11 characters), which searched a third slower than
+  `.WAV`. **Measured** (`search_bench --scale 20 --size 43`, a new
+  `--suffix` option, alternating pairs): +17% with `\BWUNIN.EXE`, the same
+  with `.WAV`. It also changed what the tuning knobs prefer, so they were
+  swept again on top of it (sizes 40, 43, 49; suffixes `.WAV` and
+  `\BWUNIN.EXE`):
+  - `NAMEBREAK_ROWS_PER_THREAD` **64** (a whole row group per thread) instead
+    of 25: 2-6% faster in every configuration (43, also a whole group at
+    size 43, about 4%), and 15 about 6-9% slower than 25.
+  - **Suffix lengths 9-12 compiled in** (`dispatchSuffixLen`): the runtime
+    loop for longer suffixes cost about 10% with a 9- or 11-character one.
+    32 more kernel instantiations to compile.
+  - **A 6-bit table for CUDA** (`kCudaLowBitsFilterBits`, 32 KB): 13% faster
+    than 7 bits with `.WAV`, the same with 9-11 characters (and slower
+    with the runtime suffix loop, before lengths 9-12 were compiled in). 8
+    bits was 11-22% slower. The OpenCL backend measured 3% (`.WAV`) to 15%
+    (`\BWUNIN.EXE`) slower at 6 bits, the CPU backend 17%, so the width
+    became a parameter of `buildLowBitsFilterTable`,
+    `checkLowBitsFilterTable` and `lowBitsFilterIndex`, defaulting to the
+    shared 7 - only CUDA (and HIP) pass their own. A build that sets
+    `NAMEBREAK_LOWBITS_FILTER_BITS` (the stress tests' 1-bit filter) sets
+    CUDA's too; `lowbits_filter_test` now also runs at 6 bits.
+  All together, **measured** against the code before (three alternating
+  rounds, every pair faster): 49 characters `.WAV` +14% (about 2,140
+  against 1,875 G candidates/s), 43 `.WAV` +18%, 40 `.WAV` with `--whole`
+  +22%, 49 `.WAV` with `--whole` +16%, 43 `\BWUNIN.EXE` and `BWUNIN.EXE`
+  +35% (about 1,620 against 1,195).
+  - [ ] **The same on OpenCL and Metal**, whose kernels still hash each
+    row's candidates right after its lookup - and then re-sweep their
+    table width and chunk size, as above.
+  - [ ] **HIP on AMD** gets all of this with the CUDA code, unmeasured: a
+    64-lane wavefront may like other values.
 - [x] **Where the table lives.** Tried: a 6-bit table (32 KB) copied into
   each block's shared memory, with the grid capped at 116, 174 or 348
   blocks (2, 3 or 6 per SM) so each block loads it once and walks many

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <type_traits>
 
@@ -12,22 +13,12 @@ inline void mpqStep(uint32_t& seed1, uint32_t& seed2, uint32_t key, uint32_t ord
     seed2 = ord + seed1 + seed2 + (seed2 << 5) + 3;
 }
 
-} // namespace
-
-std::vector<uint64_t> buildLowBitsFilterTable(const SearchConstants& constants) {
-    // Every entry's state has only kLowBitsFilterBits bits (the rest are 0 -
-    // they can't affect the result's low bits), and only the result's low
-    // kLowBitsFilterBits bits matter. The hash step is a T-function - no bit
-    // of its result depends on a higher bit of its input - so all of it can
-    // be computed in the narrowest integer that holds those bits, modulo its
-    // size: 8-bit lanes for up to 8 bits, 16-bit ones up to 10. The low bits
-    // come out exactly as the 32-bit hash's, and the compiler packs four or
-    // two times as many lanes into each vector instruction. (The check below,
-    // and lowbits_filter_test, recompute entries with the 32-bit hash, from
-    // states with random high bits.)
-    using Lane = std::conditional_t<(kLowBitsFilterBits <= 8), uint8_t, uint16_t>;
-    static_assert(kLowBitsFilterBits <= 8 * sizeof(Lane), "the table's state bits must fit a lane");
-    std::vector<uint64_t> table(kLowBitsFilterEntries, 0);
+// buildLowBitsFilterTable, in lanes of type Lane.
+template<typename Lane>
+std::vector<uint64_t> buildLowBitsFilterTableIn(const SearchConstants& constants, int bits) {
+    const uint32_t entries = lowBitsFilterEntries(bits);
+    const uint32_t stateMask = lowBitsFilterStateMask(bits);
+    std::vector<uint64_t> table(entries, 0);
     const uint32_t* cryptTable = constants.cryptTable;
     std::vector<Lane> suffixKey, suffixOrd;
     for (unsigned char ch : constants.suffix) {
@@ -35,7 +26,7 @@ std::vector<uint64_t> buildLowBitsFilterTable(const SearchConstants& constants) 
         suffixKey.push_back((Lane) cryptTable[0x100 + ch]);
     }
     const Lane targetA = (Lane) constants.targetHashA;
-    const Lane hashMask = (Lane) kLowBitsFilterHashMask;
+    const Lane hashMask = (Lane) lowBitsFilterHashMask(bits);
     // mpqStep, in Lane arithmetic.
     auto step = [](Lane& seed1, Lane& seed2, Lane key, Lane ord) {
         seed1 = (Lane) (key ^ (Lane) (seed1 + seed2));
@@ -48,16 +39,16 @@ std::vector<uint64_t> buildLowBitsFilterTable(const SearchConstants& constants) 
     constexpr uint32_t kBlock = 1024;
     Lane seed1[kBlock], seed2[kBlock];
     uint64_t mask[kBlock];
-    for (uint32_t base = 0; base < kLowBitsFilterEntries; base += kBlock) {
-        const uint32_t count = std::min(kBlock, kLowBitsFilterEntries - base);
+    for (uint32_t base = 0; base < entries; base += kBlock) {
+        const uint32_t count = std::min(kBlock, entries - base);
         for (uint32_t b = 0; b < count; ++b)
             mask[b] = 0;
         for (size_t k = 0; k < constants.alphabet.size(); ++k) {
             const unsigned char ch = (unsigned char) constants.alphabet[k];
             const Lane ord = (Lane) ch, key = (Lane) cryptTable[0x100 + ch];
             for (uint32_t b = 0; b < count; ++b) {
-                seed1[b] = (Lane) ((base + b) & kLowBitsFilterStateMask);
-                seed2[b] = (Lane) ((base + b) >> kLowBitsFilterBits);
+                seed1[b] = (Lane) ((base + b) & stateMask);
+                seed2[b] = (Lane) ((base + b) >> bits);
                 step(seed1[b], seed2[b], key, ord);
             }
             for (size_t i = 0; i < suffixKey.size(); ++i) {
@@ -73,27 +64,52 @@ std::vector<uint64_t> buildLowBitsFilterTable(const SearchConstants& constants) 
     return table;
 }
 
+} // namespace
+
+std::vector<uint64_t> buildLowBitsFilterTable(const SearchConstants& constants, int bits) {
+    // Every entry's state has only `bits` bits (the rest are 0 - they can't
+    // affect the result's low bits), and only the result's low `bits` bits
+    // matter. The hash step is a T-function - no bit of its result depends
+    // on a higher bit of its input - so all of it can be computed in the
+    // narrowest integer that holds those bits, modulo its size: 8-bit lanes
+    // for up to 8 bits, 16-bit ones up to 10. The low bits
+    // come out exactly as the 32-bit hash's, and the compiler packs four or
+    // two times as many lanes into each vector instruction. (The check below,
+    // and lowbits_filter_test, recompute entries with the 32-bit hash, from
+    // states with random high bits.)
+    if (bits < 0 || bits > kMaxLowBitsFilterBits) {
+        fprintf(stderr, "INTERNAL ERROR: a lookup filter table of %d bits (0 to %d allowed) - exiting\n", bits, kMaxLowBitsFilterBits);
+        exit(1);
+    }
+    static_assert(kMaxLowBitsFilterBits <= 16, "the table's state bits must fit a lane");
+    if (bits <= 8)
+        return buildLowBitsFilterTableIn<uint8_t>(constants, bits);
+    return buildLowBitsFilterTableIn<uint16_t>(constants, bits);
+}
+
 bool checkLowBitsFilterTable(const std::vector<uint64_t>& table, const SearchConstants& constants, uint32_t entriesToCheck,
-                             int highBitRounds, uint64_t seed, std::string& error) {
+                             int highBitRounds, uint64_t seed, std::string& error, int bits) {
     char message[512];
-    if (table.size() != kLowBitsFilterEntries) {
-        snprintf(message, sizeof(message), "the table has %zu entries, not %u", table.size(), kLowBitsFilterEntries);
+    const uint32_t entries = lowBitsFilterEntries(bits);
+    const uint32_t stateMask = lowBitsFilterStateMask(bits);
+    if (table.size() != entries) {
+        snprintf(message, sizeof(message), "the table has %zu entries, not %u", table.size(), entries);
         error = message;
         return false;
     }
     const uint32_t* cryptTable = constants.cryptTable;
     const int alphabetSize = (int) constants.alphabet.size();
     std::mt19937_64 rng(seed);
-    const uint32_t checks = entriesToCheck == 0 ? kLowBitsFilterEntries : entriesToCheck;
+    const uint32_t checks = entriesToCheck == 0 ? entries : entriesToCheck;
     for (uint32_t c = 0; c < checks; ++c) {
-        const uint32_t entry = entriesToCheck == 0 ? c : (uint32_t) (rng() % kLowBitsFilterEntries);
+        const uint32_t entry = entriesToCheck == 0 ? c : (uint32_t) (rng() % entries);
         for (int round = 0; round < highBitRounds; ++round) {
             // A state lowBitsFilterIndex maps to `entry`, with random high bits.
-            const uint32_t seed1 = ((uint32_t) rng() & ~kLowBitsFilterStateMask) | (entry & kLowBitsFilterStateMask);
-            const uint32_t seed2 = ((uint32_t) rng() & ~kLowBitsFilterStateMask) | (entry >> kLowBitsFilterBits);
-            if (lowBitsFilterIndex(seed1, seed2) != entry) {
+            const uint32_t seed1 = ((uint32_t) rng() & ~stateMask) | (entry & stateMask);
+            const uint32_t seed2 = ((uint32_t) rng() & ~stateMask) | (entry >> bits);
+            if (lowBitsFilterIndex(seed1, seed2, bits) != entry) {
                 snprintf(message, sizeof(message), "lowBitsFilterIndex(0x%08X, 0x%08X) is %u, not entry %u", seed1, seed2,
-                         lowBitsFilterIndex(seed1, seed2), entry);
+                         lowBitsFilterIndex(seed1, seed2, bits), entry);
                 error = message;
                 return false;
             }
@@ -106,7 +122,7 @@ bool checkLowBitsFilterTable(const std::vector<uint64_t>& table, const SearchCon
                     mpqStep(a, b, cryptTable[0x100 + ch], ch);
                     for (unsigned char s : constants.suffix)
                         mpqStep(a, b, cryptTable[0x100 + s], s);
-                    expected = ((a ^ constants.targetHashA) & kLowBitsFilterHashMask) == 0;
+                    expected = ((a ^ constants.targetHashA) & lowBitsFilterHashMask(bits)) == 0;
                 }
                 if (bit != expected) {
                     snprintf(message, sizeof(message),

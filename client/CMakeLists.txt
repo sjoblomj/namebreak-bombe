@@ -274,8 +274,9 @@ namebreak_test(lowbits_filter_test lowbits_filter_test)
 # The same at other table widths, built from just the two sources it needs
 # rather than a whole search library each: the table is built in 8-bit lanes
 # up to 8 bits and 16-bit ones above (buildLowBitsFilterTable), so 1, 8 and 10
-# bits cover both at their narrowest and widest.
-foreach(bits IN ITEMS 1 8 10)
+# bits cover both at their narrowest and widest - and 6 is the CUDA backend's
+# width (kCudaLowBitsFilterBits).
+foreach(bits IN ITEMS 1 6 8 10)
     add_executable(lowbits_filter_test_${bits} tests/lowbits_filter_test.cpp src/backends/common/lowbits_filter.cpp src/engine/mpq_hash.cpp)
     target_include_directories(lowbits_filter_test_${bits} PRIVATE src)
     target_compile_definitions(lowbits_filter_test_${bits} PRIVATE NAMEBREAK_LOWBITS_FILTER_BITS=${bits})

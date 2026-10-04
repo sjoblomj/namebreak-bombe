@@ -48,11 +48,16 @@ constexpr int kMaxBatchesPerLaunch = 32;
 // per launch. On the RTX 3080 Ti Laptop (search_bench --scale 20, three runs
 // each), 1 row per thread did 1,133 G candidates/s, 4 did 1,477, 7 did 1,575,
 // 10-16 about 1,605, 25 did 1,659 and 49 did 1,611 - 25, i.e. two chunks per
-// row group for the real 49-character alphabet, was best in every run.
+// row group for the real 49-character alphabet, was best in every run. Since
+// the kernel hashes a chunk's flagged candidates after all of its rows
+// (searchChunk), longer chunks share those out better among a warp's lanes:
+// a whole row group per thread (64, more than any alphabet's size) measured
+// 2-6% faster than 25 at alphabet sizes 40, 43 and 49, with 4- and
+// 11-character suffixes alike, and 15 about 6-9% slower.
 // Overridable at compile time (-DNAMEBREAK_ROWS_PER_THREAD=N) so the tests can
 // exercise other splits, and benchmarks re-sweep it.
 #ifndef NAMEBREAK_ROWS_PER_THREAD
-#define NAMEBREAK_ROWS_PER_THREAD 25
+#define NAMEBREAK_ROWS_PER_THREAD 64
 #endif
 
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index

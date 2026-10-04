@@ -350,8 +350,8 @@ then tells it which of a row's candidates could match at all, so that only
 those are hashed in full (see [The lookup
 filter](#the-lookup-filter-most-candidates-are-never-hashed)). With the real
 49-character alphabet, one leading value is 49^5 = 282,475,249 candidates:
-5,764,801 rows of 49, in 117,649 row groups of 49 rows, in 235,298 chunks of
-24 or 25 rows - one per GPU thread. The CPU collects 16 leading values that
+5,764,801 rows of 49, in 117,649 row groups of 49 rows - one row group per
+GPU thread. The CPU collects 16 leading values that
 aren't pruned (`NAMEBREAK_BATCHES_PER_LAUNCH`), and one kernel launch
 searches them all, a row of thread blocks for each.
 
@@ -455,8 +455,9 @@ The CUDA kernel takes this one step further. Consecutive rows share even
 more than their candidates do: the rows `XA*`, `XB*`, ... `XZ*` all start
 with `X`. So a *row group* - the rows that share every trailing character
 but the row's own last - is split into chunks of about
-`NAMEBREAK_ROWS_PER_THREAD` consecutive rows (25, in `tuning.h`: two chunks
-per group for a 49-character alphabet), and one thread takes a chunk: it
+`NAMEBREAK_ROWS_PER_THREAD` consecutive rows (64, in `tuning.h`: more than
+any alphabet has characters, so a whole group per thread), and one thread
+takes a chunk: it
 hashes the group's shared characters once, and each of its rows then costs
 one more step, instead of every thread working out its row's characters
 from its number (a division per character) and hashing all of them. A chunk
@@ -465,14 +466,15 @@ launch itself, so how many threads are launched only decides how the work
 is shared out, never what gets searched. That made the search about a third
 faster again (1,088-1,124 to 1,434-1,467 G candidates/s, three runs each
 side by side; 1 row per thread measured 1,133, 7 rows 1,575, 25 rows 1,659
-and 49 rows 1,611 in a cooler run). The OpenCL kernel does the same, but
+and 49 rows 1,611 in a cooler run - 25 was the default then; a whole group
+is now 2-6% faster than 25, see below). The OpenCL kernel does the same, but
 does best with a whole row group per work-item (1 row per work-item measured
 about 880, 7 about 1,300, 25 about 1,435, and 49 and 64 about 1,460). The
 Metal kernel does the same, with CUDA's 25 rows per thread until it has
 been measured on a Mac (see [PERFORMANCE.md](PERFORMANCE.md)).
 
-Group `X**` from above, with its 26 rows split into two chunks of 13 (26
-characters, 25 rows per thread), marked with what the lookup filter
+Group `X**` from above, with its 26 rows split into two chunks of 13 (as
+with 13 rows per thread), marked with what the lookup filter
 described below does to each candidate - `#`: flagged, hashed in full; `·`:
 never hashed. (Where the `#`s fall here is made up; a row has
 alphabetSize / 256 of them on average.)
@@ -495,6 +497,19 @@ Thread 1 hashes `X` once, then one more character for each of `XA*` to
 `XM*`; thread 2 does the same for `XN*` to `XZ*`. Every row then costs one
 table lookup, and only its `#`s are hashed any further.
 
+The CUDA kernel hashes a chunk's `#`s only after it has looked up all of its
+rows: the row walk just notes which rows have any (a bit per row), and a
+second loop then hashes them, one candidate per lane per round. The 32 lanes
+of a warp go round a loop together as often as the busiest of them needs,
+so hashing each row's `#`s right after its lookup cost as many rounds as
+the busiest lane's `#`s in *every row* - about two a row, though a row has
+less than one on average - and each round hashes the whole suffix. Now it
+costs as many as the busiest lane's `#`s in the whole chunk. On its own that
+made the CUDA kernel about 17% faster with an 11-character suffix, and no
+faster with `.WAV` - but it is why longer chunks (a whole group) and a
+smaller table (6 bits, see below) now pay off there: all together, 14-22%
+faster with `.WAV` and about 35% with an 11-character suffix.
+
 What a thread then does with its rows: the GPU kernels
 (`filteredRowsKernel`, `search.cl`, `search.metal`) look each row up in a
 table and hash only the handful of its candidates that could possibly
@@ -510,7 +525,7 @@ as the CPU backend still does, which two more things made fast:
   "warp") - a runtime lookup where each of those 32 threads needs a
   different table entry serializes the whole warp, one lookup at a time,
   while a compile-time constant costs nothing extra.
-- **The suffix length is a compile-time parameter too** (for lengths 0-8;
+- **The suffix length is a compile-time parameter too** (for lengths 0-12;
   longer suffixes fall back to a slower runtime-length loop), for the same
   reason. The CUDA kernel still does this for the candidates it does hash.
 
@@ -600,12 +615,18 @@ with one bit per alphabet character - a 512 KB table
 thread looks its row up in it and hashes only the candidates in the mask,
 in full, exactly as before.
 
-The examples here use 8 bits, but the backends ship with 7
-(`NAMEBREAK_LOWBITS_FILTER_BITS`): a 128 KB table, which lets twice as many
-candidates through, is still faster, because it stays in the GPU's caches.
-Measured on the RTX 3080 Ti Laptop (`search_bench --scale 20`, interleaved
-runs): 6 bits about 1,770 G candidates/s, 7 about 1,800, 8 about 1,550, 9
-about 1,580, and 10 (an 8 MB table, twice the L2 cache) about 390.
+The examples here use 8 bits, but the OpenCL, Metal and CPU backends ship
+with 7 (`NAMEBREAK_LOWBITS_FILTER_BITS`): a 128 KB table, which lets twice
+as many candidates through, is still faster, because it stays in the GPU's
+caches. Measured on the RTX 3080 Ti Laptop (`search_bench --scale 20`,
+interleaved runs): 6 bits about 1,770 G candidates/s, 7 about 1,800, 8
+about 1,550, 9 about 1,580, and 10 (an 8 MB table, twice the L2 cache)
+about 390. The CUDA backend has used 6 (`kCudaLowBitsFilterBits`, a 32 KB
+table) since it started hashing a chunk's flagged candidates after all of
+its rows: each one it lets through costs less, so the smaller table's
+cheaper reads win - about 13% faster than 7 bits with `.WAV`, and the same
+with an 11-character suffix. The OpenCL and CPU backends measured 3-17%
+slower at 6 bits, and keep 7.
 
 The same row, looked up for the real target (every number here is computed,
 not made up):
