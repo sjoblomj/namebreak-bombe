@@ -314,7 +314,7 @@ struct PruneSetup {
     std::string prefix;
     PruneRules rules;
     PruneState entry;
-    // Which way a backend that can search either (CUDA) does - see
+    // Which way a backend that can search either (CUDA, OpenCL) does - see
     // SearchConstants::listWalking. The cases run both ways.
     SearchConstants::ListWalking walking = SearchConstants::ListWalking::Auto;
 };

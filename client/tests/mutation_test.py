@@ -121,6 +121,20 @@ ROW_PRUNING_MUTATIONS = [
              [(PRUNING, "    lists_.clear();\n    ++generation_;", "    lists_.clear();")]),
 ]
 
+# The host's check of a hit against its batch's list, for a launch that
+# searched every row group rather than walk the lists (RowPruning::survives),
+# shared by the backends that can (CUDA, OpenCL).
+SURVIVES_MUTATIONS = [
+    Mutation("survivesrow", "a hit kept whenever its row group survives, whatever its row",
+             [(PRUNING, "(*entry >> kRowFlagBits) == group && (rowMasks_[*entry & (kRowFlagCount - 1)] >> d & 1);",
+               "(*entry >> kRowFlagBits) == group;")]),
+    # The integration test's candidates planted in a pruned row group are in
+    # ranges of a few groups, which prune enough of them to walk the lists.
+    Mutation("survivesgroup", "a hit kept in a pruned row group when a later one survives",
+             [(PRUNING, "return entry != end && (*entry >> kRowFlagBits) == group &&", "return entry != end &&")],
+             caught_by=("self-test", "stress")),
+]
+
 # The engine's side of pruning the whole candidate: the self-test tests a
 # backend without the engine.
 ENGINE_PRUNING_MUTATIONS = [
@@ -263,14 +277,6 @@ CUDA_MUTATIONS = [
     # (runBatches, RowPruning::survives).
     Mutation("unlistedhits", "the hits of a launch that didn't walk its lists all kept",
              [(KERNEL, "if (listed_ && !listed && !rowPruning_.survives(", "if (false && !rowPruning_.survives(")]),
-    Mutation("survivesrow", "a hit kept whenever its row group survives, whatever its row",
-             [(PRUNING, "(*entry >> kRowFlagBits) == group && (rowMasks_[*entry & (kRowFlagCount - 1)] >> d & 1);",
-               "(*entry >> kRowFlagBits) == group;")]),
-    # The integration test's candidates planted in a pruned row group are in
-    # ranges of a few groups, which prune enough of them to walk the lists.
-    Mutation("survivesgroup", "a hit kept in a pruned row group when a later one survives",
-             [(PRUNING, "return entry != end && (*entry >> kRowFlagBits) == group &&", "return entry != end &&")],
-             caught_by=("self-test", "stress")),
     # The self-test's pruning cases search one batch at a time.
     Mutation("survivesbatch", "every hit checked against the list of the launch's first batch",
              [(KERNEL, "!rowPruning_.survives(RowPruning::Slice{batch.groupsOffset, batch.groupCount}, hit.row)",
@@ -281,7 +287,7 @@ CUDA_MUTATIONS = [
              edits=[(KERNEL, ">= groups * NAMEBREAK_LIST_MIN_PRUNED_PERCENT);", ">= 0);")]),
     Mutation("neverlisted", "no launch walking its lists", expect="harmless",
              edits=[(KERNEL, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
-] + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS
 
 OPENCL_MUTATIONS = [
     # The lookup filter's mask.
@@ -362,8 +368,7 @@ OPENCL_MUTATIONS = [
              edits=[(CL_HOST, "const size_t global[2] = {(chunks + local[0] - 1) / local[0] * local[0], (size_t) batchCount};",
                      "const size_t global[2] = {(chunks + 2 * local[0] - 1) / local[0] * local[0], (size_t) batchCount};")]),
     Mutation("firstbatchgrid", "only as many work-items as the first batch needs", expect="harmless",
-             edits=[(CL_HOST, "maxGroups = std::max<uint64_t>(maxGroups, batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1);",
-                     "maxGroups = b == 0 ? batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1 : maxGroups;")]),
+             edits=[(CL_HOST, "maxGroups = std::max(maxGroups, batchGroups);", "maxGroups = b == 0 ? batchGroups : maxGroups;")]),
     # Pruning the whole candidate: the lists of row groups, and the rows of each.
     Mutation("notlisted", "the whole candidate never pruned",
              [(CL_HOST, "listed_ = constants.trailingRules.any();", "listed_ = false;")]),
@@ -391,7 +396,22 @@ OPENCL_MUTATIONS = [
              caught_by=("self-test", "integration")),
     Mutation("stalelists", "the lists on the device kept when they're cleared for another alphabet",
              [(CL_HOST, "if (rowPruning_.generation() != groupsGeneration_) {", "if (false) {")]),
-] + ROW_PRUNING_MUTATIONS
+    # A launch whose lists leave out too few row groups walks every group
+    # instead, and its hits are checked against the lists on the host
+    # (runBatches, RowPruning::survives - see SURVIVES_MUTATIONS too).
+    Mutation("unlistedhits", "the hits of a launch that didn't walk its lists all kept",
+             [(CL_HOST, "if (listed_ && !listed && !rowPruning_.survives(", "if (false && !rowPruning_.survives(")]),
+    # The self-test's pruning cases search one batch at a time.
+    Mutation("survivesbatch", "every hit checked against the list of the launch's first batch",
+             [(CL_HOST, "!rowPruning_.survives(RowPruning::Slice{batch.groupsOffset, batch.groupCount}, hit.trailingIdx / alphabetSize_)",
+               "!rowPruning_.survives(RowPruning::Slice{hostBatches_[0].groupsOffset, hostBatches_[0].groupCount}, hit.trailingIdx / alphabetSize_)")],
+             caught_by=("integration", "stress")),
+    # Which of the two ways a launch takes must not change what it finds.
+    Mutation("alwayslisted", "every launch walking its lists", expect="harmless",
+             edits=[(CL_HOST, ">= groups * kListMinPrunedPercent);", ">= 0);")]),
+    Mutation("neverlisted", "no launch walking its lists", expect="harmless",
+             edits=[(CL_HOST, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS
 
 # The Metal ones can only be run on a Mac (--backend metal).
 METAL_MUTATIONS = [

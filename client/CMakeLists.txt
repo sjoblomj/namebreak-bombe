@@ -344,8 +344,8 @@ list(APPEND ROW_BACKENDS cpu)
 # 32 at a time: with batches of a few rows, a launch then often spans several
 # leading values, with pruned ones between them. All three also make the cpu backend
 # split every call, however small, across its threads. And a search that prunes
-# the whole candidate walks its lists of row groups on CUDA/HIP only where they
-# leave out enough of them (NAMEBREAK_LIST_MIN_PRUNED_PERCENT, tuning.h), so
+# the whole candidate walks its lists of row groups on CUDA/HIP and OpenCL only
+# where they leave out enough of them (NAMEBREAK_LIST_MIN_PRUNED_PERCENT), so
 # small_launch always walks them (0) and window2 never does (101), its hits
 # checked against the lists on the host instead; the shipped default and window6
 # do some of each.

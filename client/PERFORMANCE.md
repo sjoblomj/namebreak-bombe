@@ -583,9 +583,26 @@ will have grown (not measured again).
     **8.6-9.0% faster** than before both (two runs of four and six
     interleaved rounds, every round faster); the coordinator's other
     targets, which don't prune the whole candidate, the same.
-  - [ ] **The same for OpenCL and Metal**, whose list-walking kernels cost
-    about 6%: the host's check is shared (`RowPruning::survives`). OpenCL
-    is what the coordinator's busiest volunteer runs.
+  - [x] **The same for OpenCL** (`kListMinPrunedPercent`, the same 5%;
+    the tests' variants and the self-test ask it for each way as they do
+    CUDA, and its mutation list got the same six mutations). Its kernel is
+    compiled for the alphabet's size at runtime anyway, so there was no size
+    to compile in. **Measured** the same way, against the code before:
+
+    | Search, with `--whole` | Pruned by the backend | At 5% (shipped) | Never walking them |
+    |---|---|---|---|
+    | `" -.0-9A-Z_"`, `MUSIC\`, `.WAV`, symbol runs | 0.14% | **+4.3%** | +4.2% |
+    | `" ()-.0-9A-Z_"`, `REZ\`, `.WAV`, all rules | 4.9% | +0.5% | -3.6% |
+    | `" ()-.0-9A-Z\_"`, `\BWUNIN.EXE`, all rules | 5.1% | +0.6% | -4.8% |
+    | the real 49 characters, all rules | 17.4% | +0.2% | -12.3% |
+
+    Walking the lists pays at 5% here even with `.WAV`, so the threshold
+    shouldn't be any higher. OpenCL is what the coordinator's busiest
+    volunteer runs - whose kernel still hashes each row's candidates right
+    after its lookup (see **Verify a chunk's candidates after its rows**),
+    worth more than this.
+  - [ ] **The same for Metal**, whose list-walking kernel would cost about
+    as much: the host's check is shared (`RowPruning::survives`).
 
 ## Tooling
 

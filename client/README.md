@@ -973,9 +973,10 @@ groups out of what it searches:
   no candidates. A kernel walking a list measured about 5% slower (CUDA;
   6% OpenCL) than one walking every group, so a search that doesn't prune
   the whole candidate gets the kernel that walks every group, as before -
-  the kernels are compiled both ways. So does a CUDA launch whose lists
-  leave out less than 5% of its row groups (`NAMEBREAK_LIST_MIN_PRUNED_PERCENT`
-  in `backends/cuda/tuning.h`): with few symbols in the alphabet, the rules
+  the kernels are compiled both ways. So does a CUDA or OpenCL launch whose
+  lists leave out less than 5% of its row groups
+  (`NAMEBREAK_LIST_MIN_PRUNED_PERCENT` in `backends/cuda/tuning.h`,
+  `kListMinPrunedPercent` in the OpenCL backend): with few symbols in the alphabet, the rules
   hardly prune - `" -.0-9A-Z_"` with symbol runs pruned loses about 0.3% of
   its candidates - and the lists cost more than they save. The hits such a
   launch has in rows the lists leave out are dropped on the host

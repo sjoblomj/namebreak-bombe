@@ -65,6 +65,18 @@ constexpr int batchesPerLaunchOr([[maybe_unused]] int backendDefault) {
     return backendDefault;
 #endif
 }
+// And the share of a launch's row groups (in percent) its lists of them must
+// leave out for it to walk them, for the backends that can also search every
+// group and check the hits on the host instead
+// (-DNAMEBREAK_LIST_MIN_PRUNED_PERCENT=N, 0 always walking them and 101
+// never - see the CUDA backend's tuning.h).
+constexpr int listMinPrunedPercentOr([[maybe_unused]] int backendDefault) {
+#ifdef NAMEBREAK_LIST_MIN_PRUNED_PERCENT
+    return NAMEBREAK_LIST_MIN_PRUNED_PERCENT;
+#else
+    return backendDefault;
+#endif
+}
 
 // The text inserted into the trailing part (SearchConstants::
 // trailingInsertions), as a GPU kernel hashes it: up to two insertions among

@@ -77,7 +77,7 @@ struct SearchConstants {
     std::vector<TrailingInsertion> trailingInsertions;
     // How a backend that can search what trailingRules leave either way -
     // walking lists of the row groups that survive them, or every group and
-    // dropping the hits outside them (CUDA/HIP, see
+    // dropping the hits outside them (CUDA/HIP and OpenCL, see
     // NAMEBREAK_LIST_MIN_PRUNED_PERCENT) - chooses: by how much the lists
     // leave out, or always the one way. Only the self-test asks for one, to
     // test both: they find the same. Other backends ignore it.

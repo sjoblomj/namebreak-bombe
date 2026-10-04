@@ -62,6 +62,15 @@ constexpr int kMaxBatchesPerLaunch = 32; // the batches buffer's size
 constexpr int kBatchesPerLaunch = batchesPerLaunchOr(16);
 static_assert(kBatchesPerLaunch >= 1 && kBatchesPerLaunch <= kMaxBatchesPerLaunch, "NAMEBREAK_BATCHES_PER_LAUNCH must be 1-32");
 
+// A launch of a search that prunes the whole candidate walks its batches'
+// lists of row groups (LISTED in search.cl) only if they leave out at least
+// this percentage of its row groups; if not, it walks every group, and the
+// hits the lists would have left out are dropped on the host (runBatches) -
+// as the CUDA backend does (NAMEBREAK_LIST_MIN_PRUNED_PERCENT in its
+// tuning.h), the list-walking kernel costing about 6% here.
+constexpr int kListMinPrunedPercent = listMinPrunedPercentOr(5);
+static_assert(kListMinPrunedPercent >= 0 && kListMinPrunedPercent <= 101, "NAMEBREAK_LIST_MIN_PRUNED_PERCENT must be 0-101");
+
 // These three must match their namesakes in search.cl.
 struct LaunchBatch {
     cl_uint firstRow;
@@ -204,11 +213,13 @@ private:
     size_t groupsCapacity_ = 0;
     size_t groupsUploaded_ = 0;
     uint64_t groupsGeneration_ = 0;
-    // Whether this search prunes the whole candidate, and the kernel walks
-    // lists of row groups (LISTED in search.cl): only then - a kernel that
-    // walks every group measured about 6% faster than one walking a list of
-    // them all.
+    // Whether this search prunes the whole candidate, and so has lists of row
+    // groups (LISTED in search.cl): only then - a kernel that walks every
+    // group measured about 6% faster than one walking a list of them all, so
+    // a launch walks them only if they leave out enough groups (see
+    // runBatches) - or as SearchConstants::listWalking says.
     bool listed_ = false;
+    SearchConstants::ListWalking listWalking_ = SearchConstants::ListWalking::Auto;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -266,6 +277,7 @@ void OpenClBackend::beginSearch(const SearchConstants& constants) {
         insertMacros_ += " -DROW_INSERT_START=" + std::to_string(layout.rowStart) + " -DROW_INSERT_LEN=" + std::to_string(layout.rowLen);
     }
     listed_ = constants.trailingRules.any();
+    listWalking_ = constants.listWalking;
     if (listed_) {
         rowPruning_.begin(constants);
         CL_CHECK(clEnqueueWriteBuffer(queue_, rowMasks_, CL_TRUE, 0, kRowFlagCount * sizeof(cl_ulong), rowPruning_.rowMasks(), 0, nullptr, nullptr));
@@ -369,8 +381,9 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
         exit(1);
     }
     // Each batch's rows, cut to its range in its first and last row (see
-    // search.cl), its row groups to search, and the most any of them has.
-    uint64_t maxGroups = 0, candidates = 0;
+    // search.cl), its row groups to search, and the most any of them has -
+    // and with the whole candidate pruned, the list of those that survive.
+    uint64_t maxGroups = 0, maxListedGroups = 0, groups = 0, listedGroups = 0, candidates = 0;
     for (int b = 0; b < batchCount; ++b) {
         const RowRange rows = rowRangeFor(requests[b].start, requests[b].count, alphabetSize_);
         if (requests[b].count == 0 || rows.firstRow + rows.rowCount - 1 > UINT32_MAX || rows.rowCount > (1ull << 31)) {
@@ -385,23 +398,34 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
         batch.lastRowEndK = rows.lastRowEndK;
         batch.seed1Start = requests[b].params.seed1Start;
         batch.seed2Start = requests[b].params.seed2Start;
+        const uint64_t batchGroups = batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1;
+        maxGroups = std::max(maxGroups, batchGroups);
+        groups += batchGroups;
         if (listed_) {
-            const RowPruning::Slice groups =
+            const RowPruning::Slice list =
                 rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry, batch.firstRow / alphabetSize_, batch.lastRow / alphabetSize_);
-            batch.groupsOffset = groups.offset;
-            batch.groupCount = groups.count;
-            maxGroups = std::max<uint64_t>(maxGroups, groups.count);
-        } else {
-            maxGroups = std::max<uint64_t>(maxGroups, batch.lastRow / alphabetSize_ - batch.firstRow / alphabetSize_ + 1);
+            batch.groupsOffset = list.offset;
+            batch.groupCount = list.count;
+            maxListedGroups = std::max<uint64_t>(maxListedGroups, list.count);
+            listedGroups += list.count;
         }
         candidates += requests[b].count;
     }
     // Every row of every batch pruned: nothing to launch.
-    if (maxGroups == 0)
+    if (listed_ && maxListedGroups == 0)
         return BatchOutcome();
-    if (listed_)
+    // Whether this launch walks its batches' lists, or every group they
+    // touch - when the lists leave out too few of them to pay for walking
+    // them (see kListMinPrunedPercent), and the hits they'd have left out
+    // are dropped below instead.
+    using ListWalking = SearchConstants::ListWalking;
+    const bool listed = listed_ && listWalking_ != ListWalking::Never &&
+                        (listWalking_ == ListWalking::Always || (groups - listedGroups) * 100 >= groups * kListMinPrunedPercent);
+    if (listed) {
+        maxGroups = maxListedGroups;
         uploadGroups();
-    const CompiledKernel& compiled = kernelFor(trailingLen, listed_);
+    }
+    const CompiledKernel& compiled = kernelFor(trailingLen, listed);
     cl_kernel kernel = compiled.kernel;
     // Not waited for: the queue runs it before the kernel, and hostBatches_
     // isn't touched again until this launch is done.
@@ -460,15 +484,23 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
         return outcome;
     // Every hit, checked on the CPU with its own batch's prefix (HitVerifier:
     // rebuilt from its trailing index and hashed from scratch, and hashB
-    // checked).
+    // checked). If the launch searched every row group where it had lists,
+    // the hits in a row the lists leave out are dropped first, as walking the
+    // lists would have.
+    int kept = 0;
     for (int i = 0; i < hitCount; ++i) {
         const Hit& hit = hostResults_->hits[i];
         if (hit.batch >= (cl_uint) batchCount) {
             fprintf(stderr, "INTERNAL ERROR: the kernel reported a hit in batch %u of a launch of %d - exiting\n", hit.batch, batchCount);
             exit(1);
         }
+        const LaunchBatch& batch = hostBatches_[hit.batch];
+        if (listed_ && !listed && !rowPruning_.survives(RowPruning::Slice{batch.groupsOffset, batch.groupCount}, hit.trailingIdx / alphabetSize_))
+            continue;
         verifier_.addHits({hit.trailingIdx}, trailingLen, requests[hit.batch].params, outcome);
+        ++kept;
     }
+    outcome.hitCount = kept;
     return outcome;
 }
 
