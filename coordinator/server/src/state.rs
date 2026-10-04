@@ -1,4 +1,6 @@
 use sqlx::SqlitePool;
+
+use crate::likely_prefixes::LikelyPrefixes;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -49,6 +51,9 @@ pub struct RangeConfig {
     /// measured rate - a few seconds, well under the 10 it's meant to stay
     /// within.
     pub canary_seconds: f64,
+    /// What automatic priority ranges are made from - see
+    /// `likely_prefixes.rs`. Counted once, when the server starts.
+    pub likely_prefixes: Arc<LikelyPrefixes>,
 }
 
 impl RangeConfig {
@@ -74,6 +79,7 @@ impl RangeConfig {
             stall_release_seconds: env_i64("STALL_RELEASE_SECONDS", 24 * 60 * 60),
             canary_probability: env_f64("CANARY_PROBABILITY", 0.33),
             canary_seconds: env_f64("CANARY_SECONDS", 5.0),
+            likely_prefixes: Arc::new(LikelyPrefixes::load()),
         }
     }
 }

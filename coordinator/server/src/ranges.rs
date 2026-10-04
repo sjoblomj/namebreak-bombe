@@ -621,7 +621,11 @@ async fn claim_priority_range_chunk(
     now: i64,
 ) -> Result<Option<ClaimResponse>, AppError> {
     loop {
-        let priority_ranges = sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE target_id = ? ORDER BY priority DESC, created_at ASC")
+        // An operator's own priority ranges before any automatic one (see
+        // `create_next_auto_priority_range`), whatever their priorities.
+        let priority_ranges = sqlx::query_as::<_, PriorityRange>(
+            "SELECT * FROM priority_ranges WHERE target_id = ? ORDER BY auto_source IS NOT NULL, priority DESC, created_at ASC",
+        )
             .bind(target.id)
             .fetch_all(&mut *tx)
             .await?;
@@ -693,6 +697,98 @@ async fn claim_priority_range_chunk(
 
         return Ok(Some(to_claim_response(target, range_id, pr.candidate_len, start_index, end_index, lease_seconds, &pr.alphabet, client_alphabet)));
     }
+}
+
+/// Makes `target`'s next automatic priority range (see
+/// `AdminCreateTargetRequest::auto_priority`), if it has any left, and
+/// returns whether it did. It's for the length the main sweep is on, and for
+/// the most likely prefix (see `likely_prefixes.rs`) not made into one there
+/// yet that still has candidates left to search: within the target's bounds,
+/// ahead of the main sweep, and not another priority range's already. Only
+/// those candidates become its segments, so it never overlaps anything.
+///
+/// One at a time, when nothing else is - so a claim never has more than one
+/// prefix's worth to do, and the table only grows as fast as they're
+/// searched. Once a length runs out of prefixes, that's recorded on the
+/// target, so later claims don't look again.
+async fn create_next_auto_priority_range(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, target: &Target, now: i64) -> Result<bool, AppError> {
+    let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?")
+        .bind(target.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    // Mirrors claim_range: a sweep below start_len jumps to the start of
+    // start_len. A sweep still in an alphabet the target has been patched
+    // away from isn't comparable - wait until claim_range has moved it on.
+    let (len, sweep_at) = if progress.candidate_len < target.start_len {
+        (target.start_len, bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, target.start_len).0)
+    } else if progress.alphabet_name != target.alphabet_name {
+        return Ok(false);
+    } else {
+        (progress.candidate_len, progress.next())
+    };
+    if target.auto_priority_exhausted_len == Some(len) {
+        return Ok(false);
+    }
+    let Some(prefix_len) = crate::likely_prefixes::prefix_len_for(len) else {
+        return Ok(false);
+    };
+
+    let priority_ranges = sqlx::query_as::<_, PriorityRange>("SELECT * FROM priority_ranges WHERE target_id = ? AND candidate_len = ?")
+        .bind(target.id)
+        .bind(len)
+        .fetch_all(&mut *tx)
+        .await?;
+    let segments = priority_segments_by_range(tx, target.id).await?;
+    let made: std::collections::HashSet<&str> = priority_ranges.iter().filter(|pr| pr.auto_source.is_some()).map(|pr| pr.pattern.as_str()).collect();
+    // Everything already searched or someone else's.
+    let mut taken = vec![(0, sweep_at)];
+    for pr in priority_ranges.iter().filter(|pr| pr.alphabet_name == target.alphabet_name) {
+        taken.extend(owned_spans(pr, segments.get(&pr.id)));
+    }
+    let taken = normalize_spans(&taken);
+    let (lo, hi) = bound_indices_at_len(&target.alphabet, &target.lower_bound, &target.upper_bound, len);
+    let block = space_size(&target.alphabet, len - prefix_len as i64);
+
+    let ranking = config.likely_prefixes.ranking();
+    for likely in ranking.get(prefix_len) {
+        if made.contains(likely.prefix.as_str()) {
+            continue;
+        }
+        // None: a character the alphabet doesn't have.
+        let Some(first) = candidate_to_index(&target.alphabet, &likely.prefix) else { continue };
+        let start = first * block;
+        let spans = subtract_spans(&intersect_spans(&[(start, start + block)], &[(lo, hi + 1)]), &taken);
+        let (Some(&(start, _)), Some(&(_, end))) = (spans.first(), spans.last()) else { continue };
+
+        let (start_block, start_index) = split_pos(&target.alphabet, len, start);
+        let (end_block, end_index) = split_end(&target.alphabet, len, end);
+        let priority_range_id: i64 = sqlx::query_scalar(
+            "INSERT INTO priority_ranges (target_id, priority, pattern, candidate_len, start_block, start_index, end_block, end_index, \
+             next_block, next_index, alphabet_name, alphabet, created_at, auto_source) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(target.id)
+        .bind(likely.count)
+        .bind(&likely.prefix)
+        .bind(len)
+        .bind(start_block)
+        .bind(start_index)
+        .bind(end_block)
+        .bind(end_index)
+        .bind(start_block)
+        .bind(start_index)
+        .bind(&target.alphabet_name)
+        .bind(&target.alphabet)
+        .bind(now)
+        .bind(likely.source.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        insert_segments(&mut *tx, SegmentOwner::Priority, priority_range_id, &target.alphabet, len, &spans).await?;
+        return Ok(true);
+    }
+
+    sqlx::query("UPDATE targets SET auto_priority_exhausted_len = ? WHERE id = ?").bind(len).bind(target.id).execute(&mut *tx).await?;
+    Ok(false)
 }
 
 /// Tries to hand `user` a unit of work: for the highest-priority active target
@@ -801,6 +897,14 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         if let Some(claim) = claim_priority_range_chunk(&mut tx, config, &target, user, client_version, rate, now).await? {
             tx.commit().await?;
             return Ok(Some(claim));
+        }
+        // With none left, the next automatic one, if the target has them -
+        // again, should the new one turn out to be all skip ranges.
+        while target.auto_priority != 0 && create_next_auto_priority_range(&mut tx, config, &target, now).await? {
+            if let Some(claim) = claim_priority_range_chunk(&mut tx, config, &target, user, client_version, rate, now).await? {
+                tx.commit().await?;
+                return Ok(Some(claim));
+            }
         }
 
         // 3) Otherwise carve a fresh chunk off this target's own cursor, if it still has room.
@@ -1609,8 +1713,11 @@ fn main_sweep_passed_to(progress: &TargetProgress, pr: &PriorityRange) -> Pos {
 ///   - whatever the main sweep has already jumped past stays in the span
 ///     and keeps being handed out as priority work - see
 ///     `main_sweep_passed_to`.
+///
 /// A priority range that never carved anything and keeps nothing is deleted
-/// outright. Returns `None` if no such row exists.
+/// outright - unless it's an automatic one, which stays, owning nothing, so
+/// its prefix isn't made into one again (see
+/// `create_next_auto_priority_range`). Returns `None` if no such row exists.
 ///
 /// Deliberately checks for an actual referencing `ranges` row rather than
 /// comparing `next_index` to `start_index` to decide on deletion: a
@@ -1646,7 +1753,7 @@ pub async fn remove_priority_range(pool: &SqlitePool, priority_range_id: i64) ->
     let ever_carved: Option<(i64,)> =
         sqlx::query_as("SELECT 1 FROM ranges WHERE priority_range_id = ? LIMIT 1").bind(priority_range_id).fetch_optional(&mut *tx).await?;
 
-    let removal = if ever_carved.is_none() && removal.kept == 0 {
+    let removal = if ever_carved.is_none() && removal.kept == 0 && pr.auto_source.is_none() {
         sqlx::query("DELETE FROM priority_range_segments WHERE priority_range_id = ?").bind(priority_range_id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM priority_ranges WHERE id = ?").bind(priority_range_id).execute(&mut *tx).await?;
         PriorityRangeRemoval { deleted: true, ..removal }
@@ -1959,6 +2066,8 @@ pub async fn migrate_skip_ranges_to_new_alphabet(
 mod tests {
     use super::*;
     use crate::alphabet::{index_width, max_supported_len, Pos};
+    use crate::likely_prefixes::LikelyPrefixes;
+    use std::sync::Arc;
 
     // `i64` versions of the alphabet's position functions, which is what the
     // tests below work in: they stay at lengths up to `index_width`, where a
@@ -2010,6 +2119,7 @@ mod tests {
             canary_probability: 0.0,
             canary_seconds: 5.0,
             stall_release_seconds: 24 * 60 * 60,
+            likely_prefixes: Default::default(),
         }
     }
 
@@ -4596,5 +4706,207 @@ mod tests {
         assert_eq!((v.candidates, v.ranges_completed, v.found), (0, 0, 0), "canaries count towards nothing else");
         assert_eq!((v.canaries_found, v.canaries_total), (1, 2));
 
+    }
+
+
+    /// A five-letter alphabet, so a two-letter prefix at length 11 is
+    /// `5^9` candidates - one claim each with `auto_priority_config`.
+    const FIVE: &str = "ABFOX";
+
+    /// Listfile prefixes FO (3 words), BA (1) and ZZ (1, not in `FIVE`),
+    /// then the dictionary's AX (3) - its FO and BA are the listfile's already.
+    fn auto_priority_config(chunk: i64) -> RangeConfig {
+        RangeConfig {
+            likely_prefixes: Arc::new(LikelyPrefixes::from_texts("FOX\nFOXES\nFOG\nBAT\nZZZ", "fox\nfoxy\nax\naxe\naxes\nbat\n")),
+            ..test_config(chunk)
+        }
+    }
+
+    /// A `FIVE` target over all of length 11, with `auto_priority` on.
+    async fn insert_auto_priority_target(pool: &SqlitePool) -> i64 {
+        let (lower, upper) = full_bounds(FIVE, 11);
+        let target_id = insert_target_with_alphabet(pool, "custom", FIVE, &lower, &upper).await;
+        sqlx::query("UPDATE targets SET auto_priority = 1 WHERE id = ?").bind(target_id).execute(pool).await.unwrap();
+        target_id
+    }
+
+    /// Where `prefix`'s candidates start at length 11.
+    fn prefix_start(prefix: &str) -> i64 {
+        candidate_to_index(FIVE, prefix).unwrap() * space_size(FIVE, 11 - prefix.len() as i64)
+    }
+
+    /// The claimed range's start and the pattern and source of the priority
+    /// range it came from, if any.
+    async fn claimed_from(pool: &SqlitePool, range_id: i64) -> (i64, Option<(String, Option<String>)>) {
+        let (start, priority_range_id): (i64, Option<i64>) =
+            sqlx::query_as("SELECT start_index, priority_range_id FROM ranges WHERE id = ?").bind(range_id).fetch_one(pool).await.unwrap();
+        let origin = match priority_range_id {
+            Some(id) => Some(sqlx::query_as("SELECT pattern, auto_source FROM priority_ranges WHERE id = ?").bind(id).fetch_one(pool).await.unwrap()),
+            None => None,
+        };
+        (start, origin)
+    }
+
+    fn auto(pattern: &str, source: &str) -> Option<(String, Option<String>)> {
+        Some((pattern.to_string(), Some(source.to_string())))
+    }
+
+    #[tokio::test]
+    async fn auto_priority_searches_the_listfiles_prefixes_then_the_dictionarys_then_sweeps() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "alice").await;
+        let config = auto_priority_config(space_size(FIVE, 9));
+        let target_id = insert_auto_priority_target(&pool).await;
+
+        let mut claimed = Vec::new();
+        for _ in 0..4 {
+            let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work");
+            claimed.push(claimed_from(&pool, claim.range_id).await);
+        }
+        assert_eq!(
+            claimed,
+            [(prefix_start("FO"), auto("FO", "listfile")), (prefix_start("BA"), auto("BA", "listfile")), (prefix_start("AX"), auto("AX", "dictionary")), (0, None)],
+            "ZZ can't be spelt in this alphabet"
+        );
+
+        let priorities: Vec<(String, i64)> =
+            sqlx::query_as("SELECT pattern, priority FROM priority_ranges ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(priorities, [("FO".into(), 3), ("BA".into(), 1), ("AX".into(), 3)], "priority is how many words start with it");
+        let exhausted: Option<i64> = sqlx::query_scalar("SELECT auto_priority_exhausted_len FROM targets WHERE id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(exhausted, Some(11));
+
+        // The main sweep jumps over each of them, through the rest of length 11.
+        let mut starts = Vec::new();
+        for _ in 0..25 - 1 - 3 {
+            let claim = claim_range(&pool, &config, &user).await.unwrap().unwrap();
+            assert_eq!(range_position(&pool, claim.range_id).await.0, 11);
+            starts.push(claimed_from(&pool, claim.range_id).await.0);
+        }
+        for prefix in ["FO", "BA", "AX"] {
+            assert!(!starts.contains(&prefix_start(prefix)), "{prefix} was searched twice");
+        }
+
+        // Then length 12 starts over, with three-letter prefixes.
+        let claim = claim_range(&pool, &config, &user).await.unwrap().unwrap();
+        assert_eq!(range_position(&pool, claim.range_id).await.0, 12);
+        let at_12 = candidate_to_index(FIVE, "FOX").unwrap() * space_size(FIVE, 9);
+        assert_eq!(claimed_from(&pool, claim.range_id).await, (at_12, auto("FOX", "listfile")));
+    }
+
+    /// What the main sweep has already searched is left out: a prefix it has
+    /// passed is skipped, one it's partway into starts where it is.
+    #[tokio::test]
+    async fn auto_priority_starts_ahead_of_the_main_sweep() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "alice").await;
+        let config = auto_priority_config(space_size(FIVE, 9));
+        let target_id = insert_auto_priority_target(&pool).await;
+        let cursor = prefix_start("FO") + 7;
+        sqlx::query("UPDATE target_progress SET next_index = ? WHERE target_id = ?").bind(cursor).bind(target_id).execute(&pool).await.unwrap();
+
+        let claim = claim_range(&pool, &config, &user).await.unwrap().unwrap();
+        assert_eq!(claimed_from(&pool, claim.range_id).await, (cursor, auto("FO", "listfile")));
+        let claim = claim_range(&pool, &config, &user).await.unwrap().unwrap();
+        assert_eq!(claimed_from(&pool, claim.range_id).await, (prefix_start("FX"), None), "BA and AX are behind the sweep, and FO is done");
+    }
+
+    /// An operator's priority ranges come first, whatever their priority,
+    /// and an automatic one leaves out what they cover.
+    #[tokio::test]
+    async fn auto_priority_comes_after_an_operators_priority_ranges_and_around_them() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "alice").await;
+        let config = auto_priority_config(5 * space_size(FIVE, 9));
+        let target_id = insert_auto_priority_target(&pool).await;
+        insert_priority_range(&pool, target_id, FIVE, "custom", -5, "B", 11).await;
+
+        let mut claimed = Vec::new();
+        for _ in 0..3 {
+            let claim = claim_range(&pool, &config, &user).await.unwrap().unwrap();
+            claimed.push(claimed_from(&pool, claim.range_id).await);
+        }
+        assert_eq!(
+            claimed,
+            [
+                (prefix_start("BA"), Some(("B".into(), None))),
+                (prefix_start("FO"), auto("FO", "listfile")),
+                (prefix_start("AX"), auto("AX", "dictionary")),
+            ],
+            "BA is all the operator's B already"
+        );
+    }
+
+    /// Removing an automatic priority range nothing was carved from keeps
+    /// its row, so the same prefix isn't made into one again.
+    #[tokio::test]
+    async fn a_removed_auto_priority_range_is_not_made_again() {
+        let pool = test_pool().await;
+        let config = auto_priority_config(space_size(FIVE, 9));
+        let target_id = insert_auto_priority_target(&pool).await;
+        let target: Target = sqlx::query_as("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_one(&pool).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(create_next_auto_priority_range(&mut conn, &config, &target, now_unix()).await.unwrap());
+        drop(conn);
+        let fo: i64 = sqlx::query_scalar("SELECT id FROM priority_ranges WHERE pattern = 'FO'").fetch_one(&pool).await.unwrap();
+        let removal = remove_priority_range(&pool, fo).await.unwrap().unwrap();
+        assert!(!removal.deleted);
+        assert_eq!(removal.returned_to_main_sweep, space_size(FIVE, 9) as Pos);
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(create_next_auto_priority_range(&mut conn, &config, &target, now_unix()).await.unwrap());
+        let patterns: Vec<String> = sqlx::query_scalar("SELECT pattern FROM priority_ranges ORDER BY id").fetch_all(&mut *conn).await.unwrap();
+        assert_eq!(patterns, ["FO", "BA"]);
+    }
+
+    #[tokio::test]
+    async fn auto_priority_makes_nothing_below_eleven_characters() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "alice").await;
+        let (lower, upper) = full_bounds(FIVE, 10);
+        let target_id = insert_target_with_alphabet(&pool, "custom", FIVE, &lower, &upper).await;
+        sqlx::query("UPDATE targets SET auto_priority = 1 WHERE id = ?").bind(target_id).execute(&pool).await.unwrap();
+
+        let claim = claim_range(&pool, &auto_priority_config(space_size(FIVE, 9)), &user).await.unwrap().unwrap();
+        assert_eq!(claimed_from(&pool, claim.range_id).await, (0, None));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM priority_ranges").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Found names join the listfile's words - virtual (canary) targets' don't.
+    #[tokio::test]
+    async fn refresh_matches_counts_the_names_found_so_far() {
+        let pool = test_pool().await;
+        let real = insert_target(&pool, "A", "Z").await;
+        let canary = insert_target(&pool, "A", "Z").await;
+        sqlx::query("UPDATE targets SET status = 'solved', found_filename = 'REZ\\QUUX.TXT' WHERE id = ?").bind(real).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE targets SET status = 'solved', found_filename = 'JOLT.TXT', is_virtual = 1 WHERE id = ?").bind(canary).execute(&pool).await.unwrap();
+
+        let prefixes = LikelyPrefixes::from_texts("FOX", "");
+        prefixes.refresh_matches(&pool).await.unwrap();
+        let mut found: Vec<String> = prefixes.ranking().get(3).iter().map(|p| p.prefix.clone()).collect();
+        found.sort();
+        assert_eq!(found, ["FOX", "QUU", "REZ"]);
+    }
+
+    /// Skip ranges still apply inside an automatic priority range: one
+    /// that's all skipped hands nothing out, and the next prefix is made.
+    #[tokio::test]
+    async fn auto_priority_honours_skip_ranges() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "alice").await;
+        let config = auto_priority_config(space_size(FIVE, 9));
+        let target_id = insert_auto_priority_target(&pool).await;
+        add_skip_range(&pool, target_id, "FO", 11).await;
+        add_skip_range(&pool, target_id, "BA[A-F]", 11).await;
+
+        let claim = claim_range(&pool, &config, &user).await.unwrap().unwrap();
+        assert_eq!(claimed_from(&pool, claim.range_id).await, (prefix_start("BAO"), auto("BA", "listfile")), "all of FO, and BA up to BAO, skipped");
+        let carved_from_fo: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ranges r JOIN priority_ranges p ON p.id = r.priority_range_id WHERE p.pattern = 'FO' AND r.status != 'skipped'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(carved_from_fo, 0);
     }
 }

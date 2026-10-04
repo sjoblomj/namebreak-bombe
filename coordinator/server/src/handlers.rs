@@ -164,6 +164,14 @@ pub async fn complete(
     .await?;
     if outcome.target_solved {
         tracing::info!(range_id, user_id = user.id, "target solved");
+        // The name found is a real filename too - see likely_prefixes.rs.
+        // In the background, so the client isn't kept waiting for it.
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = state.config.likely_prefixes.refresh_matches(&state.pool).await {
+                tracing::error!(%err, "failed to count the found names into the likely prefixes");
+            }
+        });
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -302,8 +310,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start_text, insert_from_start_position, insert_from_end_text, insert_from_end_position, alphabet_name, alphabet, status, priority, description, start_len, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start_text, insert_from_start_position, insert_from_end_text, insert_from_end_position, alphabet_name, alphabet, status, priority, description, start_len, auto_priority, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -327,6 +335,7 @@ pub async fn admin_create_target(
     .bind(req.priority)
     .bind(&req.description)
     .bind(req.start_len)
+    .bind(req.auto_priority as i64)
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
@@ -429,11 +438,12 @@ pub async fn admin_patch_target(
         && req.insert_from_start.is_none()
         && req.insert_from_end.is_none()
         && req.start_len.is_none()
+        && req.auto_priority.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of name, status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
              prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start, \
-             insert_from_end or start_len must be provided"
+             insert_from_end, start_len or auto_priority must be provided"
                 .into(),
         ));
     }
@@ -486,7 +496,7 @@ pub async fn admin_patch_target(
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
          prune_whole_candidate = COALESCE(?, prune_whole_candidate), max_backslash_count = COALESCE(?, max_backslash_count), \
          min_backslash_count = COALESCE(?, min_backslash_count), prune_adjacent_backslashes = COALESCE(?, prune_adjacent_backslashes), \
-         start_len = COALESCE(?, start_len) \
+         start_len = COALESCE(?, start_len), auto_priority = COALESCE(?, auto_priority) \
          WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.name)
@@ -502,6 +512,7 @@ pub async fn admin_patch_target(
     .bind(req.min_backslash_count)
     .bind(req.prune_adjacent_backslashes.map(i64::from))
     .bind(req.start_len)
+    .bind(req.auto_priority.map(i64::from))
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
@@ -519,6 +530,12 @@ pub async fn admin_patch_target(
         .bind(target_id)
         .execute(&mut *tx)
         .await?;
+    }
+
+    // Turned on again, or in an alphabet that can spell other prefixes: look
+    // for likely prefixes afresh - see ranges::create_next_auto_priority_range.
+    if req.auto_priority.is_some() || alphabet.is_some() {
+        sqlx::query("UPDATE targets SET auto_priority_exhausted_len = NULL WHERE id = ?").bind(target_id).execute(&mut *tx).await?;
     }
 
     // Priority and skip ranges are translated eagerly, in the same

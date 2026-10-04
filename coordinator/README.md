@@ -105,6 +105,30 @@ See the top-level plan/design notes for the full rationale; the short version:
   searched. The response says how much went each way
   (`{"deleted": false, "returned_to_main_sweep": 21, "kept": 0}`); `deleted`
   is true only when nothing was ever handed out and nothing had to be kept.
+- **Automatic priority ranges**: with `"auto_priority": true` on a target,
+  the server makes priority ranges itself, from the leading characters real
+  names most often start with - the first 2 characters at length 11, the
+  first 3 from length 12 (shorter lengths are quick enough to sweep as they
+  are). The prefixes are ranked at startup and again after every find:
+  first by how many words in real filenames start with them - those of
+  `server/data/sc-listfile.txt` (a copy of `tools/sc-listfile.txt`) and
+  every name found so far, split into words and counted like
+  `tools/prefix_counter.py` -
+  then, for prefixes no filename starts with, by how many English words do
+  (`/usr/share/dict/words`, or `DICTIONARY_PATH`; counted like
+  `tools/next_letters.py --rank`). Whenever the target has no other priority
+  work left, a claim makes one priority range, for the most likely prefix
+  not made into one yet at the length the main sweep is on, covering only
+  what's within the bounds, ahead of the sweep and not already another
+  priority range's - so a target bounded from `J` to `M` only gets prefixes
+  from `J` to `M`. Skip ranges still apply inside them. One at a time, so claims stay quick and the dashboard
+  shows them as they come. They show as `auto` in the Prio column, with how
+  many words start with the prefix on hover; it's also their `priority`.
+  An operator's own priority ranges always come first. Once the prefixes run
+  out at a length, the main sweep carries on there, jumping over them, and
+  the next length starts over. Deleting an automatic one works like any
+  other, and its prefix isn't used again. Turning `auto_priority` off makes
+  no new ones but leaves those already made.
 - **Skip ranges**: the opposite - candidates an operator never wants handed
   out. `POST /api/v1/admin/targets/{id}/skip-ranges` takes the same kind of
   `pattern`, a `length` and a plain-text `reason` (required), and returns
@@ -268,7 +292,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "insert_from_end": ["\\", 4],
     "priority": 0,
     "description": "From the <b>1998</b> demo listing",
-    "start_len": 1
+    "start_len": 1,
+    "auto_priority": false
   }'
 ```
 
@@ -348,7 +373,8 @@ curl localhost:8080/api/v1/status
 Pause/resume a target, and/or change its name, priority, description,
 alphabet_name (or a custom alphabet), prune_symbol_runs, prune_unopened_brackets,
 prune_whole_candidate, max_backslash_count, min_backslash_count,
-prune_adjacent_backslashes, insert_from_start, insert_from_end or start_len:
+prune_adjacent_backslashes, insert_from_start, insert_from_end, start_len or
+auto_priority:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \

@@ -352,6 +352,17 @@ pub struct AdminCreateTargetRequest {
     /// max supported length. Defaults to 1, i.e. every length.
     #[serde(default = "default_start_len")]
     pub start_len: i64,
+    /// Search the most likely prefixes first, without having to make
+    /// priority ranges for them: once the main sweep reaches 11 characters,
+    /// whenever the target has no other priority work left, the server makes
+    /// a priority range for the next most likely prefix at the sweep's
+    /// length - 2 characters at length 11, 3 from length 12. Most likely
+    /// means the starts of the most words in a list of real filenames, then
+    /// of the most English words. Each covers only what's within the bounds,
+    /// ahead of the main sweep and not another priority range's; an
+    /// operator's own priority ranges come first. Defaults to false.
+    #[serde(default)]
+    pub auto_priority: bool,
 }
 
 fn default_start_len() -> i64 {
@@ -450,6 +461,11 @@ pub struct AdminPatchTargetRequest {
     /// untouched either way, and so are priority ranges.
     #[serde(default)]
     pub start_len: Option<i64>,
+    /// See `AdminCreateTargetRequest::auto_priority`. Leave unset to leave it
+    /// unchanged. Turning it off leaves the automatic priority ranges already
+    /// made as they are - delete them like any other to stop them.
+    #[serde(default)]
+    pub auto_priority: Option<bool>,
 }
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of

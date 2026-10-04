@@ -1454,7 +1454,14 @@
 
       const tdPriority = document.createElement('td');
       tdPriority.className = 'mono';
-      tdPriority.textContent = String(pr.priority);
+      if (pr.auto_source) {
+        // Made by the server (see ranges::create_next_auto_priority_range),
+        // and its priority is how many words start with its prefix.
+        tdPriority.textContent = 'auto';
+        tdPriority.title = `${pr.priority} ${pr.auto_source === 'listfile' ? 'words in real filenames' : 'English words'} start with ${pr.pattern}`;
+      } else {
+        tdPriority.textContent = String(pr.priority);
+      }
       tr.appendChild(tdPriority);
 
       const tdPattern = document.createElement('td');
@@ -1670,6 +1677,10 @@
       insertions.push([candidateChip(text), position === 0 ? ' at the end' : ` before the last ${characters(position)}`]);
     }
     if (insertions.length > 0) frag.appendChild(settingsLine('Inserting', insertions));
+    if (t.auto_priority) {
+      frag.appendChild(settingsLine('Priority ranges', [hint('likely prefixes first',
+        'From 11 characters, the 2 (or from 12, 3) leading characters most words start with - in real filenames, then in English - get priority ranges of their own, one at a time')]));
+    }
     return frag;
   }
 

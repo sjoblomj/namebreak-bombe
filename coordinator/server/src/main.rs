@@ -6,6 +6,7 @@ mod dashboard;
 mod db;
 mod error;
 mod handlers;
+mod likely_prefixes;
 mod models;
 mod ranges;
 mod state;
@@ -29,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::connect(&database_url).await?;
     let config = RangeConfig::from_env();
+    config.likely_prefixes.refresh_matches(&pool).await?;
     let state = AppState(Arc::new(Inner { pool, admin_token, config }));
 
     spawn_reclaim_task(state.clone());

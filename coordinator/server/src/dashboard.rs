@@ -186,6 +186,8 @@ pub struct DashboardTarget {
     /// The shortest candidate length the main sweep carves - see
     /// `AdminCreateTargetRequest::start_len`.
     pub start_len: i64,
+    /// See `AdminCreateTargetRequest::auto_priority`.
+    pub auto_priority: bool,
     /// Where the target's own main sweep will carve next - its stored
     /// position, moved past any priority range span it would jump over on
     /// its next carve (see `effective_sweep_position`). Compared against
@@ -364,6 +366,11 @@ pub struct DashboardPriorityRange {
     pub handed_out_count: Pos,
     /// How many separate stretches of candidates it owns.
     pub segment_count: usize,
+    /// Where an automatic one's prefix came from (`"listfile"` or
+    /// `"dictionary"`) - `None` for one an operator made. Its `priority` is
+    /// then how many words start with it - see
+    /// `ranges::create_next_auto_priority_range`.
+    pub auto_source: Option<String>,
     /// What it owns - only used here, by `effective_sweep_position`.
     #[serde(skip)]
     pub spans: Vec<(Pos, Pos)>,
@@ -627,6 +634,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                     next_candidate: (next_index < end_index).then(|| index_to_candidate(&pr.alphabet, next_index, pr.candidate_len)),
                     pattern: pr.pattern,
                     alphabet: pr.alphabet,
+                    auto_source: pr.auto_source,
                 }
             })
             .collect::<Vec<_>>();
@@ -660,6 +668,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             prune_adjacent_backslashes: settings.prune_adjacent_backslashes != 0,
             insert_from_start: settings.insert_from_start_text.map(|text| (text, settings.insert_from_start_position)),
             insert_from_end: settings.insert_from_end_text.map(|text| (text, settings.insert_from_end_position)),
+            auto_priority: settings.auto_priority != 0,
             found_filename,
             found_by,
             found_by_backend,

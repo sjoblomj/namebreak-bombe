@@ -66,6 +66,12 @@ pub struct Target {
     /// 1 for a canary's virtual target (see `canary.rs`), which takes part in
     /// nothing but its one claim.
     pub is_virtual: i64,
+    /// 1 to make priority ranges from likely prefixes automatically - see
+    /// `AdminCreateTargetRequest::auto_priority`.
+    pub auto_priority: i64,
+    /// The length at which the likely prefixes ran out - see
+    /// `ranges::create_next_auto_priority_range`.
+    pub auto_priority_exhausted_len: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -194,6 +200,10 @@ pub struct PriorityRange {
     pub start_block: i64,
     pub end_block: i64,
     pub next_block: i64,
+    /// Where the prefix of an automatic priority range came from
+    /// (`likely_prefixes::Source::as_str`) - `None` for one an operator made.
+    /// See `ranges::create_next_auto_priority_range`.
+    pub auto_source: Option<String>,
 }
 
 impl PriorityRange {
