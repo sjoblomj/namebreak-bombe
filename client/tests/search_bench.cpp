@@ -154,13 +154,14 @@ double survivingShare(const SearchRequest& req, uint64_t total, int len, int lea
 
 int main(int argc, char** argv) {
     // [--prune all|symbols|none] [noprune] [--whole] [--backend <name>]
-    // [--scale <n>] [--size <n>] - the default backend is the first that can
+    // [--scale <n>] [--size <n>] [--suffix <text>] - the default backend is the first that can
     // run here (see backends/backends.h).
     std::string prune = "all";
     bool whole = false;
     std::string backendName;
     uint64_t scale = 1;
     int alphabetSize = 49;
+    std::string suffix = ".WAV";
     Insertion insertFromStart, insertFromEnd;
     // "<text>,<position>", split at the last comma.
     auto parseInsertion = [](const std::string& value, Insertion& out) {
@@ -186,6 +187,8 @@ int main(int argc, char** argv) {
         } else if ((arg == "--insert-from-start" || arg == "--insert-from-end") && i + 1 < argc) {
             if (!parseInsertion(argv[++i], arg == "--insert-from-start" ? insertFromStart : insertFromEnd))
                 prune = "?";
+        } else if (arg == "--suffix" && i + 1 < argc) {
+            suffix = argv[++i];
         } else if (arg == "--size" && i + 1 < argc) {
             alphabetSize = std::stoi(argv[++i]);
             if (alphabetSize < 1 || alphabetSize > MAX_ALPHABET_SIZE)
@@ -196,7 +199,7 @@ int main(int argc, char** argv) {
         if (prune != "all" && prune != "symbols" && prune != "none") {
             fprintf(stderr,
                     "Usage: %s [--prune all|symbols|none] [noprune] [--whole] [--backend <name>] [--scale <n>] [--size 1-%d]\n"
-                    "       [--insert-from-start <text>,<position>] [--insert-from-end <text>,<position>]\n",
+                    "       [--suffix <text>] [--insert-from-start <text>,<position>] [--insert-from-end <text>,<position>]\n",
                     argv[0], MAX_ALPHABET_SIZE);
             return 1;
         }
@@ -205,7 +208,6 @@ int main(int argc, char** argv) {
     // (14 more after the real ones, up to MAX_ALPHABET_SIZE), to time other sizes.
     const std::string alphabet = std::string(" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#$%*:;<=>?@^`~").substr(0, alphabetSize);
     const std::string prefix = "REZ\\";
-    const std::string suffix = ".WAV";
     const int candidateLen = 10;
     // Chosen directly in full-candidate space (not tied to any particular
     // leading/trailing split - runSearch() picks that internally via the
