@@ -31,6 +31,10 @@
 // every candidate (SearchRequest::insertFromStart/insertFromEnd), to time
 // what it costs where it lands - see the README's "Inserted text".
 //
+// --alphabet, --prefix and --suffix time another search's - a coordinator
+// target's, say (the dashboard shows them): how much the rules prune
+// depends on the alphabet's characters, not only on its size (--size).
+//
 // Creating the backend (for CUDA, the GPU context, and its self-test) and a
 // first, small warm-up search happen before the clock starts: a fast GPU
 // covers the default range in a few hundredths of a second, which that
@@ -154,14 +158,17 @@ double survivingShare(const SearchRequest& req, uint64_t total, int len, int lea
 
 int main(int argc, char** argv) {
     // [--prune all|symbols|none] [noprune] [--whole] [--backend <name>]
-    // [--scale <n>] [--size <n>] [--suffix <text>] - the default backend is the first that can
-    // run here (see backends/backends.h).
+    // [--scale <n>] [--size <n>] [--alphabet <characters>] [--prefix <text>]
+    // [--suffix <text>] - the default backend is the first that can run here
+    // (see backends/backends.h).
     std::string prune = "all";
     bool whole = false;
     std::string backendName;
     uint64_t scale = 1;
     int alphabetSize = 49;
     std::string suffix = ".WAV";
+    std::string prefix = "REZ\\";
+    std::string alphabetOption;
     Insertion insertFromStart, insertFromEnd;
     // "<text>,<position>", split at the last comma.
     auto parseInsertion = [](const std::string& value, Insertion& out) {
@@ -189,6 +196,12 @@ int main(int argc, char** argv) {
                 prune = "?";
         } else if (arg == "--suffix" && i + 1 < argc) {
             suffix = argv[++i];
+        } else if (arg == "--prefix" && i + 1 < argc) {
+            prefix = argv[++i];
+        } else if (arg == "--alphabet" && i + 1 < argc) {
+            alphabetOption = argv[++i];
+            if (alphabetOption.empty() || alphabetOption.size() > (size_t) MAX_ALPHABET_SIZE)
+                prune = "?";
         } else if (arg == "--size" && i + 1 < argc) {
             alphabetSize = std::stoi(argv[++i]);
             if (alphabetSize < 1 || alphabetSize > MAX_ALPHABET_SIZE)
@@ -199,15 +212,19 @@ int main(int argc, char** argv) {
         if (prune != "all" && prune != "symbols" && prune != "none") {
             fprintf(stderr,
                     "Usage: %s [--prune all|symbols|none] [noprune] [--whole] [--backend <name>] [--scale <n>] [--size 1-%d]\n"
-                    "       [--suffix <text>] [--insert-from-start <text>,<position>] [--insert-from-end <text>,<position>]\n",
+                    "       [--alphabet <characters>] [--prefix <text>] [--suffix <text>]\n"
+                    "       [--insert-from-start <text>,<position>] [--insert-from-end <text>,<position>]\n",
                     argv[0], MAX_ALPHABET_SIZE);
             return 1;
         }
     }
     // The real 49 characters - or with --size, the first that many of these
     // (14 more after the real ones, up to MAX_ALPHABET_SIZE), to time other sizes.
-    const std::string alphabet = std::string(" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#$%*:;<=>?@^`~").substr(0, alphabetSize);
-    const std::string prefix = "REZ\\";
+    // --alphabet gives one outright, e.g. a coordinator target's.
+    const std::string alphabet = !alphabetOption.empty()
+                                     ? alphabetOption
+                                     : std::string(" !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_#$%*:;<=>?@^`~").substr(0, alphabetSize);
+    alphabetSize = (int) alphabet.size();
     const int candidateLen = 10;
     // Chosen directly in full-candidate space (not tied to any particular
     // leading/trailing split - runSearch() picks that internally via the

@@ -212,7 +212,8 @@ compile of the CUDA backend - the build runs them in parallel.
 `cmake --build --preset default --target run_search_bench` times the real
 search over a fixed range (`build/tests/search_bench --scale <n>` for a
 longer one), pruning as the real configuration does (`--prune symbols` or
-`none` for less, `--whole` to prune the whole candidate). It reports the range covered per second, the rate at
+`none` for less, `--whole` to prune the whole candidate; `--alphabet`,
+`--prefix` and `--suffix` time a coordinator target's). It reports the range covered per second, the rate at
 which the backend searched what pruning left, and a projection for a real
 search, whose leading characters all vary - the timed range only varies
 its last few, so it prunes far less than a real search would. The
