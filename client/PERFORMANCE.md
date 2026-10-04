@@ -215,6 +215,22 @@ will have grown (not measured again).
     table width and chunk size, as above.
   - [ ] **HIP on AMD** gets all of this with the CUDA code, unmeasured: a
     64-lane wavefront may like other values.
+- [x] **Threads per block**, and the other knobs re-checked at the
+  coordinator's targets (alphabet sizes 40, 42 and 43, `.WAV` and
+  `\BWUNIN.EXE`; `search_bench --scale 60` with their `--alphabet`, four to
+  eight interleaved rounds). **Measured**:
+  - 512 and 1,024 threads per block (`kThreadsPerBlock`) instead of 256:
+    +1-2% and +1-4% at the GPU's own clocks - but at Nsight Compute's fixed
+    clocks 1,024 is **6% slower** (2.76 ms instead of 2.60 for the same
+    launch, the same 273M instructions, 62% of the warps a scheduler could
+    hold instead of 92%). This GPU runs at its 80 W power cap ("SW power
+    cap", 1.0-1.1 GHz): a less occupied kernel draws less and gets a higher
+    clock, which a GPU with power to spare wouldn't give it. **Unchanged**.
+  - The lookup filter: 5 bits 31-38% slower than 6, 7 bits 11-15% slower
+    (the same with `\BWUNIN.EXE`). 6 stays.
+  - 32 batches per launch instead of 16: within the noise. Between two full
+    launches the GPU idles 1.5-1.7% (Nsight Systems, 14 us median gaps,
+    launches of 0.8-1 ms at sizes 40-42), so there's little left to win.
 - [x] **Where the table lives.** Tried: a 6-bit table (32 KB) copied into
   each block's shared memory, with the grid capped at 116, 174 or 348
   blocks (2, 3 or 6 per SM) so each block loads it once and walks many
@@ -336,6 +352,18 @@ will have grown (not measured again).
     and then the same `LaunchWaiter`, now shared (after a `clFlush`, so the
     launch is on its way before the host sleeps). **Measured**: 21% of a
     core instead of 100%.
+  - [ ] **Short launches never sleep.** A launch of 16 batches is 16 x
+    size^5 candidates - about 0.8 ms at size 40 and 1 ms at 42, against 2.3
+    at 49 - and the waiter starts out assuming a sleep overshoots by 0.5 ms,
+    a margin of 1 ms, so it never sleeps through one, and never learns that
+    sleeps here overshoot by far less: those searches keep a core at 100%
+    (**measured**: `sc-ptbr-poor-fellars-dog`'s and `rez-wav1`'s settings;
+    `\BWUNIN.EXE`'s longer launches sleep, at about 30%). Starting from
+    0.1 ms took it to 33-35% - and the same speed (six alternating rounds
+    each, -0.3 and -0.1%; a laptop whose GPU sat at its own 80 W cap
+    throughout). Worth doing for the core it frees, not for speed; on
+    Windows' default 15.6 ms timer its first sleep would overshoot once,
+    and it would stop sleeping, as now.
   - [ ] **Metal**: `waitUntilCompleted` is documented as a blocking wait, so
     it may not spin at all - measure on a Mac before changing anything; its
     launches, one batch of 2^21 rows, are short too.
