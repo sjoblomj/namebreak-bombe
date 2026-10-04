@@ -547,12 +547,16 @@ void dispatchSuffixLen(int suffixLen, F&& f) {
 }
 
 // The alphabet sizes filteredRowsKernel has compiled in, rather than taking
-// them at runtime (see alphabetSizeOf): 42 and 43. Every other size is taken
-// at runtime. Adding one is a number here - and 20 more instantiations of the
-// kernel to compile.
+// them at runtime (see alphabetSizeOf): 40, 42 and 43 - those of the
+// coordinator's targets. Every other size is taken at runtime. Adding one is
+// a number here - and 28 more instantiations of the kernel to compile. 40,
+// with a whole row group per thread (NAMEBREAK_ROWS_PER_THREAD), issued 4.4%
+// fewer instructions than at runtime walking every row group (Nsight
+// Compute: 149M instead of 156M, 1.50 ms instead of 1.53, at the profiler's
+// fixed clocks), and searched about 4% faster at the GPU's own clocks.
 template<int... Sizes>
 struct AlphabetSizeList {};
-using CompiledAlphabetSizes = AlphabetSizeList<42, 43>;
+using CompiledAlphabetSizes = AlphabetSizeList<40, 42, 43>;
 
 // Launches filteredRowsKernel, walking every row group or lists of them -
 // with the text inserted into the trailing part hashed if Inserted.

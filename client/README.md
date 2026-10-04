@@ -186,7 +186,7 @@ Every backend searches an alphabet of any size from 1 to `MAX_ALPHABET_SIZE`
 (63, as a row's candidates are a 64-bit mask, one bit each). The CUDA
 kernel takes the size at runtime, dividing by it with
 multipliers worked out on the host, the way a compiler divides by a
-constant - except for 42 and 43 (`CompiledAlphabetSizes` in
+constant - except for 40, 42 and 43 (`CompiledAlphabetSizes` in
 `src/backends/cuda/cuda_backend.cu`), compiled in: a size the compiler knows saves it a few instructions a row (see
 [PERFORMANCE.md](PERFORMANCE.md)).
 

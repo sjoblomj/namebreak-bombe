@@ -395,6 +395,16 @@ will have grown (not measured again).
     the same speed (0.5% slower, within the noise) and **2.1% slower** with
     `--whole` (all four pairs); 43 **4.5% faster** (all four) and **1.3%**
     with `--whole`.
+  - Then 40 compiled in too, the size of the coordinator's
+    `sc-ptbr-poor-fellars-dog`: with a whole row group per thread, a known
+    size of 40 is also one chunk per group known. **Measured** (Nsight
+    Compute, the same launch, walking every group): 149M instructions
+    instead of 156M, 1.50 ms instead of 1.53; `search_bench` with that
+    target's alphabet **+4.1%** without `--whole` (eight rounds, all faster,
+    +3.5 to +6.7%), and about +1.3% with it, walking the lists. 140 kernel
+    instantiations instead of 112; the CUDA file compiles in 13.3 s instead
+    of 11.8 here, and the self-test's five cases at 40 (and its pruning and
+    grouped cases) take it from 143 to 157 ms.
   - The first runtime version issued 25% more instructions: with the size
     unknown, the compiler worked the batch's first and last row out again
     for every row (reading the batch from the kernel's arguments by

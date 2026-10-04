@@ -471,14 +471,15 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
     uint32_t cryptTable[0x500];
     prepareCryptTable(cryptTable);
 
-    // Alphabet sizes: the largest allowed, the default alphabet's, 42 and 43
-    // (which the CUDA kernel has compiled in, rather than taking at runtime),
+    // Alphabet sizes: the largest allowed, the default alphabet's, 40, 42 and
+    // 43 (which the CUDA kernel has compiled in, rather than taking at runtime),
     // a smaller one, and one small enough that a row group's chunks have only
     // a few rows each.
     const int big = MAX_ALPHABET_SIZE;
     const int common = 49;
     const int compiled = 42;
     const int compiled2 = 43;
+    const int compiled3 = 40;
     const int small = 29;
     const int odd = 13;
     const int window = std::min(backend.windowChars(), backend.maxTrailingLen());
@@ -540,6 +541,11 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
         {compiled2, "REZ\\", ".WAV", window, 31, Case::AtEnd},
         {compiled2, "REZ\\", ".WAV", window, 41, Case::Inside, Case::LastRowOfGroup},
         {compiled2, "REZ\\", ".WAV", window, 20, Case::InLongRange, Case::LastRowOfGroup},
+        {compiled3, "REZ\\", ".WAV", window, 39, Case::Inside},
+        {compiled3, "REZ\\", ".WAV", window, 20, Case::AtStart},
+        {compiled3, "REZ\\", ".WAV", window, 31, Case::AtEnd},
+        {compiled3, "REZ\\", ".WAV", window, 38, Case::Inside, Case::LastRowOfGroup},
+        {compiled3, "REZ\\", ".WAV", window, 20, Case::InLongRange, Case::LastRowOfGroup},
         {odd, "REZ\\", ".WAV", window, 12, Case::Inside},
         {odd, "REZ\\", ".WAV", window, 0, Case::AtStart, Case::FirstRowOfGroup},
         {odd, "REZ\\", ".WAV", window, 5, Case::InLongRange, Case::LastRowOfGroup},
@@ -596,7 +602,7 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             "B" + pad + "\\A",  // the row's own last character is one: survives
             "\\" + pad + "AA",  // one in the row group's characters: survives
         };
-        for (int size : {big, common, compiled, compiled2, small}) {
+        for (int size : {big, common, compiled, compiled2, compiled3, small}) {
             for (const std::string& trailing : pruneCases) {
                 if (!runPruneCase(backend, size, trailing, rules, cryptTable, error))
                     return false;
@@ -641,7 +647,7 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             {0, GroupedCase::Inside, true}, {1, GroupedCase::Inside, true}, {2, GroupedCase::AtEnd, true},
             {3, GroupedCase::AtStart, true}, {-1, GroupedCase::Inside, true},
         };
-        for (int size : {big, common, compiled, compiled2}) {
+        for (int size : {big, common, compiled, compiled2, compiled3}) {
             for (const GroupedCase& c : groupedCases) {
                 if (!runGroupedCase(backend, c, batchCount, size, window, cryptTable, error))
                     return false;
