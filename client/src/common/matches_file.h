@@ -21,8 +21,9 @@ inline constexpr const char* kDefaultMatchesDir = "matches";
 // `matchesDir` - or, if `targetName` is empty, the local search's.
 std::string matchesFilePath(const std::string& matchesDir, const std::string& targetName);
 
-// Reads up to the last `maxLines` lines of `path` (oldest first) - empty if
-// it doesn't exist (yet).
+// Reads up to the last `maxLines` lines of `path` (oldest first, without
+// their "\n" or "\r\n") - empty if it doesn't exist (yet). Reads only the end
+// of the file, however big it is.
 std::vector<std::string> readLastLines(const std::string& path, size_t maxLines);
 
 // Fraction (0.0-1.0) of the way `matchFilename` (a full prefix+candidate+

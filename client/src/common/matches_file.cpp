@@ -33,20 +33,56 @@ std::string matchesFilePath(const std::string& matchesDir, const std::string& ta
     return (last == '/' || last == '\\') ? matchesDir + name : matchesDir + "/" + name;
 }
 
-// A matches file only ever grows a few KB to low MB over a session (one line
-// per Hash-A hit), so re-reading it whole on every refresh (the Windows GUI's
-// ~1s tick) is cheap enough not to need a real seek-from-end tail
-// implementation.
+// Reads only the end of the file: a coordinator target's matches file is
+// appended to for as long as the target runs, across sessions - one line per
+// Hash-A hit, which on a fast GPU is hundreds a second - so it reaches
+// hundreds of MB, and the Windows GUI calls this on every ~1s tick. Reading
+// such a file whole took most of a second and most of a GB each time, which
+// left the GUI's UI thread with no time for anything else.
 std::vector<std::string> readLastLines(const std::string& path, size_t maxLines) {
     std::vector<std::string> lines;
-    std::ifstream in(path);
-    if (!in)
+    // Binary, since a text-mode stream can't be seeked to a byte offset
+    // reliably on Windows - so the '\r' a Windows text-mode writer puts
+    // before each '\n' is stripped below instead.
+    std::ifstream in(path, std::ios::binary);
+    if (!in || maxLines == 0)
         return lines;
-    std::string line;
-    while (std::getline(in, line))
-        lines.push_back(line);
-    if (lines.size() > maxLines)
-        lines.erase(lines.begin(), lines.begin() + (lines.size() - maxLines));
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size <= 0)
+        return lines;
+
+    // Walks back from the end a chunk at a time to the line break just before
+    // the oldest wanted line - or to the start of the file. The file's own
+    // final '\n' ends its last line rather than starting a new one, so it
+    // doesn't count.
+    std::streamoff start = 0;
+    size_t breaks = 0;
+    char chunk[4096];
+    for (std::streamoff chunkEnd = size; chunkEnd > 0 && start == 0;) {
+        std::streamoff chunkStart = std::max<std::streamoff>(0, chunkEnd - (std::streamoff) sizeof(chunk));
+        in.seekg(chunkStart);
+        if (!in.read(chunk, chunkEnd - chunkStart))
+            return lines;
+        for (std::streamoff i = chunkEnd - 1; i >= chunkStart; --i) {
+            if (chunk[i - chunkStart] == '\n' && i != size - 1 && ++breaks == maxLines) {
+                start = i + 1;
+                break;
+            }
+        }
+        chunkEnd = chunkStart;
+    }
+
+    std::string tail((size_t) (size - start), '\0');
+    in.seekg(start);
+    if (!in.read(&tail[0], (std::streamsize) tail.size()))
+        return lines;
+    for (size_t lineStart = 0; lineStart < tail.size();) {
+        size_t lineEnd = std::min(tail.find('\n', lineStart), tail.size());
+        size_t contentEnd = (lineEnd > lineStart && tail[lineEnd - 1] == '\r') ? lineEnd - 1 : lineEnd;
+        lines.push_back(tail.substr(lineStart, contentEnd - lineStart));
+        lineStart = lineEnd + 1;
+    }
     return lines;
 }
 

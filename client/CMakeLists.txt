@@ -294,6 +294,11 @@ namebreak_test(self_test_test self_test_test)
 namebreak_test_executable(config_test tests/config_test.cpp namebreak_common)
 namebreak_test(config_test config_test)
 
+# readLastLines (src/common/matches_file.h), which reads the end of a matches
+# file without reading the rest of it. CPU only.
+namebreak_test_executable(matches_file_test tests/matches_file_test.cpp namebreak_common)
+namebreak_test(matches_file_test matches_file_test)
+
 # Release versions (src/common/version.h) and, with networking, the pure
 # parts of the startup update check. No network access.
 if(NAMEBREAK_NETWORK)
