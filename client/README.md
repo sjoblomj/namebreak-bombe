@@ -973,8 +973,15 @@ groups out of what it searches:
   no candidates. A kernel walking a list measured about 5% slower (CUDA;
   6% OpenCL) than one walking every group, so a search that doesn't prune
   the whole candidate gets the kernel that walks every group, as before -
-  the kernels are compiled both ways. The CPU backend checks its rows as it
-  walks them, and skips the pruned ones.
+  the kernels are compiled both ways. So does a CUDA launch whose lists
+  leave out less than 5% of its row groups (`NAMEBREAK_LIST_MIN_PRUNED_PERCENT`
+  in `backends/cuda/tuning.h`): with few symbols in the alphabet, the rules
+  hardly prune - `" -.0-9A-Z_"` with symbol runs pruned loses about 0.3% of
+  its candidates - and the lists cost more than they save. The hits such a
+  launch has in rows the lists leave out are dropped on the host
+  (`RowPruning::survives`), so it reports what walking the lists would have.
+  The CPU backend checks its rows as it walks them, and skips the pruned
+  ones.
 - A candidate's last character is never checked - for `min_backslash_count`,
   it's assumed to be a `\` if it may be one. Skipping one would save
   nothing - its row is hashed anyway, and at most a few of its candidates

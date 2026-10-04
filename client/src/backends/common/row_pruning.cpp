@@ -203,3 +203,13 @@ RowPruning::Slice RowPruning::groupsFor(int trailingLen, const PruneState& entry
     const uint32_t* hi = std::upper_bound(lo, end, lastGroup, [](uint64_t g, uint32_t e) { return g < (e >> kRowFlagBits); });
     return Slice{(uint32_t) (lo - arena_.data()), (uint32_t) (hi - lo)};
 }
+
+bool RowPruning::survives(Slice list, uint64_t row) const {
+    const uint64_t alphabetSize = alphabet_.size();
+    const uint64_t group = row / alphabetSize;
+    const uint64_t d = row % alphabetSize;
+    const uint32_t* begin = arena_.data() + list.offset;
+    const uint32_t* end = begin + list.count;
+    const uint32_t* entry = std::lower_bound(begin, end, group, [](uint32_t e, uint64_t g) { return (e >> kRowFlagBits) < g; });
+    return entry != end && (*entry >> kRowFlagBits) == group && (rowMasks_[*entry & (kRowFlagCount - 1)] >> d & 1);
+}

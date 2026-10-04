@@ -515,6 +515,49 @@ will have grown (not measured again).
   - [ ] **Metal** has it too, walking its batch's list with `LISTED`
     (compiled here only as C++ against a stand-in for `<metal_stdlib>`, for
     its syntax): run the tests on a Mac.
+  - [x] **Walk the lists only where they pay** (CUDA). How much the rules
+    prune depends on the alphabet's characters: the coordinator's
+    `sc-ptbr-poor-fellars-dog` searches `" -.0-9A-Z_"` with symbol runs
+    pruned, where a run of three needs three of `-`, `.` and `_` in a row -
+    0.3% of its candidates - so the lists left out almost nothing, and cost
+    the list-walking kernel's 5% (**measured**, Nsight Compute, the same
+    launch: 165M instructions and 1.60 ms walking the lists, 156M and 1.53 ms
+    walking every group). Now a launch walks its batches' lists only if
+    they leave out at least `NAMEBREAK_LIST_MIN_PRUNED_PERCENT` (5) of its
+    row groups; if not, it walks every group, and the hits in rows the lists
+    leave out are dropped on the host (`RowPruning::survives` - a launch has
+    about one hit), so a search reports exactly what it did. The tests run
+    both ways: small_launch always walks the lists, window2 and the stress
+    test's overflow variant never do, the rest take the default. So does the
+    self-test, whose ranges of a few row groups would otherwise never walk
+    the lists where only a row is pruned (the mutation script's `rowbit` got
+    past it): it asks for each way (`SearchConstants::listWalking`, which
+    the engine leaves to the backend), and takes 207 ms instead of 157. The
+    mutation script has four mutations of the host's check, and two that
+    force either way and must change nothing. **Measured** (`search_bench
+    --scale 60`, six rounds interleaved with the code before, with the
+    `--alphabet`, `--prefix` and `--suffix` of the coordinator's targets;
+    the backend's search rate), against the code before, which always
+    walked the lists:
+
+    | Search, with `--whole` | Pruned by the backend | At 5% (shipped) | Never walking them |
+    |---|---|---|---|
+    | `" -.0-9A-Z_"`, `MUSIC\`, `.WAV`, symbol runs | 0.14% | **+4.8%** | +4.4% |
+    | `" ()-.0-9A-Z_"`, `REZ\`, `.WAV`, all rules | 4.9% | +1.1% | +0.9% |
+    | `" ()-.0-9A-Z\_"`, `\BWUNIN.EXE`, all rules | 5.1% | -0.2% | -4.0% |
+    | the real 49 characters, all rules | 17.4% | +0.1% | -13.1% |
+
+    The 11-character suffix makes the rows pruned inside surviving groups
+    worth more (a flagged candidate costs more to hash), so walking the
+    lists still pays at 5% there - the threshold counts groups only. With
+    size 40 compiled in too (above), which also counts for more once its
+    launches walk every group, `sc-ptbr-poor-fellars-dog`'s search is
+    **8.6-9.0% faster** than before both (two runs of four and six
+    interleaved rounds, every round faster); the coordinator's other
+    targets, which don't prune the whole candidate, the same.
+  - [ ] **The same for OpenCL and Metal**, whose list-walking kernels cost
+    about 6%: the host's check is shared (`RowPruning::survives`). OpenCL
+    is what the coordinator's busiest volunteer runs.
 
 ## Tooling
 

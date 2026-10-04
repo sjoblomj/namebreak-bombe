@@ -343,15 +343,20 @@ list(APPEND ROW_BACKENDS cpu)
 # (NAMEBREAK_BATCHES_PER_LAUNCH, see runBatches in cuda_backend.cu) 3, 5 and
 # 32 at a time: with batches of a few rows, a launch then often spans several
 # leading values, with pruned ones between them. All three also make the cpu backend
-# split every call, however small, across its threads.
+# split every call, however small, across its threads. And a search that prunes
+# the whole candidate walks its lists of row groups on CUDA/HIP only where they
+# leave out enough of them (NAMEBREAK_LIST_MIN_PRUNED_PERCENT, tuning.h), so
+# small_launch always walks them (0) and window2 never does (101), its hits
+# checked against the lists on the host instead; the shipped default and window6
+# do some of each.
 namebreak_test_executable(search_integration_test tests/search_integration_test.cpp namebreak_search)
 foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(integration-${backend} search_integration_test --backend ${backend})
 endforeach()
 if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
     foreach(config IN ITEMS
-            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_ROWS_PER_THREAD=3;NAMEBREAK_BATCHES_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
-            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_ROWS_PER_THREAD=1;NAMEBREAK_BATCHES_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1"
+            "small_launch;NAMEBREAK_ROWS_PER_LAUNCH=3;NAMEBREAK_ROWS_PER_THREAD=3;NAMEBREAK_BATCHES_PER_LAUNCH=3;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_LIST_MIN_PRUNED_PERCENT=0"
+            "window2;NAMEBREAK_GPU_WINDOW_CHARS=2;NAMEBREAK_ROWS_PER_LAUNCH=5;NAMEBREAK_ROWS_PER_THREAD=1;NAMEBREAK_BATCHES_PER_LAUNCH=5;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1;NAMEBREAK_LIST_MIN_PRUNED_PERCENT=101"
             "window6;NAMEBREAK_GPU_WINDOW_CHARS=6;NAMEBREAK_ROWS_PER_THREAD=64;NAMEBREAK_BATCHES_PER_LAUNCH=32;NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1")
         list(POP_FRONT config suffix)
         namebreak_search_library(namebreak_search_${suffix} ${config})
@@ -391,7 +396,10 @@ endforeach()
 # through to be hashed in full, and small_launch's geometry with room for a
 # single hit per launch (MAX_MATCHES=1), so that batches - and batches
 # searched together - overflow all the time, and the engine's fallbacks of
-# searching them again in halves, or one by one, run on random ranges.
+# searching them again in halves, or one by one, run on random ranges. As in
+# the integration test, small_launch always walks its lists of row groups and
+# window2 never does - nor does overflow, whose launches then overflow with
+# hits the host would have dropped too.
 set(STRESS_BACKENDS ${ROW_BACKENDS})
 set(STRESS_DEFINITIONS NAMEBREAK_HASHA_MATCH_BITS=12)
 namebreak_search_library(namebreak_search_stress ${STRESS_DEFINITIONS})
@@ -400,11 +408,11 @@ foreach(backend IN LISTS STRESS_BACKENDS ITEMS reference)
     namebreak_test(stress-${backend} search_stress_test --backend ${backend})
 endforeach()
 if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
-    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
-    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_ROWS_PER_THREAD=1 NAMEBREAK_BATCHES_PER_LAUNCH=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_small_launch NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_LIST_MIN_PRUNED_PERCENT=0)
+    set(STRESS_window2 NAMEBREAK_GPU_WINDOW_CHARS=2 NAMEBREAK_ROWS_PER_LAUNCH=5 NAMEBREAK_ROWS_PER_THREAD=1 NAMEBREAK_BATCHES_PER_LAUNCH=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_LIST_MIN_PRUNED_PERCENT=101)
     set(STRESS_window6 NAMEBREAK_GPU_WINDOW_CHARS=6 NAMEBREAK_ROWS_PER_THREAD=64 NAMEBREAK_BATCHES_PER_LAUNCH=32 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
     set(STRESS_filter1 NAMEBREAK_LOWBITS_FILTER_BITS=1)
-    set(STRESS_overflow MAX_MATCHES=1 NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1)
+    set(STRESS_overflow MAX_MATCHES=1 NAMEBREAK_ROWS_PER_LAUNCH=3 NAMEBREAK_ROWS_PER_THREAD=3 NAMEBREAK_BATCHES_PER_LAUNCH=3 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=1 NAMEBREAK_LIST_MIN_PRUNED_PERCENT=101)
     foreach(variant IN ITEMS small_launch window2 window6 filter1 overflow)
         namebreak_search_library(namebreak_search_stress_${variant} ${STRESS_DEFINITIONS} ${STRESS_${variant}})
         namebreak_test_executable(search_stress_test_${variant} tests/search_stress_test.cpp namebreak_search_stress_${variant})

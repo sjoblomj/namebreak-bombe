@@ -60,6 +60,22 @@ constexpr int kMaxBatchesPerLaunch = 32;
 #define NAMEBREAK_ROWS_PER_THREAD 64
 #endif
 
+// A search that prunes the whole candidate gets, for each batch, the list of
+// its row groups that survive the rules (backends/common/row_pruning.h). A
+// launch walks those lists only if they leave out at least this percentage
+// of its batches' row groups; if not, it walks every group, as a search that
+// doesn't prune the whole candidate does, and the hits the lists would have
+// left out are dropped on the host (runBatches) - so what a search reports
+// is the same either way. Walking a list costs about 5% more per row group
+// (Nsight Compute: 1.60 ms instead of 1.53 for the same launch), more than
+// the groups some rules leave out: the alphabet " -.0-9A-Z_" with symbol
+// runs pruned loses about 0.3%. 0 always walks the lists, 101 never does.
+// Overridable at compile time (-DNAMEBREAK_LIST_MIN_PRUNED_PERCENT=N) so the
+// tests can exercise both ways.
+#ifndef NAMEBREAK_LIST_MIN_PRUNED_PERCENT
+#define NAMEBREAK_LIST_MIN_PRUNED_PERCENT 5
+#endif
+
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index
 // (alphabetSize^(trailingLen-1)) must fit in 32 bits: 63^5 < 2^32 <= 63^6.
 constexpr int kMaxTrailingLen = 6;
@@ -74,6 +90,8 @@ static_assert(NAMEBREAK_ROWS_PER_LAUNCH >= 1, "NAMEBREAK_ROWS_PER_LAUNCH must be
 static_assert(NAMEBREAK_BATCHES_PER_LAUNCH >= 1 && NAMEBREAK_BATCHES_PER_LAUNCH <= kMaxBatchesPerLaunch,
               "NAMEBREAK_BATCHES_PER_LAUNCH must be between 1 and kMaxBatchesPerLaunch");
 static_assert(NAMEBREAK_ROWS_PER_THREAD >= 1, "NAMEBREAK_ROWS_PER_THREAD must be >= 1");
+static_assert(NAMEBREAK_LIST_MIN_PRUNED_PERCENT >= 0 && NAMEBREAK_LIST_MIN_PRUNED_PERCENT <= 101,
+              "NAMEBREAK_LIST_MIN_PRUNED_PERCENT must be between 0 (always walk the lists) and 101 (never)");
 static_assert(NAMEBREAK_ROWS_PER_LAUNCH <= (1u << 30), "a launch's row count must stay well within 32 bits");
 
 #endif // NAMEBREAK_BACKENDS_CUDA_TUNING_H

@@ -75,6 +75,14 @@ struct SearchConstants {
     // inserted after a candidate's last character is part of `suffix`; text
     // inserted into its leading part, of each batch's BatchParams::prefix.)
     std::vector<TrailingInsertion> trailingInsertions;
+    // How a backend that can search what trailingRules leave either way -
+    // walking lists of the row groups that survive them, or every group and
+    // dropping the hits outside them (CUDA/HIP, see
+    // NAMEBREAK_LIST_MIN_PRUNED_PERCENT) - chooses: by how much the lists
+    // leave out, or always the one way. Only the self-test asks for one, to
+    // test both: they find the same. Other backends ignore it.
+    enum class ListWalking { Auto, Always, Never };
+    ListWalking listWalking = ListWalking::Auto;
 };
 
 // A trailing part of `trailing` (trailingLen characters) with `insertions`

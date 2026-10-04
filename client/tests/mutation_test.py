@@ -228,8 +228,7 @@ CUDA_MUTATIONS = [
              edits=[(KERNEL, "const uint64_t threads = maxGroups * shape_.chunksPerGroup;",
                      "const uint64_t threads = std::max<uint64_t>(1, maxGroups * shape_.chunksPerGroup - 1);")]),
     Mutation("firstbatchgrid", "only as many threads as the first batch needs", expect="harmless",
-             edits=[(KERNEL, "maxGroups = std::max<uint64_t>(maxGroups, batch.lastGroup - batch.firstGroup + 1);",
-                     "maxGroups = b == 0 ? batch.lastGroup - batch.firstGroup + 1 : maxGroups;")]),
+             edits=[(KERNEL, "maxGroups = std::max(maxGroups, batchGroups);", "maxGroups = b == 0 ? batchGroups : maxGroups;")]),
     # Pruning the whole candidate: the lists of row groups, and the rows of each.
     Mutation("notlisted", "the whole candidate never pruned",
              [(KERNEL, "listed_ = constants.trailingRules.any();", "listed_ = false;")]),
@@ -259,6 +258,29 @@ CUDA_MUTATIONS = [
              caught_by=("self-test", "integration")),
     Mutation("stalelists", "the lists on the GPU kept when they're cleared for another alphabet",
              [(KERNEL, "if (rowPruning_.generation() != groupsGeneration_) {", "if (false) {")]),
+    # A launch whose lists leave out too few row groups walks every group
+    # instead, and its hits are checked against the lists on the host
+    # (runBatches, RowPruning::survives).
+    Mutation("unlistedhits", "the hits of a launch that didn't walk its lists all kept",
+             [(KERNEL, "if (listed_ && !listed && !rowPruning_.survives(", "if (false && !rowPruning_.survives(")]),
+    Mutation("survivesrow", "a hit kept whenever its row group survives, whatever its row",
+             [(PRUNING, "(*entry >> kRowFlagBits) == group && (rowMasks_[*entry & (kRowFlagCount - 1)] >> d & 1);",
+               "(*entry >> kRowFlagBits) == group;")]),
+    # The integration test's candidates planted in a pruned row group are in
+    # ranges of a few groups, which prune enough of them to walk the lists.
+    Mutation("survivesgroup", "a hit kept in a pruned row group when a later one survives",
+             [(PRUNING, "return entry != end && (*entry >> kRowFlagBits) == group &&", "return entry != end &&")],
+             caught_by=("self-test", "stress")),
+    # The self-test's pruning cases search one batch at a time.
+    Mutation("survivesbatch", "every hit checked against the list of the launch's first batch",
+             [(KERNEL, "!rowPruning_.survives(RowPruning::Slice{batch.groupsOffset, batch.groupCount}, hit.row)",
+               "!rowPruning_.survives(RowPruning::Slice{batches.batch[0].groupsOffset, batches.batch[0].groupCount}, hit.row)")],
+             caught_by=("integration", "stress")),
+    # Which of the two ways a launch takes must not change what it finds.
+    Mutation("alwayslisted", "every launch walking its lists", expect="harmless",
+             edits=[(KERNEL, ">= groups * NAMEBREAK_LIST_MIN_PRUNED_PERCENT);", ">= 0);")]),
+    Mutation("neverlisted", "no launch walking its lists", expect="harmless",
+             edits=[(KERNEL, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
 ] + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS
 
 OPENCL_MUTATIONS = [

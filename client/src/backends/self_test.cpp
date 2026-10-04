@@ -314,6 +314,9 @@ struct PruneSetup {
     std::string prefix;
     PruneRules rules;
     PruneState entry;
+    // Which way a backend that can search either (CUDA) does - see
+    // SearchConstants::listWalking. The cases run both ways.
+    SearchConstants::ListWalking walking = SearchConstants::ListWalking::Auto;
 };
 
 // A search that prunes the whole candidate (SearchConstants::trailingRules):
@@ -346,6 +349,7 @@ bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& t
     constants.targetHashA = hashFromScratch(plantedName, cryptTable, 0x100);
     constants.targetHashB = hashFromScratch(plantedName, cryptTable, 0x200);
     constants.trailingRules = setup.rules;
+    constants.listWalking = setup.walking;
 
     BatchParams params;
     memcpy(params.prefix, prefix.c_str(), prefix.size() + 1);
@@ -400,7 +404,7 @@ bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& t
 // place, or not at all, misses it - and one that checked the rows' own last
 // characters without the text after them reports a pruned one.
 bool runInsertCase(SearchBackend& backend, int alphabetSize, const std::string& trailing, const std::vector<TrailingInsertion>& insertions,
-                   const uint32_t* cryptTable, std::string& error) {
+                   SearchConstants::ListWalking walking, const uint32_t* cryptTable, std::string& error) {
     // With a backslash, in place of the last character.
     std::string alphabet = kCharacters.substr(0, alphabetSize);
     alphabet.back() = '\\';
@@ -424,6 +428,7 @@ bool runInsertCase(SearchBackend& backend, int alphabetSize, const std::string& 
     constants.targetHashB = hashFromScratch(plantedName, cryptTable, 0x200);
     constants.trailingRules.adjacentBackslashes = true;
     constants.trailingInsertions = insertions;
+    constants.listWalking = walking;
 
     BatchParams params;
     memcpy(params.prefix, prefix.c_str(), prefix.size() + 1);
@@ -602,14 +607,27 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             "B" + pad + "\\A",  // the row's own last character is one: survives
             "\\" + pad + "AA",  // one in the row group's characters: survives
         };
-        for (int size : {big, common, compiled, compiled2, compiled3, small}) {
-            for (const std::string& trailing : pruneCases) {
-                if (!runPruneCase(backend, size, trailing, rules, cryptTable, error))
-                    return false;
-            }
-            for (const std::string& trailing : minCases) {
-                if (!runPruneCase(backend, size, trailing, atLeastTwo, cryptTable, error))
-                    return false;
+        // Both ways a backend may search what the rules leave: these ranges
+        // are a few row groups, which it would search in whichever way their
+        // share of pruned groups decides - and with only a row pruned, never
+        // by walking the lists. Not walking them, the kernel is the one every
+        // case above tests at every size, and the hits are checked on the
+        // host: fewer sizes do.
+        for (SearchConstants::ListWalking walking : {SearchConstants::ListWalking::Always, SearchConstants::ListWalking::Never}) {
+            rules.walking = walking;
+            atLeastTwo.walking = walking;
+            const std::vector<int> sizes = walking == SearchConstants::ListWalking::Always
+                                               ? std::vector<int>{big, common, compiled, compiled2, compiled3, small}
+                                               : std::vector<int>{big, compiled3, small};
+            for (int size : sizes) {
+                for (const std::string& trailing : pruneCases) {
+                    if (!runPruneCase(backend, size, trailing, rules, cryptTable, error))
+                        return false;
+                }
+                for (const std::string& trailing : minCases) {
+                    if (!runPruneCase(backend, size, trailing, atLeastTwo, cryptTable, error))
+                        return false;
+                }
             }
         }
     }
@@ -621,19 +639,25 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
     if (window >= 3) {
         std::vector<int> places = {1, 2, window - 1};
         places.erase(std::unique(places.begin(), places.end()), places.end());
-        for (int size : {big, common, compiled, small}) {
-            for (int charsAfter : places) {
-                std::string plain(window, 'A');
-                plain[0] = 'B';
-                std::string beside = plain;
-                beside[window - charsAfter - 1] = '\\';
-                for (const std::string& trailing : {plain, beside}) {
-                    if (!runInsertCase(backend, size, trailing, {{charsAfter, "\\"}}, cryptTable, error))
-                        return false;
+        // Both ways, as the pruning cases above.
+        for (SearchConstants::ListWalking walking : {SearchConstants::ListWalking::Always, SearchConstants::ListWalking::Never}) {
+            const std::vector<int> sizes = walking == SearchConstants::ListWalking::Always ? std::vector<int>{big, common, compiled, small}
+                                                                                           : std::vector<int>{big, small};
+            for (int size : sizes) {
+                for (int charsAfter : places) {
+                    std::string plain(window, 'A');
+                    plain[0] = 'B';
+                    std::string beside = plain;
+                    beside[window - charsAfter - 1] = '\\';
+                    for (const std::string& trailing : {plain, beside}) {
+                        if (!runInsertCase(backend, size, trailing, {{charsAfter, "\\"}}, walking, cryptTable, error))
+                            return false;
+                    }
                 }
+                if (window >= 4 &&
+                    !runInsertCase(backend, size, std::string(window, 'C'), {{window - 1, "(S"}, {1, "E)"}}, walking, cryptTable, error))
+                    return false;
             }
-            if (window >= 4 && !runInsertCase(backend, size, std::string(window, 'C'), {{window - 1, "(S"}, {1, "E)"}}, cryptTable, error))
-                return false;
         }
     }
 

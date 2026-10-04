@@ -657,10 +657,13 @@ private:
     size_t groupsUploaded_ = 0;
     uint64_t groupsGeneration_ = 0;
     void uploadGroups();
-    // Whether this search prunes the whole candidate, and the kernel walks
-    // lists of row groups: only then - a kernel that walks every group
-    // measured about 5% faster than one walking a list of them all.
+    // Whether this search prunes the whole candidate, and so has lists of row
+    // groups: only then - a kernel that walks every group measured about 5%
+    // faster than one walking a list of them all, so a launch walks them
+    // only if they leave out enough groups (see runBatches) - or as
+    // SearchConstants::listWalking says.
     bool listed_ = false;
+    SearchConstants::ListWalking listWalking_ = SearchConstants::ListWalking::Auto;
     // Whether this search inserts text into the trailing part, and gets the
     // kernel that hashes it.
     bool inserted_ = false;
@@ -751,6 +754,7 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
     waiter_.beginSearch();
     verifier_.begin(constants);
     listed_ = constants.trailingRules.any();
+    listWalking_ = constants.listWalking;
     if (listed_) {
         rowPruning_.begin(constants);
         if (!rowMasks_)
@@ -830,9 +834,9 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
     // LaunchBatch); only the first and last row can be partial (see
     // filteredRowsKernel). With the whole candidate pruned, each also gets
     // the list of its row groups that survive.
-    const bool listed = listed_;
     LaunchBatches batches = {};
-    uint64_t maxGroups = 0;
+    uint64_t maxGroups = 0, maxListedGroups = 0;
+    uint64_t groups = 0, listedGroups = 0;
     for (int b = 0; b < batchCount; ++b) {
         const uint64_t startIdx = requests[b].start;
         const uint64_t endIdx = startIdx + requests[b].count;
@@ -853,20 +857,31 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
         batch.lastRowEndK = (int) (endIdx - lastRow * alphabetSize); // in [1, alphabetSize]
         batch.seed1Start = requests[b].params.seed1Start;
         batch.seed2Start = requests[b].params.seed2Start;
-        if (listed) {
-            const RowPruning::Slice groups = rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry, batch.firstGroup, batch.lastGroup);
-            batch.groupsOffset = groups.offset;
-            batch.groupCount = groups.count;
-            maxGroups = std::max<uint64_t>(maxGroups, groups.count);
-        } else {
-            maxGroups = std::max<uint64_t>(maxGroups, batch.lastGroup - batch.firstGroup + 1);
+        const uint64_t batchGroups = batch.lastGroup - batch.firstGroup + 1;
+        maxGroups = std::max(maxGroups, batchGroups);
+        groups += batchGroups;
+        if (listed_) {
+            const RowPruning::Slice list = rowPruning_.groupsFor(trailingLen, requests[b].params.pruneEntry, batch.firstGroup, batch.lastGroup);
+            batch.groupsOffset = list.offset;
+            batch.groupCount = list.count;
+            maxListedGroups = std::max<uint64_t>(maxListedGroups, list.count);
+            listedGroups += list.count;
         }
     }
     // Every row of every batch pruned: nothing to launch.
-    if (maxGroups == 0)
+    if (listed_ && maxListedGroups == 0)
         return outcome;
-    if (listed)
+    // Whether this launch walks its batches' lists, or every group they
+    // touch - when the lists leave out too few of them to pay for walking
+    // them (see NAMEBREAK_LIST_MIN_PRUNED_PERCENT), and the hits they'd have
+    // left out are dropped below instead.
+    using ListWalking = SearchConstants::ListWalking;
+    const bool listed = listed_ && listWalking_ != ListWalking::Never &&
+                        (listWalking_ == ListWalking::Always || (groups - listedGroups) * 100 >= groups * NAMEBREAK_LIST_MIN_PRUNED_PERCENT);
+    if (listed) {
+        maxGroups = maxListedGroups;
         uploadGroups();
+    }
 
     const auto launched = std::chrono::steady_clock::now();
     // One row of blocks per batch (blockIdx.y), and in it one GPU thread per
@@ -924,15 +939,23 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
     // WARNING if it doesn't get the target's hashA (the tests treat that as a
     // failure) - and hashB is checked. A match found by *this* launch is
     // reported now, not by whatever call comes after it, which may never come
-    // (a bounded search's last launch).
+    // (a bounded search's last launch). If the launch searched every row
+    // group where it had lists, the hits in a row the lists leave out are
+    // dropped first, as walking the lists would have.
+    int kept = 0;
     for (int i = 0; i < hitCount; ++i) {
         const Hit& hit = pinnedResults_->hits[i];
         if (hit.batch >= (uint32_t) batchCount) {
             fprintf(stderr, "INTERNAL ERROR: the kernel reported a hit in batch %u of a launch of %d - exiting\n", hit.batch, batchCount);
             exit(1);
         }
+        const LaunchBatch& batch = batches.batch[hit.batch];
+        if (listed_ && !listed && !rowPruning_.survives(RowPruning::Slice{batch.groupsOffset, batch.groupCount}, hit.row))
+            continue;
         verifier_.addHits({hit.row * alphabetSize_ + hit.k}, trailingLen, requests[hit.batch].params, outcome);
+        ++kept;
     }
+    outcome.hitCount = kept;
     return outcome;
 }
 

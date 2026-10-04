@@ -79,6 +79,13 @@ public:
     // alphabet.
     const uint64_t* rowMasks() const { return rowMasks_; }
 
+    // Whether `row` - a trailing row index, of a batch whose list is `list`
+    // (from groupsFor) - is one the list keeps: its group is in the list, and
+    // its own last character d in that entry's row mask. The same test a
+    // kernel walking the list makes, for a backend that searched every group
+    // instead and has a hit to check.
+    bool survives(Slice list, uint64_t row) const;
+
 private:
     std::string alphabet_;
     PruneRules rules_;
