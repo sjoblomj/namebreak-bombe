@@ -756,8 +756,8 @@ ones are built on purpose - each a bug that silently misses (or invents)
 candidates - and run against each check on its own (the integration and
 stress tests with the self-test switched off). `tests/mutation_test.py`
 does it, a backend at a time: `cmake --build --preset default --target
-run_mutation_test` for the CUDA kernel (about fifteen minutes on the RTX
-3080 Ti Laptop), `run_mutation_test_opencl` for the OpenCL one (about four).
+run_mutation_test` for the CUDA kernel (about an hour on the RTX 3080 Ti
+Laptop, with the pruning mutations below), `run_mutation_test_opencl` for the OpenCL one (about four).
 Run it after any change to a kernel - and when it
 says a mutation no longer applies, because the code it breaks has changed,
 update the mutation rather than drop it. It also runs two more checks on
@@ -796,7 +796,11 @@ one launch only in a search of many (the self-test, which searches its
 grouped batches twice in one search, and `stress-small`); the engine's two
 not by the self-test, which tests a backend without the engine (the first
 was caught by the integration and stress tests, the overflow one by the
-overflow test alone). Against the OpenCL kernel, twenty-one: the same kinds
+overflow test alone). Since the CUDA kernel hashes a chunk's flagged
+candidates after all of its rows, three more: only the first flagged
+candidate of a chunk's last flagged row hashed, the flagged rows hashed
+from the next row's state, and a row's flag recorded as the next row's -
+each caught by all three checks. Against the OpenCL kernel, twenty-one: the same kinds
 of bug in its mask, lookup, row edges, loop, suffix and chunking, plus a
 lowest-set-bit taken one too high, its own copy of the table index shifting
 one bit too far, and the kernel compiled for a table one bit narrower - with
@@ -861,7 +865,19 @@ leave open, got past every check but the self-test (the first) or all of
 them (the second). The integration test now searches two leading values
 in one launch, one leaving a bracket open and the next not, and a search
 whose prefix leaves more brackets open than a row can close; each catches
-its mutation.
+its mutation. The rules that came after - min_backslash_count, and text
+inserted into the candidate - found three more gaps, each a mutation one
+check let through: a row kept when its last character can't make up the
+backslashes still needed got past the self-test, which never set
+min_backslash_count; the text inserted after a row's own character left
+unchecked got past the integration test, which only ever inserted text
+among a row group's characters with the rules on; and ')' taken for '('
+in the rows' classes got past it too, as the alphabet it pruned brackets
+with has ')' first, and it never planted a candidate in a row ending in
+'('. The self-test now prunes for at least two backslashes, and the
+integration test inserts a backslash before the last character, and plants
+candidates in the row "BAAA(" beside the pruned "BAAA)"; each catches its
+mutation, on CUDA and OpenCL.
 `tests/self_test_test.cpp` does the same for the self-test on the CPU
 backends, on every `ctest` run.
 

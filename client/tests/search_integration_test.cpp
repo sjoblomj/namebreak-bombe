@@ -734,6 +734,14 @@ static bool scenarioPruneWholeCandidate() {
     row = index * as;
     ok &= wholeCandidateCase("unopened brackets, a pruned row", bracketAlphabet, "TEST_", false, true, 0, len, row - 60, row + as + 60,
                              {{row - 1, true}, {row - as + 1, true}, {row, false}, {row + as - 1, false}, {row + as, true}});
+    // The row "BAAA(", four rows after the pruned "BAAA)", opens one instead:
+    // it survives. ('(' comes after ')' in this alphabet, so a backend that
+    // took one for the other would get it from ')'.)
+    {
+        const uint64_t opener = row + 4 * as;
+        ok &= wholeCandidateCase("unopened brackets, a row opening one beside one closing one", bracketAlphabet, "TEST_", false, true, 0, len,
+                                 row - 10, opener + as + 10, {{row, false}, {row + as - 1, false}, {opener, true}, {opener + as - 1, true}});
+    }
     // (Nothing in this range breaks a rule: every row closes one bracket at
     // most, and a candidate's last character isn't checked.)
     ok &= wholeCandidateCase("unopened brackets, the prefix's opened", bracketAlphabet, "TEST(", false, true, 0, len, row - 60, row + as + 60,
@@ -1018,6 +1026,24 @@ static bool scenarioInsertions() {
         stringToIndex("AAA\\" + std::string(len - 4, 'A'), backslashSecond, index, error);
         ok &= backslashCase("an inserted backslash before the candidate's, " + mode, backslashSecond, "TEST_", adjacent, len, index - 40,
                             index + 40, {{index - 1, true}, {index - 30, true}, {index, false}, {index + 30, false}});
+    }
+    // A backslash inserted right before the last character - after the
+    // row's own one - is next to the row's own character when that's a
+    // backslash too: the rows "BA...A\\" are pruned, the ones either side
+    // not.
+    {
+        const int len = std::max(g_window + 1, 5);
+        const uint64_t bs = backslashSecond.size();
+        BackslashRules adjacent;
+        adjacent.adjacent = true;
+        adjacent.whole = true;
+        adjacent.fromEnd = Insertion{"\\", 1};
+        uint64_t row = 0;
+        std::string error;
+        stringToIndex("B" + std::string(len - 3, 'A') + "\\", backslashSecond, row, error);
+        row *= bs;
+        ok &= backslashCase("an inserted backslash after the row's own one", backslashSecond, "TEST_", adjacent, len, row - 60, row + bs + 60,
+                            {{row - 1, true}, {row, false}, {row + bs - 1, false}, {row + bs, true}});
     }
     // At least three backslashes, one of them inserted: a row with one more
     // before the last character survives, one with none doesn't.

@@ -308,15 +308,23 @@ bool runGroupedCase(SearchBackend& backend, const GroupedCase& c, int batchCount
     return true;
 }
 
+// The rules of a search that prunes the whole candidate, the prefix, and the
+// state the leading characters leave the rules in (BatchParams::pruneEntry).
+struct PruneSetup {
+    std::string prefix;
+    PruneRules rules;
+    PruneState entry;
+};
+
 // A search that prunes the whole candidate (SearchConstants::trailingRules):
-// a candidate planted at `trailing` - every rule on, at most one backslash,
-// starting from a state as if the leading characters had left a symbol run
-// of 1, a '(' open and a backslash used - must be reported exactly when its
-// characters, all but the last, break none of them. The range reaches two
-// row groups either side, where other groups and rows are pruned or not, so
-// a backend that searched the wrong ones, or used the wrong rows of one,
-// misses it or reports a pruned one.
-bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& trailing, const uint32_t* cryptTable, std::string& error) {
+// a candidate planted at `trailing` must be reported exactly when its
+// characters, all but the last, break none of `setup`'s rules - and leave
+// the last room for the backslashes minBackslashCount still asks for. The
+// range reaches two row groups either side, where other groups and rows are
+// pruned or not, so a backend that searched the wrong ones, or used the
+// wrong rows of one, misses it or reports a pruned one.
+bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& trailing, const PruneSetup& setup, const uint32_t* cryptTable,
+                  std::string& error) {
     // With a backslash, in place of the last character.
     std::string alphabet = kCharacters.substr(0, alphabetSize);
     alphabet.back() = '\\';
@@ -327,7 +335,7 @@ bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& t
         space *= as;
         planted = planted * as + alphabet.find(c);
     }
-    const std::string prefix = "REZ\\(!";
+    const std::string& prefix = setup.prefix;
     const std::string suffix = ".WAV";
     const std::string plantedName = prefix + trailing + suffix;
 
@@ -337,9 +345,7 @@ bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& t
     constants.cryptTable = cryptTable;
     constants.targetHashA = hashFromScratch(plantedName, cryptTable, 0x100);
     constants.targetHashB = hashFromScratch(plantedName, cryptTable, 0x200);
-    constants.trailingRules.symbolRuns = true;
-    constants.trailingRules.unopenedBrackets = true;
-    constants.trailingRules.maxBackslashCount = 1;
+    constants.trailingRules = setup.rules;
 
     BatchParams params;
     memcpy(params.prefix, prefix.c_str(), prefix.size() + 1);
@@ -347,15 +353,16 @@ bool runPruneCase(SearchBackend& backend, int alphabetSize, const std::string& t
     std::pair<uint32_t, uint32_t> seeds = mpqHashWithPrefixCache_CPU(prefix.c_str(), cryptTable);
     params.seed1Start = seeds.first;
     params.seed2Start = seeds.second;
-    params.pruneEntry.symbolRun = 1;
-    params.pruneEntry.open.round = 1;
-    params.pruneEntry.backslashes = 1;
+    params.pruneEntry = setup.entry;
 
-    // What the rules say, worked out here one character at a time.
+    // What the rules say, worked out here one character at a time - and then
+    // whether the last character could still make up the backslashes.
     PruneState state = params.pruneEntry;
     bool survives = true;
     for (int i = 0; i + 1 < trailingLen && survives; ++i)
         survives = pruneStep_CPU(constants.trailingRules, state, trailing[i]);
+    if (survives)
+        survives = canReachMinBackslashes_CPU(constants.trailingRules, state, 1);
 
     const uint64_t reach = 2 * as * as + 7;
     const uint64_t start = planted - std::min(planted, reach);
@@ -545,13 +552,28 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             return false;
     }
 
-    // Pruning the whole candidate (see runPruneCase), with the rules' state
-    // from before the trailing part as if the leading characters had left a
-    // symbol run of 1, a '(' open and the one backslash allowed used. Each
-    // breaks - or doesn't - at a different character: in a row group's
-    // characters or at the row's own last one, and never at the last, which
-    // isn't checked.
+    // Pruning the whole candidate (see runPruneCase): every rule but those
+    // about backslashes at least, with the rules' state from before the
+    // trailing part as if the leading characters had left a symbol run of 1,
+    // a '(' open and the one backslash allowed used. Each breaks - or
+    // doesn't - at a different character: in a row group's characters or at
+    // the row's own last one, and never at the last, which isn't checked.
+    // Then at least two backslashes, from none: a row that leaves its last
+    // character one short survives, one that leaves it two short doesn't,
+    // though its group has room for both.
     if (window >= 3) {
+        PruneSetup rules;
+        rules.prefix = "REZ\\(!";
+        rules.rules.symbolRuns = true;
+        rules.rules.unopenedBrackets = true;
+        rules.rules.maxBackslashCount = 1;
+        rules.entry.symbolRun = 1;
+        rules.entry.open.round = 1;
+        rules.entry.backslashes = 1;
+        PruneSetup atLeastTwo;
+        atLeastTwo.prefix = "REZ_";
+        atLeastTwo.rules.minBackslashCount = 2;
+
         // As they are at a window of 3; a longer window adds 'A's.
         const std::string pad(window - 3, 'A');
         const std::string shorter(std::max(0, window - 4), 'A');
@@ -568,9 +590,19 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             ")" + pad + "(A",                             // a '(' right after the last open bracket is closed: survives
             "AB" + pad + "(",                             // nothing: survives
         };
+        const std::vector<std::string> minCases = {
+            "B" + pad + "AA",   // none, and the row's own last character not one: pruned
+            "B" + pad + "A\\",  // ... whatever the last character
+            "B" + pad + "\\A",  // the row's own last character is one: survives
+            "\\" + pad + "AA",  // one in the row group's characters: survives
+        };
         for (int size : {big, common, compiled, compiled2, small}) {
             for (const std::string& trailing : pruneCases) {
-                if (!runPruneCase(backend, size, trailing, cryptTable, error))
+                if (!runPruneCase(backend, size, trailing, rules, cryptTable, error))
+                    return false;
+            }
+            for (const std::string& trailing : minCases) {
+                if (!runPruneCase(backend, size, trailing, atLeastTwo, cryptTable, error))
                     return false;
             }
         }
