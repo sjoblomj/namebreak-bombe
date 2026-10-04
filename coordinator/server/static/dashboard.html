@@ -108,7 +108,7 @@
     gap: 16px;
     max-width: 1800px;
   }
-  /* The page's own Targets / Volunteers / Introduction tabs - the same look
+  /* The page's own Targets / Matches / Volunteers / Introduction tabs - the same look
      as a target card's tabs (.tab-bar/.tab-btn below), a little larger. */
   .page-tabs {
     max-width: 1800px;
@@ -136,7 +136,7 @@
   .about p:last-child { margin-bottom: 0; }
   .about code { font-family: var(--mono); font-size: 13px; }
   .about a { color: var(--accent); }
-  .volunteers-intro {
+  .volunteers-intro, .matches-intro {
     color: var(--muted);
     font-size: 12px;
     margin: 0 0 8px;
@@ -144,6 +144,11 @@
   .volunteers-table td.num, .volunteers-table th.num { text-align: right; }
   .volunteers-table td.rank { color: var(--muted); }
   .volunteers-table [title] { cursor: help; }
+  .matches-table th[title] { cursor: help; }
+  .matches-table td.targets-cell { white-space: normal; }
+  /* A found name on one line, however narrow the screen - the table
+     scrolls within its .table-scroll instead. */
+  .matches-table .candidate { white-space: pre; overflow-wrap: normal; }
   .volunteers-table td.canary-missed { color: var(--b-hip); font-weight: 600; }
   .target-card {
     background: var(--card-bg);
@@ -548,6 +553,10 @@
     .col-worker { display: none; }
   }
   @media (max-width: 600px) {
+    /* Four page tabs don't fit a phone at full padding; wrap rather than
+       widen the page if they still don't. */
+    .page-tabs { flex-wrap: wrap; }
+    .page-tabs .tab-btn { padding: 8px 8px; }
     .col-range { display: none; }
     th, td { padding: 6px 4px; }
     /* Keep the badge itself but trim it to just the percentage, and move the
@@ -603,12 +612,30 @@
   <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span></div>
   <nav class="page-tabs tab-bar" id="page-tabs" role="tablist">
     <button type="button" class="tab-btn" role="tab" data-page="targets">Targets</button>
+    <button type="button" class="tab-btn" role="tab" data-page="matches">Matches</button>
     <button type="button" class="tab-btn" role="tab" data-page="volunteers">Volunteers</button>
     <button type="button" class="tab-btn" role="tab" data-page="introduction">Introduction</button>
   </nav>
 
   <div class="page-panel" id="page-targets" role="tabpanel">
     <div id="targets" class="targets"></div>
+  </div>
+
+  <div class="page-panel" id="page-matches" role="tabpanel" hidden>
+    <div class="panel-card">
+      <p class="matches-intro">Every name found so far, newest first. Targets with the same Hash A and Hash B are the same
+        file, so one find solves them all; they share a row here.</p>
+      <div class="table-scroll">
+        <table class="matches-table">
+          <thead><tr><th title="The file name that was found">Name</th>
+            <th title="The volunteer and machine that found it">Found by</th>
+            <th title="When it was found, in your local time">Found at</th>
+            <th>Hash A</th><th>Hash B</th>
+            <th title="The targets this find solved">Targets</th></tr></thead>
+          <tbody id="matches"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <div class="page-panel" id="page-volunteers" role="tabpanel" hidden>
@@ -652,14 +679,15 @@
         and only the part in between is searched.</p>
       <p>That's what this coordinator is for. It splits each <em>target</em>, one unknown name, into ranges of candidates and
         hands them out to volunteers running <code>namebreak</code> on their GPUs. The Targets tab shows how far each target has
-        come, who searched what, and the name, once it's found; the Volunteers tab shows who has put in the most work.</p>
+        come, who searched what, and the name, once it's found; the Matches tab lists every name found so far; and the
+        Volunteers tab shows who has put in the most work.</p>
     </div>
   </section>
   </div>
 
 <script>
 (function () {
-  // The page's Targets / Volunteers / Introduction tabs. The open one is
+  // The page's Targets / Matches / Volunteers / Introduction tabs. The open one is
   // kept in the URL's #fragment, so a link (or a reload) opens the same tab.
   (function () {
     const buttons = document.querySelectorAll('#page-tabs .tab-btn');
@@ -720,6 +748,81 @@
       });
       tbody.appendChild(tr);
     });
+  }
+
+  // The Matches tab's table: the solved targets, one row per find - the
+  // targets one volunteer solved by finding one Hash A/Hash B pair share a
+  // row, just as they count as one of its Names found (see dashboard.rs's
+  // DashboardVolunteer::found). Newest first; a find from before found_at
+  // was recorded goes last.
+  function renderMatches(targets) {
+    const tbody = document.getElementById('matches');
+    tbody.replaceChildren();
+    const finds = new Map();
+    for (const t of targets) {
+      if (t.status !== 'solved') continue;
+      const key = [t.hash_a_hex, t.hash_b_hex, t.found_by].join(' ');
+      const find = finds.get(key);
+      if (find) {
+        find.targets.push(t);
+        if (t.found_at != null && (find.found_at == null || t.found_at < find.found_at)) find.found_at = t.found_at;
+      } else {
+        finds.set(key, { ...t, targets: [t] });
+      }
+    }
+    const rows = [...finds.values()].sort((a, b) => (b.found_at ?? -Infinity) - (a.found_at ?? -Infinity));
+    if (rows.length === 0) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.className = 'loading';
+      td.textContent = 'No names found yet.';
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+    for (const m of rows) {
+      const tr = document.createElement('tr');
+
+      const name = document.createElement('td');
+      if (m.found_filename) {
+        name.appendChild(candidateChip(m.found_filename));
+      } else {
+        name.className = 'muted';
+        name.textContent = 'filename not recorded';
+      }
+      tr.appendChild(name);
+
+      const by = document.createElement('td');
+      by.className = 'worker' + (m.found_by ? '' : ' none');
+      by.appendChild(workerFragment(m.found_by, m.found_by_backend));
+      tr.appendChild(by);
+
+      const at = document.createElement('td');
+      at.className = 'mono';
+      setTimeCell(at, m.found_at);
+      tr.appendChild(at);
+
+      for (const hash of [m.hash_a_hex, m.hash_b_hex]) {
+        const td = document.createElement('td');
+        td.className = 'mono';
+        td.textContent = hash;
+        tr.appendChild(td);
+      }
+
+      const names = document.createElement('td');
+      names.className = 'targets-cell';
+      m.targets.forEach((t, i) => {
+        if (i > 0) names.appendChild(document.createElement('br'));
+        const span = document.createElement('span');
+        span.textContent = t.name;
+        span.title = 'id ' + t.id;
+        names.appendChild(span);
+      });
+      tr.appendChild(names);
+
+      tbody.appendChild(tr);
+    }
   }
 
   const targetsEl = document.getElementById('targets');
@@ -1697,6 +1800,7 @@
       } else {
         for (const t of targets) targetsEl.appendChild(targetCard(t));
       }
+      renderMatches(targets);
       renderVolunteers(data.volunteers || []);
 
       subheadEl.classList.remove('stale');

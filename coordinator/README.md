@@ -28,7 +28,9 @@ reclaim), and a solved target's find called out with a prominent banner. If a
 range was reassigned partway through (see progress checkpointing below), each
 finished portion shows up as its own row credited to whoever actually searched
 it, rather than the whole thing appearing under just the most recent claimer.
-That's the **Targets** tab. The **Volunteers** tab ranks every username that
+That's the **Targets** tab. The **Matches** tab lists every name found, newest
+first - who found it and when, its Hash A and Hash B, and the targets it
+solved (targets sharing a Hash A/Hash B pair share a row). The **Volunteers** tab ranks every username that
 has claimed work or found a name by candidates searched (the sizes of its
 completed ranges, across all its hostnames - a little generous, since a range
 closed early by a find still counts in full), alongside its completed ranges,
