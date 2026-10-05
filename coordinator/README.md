@@ -293,7 +293,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "priority": 0,
     "description": "From the <b>1998</b> demo listing",
     "start_len": 1,
-    "auto_priority": false
+    "auto_priority": false,
+    "encryption_key_hex": "0xD9AC2EFF"
   }'
 ```
 
@@ -352,6 +353,17 @@ header on the dashboard. It's rendered there as raw HTML, not escaped - tags
 like `<b>` come out formatted - so only ever set it from text you trust,
 since it's never sanitized.
 
+`encryption_key_hex` and `base_file_name` (both optional) record what's known
+about an encrypted target file beyond its two hashes. They're shown on the
+target's dashboard card; the search doesn't use them. `encryption_key_hex` is
+the file's encryption key, in hex like the hashes, without the adjustment
+some files' keys get for their position and size in the archive - mpqcli's
+`encryption-key-raw`. That key is made from the file's name without its
+directory, so it's the same for every file of that name, in any directory.
+`base_file_name` is that name without the directory, when it's known but the
+directory isn't - e.g. because the key is that of a known name. It can't
+have a `\` or `/`.
+
 Skip part of a target's search space (see **Skip ranges** above), or
 prioritize part of it:
 
@@ -373,8 +385,8 @@ curl localhost:8080/api/v1/status
 Pause/resume a target, and/or change its name, priority, description,
 alphabet_name (or a custom alphabet), prune_symbol_runs, prune_unopened_brackets,
 prune_whole_candidate, max_backslash_count, min_backslash_count,
-prune_adjacent_backslashes, insert_from_start, insert_from_end, start_len or
-auto_priority:
+prune_adjacent_backslashes, insert_from_start, insert_from_end, start_len,
+auto_priority, encryption_key_hex or base_file_name:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -383,8 +395,9 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 ```
 
 Any field can be omitted to leave it unchanged (pass `"description": ""` to
-clear an existing one, and `"insert_from_start": null` to remove that), but at
-least one must be given. A changed
+clear an existing one, and `null` to remove `insert_from_start`,
+`insert_from_end`, `encryption_key_hex` or `base_file_name`), but at least one
+must be given. A changed
 `prune_symbol_runs`/`prune_unopened_brackets`/`prune_whole_candidate`/`max_backslash_count`/`min_backslash_count`/`prune_adjacent_backslashes` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in
 progress finish with the old setting. So does a changed `insert_from_start` or

@@ -363,6 +363,21 @@ pub struct AdminCreateTargetRequest {
     /// operator's own priority ranges come first. Defaults to false.
     #[serde(default)]
     pub auto_priority: bool,
+    /// The target file's encryption key, if it's encrypted and the key is
+    /// known: in hex like `hash_a_hex`, without the adjustment some files'
+    /// keys get for their position and size in the archive - mpqcli's
+    /// `encryption-key-raw`, StormLib's `SFileInfoEncryptionKeyRaw`. That
+    /// key is made from the file's name without its directory, so it's the
+    /// same for every file of that name, wherever it lies. Only stored and
+    /// shown on the dashboard; the search doesn't use it. Defaults to none.
+    #[serde(default)]
+    pub encryption_key_hex: Option<String>,
+    /// The target file's name without its directory, when that's known but
+    /// the directory isn't - e.g. because its `encryption_key_hex` is that
+    /// of a known name. No '\' or '/'. Only stored and shown on the
+    /// dashboard; the search doesn't use it. Defaults to none.
+    #[serde(default)]
+    pub base_file_name: Option<String>,
 }
 
 fn default_start_len() -> i64 {
@@ -466,6 +481,14 @@ pub struct AdminPatchTargetRequest {
     /// made as they are - delete them like any other to stop them.
     #[serde(default)]
     pub auto_priority: Option<bool>,
+    /// See `AdminCreateTargetRequest::encryption_key_hex`. Leave unset to
+    /// leave it unchanged; pass `null` to remove it.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub encryption_key_hex: Option<Option<String>>,
+    /// See `AdminCreateTargetRequest::base_file_name`, changed like
+    /// `encryption_key_hex`.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub base_file_name: Option<Option<String>>,
 }
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of

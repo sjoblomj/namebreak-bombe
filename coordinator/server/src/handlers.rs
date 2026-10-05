@@ -256,6 +256,23 @@ fn validate_insertions(prefix: &str, suffix: &str, from_start: &Option<(String, 
     Ok(())
 }
 
+/// Parses an `encryption_key_hex` - see `AdminCreateTargetRequest::encryption_key_hex`.
+fn parse_encryption_key(hex: &str) -> Result<u32, AppError> {
+    parse_hash_hex(hex).map_err(|_| AppError::BadRequest("invalid encryption_key_hex".into()))
+}
+
+/// Rejects a `base_file_name` that can't be a file's name without its
+/// directory - see `AdminCreateTargetRequest::base_file_name`.
+fn validate_base_file_name(name: &str) -> Result<(), AppError> {
+    if name.trim().is_empty() {
+        return Err(AppError::BadRequest("base_file_name can't be blank".into()));
+    }
+    if name.contains(['\\', '/']) {
+        return Err(AppError::BadRequest("base_file_name is a name without its directory, so it can't have '\\' or '/'".into()));
+    }
+    Ok(())
+}
+
 pub async fn admin_create_target(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -263,6 +280,10 @@ pub async fn admin_create_target(
 ) -> Result<Json<AdminCreateTargetResponse>, AppError> {
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
+    }
+    let encryption_key = req.encryption_key_hex.as_deref().map(parse_encryption_key).transpose()?;
+    if let Some(name) = &req.base_file_name {
+        validate_base_file_name(name)?;
     }
     validate_backslash_counts(req.max_backslash_count, req.min_backslash_count)?;
     validate_insertions(&req.prefix, &req.suffix, &req.insert_from_start, &req.insert_from_end)?;
@@ -310,8 +331,8 @@ pub async fn admin_create_target(
     let mut tx = state.pool.begin().await?;
     let now = now_unix();
     let target_id: i64 = sqlx::query_scalar(
-        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start_text, insert_from_start_position, insert_from_end_text, insert_from_end_position, alphabet_name, alphabet, status, priority, description, start_len, auto_priority, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start_text, insert_from_start_position, insert_from_end_text, insert_from_end_position, alphabet_name, alphabet, status, priority, description, start_len, auto_priority, encryption_key, base_file_name, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -336,6 +357,8 @@ pub async fn admin_create_target(
     .bind(&req.description)
     .bind(req.start_len)
     .bind(req.auto_priority as i64)
+    .bind(encryption_key.map(u32_to_i64))
+    .bind(&req.base_file_name)
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
@@ -439,13 +462,20 @@ pub async fn admin_patch_target(
         && req.insert_from_end.is_none()
         && req.start_len.is_none()
         && req.auto_priority.is_none()
+        && req.encryption_key_hex.is_none()
+        && req.base_file_name.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of name, status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
              prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start, \
-             insert_from_end, start_len or auto_priority must be provided"
+             insert_from_end, start_len, auto_priority, encryption_key_hex or base_file_name must be provided"
                 .into(),
         ));
+    }
+    // Some(None): remove it (`null`); None: leave it as it is.
+    let encryption_key = req.encryption_key_hex.as_ref().map(|hex| hex.as_deref().map(parse_encryption_key).transpose()).transpose()?;
+    if let Some(Some(name)) = &req.base_file_name {
+        validate_base_file_name(name)?;
     }
 
     let (alphabet_name, alphabet) = if req.alphabet_name.is_some() || req.alphabet.is_some() {
@@ -530,6 +560,12 @@ pub async fn admin_patch_target(
         .bind(target_id)
         .execute(&mut *tx)
         .await?;
+    }
+    if let Some(encryption_key) = encryption_key {
+        sqlx::query("UPDATE targets SET encryption_key = ? WHERE id = ?").bind(encryption_key.map(u32_to_i64)).bind(target_id).execute(&mut *tx).await?;
+    }
+    if let Some(base_file_name) = &req.base_file_name {
+        sqlx::query("UPDATE targets SET base_file_name = ? WHERE id = ?").bind(base_file_name).bind(target_id).execute(&mut *tx).await?;
     }
 
     // Turned on again, or in an alphabet that can spell other prefixes: look
@@ -778,6 +814,89 @@ mod tests {
         assert!(matches!(validate_backslash_counts(2, 3), Err(AppError::BadRequest(_))));
         assert!(matches!(validate_backslash_counts(-1, 0), Err(AppError::BadRequest(_))));
         assert!(matches!(validate_backslash_counts(0, -1), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_base_file_name_wants_a_name_without_a_directory() {
+        assert!(validate_base_file_name("DF.Diablo II").is_ok());
+        assert!(validate_base_file_name("patch.txt").is_ok());
+        assert!(matches!(validate_base_file_name(""), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_base_file_name("  "), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_base_file_name("103c\\DF.Diablo II"), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_base_file_name("rez/x.wav"), Err(AppError::BadRequest(_))));
+    }
+
+    async fn state_with_empty_database() -> AppState {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let config = crate::state::RangeConfig {
+            target_chunk_seconds: 1.0,
+            default_rate_per_sec: 1.0,
+            min_chunk_candidates: 1,
+            max_chunk_candidates: 1,
+            lease_seconds: 60,
+            reclaim_interval_secs: 30,
+            ema_alpha: 0.3,
+            canary_probability: 0.0,
+            canary_seconds: 5.0,
+            stall_release_seconds: 60,
+            likely_prefixes: Default::default(),
+        };
+        AppState(std::sync::Arc::new(crate::state::Inner { pool, admin_token: "t".into(), config }))
+    }
+
+    async fn create_target(state: &AppState, extra: serde_json::Value) -> Result<i64, AppError> {
+        let mut body = serde_json::json!({
+            "name": "t", "prefix": "REZ\\", "suffix": ".WAV",
+            "hash_a_hex": "0xF60F5D90", "hash_b_hex": "0xCE0A9BDB",
+            "lower_bound": "FINZ09BX", "upper_bound": "GLUCMPGN",
+        });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let req = serde_json::from_value(body).unwrap();
+        admin_create_target(State(state.clone()), AdminAuth, Json(req)).await.map(|response| response.target_id)
+    }
+
+    async fn patch_target(state: &AppState, target_id: i64, body: serde_json::Value) -> Result<StatusCode, AppError> {
+        admin_patch_target(State(state.clone()), AdminAuth, Path(target_id), Json(serde_json::from_value(body).unwrap())).await
+    }
+
+    async fn key_and_base_file_name(state: &AppState, target_id: i64) -> (Option<i64>, Option<String>) {
+        let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_one(&state.pool).await.unwrap();
+        (target.encryption_key, target.base_file_name)
+    }
+
+    #[tokio::test]
+    async fn encryption_key_and_base_file_name_are_optional_when_creating_a_target() {
+        let state = state_with_empty_database().await;
+        let without = create_target(&state, serde_json::json!({})).await.unwrap();
+        assert_eq!(key_and_base_file_name(&state, without).await, (None, None));
+
+        let with = create_target(&state, serde_json::json!({"encryption_key_hex": "0xD9AC2EFF", "base_file_name": "X.WAV"})).await.unwrap();
+        assert_eq!(key_and_base_file_name(&state, with).await, (Some(0xD9AC2EFF), Some("X.WAV".into())));
+
+        assert!(matches!(create_target(&state, serde_json::json!({"encryption_key_hex": "xyz"})).await, Err(AppError::BadRequest(_))));
+        assert!(matches!(create_target(&state, serde_json::json!({"base_file_name": "rez\\X.WAV"})).await, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn patching_encryption_key_and_base_file_name_sets_leaves_or_removes_them() {
+        let state = state_with_empty_database().await;
+        let id = create_target(&state, serde_json::json!({"encryption_key_hex": "D9AC2EFF", "base_file_name": "X.WAV"})).await.unwrap();
+
+        patch_target(&state, id, serde_json::json!({"priority": 1})).await.unwrap();
+        assert_eq!(key_and_base_file_name(&state, id).await, (Some(0xD9AC2EFF), Some("X.WAV".into())), "left out: unchanged");
+
+        patch_target(&state, id, serde_json::json!({"encryption_key_hex": null})).await.unwrap();
+        assert_eq!(key_and_base_file_name(&state, id).await, (None, Some("X.WAV".into())), "null: removed");
+
+        patch_target(&state, id, serde_json::json!({"encryption_key_hex": "0x0000002a", "base_file_name": "Y.WAV"})).await.unwrap();
+        assert_eq!(key_and_base_file_name(&state, id).await, (Some(42), Some("Y.WAV".into())));
+
+        patch_target(&state, id, serde_json::json!({"base_file_name": null})).await.unwrap();
+        assert_eq!(key_and_base_file_name(&state, id).await, (Some(42), None), "on its own, null still counts as a change");
+
+        assert!(matches!(patch_target(&state, id, serde_json::json!({"encryption_key_hex": "0x1FFFFFFFF"})).await, Err(AppError::BadRequest(_))));
+        assert!(matches!(patch_target(&state, id, serde_json::json!({"base_file_name": ""})).await, Err(AppError::BadRequest(_))));
+        assert_eq!(key_and_base_file_name(&state, id).await, (Some(42), None), "rejected patches change nothing");
     }
 
     #[test]

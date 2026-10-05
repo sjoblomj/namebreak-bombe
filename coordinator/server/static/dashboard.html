@@ -1708,6 +1708,15 @@
     hashes.className = 'target-hashes mono';
     hashes.textContent = `Hash A: ${t.hash_a_hex}  ·  Hash B: ${t.hash_b_hex}`;
     card.appendChild(hashes);
+    const fileInfo = [];
+    if (t.base_file_name) fileInfo.push(`Base file name: ${t.base_file_name}`);
+    if (t.encryption_key_hex) fileInfo.push(`Encryption key: ${t.encryption_key_hex}`);
+    if (fileInfo.length) {
+      const info = document.createElement('div');
+      info.className = 'target-hashes mono';
+      info.textContent = fileInfo.join('  ·  ');
+      card.appendChild(info);
+    }
     card.appendChild(targetSettings(t));
 
     if (t.alphabet_name) {

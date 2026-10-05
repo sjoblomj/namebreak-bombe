@@ -149,6 +149,10 @@ pub struct DashboardTarget {
     /// Shown just below the target's name - see `models::Target::hash_a`/`hash_b`.
     pub hash_a_hex: String,
     pub hash_b_hex: String,
+    /// Shown below the hashes when known - see `models::Target::encryption_key`
+    /// and `base_file_name`.
+    pub encryption_key_hex: Option<String>,
+    pub base_file_name: Option<String>,
     /// Shown below the hashes, with the settings below.
     pub prefix: String,
     pub suffix: String,
@@ -658,6 +662,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             upper_bound,
             hash_a_hex: format!("0x{:08X}", i64_to_u32(hash_a)),
             hash_b_hex: format!("0x{:08X}", i64_to_u32(hash_b)),
+            encryption_key_hex: settings.encryption_key.map(|key| format!("0x{:08X}", i64_to_u32(key))),
+            base_file_name: settings.base_file_name,
             prefix: settings.prefix,
             suffix: settings.suffix,
             prune_symbol_runs: settings.prune_symbol_runs != 0,

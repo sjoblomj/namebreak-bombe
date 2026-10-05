@@ -72,6 +72,12 @@ pub struct Target {
     /// The length at which the likely prefixes ran out - see
     /// `ranges::create_next_auto_priority_range`.
     pub auto_priority_exhausted_len: Option<i64>,
+    /// The file's encryption key, stored like `hash_a` - see
+    /// `AdminCreateTargetRequest::encryption_key_hex`. None: not known.
+    pub encryption_key: Option<i64>,
+    /// The file's name without its directory - see
+    /// `AdminCreateTargetRequest::base_file_name`. None: not known.
+    pub base_file_name: Option<String>,
 }
 
 #[allow(dead_code)]
