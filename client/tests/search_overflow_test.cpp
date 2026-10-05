@@ -23,8 +23,8 @@
 //    a pruned one lies between them,
 //  * and it doesn't poison the next runSearch() call (matchCount is reset).
 //
-// Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - ctest runs it in its own directory under build/testrun/.
+// Calls the real runSearch(), which writes matches.txt (and found.txt) in the
+// current directory - ctest runs it in its own directory under build/testrun/.
 
 #include <algorithm>
 #include <cstdio>

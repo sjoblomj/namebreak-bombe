@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -93,6 +94,14 @@ std::thread g_workerThread;
 // because we asked it to" apart from "the loop stopped on its own" (e.g.
 // registration failed at startup) and only alarm the user for the latter.
 bool g_quitting = false;
+
+// UI-thread-only: what the matches box shows. A matches file holds just its
+// latest Hash-A match (see MatchWriter, engine/match_writer.h), so each
+// tick's is added here whenever it changes, and only the last
+// kMaxMatchLines are kept. Started afresh for another matches file (another
+// target), as the box shows only the current one's.
+std::deque<std::string> g_recentMatches;
+std::string g_recentMatchesPath;
 
 // Set once in main() after prepareConfig() succeeds, never touched again -
 // "coordinator", "bounded", or "continuous" (window title, Quit's
@@ -185,8 +194,8 @@ void togglePause() {
     g_pauseRequested.store(newState, std::memory_order_relaxed);
     syncPauseControls();
     // No pause-duration bookkeeping needed here (unlike an earlier,
-    // time-based version of this progress bar): matches only ever get
-    // appended while actually searching, so the match-based progress
+    // time-based version of this progress bar): the matches file only ever
+    // changes while actually searching, so the match-based progress
     // fraction (see matchProgressFraction/updateUiFromSharedState) simply
     // stops advancing on its own while paused, with nothing to unwind on
     // resume.
@@ -249,11 +258,15 @@ void updateUiFromSharedState() {
     SetWindowTextA(g_hwndTargetLabel, (targetName.empty() ? "Target: (none yet)" : "Target: " + targetName).c_str());
     SetWindowTextA(g_hwndStatusLabel, ("Status: " + statusText + (paused ? " (paused)" : "")).c_str());
 
-    // Read once, shared below by both the progress calculation (its last
-    // line is the most recent Hash-A match) and the matches box itself.
-    std::vector<std::string> matchLines;
-    if (!outputFilePath.empty())
-        matchLines = readLastLines(outputFilePath, kMaxMatchLines);
+    // Read once, shared below by both the progress calculation and the
+    // matches box: the most recent Hash-A match (the file's only line - or
+    // its last, in one an older version appended every match to).
+    std::string latestMatch;
+    if (!outputFilePath.empty()) {
+        std::vector<std::string> lines = readLastLines(outputFilePath, 1);
+        if (!lines.empty())
+            latestMatch = lines.back();
+    }
 
     // Determinate (a real fraction, from matchProgressFraction below) only
     // for bounded-shaped work, which has a fixed finish line to measure
@@ -273,8 +286,8 @@ void updateUiFromSharedState() {
         // exists), and pausing simply stops new matches from arriving, so
         // this naturally freezes/resumes with no extra bookkeeping.
         double fraction = 0.0;
-        if (!matchLines.empty()) {
-            double f = matchProgressFraction(matchLines.back(), prefix, suffix, insertFromStart, insertFromEnd, alphabet, lowerBound, upperBound);
+        if (!latestMatch.empty()) {
+            double f = matchProgressFraction(latestMatch, prefix, suffix, insertFromStart, insertFromEnd, alphabet, lowerBound, upperBound);
             if (f >= 0.0)
                 fraction = f;
         }
@@ -297,12 +310,24 @@ void updateUiFromSharedState() {
         }
     }
 
-    if (!outputFilePath.empty()) {
+    bool matchesChanged = false;
+    if (outputFilePath != g_recentMatchesPath) {
+        g_recentMatches.clear();
+        g_recentMatchesPath = outputFilePath;
+        matchesChanged = true;
+    }
+    if (!latestMatch.empty() && (g_recentMatches.empty() || g_recentMatches.back() != latestMatch)) {
+        g_recentMatches.push_back(latestMatch);
+        if (g_recentMatches.size() > kMaxMatchLines)
+            g_recentMatches.pop_front();
+        matchesChanged = true;
+    }
+    if (matchesChanged) {
         std::string joined;
-        for (size_t i = 0; i < matchLines.size(); ++i) {
-            joined += matchLines[i];
-            if (i + 1 < matchLines.size())
+        for (const std::string& match : g_recentMatches) {
+            if (!joined.empty())
                 joined += "\r\n";
+            joined += match;
         }
         SetWindowTextA(g_hwndMatches, joined.c_str());
         SendMessage(g_hwndMatches, EM_SETSEL, (WPARAM) -1, (LPARAM) -1);

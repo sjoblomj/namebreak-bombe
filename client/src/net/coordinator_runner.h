@@ -59,7 +59,7 @@ void resolveMissingIdentity(CoordinatorArgs& args);
 struct CoordinatorCallbacks {
     // Fired once a range is claimed, before it's searched - gives the target
     // name and the exact SearchRequest that range is about to run (including
-    // outputFilePath - where that range's Hash-A matches will be appended -
+    // outputFilePath - the file that range's latest Hash-A match will be in -
     // and alphabet/lowerBound/upperBound, which a caller can use together
     // with the matches file's own last line to derive real progress through
     // the range: candidates are enumerated in a fixed order (see candidate.h's

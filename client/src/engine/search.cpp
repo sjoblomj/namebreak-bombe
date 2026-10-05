@@ -1,18 +1,17 @@
 #include "engine/search.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "engine/candidate.h"
 #include "engine/limits.h"
+#include "engine/match_writer.h"
 #include "engine/mpq_hash.h"
 
 BatchOutcome SearchBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& batches) {
@@ -84,25 +83,29 @@ bool waitUnlessAborted(const std::atomic<bool>* abortRequested, const std::atomi
 // Writes out the hits of an outcome that has them all (hitCount <=
 // MAX_MATCHES). Returns 1 if one matched both hashes (outFoundFilename is
 // filled), 0 otherwise.
-int reportOutcome(const BatchOutcome& outcome, FILE* fout, const std::function<void(const std::string&)>& onPartialMatch,
+int reportOutcome(const BatchOutcome& outcome, MatchWriter& matches, const std::function<void(const std::string&)>& onPartialMatch,
                   std::string& outFoundFilename) {
     for (const std::string& hit : outcome.hits) {
         printf("%s\n", hit.c_str());
-        fprintf(fout, "%s\n", hit.c_str());
-        fflush(fout);
         if (onPartialMatch)
             onPartialMatch(hit);
     }
     if (outcome.found) {
+        // The matches file's line from now on, whichever hits come after it
+        // in outcome.hits (they're in no particular order).
+        matches.found(outcome.foundFilename);
         printf("%s\n", outcome.foundFilename.c_str());
         printf("BOTH HASHES MATCH: %s\n", outcome.foundFilename.c_str());
         outFoundFilename = outcome.foundFilename;
         return 1;
     }
+    if (!outcome.hits.empty())
+        matches.hit(outcome.hits.back());
+    matches.writeIfDue();
     return 0;
 }
 
-int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params, FILE* fout,
+int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params, MatchWriter& matches,
                 const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
                 std::string& outFoundFilename, const std::atomic<bool>* pauseRequested) {
     if (!waitUnlessAborted(abortRequested, pauseRequested))
@@ -122,14 +125,14 @@ int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint
         fprintf(stderr, "note: %d hashA hits in one batch, more than the %d that can be recorded - searching its two halves separately\n",
                 outcome.hitCount, MAX_MATCHES);
         const uint64_t half = count / 2;
-        int r = searchChunk(backend, trailingLen, startIdx, half, params, fout, abortRequested, onPartialMatch, outFoundFilename,
+        int r = searchChunk(backend, trailingLen, startIdx, half, params, matches, abortRequested, onPartialMatch, outFoundFilename,
                             pauseRequested);
         if (r != 0)
             return r;
-        return searchChunk(backend, trailingLen, startIdx + half, count - half, params, fout, abortRequested, onPartialMatch,
+        return searchChunk(backend, trailingLen, startIdx + half, count - half, params, matches, abortRequested, onPartialMatch,
                            outFoundFilename, pauseRequested);
     }
-    return reportOutcome(outcome, fout, onPartialMatch, outFoundFilename);
+    return reportOutcome(outcome, matches, onPartialMatch, outFoundFilename);
 }
 
 // searchChunk for several batches at once, in one backend.runBatches() call
@@ -137,11 +140,11 @@ int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint
 // Returns the same as searchChunk. If they had more hits together than can be
 // recorded, each is searched again on its own, with searchChunk (which
 // splits it further if it has to).
-int searchBatches(SearchBackend& backend, int trailingLen, const std::vector<BatchRequest>& batches, FILE* fout,
+int searchBatches(SearchBackend& backend, int trailingLen, const std::vector<BatchRequest>& batches, MatchWriter& matches,
                   const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
                   std::string& outFoundFilename, const std::atomic<bool>* pauseRequested) {
     if (batches.size() == 1)
-        return searchChunk(backend, trailingLen, batches[0].start, batches[0].count, batches[0].params, fout, abortRequested,
+        return searchChunk(backend, trailingLen, batches[0].start, batches[0].count, batches[0].params, matches, abortRequested,
                            onPartialMatch, outFoundFilename, pauseRequested);
     if (!waitUnlessAborted(abortRequested, pauseRequested))
         return -1;
@@ -152,14 +155,14 @@ int searchBatches(SearchBackend& backend, int trailingLen, const std::vector<Bat
         fprintf(stderr, "note: %d hashA hits in %zu batches searched together, more than the %d that can be recorded - searching each on its own\n",
                 outcome.hitCount, batches.size(), MAX_MATCHES);
         for (const BatchRequest& batch : batches) {
-            int r = searchChunk(backend, trailingLen, batch.start, batch.count, batch.params, fout, abortRequested, onPartialMatch,
+            int r = searchChunk(backend, trailingLen, batch.start, batch.count, batch.params, matches, abortRequested, onPartialMatch,
                                 outFoundFilename, pauseRequested);
             if (r != 0)
                 return r;
         }
         return 0;
     }
-    return reportOutcome(outcome, fout, onPartialMatch, outFoundFilename);
+    return reportOutcome(outcome, matches, onPartialMatch, outFoundFilename);
 }
 
 } // namespace
@@ -332,20 +335,9 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     candidateStart.open = openBracketsAfter_CPU(req.prefix);
     candidateStart.lastWasBackslash = !req.prefix.empty() && req.prefix.back() == '\\';
 
-    std::filesystem::path outputDir = std::filesystem::path(req.outputFilePath).parent_path();
-    if (!outputDir.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(outputDir, ec);
-        if (ec) {
-            result.ok = false;
-            result.error = "cannot create " + outputDir.string() + ": " + ec.message();
-            return result;
-        }
-    }
-    FILE* fout = fopen(req.outputFilePath.c_str(), "a");
-    if (!fout) {
+    MatchWriter matches;
+    if (!matches.open(req.outputFilePath, result.error)) {
         result.ok = false;
-        result.error = std::string("fopen ") + req.outputFilePath + ": " + strerror(errno);
         return result;
     }
 
@@ -527,7 +519,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         // next one, whose trailingLen may differ.
         std::vector<BatchRequest> pending;
         auto searchPending = [&]() {
-            int r = searchBatches(backend, trailingLen, pending, fout, abortRequested, onPartialMatch, foundFilename, pauseRequested);
+            int r = searchBatches(backend, trailingLen, pending, matches, abortRequested, onPartialMatch, foundFilename, pauseRequested);
             pending.clear();
             return r;
         };
@@ -636,7 +628,7 @@ breakfree:
 
     if (begun)
         backend.endSearch();
-    fclose(fout);
+    matches.flush();
 
     result.aborted = aborted;
     result.found = found_match;

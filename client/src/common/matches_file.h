@@ -7,13 +7,14 @@
 
 #include "engine/candidate.h"
 
-// The files a search appends its Hash-A matches to, one full filename per
-// line: all of them live in one directory (config.conf's `matches_dir`,
-// default kDefaultMatchesDir, relative to the current working directory
-// unless absolute), created on first use. A local search writes
-// matches.txt there; each coordinator target gets its own
-// matches-<target name>.txt, so concurrent/successive targets don't clobber
-// each other's matches.
+// The files a search keeps its most recent Hash-A match in, as a full
+// filename on one line (see MatchWriter, engine/match_writer.h - which also
+// appends a match of both hashes to found.txt beside them): all of them live
+// in one directory (config.conf's `matches_dir`, default kDefaultMatchesDir,
+// relative to the current working directory unless absolute), created on
+// first use. A local search writes matches.txt there; each coordinator
+// target gets its own matches-<target name>.txt, so concurrent/successive
+// targets don't clobber each other's matches.
 
 inline constexpr const char* kDefaultMatchesDir = "matches";
 

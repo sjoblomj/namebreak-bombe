@@ -138,12 +138,18 @@ plus optional `username`, `hostname` (auto-detected and interactively
 confirmed if omitted), and `poll_interval_secs` (default `30`) - see the
 coordinator README linked above for the full picture.
 
-Every Hash-A match (a candidate matching the first hash, whether or not it
-matches the second) is appended to a matches file, one filename per line.
-They all go in one directory - `matches/` in the current directory, or
-whatever a top-level `matches_dir = <directory>` line (next to `mode`) says;
-it's created if missing. `bounded`/`continuous` mode writes `matches.txt`
-there, and `coordinator` mode one `matches-<target name>.txt` per target.
+The most recent Hash-A match (a candidate matching the first hash, whether
+or not it matches the second) is kept in a matches file: one filename on one
+line, replaced as the search goes - at most once a second - so the file stays
+a few dozen bytes however long the search runs. A match of both hashes is
+always the line it ends with: the search stops there. It's also appended to
+`found.txt` beside the matches files, which gets nothing else and is never
+replaced, so a later search writing the same matches file can't lose it.
+They all go in one directory -
+`matches/` in the current directory, or whatever a top-level
+`matches_dir = <directory>` line (next to `mode`) says; it's created if
+missing. `bounded`/`continuous` mode writes `matches.txt` there, and
+`coordinator` mode one `matches-<target name>.txt` per target.
 
 ## Compiling
 
@@ -372,7 +378,7 @@ flowchart TD
     end
     kernel -->|"no hits"| next
     kernel -->|"hashA hits"| verify["CPU: hash each hit again<br/>from scratch, check hashB"]
-    verify --> host["CPU: write the hits<br/>to the matches file"]
+    verify --> host["CPU: write the latest hit<br/>to the matches file"]
     host -->|"hashB matches too"| found(["found: stop"])
     host --> next
 ```

@@ -33,12 +33,12 @@ std::string matchesFilePath(const std::string& matchesDir, const std::string& ta
     return (last == '/' || last == '\\') ? matchesDir + name : matchesDir + "/" + name;
 }
 
-// Reads only the end of the file: a coordinator target's matches file is
-// appended to for as long as the target runs, across sessions - one line per
-// Hash-A hit, which on a fast GPU is hundreds a second - so it reaches
-// hundreds of MB, and the Windows GUI calls this on every ~1s tick. Reading
-// such a file whole took most of a second and most of a GB each time, which
-// left the GUI's UI thread with no time for anything else.
+// Reads only the end of the file: a matches file is one line now, but older
+// versions appended every Hash-A hit to it - hundreds a second on a fast
+// GPU - for as long as a target ran, so one they left behind can be hundreds
+// of MB until a search replaces it, and the Windows GUI calls this on every
+// ~1s tick. Reading such a file whole took most of a second and most of a GB
+// each time, which left the GUI's UI thread with no time for anything else.
 std::vector<std::string> readLastLines(const std::string& path, size_t maxLines) {
     std::vector<std::string> lines;
     // Binary, since a text-mode stream can't be seeked to a byte offset

@@ -1,19 +1,23 @@
 // Correctness test for readLastLines (common/matches_file.h), which reads a
 // matches file's last lines from its end rather than reading it whole:
 // checked against reading it whole, over files spanning many of its chunks.
-// Pure CPU.
+// And for MatchWriter (engine/match_writer.h), which keeps a matches file at
+// one line - the match of both hashes, once there is one. Pure CPU.
 //
 // Writes files under ./matches_file_test/ - ctest runs this from its own
 // directory under build/testrun/.
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "common/matches_file.h"
+#include "engine/match_writer.h"
 
 static int g_failures = 0;
 
@@ -86,7 +90,98 @@ static std::string randomContents(std::mt19937& rng, size_t lineCount, const std
     return contents;
 }
 
+// All of `path`, or "" if it doesn't exist.
+static std::string readFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return contents;
+}
+
+// What a line written in text mode reads as in binary.
+static std::string asWritten(const std::string& lines) {
+#ifdef _WIN32
+    std::string out;
+    for (char c : lines)
+        out += c == '\n' ? std::string("\r\n") : std::string(1, c);
+    return out;
+#else
+    return lines;
+#endif
+}
+
+static void testMatchWriter() {
+    printf("MatchWriter:\n");
+    const std::string dir = kDir + "/writer/sub";
+    const std::string path = dir + "/matches-x.txt";
+    const std::string found = foundFilePath(path);
+    std::filesystem::remove_all(kDir);
+
+    std::string error;
+    {
+        MatchWriter writer(std::chrono::milliseconds(0));
+        check(writer.open(path, error), "open() creates the missing directories");
+        check(std::filesystem::exists(path) && readFile(path).empty(), "... and an empty matches file");
+        check(found == dir + "/found.txt", "found.txt is beside the matches file");
+        writer.hit("REZ\\AAA.WAV");
+        check(readFile(path).empty(), "a hit isn't written before writeIfDue()");
+        writer.writeIfDue();
+        check(readFile(path) == asWritten("REZ\\AAA.WAV\n"), "writeIfDue() writes it");
+        writer.hit("REZ\\AAB.WAV");
+        writer.hit("REZ\\AAC.WAV");
+        writer.writeIfDue();
+        check(readFile(path) == asWritten("REZ\\AAC.WAV\n"), "the latest hit replaces it, with no interval");
+        check(!std::filesystem::exists(path + ".tmp"), "nothing is left beside it");
+        check(!std::filesystem::exists(found), "found.txt isn't written until something is found");
+    }
+    {
+        {
+            // An older version's file, every hit appended.
+            std::ofstream old(path, std::ios::trunc);
+            old << std::string(100000, 'A') << "\nREZ\\OLD.WAV\n";
+        }
+        MatchWriter writer(std::chrono::hours(1));
+        check(writer.open(path, error) && readFile(path).size() > 100000, "open() leaves what the file holds");
+        writer.hit("REZ\\AAA.WAV");
+        writer.writeIfDue();
+        check(readFile(path) == asWritten("REZ\\AAA.WAV\n"), "the first hit is written at once, replacing an old long file");
+        writer.hit("REZ\\AAB.WAV");
+        writer.writeIfDue();
+        check(readFile(path) == asWritten("REZ\\AAA.WAV\n"), "the next isn't, within the interval");
+        writer.flush();
+        check(readFile(path) == asWritten("REZ\\AAB.WAV\n"), "flush() writes it");
+        writer.flush();
+        check(readFile(path) == asWritten("REZ\\AAB.WAV\n"), "flush() with nothing new leaves it");
+
+        writer.hit("REZ\\AAC.WAV");
+        check(writer.found("REZ\\FND.WAV"), "found() succeeds");
+        check(readFile(path) == asWritten("REZ\\FND.WAV\n"), "found() writes the match at once, over a hit not written yet");
+        check(readFile(found) == asWritten("REZ\\FND.WAV\n"), "... and to found.txt");
+        writer.flush();
+        writer.hit("REZ\\AAD.WAV");
+        writer.writeIfDue();
+        writer.flush();
+        check(readFile(path) == asWritten("REZ\\FND.WAV\n"), "no hit replaces it, before or after it");
+    }
+    {
+        MatchWriter writer(std::chrono::milliseconds(0));
+        check(writer.open(path, error), "open() again");
+        check(readFile(path) == asWritten("REZ\\FND.WAV\n"), "... still leaves it");
+        writer.hit("REZ\\AAE.WAV");
+        writer.writeIfDue();
+        check(readFile(path) == asWritten("REZ\\AAE.WAV\n"), "another search's hit replaces it");
+        writer.found("REZ\\FN2.WAV");
+        check(readFile(found) == asWritten("REZ\\FND.WAV\nREZ\\FN2.WAV\n"), "but found.txt keeps every match, the latest last");
+    }
+    {
+        MatchWriter writer;
+        error.clear();
+        check(!writer.open(dir, error) && !error.empty(), "open() fails, saying why, for a path it can't write");
+    }
+}
+
 int main() {
+    testMatchWriter();
+
     printf("readLastLines:\n");
     std::filesystem::remove(kPath);
     check(readLastLines(kPath, 100).empty(), "a file that doesn't exist yet reads as no lines");

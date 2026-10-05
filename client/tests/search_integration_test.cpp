@@ -57,8 +57,8 @@
 // independent hashing path (HitVerifier, on the CPU) and prints one whenever
 // that disagrees with the fast kernel that reported it.
 //
-// Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - ctest runs each test in its own directory under
+// Calls the real runSearch(), which writes matches.txt (and found.txt) in
+// the current directory - ctest runs each test in its own directory under
 // build/testrun/ to keep it away from any real matches; run the binary
 // directly from somewhere else disposable if not going through ctest.
 
@@ -325,6 +325,14 @@ static std::string nameOf(const CaseSpec& c, const std::string& cand) {
     return c.prefix + insertIntoCandidate(cand, c.insertFromStart, c.insertFromEnd) + c.suffix;
 }
 
+// All of `path`, or "" if it doesn't exist.
+static std::string readFile(const std::string& path) {
+    std::ifstream in(path);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
 static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = false) {
     ++g_cases;
     const int alphabetSize = (int) c.alphabet.size();
@@ -398,13 +406,19 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
 
     std::set<std::string> reported;
     std::vector<std::string> reportedInOrder;
+    std::string lastReported;
     auto onPartialMatch = [&](const std::string& filename) {
+        lastReported = filename;
         std::string cand, error;
         if (!candidateOfFilename(filename, c.prefix, c.suffix, c.insertFromStart, c.insertFromEnd, cand, error))
             cand = "<" + filename + ": " + error + ">";
         reported.insert(cand);
         reportedInOrder.push_back(cand);
     };
+
+    // Checked below: what the search leaves in them.
+    std::remove(req.outputFilePath.c_str());
+    std::remove("found.txt");
 
     OutputCapture capture;
     capture.start();
@@ -441,6 +455,17 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
             if (!result.found) fail("runSearch() reported found=false, expected '" + expectedName + "'");
             else if (result.filename != expectedName) fail("runSearch() found '" + result.filename + "', expected '" + expectedName + "'");
         }
+
+        // One line: the match of both hashes - whatever hits it was reported
+        // with - or else the last hit reported. And found.txt has just that
+        // match.
+        const std::string lastLine = result.found ? result.filename : lastReported;
+        const std::string matchesFile = readFile(req.outputFilePath);
+        if (matchesFile != (lastLine.empty() ? "" : lastLine + "\n"))
+            fail("the matches file holds '" + matchesFile + "', not just '" + lastLine + "'");
+        const std::string foundFile = readFile("found.txt");
+        if (foundFile != (result.found ? result.filename + "\n" : ""))
+            fail("found.txt holds '" + foundFile + "'" + (result.found ? ", not just '" + result.filename + "'" : ", though nothing was found"));
     }
     if (log.find("WARNING") != std::string::npos) {
         size_t at = log.find("WARNING");

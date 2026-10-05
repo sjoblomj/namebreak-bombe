@@ -41,11 +41,11 @@
 // start-up cost would otherwise dominate. --scale 20 gives it a range long
 // enough to time well.
 //
-// Calls the real runSearch(), which does fopen("matches.txt", "a") relative
-// to the current directory - the run_search_bench target (CMakeLists.txt)
-// runs this from build/testrun/search_bench/ to keep it away from any real
-// matches; run the binary directly from somewhere else disposable if not
-// going through that target.
+// Calls the real runSearch(), which writes matches.txt in the current
+// directory - the run_search_bench target (CMakeLists.txt) runs this from
+// build/testrun/search_bench/ to keep it away from any real matches; run the
+// binary directly from somewhere else disposable if not going through that
+// target.
 
 #include <algorithm>
 #include <chrono>

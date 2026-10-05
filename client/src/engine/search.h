@@ -60,10 +60,13 @@ struct SearchRequest {
     // false ("bounded"): stop once upperBound is exhausted at its own length.
     // true ("continuous"): keep going to longer candidateLens indefinitely.
     bool continuous = false;
-    // Path (relative to the current working directory, unless absolute)
-    // every Hash-A-only match is appended to; missing parent directories are
-    // created. The program always sets this from matchesFilePath()
-    // (common/matches_file.h) - this default only matters to the tests.
+    // Path (relative to the current working directory, unless absolute) of
+    // the file that holds the most recent Hash-A match, or the match of both
+    // hashes once there is one - see MatchWriter (engine/match_writer.h),
+    // which also appends that one to found.txt next to it. Missing parent
+    // directories are created. The program always sets this from
+    // matchesFilePath() (common/matches_file.h) - this default only matters
+    // to the tests.
     std::string outputFilePath = "matches.txt";
 };
 
@@ -82,17 +85,17 @@ struct SearchResult {
 };
 
 // Runs an exhaustive (bounded) or open-ended (continuous) search over
-// `req`'s candidate space on `backend`, appending every Hash-A-only match to
-// `req.outputFilePath`. `abortRequested`, if given, is polled
-// between batches so a caller can interrupt a long-running search (e.g. once
-// a coordinator learns the target was solved elsewhere); `onPartialMatch`,
-// if given, is invoked with the full filename of every Hash-A-only match as
-// soon as it's known. `pauseRequested`, if given, is polled the same way
-// abortRequested is - but instead of ending the search, blocks (still
-// letting a caller's own heartbeat/etc. threads run) until it's cleared
-// again, so the batch already in flight always finishes normally and only
-// the *next* one is held back. See src/cli/main.cpp's main() for the key
-// listener that drives this.
+// `req`'s candidate space on `backend`, keeping its most recent Hash-A match
+// in `req.outputFilePath` - or the match of both hashes, once it finds one.
+// `abortRequested`, if given, is polled between batches so a caller can
+// interrupt a long-running search (e.g. once a coordinator learns the target
+// was solved elsewhere); `onPartialMatch`, if given, is invoked with the
+// full filename of every Hash-A match as soon as it's known.
+// `pauseRequested`, if given, is polled the same way abortRequested is - but
+// instead of ending the search, blocks (still letting a caller's own
+// heartbeat/etc. threads run) until it's cleared again, so the batch already
+// in flight always finishes normally and only the *next* one is held back.
+// See src/cli/main.cpp's main() for the key listener that drives this.
 //
 // Safe to call more than once in the same process, with the same backend
 // (e.g. once per claimed coordinator range): all backend state this depends

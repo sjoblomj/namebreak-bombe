@@ -24,6 +24,7 @@
 #include "common/string_util.h"
 #include "engine/candidate.h"
 #include "common/platform.h"
+#include "engine/match_writer.h"
 #include "engine/search.h"
 
 namespace {
@@ -439,7 +440,7 @@ void runOneRange(SearchBackend& backend, const CoordinatorArgs& args, const std:
     while ((outcome = completeClient.complete(claim.rangeId, completeReq, err)) == CoordinatorClient::CompleteOutcome::TransientError) {
         if (quitRequested && quitRequested->load(std::memory_order_relaxed)) {
             fprintf(stderr, "[coordinator] range %lld: quitting without having reported completion%s\n", (long long) claim.rangeId,
-                    result.found ? (" - the match (" + result.filename + ") is only in " + req.outputFilePath).c_str() : "");
+                    result.found ? (" - the match (" + result.filename + ") is only in " + foundFilePath(req.outputFilePath)).c_str() : "");
             return;
         }
         auto cap = backoff.cap();

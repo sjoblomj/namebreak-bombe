@@ -30,9 +30,9 @@
 // Arguments: --backend <name> (default: the first that can run here),
 // --listfile <path>, --every <n> (only every n-th name, for the slow
 // `reference` backend) and --only <line> (just that line, to rerun a
-// failure). Calls the real runSearch(), which appends to matches.txt in the
-// current directory - ctest runs this in its own directory under
-// build/testrun/, and the file is removed after every case.
+// failure). Calls the real runSearch(), which writes matches.txt and
+// found.txt in the current directory - ctest runs this in its own directory
+// under build/testrun/, and both are removed after every case.
 
 #include <algorithm>
 #include <chrono>
@@ -53,6 +53,7 @@
 #include "backends/backends.h"
 #include "engine/candidate.h"
 #include "engine/limits.h"
+#include "engine/match_writer.h"
 #include "engine/search.h"
 
 // The production alphabet, with the backslash, which the names have
@@ -214,6 +215,7 @@ static bool runCase(int line, const char* what, const std::string& name, const S
     SearchResult result = runSearch(*g_backend, req, nullptr, [&](const std::string& filename) { hits.push_back(filename); });
     std::string log = capture.stop();
     std::remove(req.outputFilePath.c_str());
+    std::remove(foundFilePath(req.outputFilePath).c_str());
 
     bool ok = true;
     auto fail = [&](const std::string& msg) {

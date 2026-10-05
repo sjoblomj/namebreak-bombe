@@ -30,9 +30,13 @@
 // tests that cut every launch's first or last row short by one, or that
 // ignored where a range starts and ends, got past this test until it did).
 //
-// Calls the real runSearch(), which appends every hit to a matches file in
-// the current directory - ctest runs this in its own directory under
-// build/testrun/, and the file is removed after every case.
+// A quarter of the cases make one of the hits match hashB too - one among
+// hundreds, so it's reported along with others, some after it: the search
+// must end at it, and leave it, and nothing after it, in the matches file.
+//
+// Calls the real runSearch(), which writes a matches file (and, on a find,
+// found.txt) in the current directory - ctest runs this in its own directory
+// under build/testrun/, and they're removed after every case.
 
 #include <algorithm>
 #include <chrono>
@@ -53,6 +57,7 @@
 #include "backends/backends.h"
 #include "engine/candidate.h"
 #include "engine/limits.h"
+#include "engine/match_writer.h"
 #include "engine/mpq_hash.h"
 #include "engine/search.h"
 
@@ -100,6 +105,14 @@ private:
     int fd_ = -1, savedOut_ = -1, savedErr_ = -1;
 };
 
+// All of `path`, or "" if it doesn't exist.
+static std::string readFile(const std::string& path) {
+    std::ifstream in(path);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
 static void hashStep(uint32_t& seed1, uint32_t& seed2, unsigned char ch, int offset) {
     seed1 = g_cryptTable[offset + ch] ^ (seed1 + seed2);
     seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
@@ -145,6 +158,8 @@ struct Case {
     // Text inserted into every candidate long enough for it.
     Insertion insertFromStart, insertFromEnd;
     int leadingLen = 0;
+    // One of the hits matches hashB too, if there are any.
+    bool foundCase = false;
     // How many of a candidate's first characters the rules look at.
     int checkedLen() const { return pruneWholeCandidate ? len - 1 : leadingLen; }
 };
@@ -356,13 +371,22 @@ static long runCase(Case c, std::mt19937_64& rng) {
                 c.plantedInside ? "inside" : "outside", c.planted.c_str(), describe(c).c_str());
         return -1;
     }
-    // No hit may match hashB too: finding one would end the search early.
+    // The hit that matches hashB too, in a found case: the one in the middle
+    // of them by name - anywhere in the order they're searched in. No other
+    // hit may match it.
+    std::string foundHit;
+    if (c.foundCase && !expected.empty()) {
+        foundHit = expected[expected.size() / 2];
+        c.targetB = hashFromScratch(foundHit, 0x200);
+    }
     for (bool clash = true; clash;) {
         clash = false;
         for (const std::string& hit : expected)
-            clash |= hashFromScratch(hit, 0x200) == c.targetB;
-        if (clash)
+            clash |= hit != foundHit && hashFromScratch(hit, 0x200) == c.targetB;
+        if (clash) {
+            foundHit.clear();
             c.targetB = (uint32_t) rng();
+        }
     }
 
     SearchRequest req;
@@ -390,7 +414,9 @@ static long runCase(Case c, std::mt19937_64& rng) {
     capture.start();
     SearchResult result = runSearch(*g_backend, req, nullptr, [&](const std::string& f) { reported.push_back(f); });
     const std::string log = capture.stop();
+    const std::string matchesFile = readFile(kMatchesFile), foundFile = readFile(foundFilePath(kMatchesFile));
     std::remove(kMatchesFile);
+    std::remove(foundFilePath(kMatchesFile).c_str());
 
     bool ok = true;
     auto fail = [&](const std::string& what) {
@@ -403,14 +429,27 @@ static long runCase(Case c, std::mt19937_64& rng) {
         fail("runSearch() failed: " + result.error);
         return -1;
     }
-    if (result.found)
+    if (foundHit.empty() && result.found)
         fail("runSearch() reported a both-hashes match ('" + result.filename + "'), but no candidate matches hashB");
+    if (!foundHit.empty() && (!result.found || result.filename != foundHit))
+        fail("runSearch() didn't report '" + foundHit + "' as matching both hashes (" + (result.found ? "it reported '" + result.filename + "'" : "it found none") + ")");
+    // One line: the match of both hashes, or else the last hit reported. And
+    // found.txt has just that match.
+    const std::string lastLine = !foundHit.empty() ? foundHit : reported.empty() ? "" : reported.back();
+    if (matchesFile != (lastLine.empty() ? "" : lastLine + "\n"))
+        fail("the matches file holds '" + matchesFile + "', not just '" + lastLine + "'");
+    if (foundFile != (foundHit.empty() ? "" : foundHit + "\n"))
+        fail("found.txt holds '" + foundFile + "'" + (foundHit.empty() ? ", though nothing was found" : ", not just '" + foundHit + "'"));
     std::sort(reported.begin(), reported.end());
     if (std::adjacent_find(reported.begin(), reported.end()) != reported.end())
         fail("a hit was reported more than once");
     reported.erase(std::unique(reported.begin(), reported.end()), reported.end());
     std::vector<std::string> missing, extra;
-    std::set_difference(expected.begin(), expected.end(), reported.begin(), reported.end(), std::back_inserter(missing));
+    // A search that finds one ends there, leaving the hits after it unsearched.
+    if (foundHit.empty())
+        std::set_difference(expected.begin(), expected.end(), reported.begin(), reported.end(), std::back_inserter(missing));
+    else if (!std::binary_search(reported.begin(), reported.end(), foundHit))
+        missing.push_back(foundHit);
     std::set_difference(reported.begin(), reported.end(), expected.begin(), expected.end(), std::back_inserter(extra));
     if (!missing.empty())
         fail(std::to_string(missing.size()) + " of " + std::to_string(expected.size()) + " hits MISSING (silently dropped), e.g. '" + missing[0] + "'");
@@ -418,7 +457,7 @@ static long runCase(Case c, std::mt19937_64& rng) {
         fail(std::to_string(extra.size()) + " EXTRA hits (not in the brute force), e.g. '" + extra[0] + "'");
     if (log.find("WARNING") != std::string::npos)
         fail("a WARNING was printed: " + log.substr(log.find("WARNING"), 200));
-    return ok ? (long) expected.size() : -1;
+    return ok ? (long) reported.size() : -1;
 }
 
 static std::string randomBytes(std::mt19937_64& rng, size_t n) {
@@ -553,6 +592,7 @@ int main(int argc, char** argv) {
         }
 
         plantAtEdge(c, window, g_backend->batchSize(as), space, rng);
+        c.foundCase = cases % 4 == 3;
         const long verified = runCase(c, rng);
         ++cases;
         candidates += c.last - c.first + 1;

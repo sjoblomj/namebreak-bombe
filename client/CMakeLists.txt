@@ -119,6 +119,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # which code paths a search exercises.
 set(SEARCH_SOURCES
     src/engine/search.cpp
+    src/engine/match_writer.cpp
     src/engine/mpq_hash.cpp
     src/engine/candidate.cpp
     src/backends/backends.cpp
@@ -238,9 +239,10 @@ endif()
 
 enable_testing()
 
-# Every GPU test runs the real runSearch() - it calls fopen("matches.txt", "a")
-# relative to the current directory - so each runs in its own directory under
-# build/testrun/, away from any real matches and from each other (ctest -j).
+# Every GPU test runs the real runSearch() - it writes matches.txt (and, on a
+# find, found.txt) in the current directory - so each runs in its own
+# directory under build/testrun/, away from any real matches and from each
+# other (ctest -j).
 # namebreak_test(<name> <executable> [<argument>...])
 # A test exits with 77 when its backend can't run on this machine (a GPU
 # backend without that kind of GPU), which ctest then reports as skipped -
