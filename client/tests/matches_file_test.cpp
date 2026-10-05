@@ -121,7 +121,8 @@ static void testMatchWriter() {
         MatchWriter writer(std::chrono::milliseconds(0));
         check(writer.open(path, error), "open() creates the missing directories");
         check(std::filesystem::exists(path) && readFile(path).empty(), "... and an empty matches file");
-        check(found == dir + "/found.txt", "found.txt is beside the matches file");
+        // As paths: on Windows, found.txt is joined on with a backslash.
+        check(std::filesystem::path(found) == std::filesystem::path(dir + "/found.txt"), "found.txt is beside the matches file");
         writer.hit("REZ\\AAA.WAV");
         check(readFile(path).empty(), "a hit isn't written before writeIfDue()");
         writer.writeIfDue();

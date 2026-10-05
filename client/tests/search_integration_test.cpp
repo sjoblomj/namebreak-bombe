@@ -325,12 +325,25 @@ static std::string nameOf(const CaseSpec& c, const std::string& cand) {
     return c.prefix + insertIntoCandidate(cand, c.insertFromStart, c.insertFromEnd) + c.suffix;
 }
 
-// All of `path`, or "" if it doesn't exist.
+// All of `path`, or "" if it doesn't exist - in binary, as a text-mode read
+// on Windows stops at a Ctrl-Z (0x1A), which a fuzzed filename can hold.
 static std::string readFile(const std::string& path) {
-    std::ifstream in(path);
+    std::ifstream in(path, std::ios::binary);
     std::stringstream ss;
     ss << in.rdbuf();
     return ss.str();
+}
+
+// What a line written in text mode reads as in binary.
+static std::string asWritten(const std::string& lines) {
+#ifdef _WIN32
+    std::string out;
+    for (char c : lines)
+        out += c == '\n' ? std::string("\r\n") : std::string(1, c);
+    return out;
+#else
+    return lines;
+#endif
 }
 
 static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = false) {
@@ -461,10 +474,10 @@ static bool runCase(const std::string& label, const CaseSpec& c, bool verbose = 
         // match.
         const std::string lastLine = result.found ? result.filename : lastReported;
         const std::string matchesFile = readFile(req.outputFilePath);
-        if (matchesFile != (lastLine.empty() ? "" : lastLine + "\n"))
+        if (matchesFile != (lastLine.empty() ? "" : asWritten(lastLine + "\n")))
             fail("the matches file holds '" + matchesFile + "', not just '" + lastLine + "'");
         const std::string foundFile = readFile("found.txt");
-        if (foundFile != (result.found ? result.filename + "\n" : ""))
+        if (foundFile != (result.found ? asWritten(result.filename + "\n") : ""))
             fail("found.txt holds '" + foundFile + "'" + (result.found ? ", not just '" + result.filename + "'" : ", though nothing was found"));
     }
     if (log.find("WARNING") != std::string::npos) {

@@ -105,12 +105,25 @@ private:
     int fd_ = -1, savedOut_ = -1, savedErr_ = -1;
 };
 
-// All of `path`, or "" if it doesn't exist.
+// All of `path`, or "" if it doesn't exist - in binary, as a text-mode read
+// on Windows stops at a Ctrl-Z (0x1A), which a fuzzed filename can hold.
 static std::string readFile(const std::string& path) {
-    std::ifstream in(path);
+    std::ifstream in(path, std::ios::binary);
     std::stringstream ss;
     ss << in.rdbuf();
     return ss.str();
+}
+
+// What a line written in text mode reads as in binary.
+static std::string asWritten(const std::string& lines) {
+#ifdef _WIN32
+    std::string out;
+    for (char c : lines)
+        out += c == '\n' ? std::string("\r\n") : std::string(1, c);
+    return out;
+#else
+    return lines;
+#endif
 }
 
 static void hashStep(uint32_t& seed1, uint32_t& seed2, unsigned char ch, int offset) {
@@ -436,9 +449,9 @@ static long runCase(Case c, std::mt19937_64& rng) {
     // One line: the match of both hashes, or else the last hit reported. And
     // found.txt has just that match.
     const std::string lastLine = !foundHit.empty() ? foundHit : reported.empty() ? "" : reported.back();
-    if (matchesFile != (lastLine.empty() ? "" : lastLine + "\n"))
+    if (matchesFile != (lastLine.empty() ? "" : asWritten(lastLine + "\n")))
         fail("the matches file holds '" + matchesFile + "', not just '" + lastLine + "'");
-    if (foundFile != (foundHit.empty() ? "" : foundHit + "\n"))
+    if (foundFile != (foundHit.empty() ? "" : asWritten(foundHit + "\n")))
         fail("found.txt holds '" + foundFile + "'" + (foundHit.empty() ? ", though nothing was found" : ", not just '" + foundHit + "'"));
     std::sort(reported.begin(), reported.end());
     if (std::adjacent_find(reported.begin(), reported.end()) != reported.end())
