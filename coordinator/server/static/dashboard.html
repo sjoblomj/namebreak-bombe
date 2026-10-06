@@ -250,8 +250,8 @@
   }
   .target-alphabet .mono { cursor: help; }
   .found-banner {
-    margin-top: 10px;
-    padding: 10px 14px;
+    margin-top: 6px;
+    padding: 6px 8px;
     border-radius: 8px;
     background: var(--solved-border);
     color: #1a1a1a;
@@ -259,7 +259,7 @@
     font-size: 15px;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 4px 8px;
     flex-wrap: wrap;
   }
   .found-banner .label {
@@ -270,11 +270,18 @@
     padding: 2px 8px;
     border-radius: 999px;
   }
+  /* A long name on one line, scrolling within its own box rather than
+     pushing the banner (and the card) wider than the screen. */
   .found-banner .filename {
     font-family: var(--mono);
     background: rgba(255,255,255,0.5);
     padding: 2px 8px;
     border-radius: 6px;
+    white-space: pre;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    box-sizing: border-box;
   }
   .found-banner .found-by, .found-banner .found-at {
     font-weight: 500;
