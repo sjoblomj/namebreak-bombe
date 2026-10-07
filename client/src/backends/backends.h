@@ -27,4 +27,11 @@ std::vector<std::string> backendNames();
 // tell a backend that searches wrongly from one that just can't run here.
 std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error, bool* selfTestFailed = nullptr);
 
+// createBackend for a dictionary search (engine/dictionary_search.h): the
+// backend called `name`, or the first of backendNames() that can search
+// dictionaries and run on this machine - having also passed
+// selfTestDictionaryBackend (self_test.h). Null, with `error` set, if the
+// one called `name` can't search dictionaries either.
+std::unique_ptr<SearchBackend> createDictionaryBackend(const std::string& name, std::string& error, bool* selfTestFailed = nullptr);
+
 #endif // NAMEBREAK_BACKENDS_BACKENDS_H

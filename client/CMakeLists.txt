@@ -127,6 +127,7 @@ set(SEARCH_SOURCES
     src/engine/wordlist.cpp
     src/backends/backends.cpp
     src/backends/self_test.cpp
+    src/backends/common/dictionary_batch.cpp
     src/backends/common/launch_waiter.cpp
     src/backends/common/lowbits_filter.cpp
     src/backends/common/row_batch.cpp
@@ -156,10 +157,12 @@ if(WITH_METAL)
     list(APPEND SEARCH_SOURCES src/backends/metal/metal_backend.mm)
     set_source_files_properties(src/backends/metal/metal_backend.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
     embed_kernel(src/backends/metal/search.metal backends/metal/search_kernel.h kSearchKernelSource)
+    embed_kernel(src/backends/metal/dictionary.metal backends/metal/dictionary_kernel.h kDictionaryKernelSource)
 endif()
 if(WITH_OPENCL)
     list(APPEND SEARCH_SOURCES src/backends/opencl/opencl_backend.cpp)
     embed_kernel(src/backends/opencl/search.cl backends/opencl/search_kernel.h kSearchKernelSource)
+    embed_kernel(src/backends/opencl/dictionary.cl backends/opencl/dictionary_kernel.h kDictionaryKernelSource)
 endif()
 
 # embed_word_list(<word list file> <header to generate, under generated/> <C++ name>)
@@ -313,6 +316,21 @@ endforeach()
 namebreak_test_executable(self_test_test tests/self_test_test.cpp namebreak_search)
 namebreak_test(self_test_test self_test_test)
 
+# The backends this build has (backends/backends.cpp); every one is tested.
+# Every backend except `reference` searches in rows (the same batch geometry
+# as the CUDA one) and honours the same tuning overrides.
+set(ROW_BACKENDS "")
+if(NOT NAMEBREAK_GPU STREQUAL "none")
+    list(APPEND ROW_BACKENDS ${NAMEBREAK_GPU})
+endif()
+if(WITH_METAL)
+    list(APPEND ROW_BACKENDS metal)
+endif()
+if(WITH_OPENCL)
+    list(APPEND ROW_BACKENDS opencl)
+endif()
+list(APPEND ROW_BACKENDS cpu)
+
 # The word lists of a dictionary search (src/engine/wordlist.h), english-1
 # pinned among them. CPU only.
 namebreak_test_executable(wordlist_test tests/wordlist_test.cpp namebreak_search)
@@ -324,12 +342,24 @@ namebreak_test(wordlist_test wordlist_test)
 namebreak_test_executable(dictionary_test tests/dictionary_test.cpp namebreak_search)
 namebreak_test(dictionary_test dictionary_test)
 
+# What the backends that search dictionaries share (src/backends/common/
+# dictionary_batch.h): the word table, the suffix filters, a launch's
+# segments, checking hits. CPU only.
+namebreak_test_executable(dictionary_batch_test tests/dictionary_batch_test.cpp namebreak_search)
+namebreak_test(dictionary_batch_test dictionary_batch_test)
+
 # runDictionarySearch (src/engine/dictionary_search.h) end to end on every
-# backend that can search dictionaries, against brute force - as built, with
-# few of hashA's bits compared (so that there are hits to compare), and with
-# also few candidates per call to the backend, on several threads (so that
-# a search is split into many calls, and stopped and resumed part way).
-set(DICTIONARY_BACKENDS cpu reference)
+# backend, against brute force - after the dictionary self-test (src/backends/
+# self_test.h), as createDictionaryBackend runs it. As built; with few of
+# hashA's bits compared (so that there are hits to compare); and with also
+# few candidates and batches per call to the backend (so that a search is
+# split into many calls, and stopped and resumed part way), on several CPU
+# threads, and the GPU backends' launches made small: a few words to a
+# thread block, so that even a small word list spans several, room for one
+# hit of each kind (so that every launch with a hit is searched again, with
+# room for them all), and a suffix filter of one bit, which lets about half
+# of the candidates through.
+set(DICTIONARY_BACKENDS ${ROW_BACKENDS} reference)
 namebreak_test_executable(dictionary_search_test tests/dictionary_search_test.cpp namebreak_search)
 foreach(backend IN LISTS DICTIONARY_BACKENDS)
     namebreak_test(dictionary-search-${backend} dictionary_search_test --backend ${backend})
@@ -338,7 +368,9 @@ if(NAMEBREAK_TEST_VARIANTS)
     namebreak_search_library(namebreak_search_dictionary_dense NAMEBREAK_HASHA_MATCH_BITS=8)
     namebreak_test_executable(dictionary_search_test_dense tests/dictionary_search_test.cpp namebreak_search_dictionary_dense)
     namebreak_search_library(namebreak_search_dictionary_small NAMEBREAK_HASHA_MATCH_BITS=8 NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL=97
-                             NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=16)
+                             NAMEBREAK_DICTIONARY_BATCHES_PER_CALL=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=16
+                             NAMEBREAK_DICTIONARY_THREADS_PER_BLOCK=8 NAMEBREAK_DICTIONARY_WORDS_PER_THREAD=3
+                             NAMEBREAK_DICTIONARY_HIT_CAPACITY=1 NAMEBREAK_DICTIONARY_FILTER_BITS=1)
     namebreak_test_executable(dictionary_search_test_small tests/dictionary_search_test.cpp namebreak_search_dictionary_small)
     foreach(backend IN LISTS DICTIONARY_BACKENDS)
         namebreak_test(dictionary-search-${backend}-dense dictionary_search_test_dense --backend ${backend})
@@ -386,21 +418,6 @@ else()
     namebreak_test_executable(version_test tests/version_test.cpp namebreak_common)
 endif()
 namebreak_test(version_test version_test)
-
-# The backends this build has (backends/backends.cpp); every one is tested.
-# Every backend except `reference` searches in rows (the same batch geometry
-# as the CUDA one) and honours the same tuning overrides.
-set(ROW_BACKENDS "")
-if(NOT NAMEBREAK_GPU STREQUAL "none")
-    list(APPEND ROW_BACKENDS ${NAMEBREAK_GPU})
-endif()
-if(WITH_METAL)
-    list(APPEND ROW_BACKENDS metal)
-endif()
-if(WITH_OPENCL)
-    list(APPEND ROW_BACKENDS opencl)
-endif()
-list(APPEND ROW_BACKENDS cpu)
 
 # End-to-end correctness check for runSearch() itself, against a brute-force
 # reference - see the file. Every backend is tested with its shipped tuning
@@ -507,6 +524,11 @@ endif()
 #                            build/tests/search_bench --backend <name> for
 #                            another; not `reference`, which would take hours)
 #   run_prefix_hasher_bench  IncrementalPrefixHasher's own speedup, CPU only
+#   run_dictionary_bench     times a real dictionary search - two words of
+#                            english-1, about 16.3 billion candidates - on the
+#                            default backend (build/tests/dictionary_bench
+#                            --backend <name> for another; --words <n> to
+#                            time the CPU backend on fewer)
 # NAMEBREAK_BENCH_WINDOW sets the GPU window for search_bench only, to
 # re-sweep that tuning value against real hardware without hand-editing the
 # source - e.g. -DNAMEBREAK_BENCH_WINDOW=6. Empty, the shipped default is used.
@@ -518,6 +540,9 @@ else()
     namebreak_test_executable(search_bench tests/search_bench.cpp namebreak_search)
 endif()
 namebreak_test_executable(prefix_hasher_bench tests/prefix_hasher_bench.cpp namebreak_search)
+namebreak_test_executable(dictionary_bench tests/dictionary_bench.cpp namebreak_search)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/dictionary_bench)
+add_custom_target(run_dictionary_bench COMMAND dictionary_bench WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/dictionary_bench USES_TERMINAL)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/search_bench)
 # A GPU covers the default range in hundredths of a second; 20 times it is long enough to time.
 if(NAMEBREAK_GPU STREQUAL "none")

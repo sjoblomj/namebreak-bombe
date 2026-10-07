@@ -42,8 +42,7 @@ unknown name lists the ones the build has.
   with separators between them, from a dictionary compiled into the program
   (`english-1`) and word lists of your own - and, given the file's
   encryption key, records every candidate whose basename matches it. See
-  [Dictionary mode](#dictionary-mode). It runs on the CPU backends only, so
-  far.
+  [Dictionary mode](#dictionary-mode).
 
 Exit code is `0` if both hashes matched, `2` if the search space was
 exhausted without a match, `1` on any setup/config error.
@@ -258,6 +257,18 @@ the wrong directory - or none, `prefix` empty - the hashes never match, but
 the right basename still lands in `basenames.txt`, leaving only the
 directory to find.
 
+**Backends.** Every backend searches dictionaries; unless `backend` says
+otherwise, the first that can run on the machine is used, as in the other
+modes. On the RTX 3080 Ti Laptop, up to two words of `english-1` with four
+separators - 16.3 billion candidates, `run_dictionary_bench` - take about a
+second on the GPU, 17 G candidates/s with CUDA and 16 with OpenCL (up to 20
+with a cool GPU), and 83 s on the CPU backend, 0.2 G candidates/s. A
+dictionary search runs a
+self-test of its own first (`selfTestDictionaryBackend`,
+`src/backends/self_test.h`): known answers planted among 9,000 words, which
+the backend must find before it's used. See [Dictionary searches on the
+GPU](#dictionary-searches-on-the-gpu) for how the kernels go about it.
+
 ## Compiling
 
 Requires CMake (3.24 or later), the CUDA Toolkit (`nvcc`), a CUDA-capable
@@ -319,10 +330,13 @@ in a small search planted around it - with hashes from the test's own copy
 of the MPQ hash, so it also catches a bug the client's hashing shares with
 every other test. Dictionary mode has its own: `dictionary_test` (numbering,
 bounds and counting against brute force), `wordlist_test` (which pins
-`english-1`), `dictionary-search-*` (whole searches on each backend that can
-search dictionaries against brute force - also with one candidate in 256 a
-hit, and with few candidates per call, stopped and resumed part way) and
-`dictionary-cli-*` (the program itself). The search is
+`english-1`), `dictionary_batch_test` (the word table, suffix filters,
+launch plan and hit checking the GPU backends share), `dictionary-search-*`
+(the dictionary self-test, then whole searches on each backend against brute
+force - also with one candidate in 256 a hit, and with few candidates and
+batches per call, stopped and resumed part way, the GPU kernels' thread
+blocks a few words each, room for a single hit and a one-bit suffix filter)
+and `dictionary-cli-*` (the program itself). The search is
 built in several configurations for this (different GPU window, launch
 sizes and rows per thread, the stress tests' weaker match, a one-bit
 filter), each with its own
@@ -406,7 +420,11 @@ so a GPU build still works on a machine without that GPU:
   library and run one GPU thread at a time behind a C++ transcription of
   `metal_backend.mm`, where every test configuration, the stress tests and
   the kernel's mutation experiment pass; `metal_backend.mm` itself has
-  never been compiled.
+  never been compiled. Its dictionary kernel (`dictionary.metal`) likewise:
+  run on the CPU, each threadgroup's threads around its barrier, behind a
+  C++ transcription of the `.mm`'s dictionary search, where the dictionary
+  self-test and every `dictionary-search` configuration pass, and planted
+  kernel bugs fail them.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
   installed. CUDA's kernel ported (`search.cl`), lookup filter, row groups,
@@ -1156,3 +1174,52 @@ anywhere else in the trailing part, or after the last character, than the
 length before (only ever the shortest ones) begins the backend's search
 again. The bounds, and the positions the coordinator hands out, stay
 without it.
+
+### Dictionary searches on the GPU
+
+A dictionary search (see [Dictionary mode](#dictionary-mode)) has nothing
+like a row for the GPU to share work along: each candidate is a word of its
+own, after a leading part - the prefix and the words and separators before
+the last word. The engine (`runDictionarySearch`) walks the leading parts on
+the CPU, hashing each once, and hands the backend *batches*: a leading part's
+two hash states (hashA's, and the basename hash's - hash type 3 of what
+follows the last `\`), followed by a run of the word list's words and then
+the suffix. A GPU launch is a call's batches, up to 2^28 candidates, cut
+into *segments* of up to 8,192 words of one batch (32 words to each of 256
+threads), one per thread block (`planDictionaryLaunch`,
+`src/backends/common/dictionary_batch.h`). A block finds its batch by a
+binary search over the batches' first segments, and its threads take
+neighbouring words.
+
+What makes it fast (see [PERFORMANCE.md](PERFORMANCE.md)'s *Dictionary
+searches* for the measurements):
+
+- **Words by length.** A warp goes round a word's loop as many times as its
+  longest word needs. The word table the kernels read
+  (`DictionaryWordTable`) has the words in the order of their lengths, so
+  neighbouring threads have words of the same length - which a batch of
+  every word, nearly every batch, is searched in. A batch of part of the
+  list (at a bound, or where a call ends) is searched in the list's order.
+  A hit is reported by the word's index in the list either way, so the
+  order is the kernel's business only.
+- **Four characters to a load, both hashes together.** The table has four
+  characters to a uint32, each word from a uint32 of its own; a character's
+  two crypt-table keys sit side by side in shared memory, one 64-bit lookup
+  for both hashes.
+- **The suffix filter.** As the row search's [lookup
+  filter](#the-lookup-filter-most-candidates-are-never-hashed): the low 7
+  bits of seed1 after the suffix depend only on the low 7 bits of seed1 and
+  seed2 before it, so a 16,384-bit table per hash, built and checked in full
+  for every search, says whether the suffix can make a match - and it's
+  hashed in full for 1 candidate in 128.
+
+A word with a `\` starts the basename hash over after its last one (the
+table has where), and a suffix with a `\` makes every candidate's basename
+the same, its end - checked once a call on the host, not per candidate
+(`DictionaryHitVerifier`). The kernel records hits as (batch, word); the
+host rebuilds each filename, hashes it from scratch and checks hashB, as
+for the row search. A launch has room for 4,096 hits of each kind - a
+search with a 32-bit target has about one hit per 2^32 candidates - and one
+that has more is searched again with room for all of them, so none is ever
+lost. The OpenCL and Metal kernels are the CUDA one ported, compiled at
+runtime once per suffix length, with or without basenames.

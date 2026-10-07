@@ -4,9 +4,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <set>
+#include <string>
 #include <vector>
 
 #include "engine/candidate.h"
+#include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
 #include "engine/mpq_hash.h"
@@ -675,6 +678,288 @@ bool selfTestBackend(SearchBackend& backend, std::string& error) {
             for (const GroupedCase& c : groupedCases) {
                 if (!runGroupedCase(backend, c, batchCount, size, window, cryptTable, error))
                     return false;
+            }
+        }
+    }
+    return true;
+}
+
+namespace {
+
+// The dictionary cases' words: 9,000 of every length from 1 to 23 letters - more than a GPU backend's thread block takes of one batch, so
+// that a batch of every word is split between several - and a few odd ones:
+// with a '\' (in the middle, first and last), with characters past ASCII, a
+// long one, and twenty that all end with the basename "FLOOD". Sorted, as a
+// search's are.
+std::vector<std::string> dictionarySelfTestWords() {
+    std::set<std::string> words;
+    uint32_t state = 12345;
+    auto next = [&]() {
+        state = state * 1103515245u + 12345u;
+        return state >> 16;
+    };
+    while (words.size() < 9000) {
+        std::string word;
+        const int length = 1 + (int) (next() % 23);
+        for (int c = 0; c < length; ++c)
+            word += (char) ('A' + next() % 26);
+        words.insert(word);
+    }
+    for (const char* odd : {"AB\\CD", "\\EF", "GH\\", "\xC9T\xE9", "LONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONG"})
+        words.insert(odd);
+    for (int i = 0; i < 20; ++i)
+        words.insert("ZZ" + std::to_string(10 + i) + "\\FLOOD");
+    return std::vector<std::string>(words.begin(), words.end());
+}
+
+// A batch of a dictionary case: its leading part, and its words.
+struct DictionarySelfTestBatch {
+    std::string leading;
+    uint32_t firstWord;
+    uint32_t wordCount;
+};
+
+DictionaryBatch dictionaryBatchOf(const DictionarySelfTestBatch& b, const uint32_t* cryptTable) {
+    DictionaryBatch batch;
+    batch.leading = b.leading;
+    const HashState a = continueHash(kInitialHashState, b.leading, kHashAOffset, cryptTable);
+    const HashState basename = continueBasenameHash(kInitialHashState, b.leading, cryptTable);
+    batch.seed1 = a.first;
+    batch.seed2 = a.second;
+    batch.basenameSeed1 = basename.first;
+    batch.basenameSeed2 = basename.second;
+    batch.firstWord = b.firstWord;
+    batch.wordCount = b.wordCount;
+    return batch;
+}
+
+// One dictionary case: `batches`, searched in one call, with the candidate
+// made of batch `plantBatch`'s leading part, word `plantWord` and `suffix`
+// as the target - and, with checkBasename, its basename's hash as the key.
+// It must be found (as matching both hashes, and its basename as matching
+// the key) exactly when the word is one of the batch's.
+bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& words, const std::vector<DictionarySelfTestBatch>& batches,
+                       const std::string& suffix, int plantBatch, uint32_t plantWord, bool checkBasename, const uint32_t* cryptTable,
+                       std::string& error) {
+    const DictionarySelfTestBatch& planted = batches[plantBatch];
+    const std::string plantedName = planted.leading + words[plantWord] + suffix;
+    const size_t slash = plantedName.rfind('\\');
+    const std::string plantedBasename = slash == std::string::npos ? plantedName : plantedName.substr(slash + 1);
+    const bool inside = plantWord >= planted.firstWord && plantWord - planted.firstWord < planted.wordCount;
+
+    DictionaryConstants constants;
+    constants.words = words;
+    constants.suffix = suffix;
+    constants.cryptTable = cryptTable;
+    constants.targetHashA = hashFromScratch(plantedName, cryptTable, kHashAOffset);
+    constants.targetHashB = hashFromScratch(plantedName, cryptTable, kHashBOffset);
+    constants.checkBasename = checkBasename;
+    constants.basenameKey = hashFromScratch(plantedBasename, cryptTable, kFileKeyOffset);
+    std::vector<DictionaryBatch> calls;
+    for (const DictionarySelfTestBatch& b : batches)
+        calls.push_back(dictionaryBatchOf(b, cryptTable));
+    backend.beginDictionarySearch(constants);
+    const DictionaryOutcome outcome = backend.runDictionaryBatches(calls);
+    backend.endDictionarySearch();
+
+    char where[200];
+    snprintf(where, sizeof where, " (dictionary search: %zu batch(es), planted in batch %d, word %u of %zu, suffix length %zu%s)", batches.size(),
+             plantBatch, plantWord, words.size(), suffix.size(), checkBasename ? ", checking basenames" : "");
+    // Every candidate of a batch, in a set, to check that a reported
+    // filename is one.
+    auto isCandidate = [&](const std::string& filename) {
+        for (const DictionarySelfTestBatch& b : batches) {
+            if (filename.compare(0, b.leading.size(), b.leading) != 0 || filename.size() < b.leading.size() + suffix.size() ||
+                filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) != 0)
+                continue;
+            const std::string word = filename.substr(b.leading.size(), filename.size() - b.leading.size() - suffix.size());
+            const auto it = std::lower_bound(words.begin(), words.end(), word);
+            if (it != words.end() && *it == word && (uint32_t) (it - words.begin()) - b.firstWord < b.wordCount)
+                return true;
+        }
+        return false;
+    };
+    for (const std::string& hit : outcome.hits) {
+        if (!isCandidate(hit) || !hashAMatches(hashFromScratch(hit, cryptTable, kHashAOffset), constants.targetHashA)) {
+            error = "reported '" + hit + "', which isn't a candidate matching the target" + where;
+            return false;
+        }
+    }
+    const bool reported = std::find(outcome.hits.begin(), outcome.hits.end(), plantedName) != outcome.hits.end();
+    if (inside && !reported) {
+        error = "missed the planted candidate '" + plantedName + "'" + where;
+        return false;
+    }
+    if (inside && (!outcome.found || outcome.foundFilename != plantedName)) {
+        error = "didn't report the planted candidate '" + plantedName + "' as matching both hashes" + where;
+        return false;
+    }
+    if (!inside && (reported || outcome.found)) {
+        error = "reported '" + plantedName + "', which isn't one of the batch's candidates" + where;
+        return false;
+    }
+    if (!checkBasename) {
+        if (!outcome.basenameHits.empty()) {
+            error = std::string("reported a basename match without being asked to check basenames") + where;
+            return false;
+        }
+        return true;
+    }
+    for (const std::string& hit : outcome.basenameHits) {
+        const size_t s = hit.rfind('\\');
+        if (!isCandidate(hit) || hashFromScratch(s == std::string::npos ? hit : hit.substr(s + 1), cryptTable, kFileKeyOffset) != constants.basenameKey) {
+            error = "reported '" + hit + "' as a basename match, which isn't a candidate whose basename matches the key" + where;
+            return false;
+        }
+    }
+    // Every candidate whose basename is the planted one's must be reported -
+    // unless the suffix has a '\', and every candidate has that basename:
+    // then one is enough.
+    if (inside && suffix.find('\\') == std::string::npos &&
+        std::find(outcome.basenameHits.begin(), outcome.basenameHits.end(), plantedName) == outcome.basenameHits.end()) {
+        error = "missed the basename of the planted candidate '" + plantedName + "'" + where;
+        return false;
+    }
+    if (inside && outcome.basenameHits.empty()) {
+        error = "missed the basename every candidate has ('" + plantedBasename + "')" + where;
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
+    if (!backend.supportsDictionary()) {
+        error = std::string("the ") + backend.name() + " backend can't search dictionaries";
+        return false;
+    }
+    uint32_t cryptTable[0x500];
+    prepareCryptTable(cryptTable);
+    const std::vector<std::string> words = dictionarySelfTestWords();
+    const uint32_t count = (uint32_t) words.size();
+    auto indexOf = [&](const std::string& word) { return (uint32_t) (std::lower_bound(words.begin(), words.end(), word) - words.begin()); };
+    const std::string wav = ".WAV";
+
+    // Every word, in one batch: the first and last word, words on both sides
+    // of where a GPU backend's thread blocks split a batch (of 8,192 words in
+    // the list's order, or in the order of their lengths), and the odd words.
+    // Its leading part doesn't end with a '\', so that a word with one has
+    // its basename start over from another state than the batch's.
+    const std::vector<DictionarySelfTestBatch> all = {{"MUSIC\\BG_", 0, count}};
+    std::vector<uint32_t> planted = {0, 1, 255, 256, 1023, 1024, 4095, 4096, 8191, 8192, count / 2, count - 2, count - 1};
+    for (const char* odd : {"AB\\CD", "\\EF", "GH\\", "\xC9T\xE9", "LONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONGWORDLONG", "ZZ10\\FLOOD"})
+        planted.push_back(indexOf(odd));
+    {
+        // By their lengths: the words around 8,192 in that order.
+        std::vector<uint32_t> byLength(count);
+        for (uint32_t w = 0; w < count; ++w)
+            byLength[w] = w;
+        std::stable_sort(byLength.begin(), byLength.end(), [&](uint32_t a, uint32_t b) { return words[a].size() < words[b].size(); });
+        for (uint32_t at : {0u, 8191u, 8192u, count - 1})
+            planted.push_back(byLength[at]);
+    }
+    for (uint32_t w : planted) {
+        if (w < count && !runDictionaryCase(backend, words, all, wav, 0, w, true, cryptTable, error))
+            return false;
+    }
+
+    // Some of the words, in the list's order: a batch of more than 8,192
+    // words, from its first word to its last, with the words just outside
+    // it - and a batch of one.
+    const std::vector<DictionarySelfTestBatch> part = {{"REZ\\CRDT_", 100, 8500}};
+    for (uint32_t w : {99u, 100u, 101u, 100u + 8191, 100u + 8192, 100u + 8499, 100u + 8500}) {
+        if (!runDictionaryCase(backend, words, part, wav, 0, w, true, cryptTable, error))
+            return false;
+    }
+    const std::vector<DictionarySelfTestBatch> one = {{"A", 4321, 1}};
+    for (uint32_t w : {4320u, 4321u, 4322u}) {
+        if (!runDictionaryCase(backend, words, one, wav, 0, w, true, cryptTable, error))
+            return false;
+    }
+
+    // Several batches at once, each with its own leading part - with a '\'
+    // at the end, none, a character past ASCII, none at all - and words.
+    const std::vector<DictionarySelfTestBatch> several = {
+        {"X\\Y\\", 0, count}, {"", 5, 13}, {"A\xC4" "B", 1000, 101}, {"MUSIC\\BG_", 0, 1}, {"T_", count - 10, 10}};
+    const struct { int batch; uint32_t word; } severalPlanted[] = {
+        {0, 0}, {0, count - 1}, {1, 5}, {1, 17}, {1, 4}, {1, 18}, {2, 1000}, {2, 1100}, {2, 999}, {2, 1101}, {3, 0}, {3, 1},
+        {4, count - 10}, {4, count - 1}, {4, count - 11},
+    };
+    for (const auto& p : severalPlanted) {
+        if (!runDictionaryCase(backend, words, several, wav, p.batch, p.word, true, cryptTable, error))
+            return false;
+    }
+
+    // Many batches, of a word or a few each: the first, a middle and the
+    // last.
+    std::vector<DictionarySelfTestBatch> many;
+    for (uint32_t b = 0; b < 300; ++b)
+        many.push_back({"M\\" + std::to_string(b) + "_", (b * 29) % (count - 3), 1 + b % 3});
+    for (int b : {0, 1, 150, 298, 299}) {
+        if (!runDictionaryCase(backend, words, many, wav, b, many[b].firstWord + many[b].wordCount - 1, true, cryptTable, error))
+            return false;
+    }
+
+    // Other suffixes - none, of a character, longer than the CUDA kernel has
+    // compiled in, longer than its constant memory holds, and with
+    // characters past ASCII - and not checking basenames.
+    const std::string veryLong(100, 'S');
+    for (const std::string& suffix : {std::string(), std::string("X"), std::string(".A LONGER SUFFIX\xE9"), veryLong}) {
+        for (uint32_t w : {0u, 8192u, count - 1}) {
+            if (!runDictionaryCase(backend, words, all, suffix, 0, w, true, cryptTable, error))
+                return false;
+        }
+    }
+    for (uint32_t w : {0u, indexOf("AB\\CD"), count - 1}) {
+        if (!runDictionaryCase(backend, words, several, wav, 0, w, false, cryptTable, error) ||
+            !runDictionaryCase(backend, words, several, wav, 2, 1050, false, cryptTable, error))
+            return false;
+    }
+    // A suffix with a '\': every candidate's basename is its end.
+    for (uint32_t w : {0u, count / 3}) {
+        if (!runDictionaryCase(backend, words, several, "\\Z.TXT", 0, w, true, cryptTable, error))
+            return false;
+    }
+
+    // More basename matches than a GPU backend has room for at first
+    // (NAMEBREAK_DICTIONARY_HIT_CAPACITY): the twenty words ending with
+    // "\FLOOD" in 210 batches. Every one must be reported.
+    {
+        const uint32_t flood = indexOf("ZZ10\\FLOOD");
+        std::vector<DictionarySelfTestBatch> floods;
+        for (int b = 0; b < 210; ++b)
+            floods.push_back({"F" + std::to_string(b), flood, 20});
+        std::vector<DictionaryBatch> calls;
+        for (const DictionarySelfTestBatch& b : floods)
+            calls.push_back(dictionaryBatchOf(b, cryptTable));
+        DictionaryConstants constants;
+        constants.words = words;
+        constants.suffix = wav;
+        constants.cryptTable = cryptTable;
+        constants.targetHashA = 0;
+        constants.targetHashB = 0;
+        constants.checkBasename = true;
+        constants.basenameKey = hashFromScratch("FLOOD.WAV", cryptTable, kFileKeyOffset);
+        backend.beginDictionarySearch(constants);
+        const DictionaryOutcome outcome = backend.runDictionaryBatches(calls);
+        // And the same call again: what the first left behind mustn't
+        // change what the second finds.
+        const DictionaryOutcome again = backend.runDictionaryBatches(calls);
+        backend.endDictionarySearch();
+        std::vector<std::string> expected;
+        for (const DictionarySelfTestBatch& b : floods) {
+            for (uint32_t w = flood; w < flood + 20; ++w)
+                expected.push_back(b.leading + words[w] + wav);
+        }
+        std::sort(expected.begin(), expected.end());
+        for (const DictionaryOutcome* o : {&outcome, &again}) {
+            std::vector<std::string> got = o->basenameHits;
+            std::sort(got.begin(), got.end());
+            if (got != expected) {
+                error = "reported " + std::to_string(got.size()) + " basename matches of " + std::to_string(expected.size()) +
+                        " (dictionary search: 20 words with the basename FLOOD.WAV in 210 batches)";
+                return false;
             }
         }
     }

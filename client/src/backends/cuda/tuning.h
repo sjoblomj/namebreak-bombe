@@ -1,6 +1,8 @@
 #ifndef NAMEBREAK_BACKENDS_CUDA_TUNING_H
 #define NAMEBREAK_BACKENDS_CUDA_TUNING_H
 
+#include "backends/common/dictionary_batch.h"
+
 // The CUDA backend's tuning values. The engine and the tests read them
 // through SearchBackend (windowChars(), batchSize(), ...), not from here.
 
@@ -75,6 +77,24 @@ constexpr int kMaxBatchesPerLaunch = 32;
 #ifndef NAMEBREAK_LIST_MIN_PRUNED_PERCENT
 #define NAMEBREAK_LIST_MIN_PRUNED_PERCENT 5
 #endif
+
+// A dictionary search's launches (dictionaryKernel in cuda_backend.cu): how
+// many candidates one covers at most (SearchBackend::
+// dictionaryCandidatesPerCall), and how many words of a batch one thread
+// hashes - one per round of a loop over the block's words, the block's
+// threads taking neighbouring ones. Words per thread times threads per block
+// is a launch's segment, one per block (see backends/common/
+// dictionary_batch.h). Overridable at compile time
+// (-DNAMEBREAK_DICTIONARY_WORDS_PER_THREAD=N,
+// -DNAMEBREAK_DICTIONARY_THREADS_PER_BLOCK=N), for every GPU backend at once,
+// so the tests can make small word lists span several segments.
+#ifndef NAMEBREAK_DICTIONARY_CANDIDATES_PER_LAUNCH
+#define NAMEBREAK_DICTIONARY_CANDIDATES_PER_LAUNCH (1ull << 28)
+#endif
+constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
+constexpr int kDictionaryThreadsPerBlock = dictionaryThreadsPerBlockOr(256);
+static_assert(kDictionaryWordsPerThread >= 1 && kDictionaryThreadsPerBlock >= 1 && kDictionaryThreadsPerBlock <= 1024,
+              "a dictionary launch needs at least one word per thread, and 1 to 1024 threads per block");
 
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index
 // (alphabetSize^(trailingLen-1)) must fit in 32 bits: 63^5 < 2^32 <= 63^6.

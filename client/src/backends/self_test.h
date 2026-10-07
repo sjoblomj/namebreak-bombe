@@ -23,4 +23,24 @@
 // backend fails it.
 bool selfTestBackend(SearchBackend& backend, std::string& error);
 
+// The same for a dictionary search (engine/dictionary_search.h), on a
+// backend that supportsDictionary(): calls with a candidate planted as the
+// target (both hashes, and its basename as the encryption key) that must be
+// found - as the first, last and only word of a batch, on both sides of
+// where a GPU backend splits a batch's words between thread blocks, in the
+// first, a middle and the last of many batches searched at once, in a batch
+// of every word and in batches of some of them, with words of every length,
+// words with a '\' and with characters past ASCII, and with no, short,
+// long and very long suffixes, and one with a '\' - plus words planted just
+// outside a batch, which must not be, and more basename matches than a GPU
+// backend has room for at first, every one of which must be. Every hit
+// reported must also genuinely match.
+//
+// Separate from selfTestBackend, as a GPU backend that compiles its kernels
+// at runtime (OpenCL, Metal) compiles several here, which a search that
+// isn't a dictionary search shouldn't wait for: createDictionaryBackend
+// (backends.h) runs both. False, with `error` saying what went wrong, if the
+// backend fails it.
+bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error);
+
 #endif // NAMEBREAK_BACKENDS_SELF_TEST_H

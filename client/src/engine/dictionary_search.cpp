@@ -23,6 +23,10 @@
 #ifndef NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL
 #define NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL UINT64_MAX
 #endif
+// Likewise the most batches one call gets.
+#ifndef NAMEBREAK_DICTIONARY_BATCHES_PER_CALL
+#define NAMEBREAK_DICTIONARY_BATCHES_PER_CALL SIZE_MAX
+#endif
 
 void SearchBackend::beginDictionarySearch(const DictionaryConstants&) {
     fprintf(stderr, "BUG: the %s backend can't search dictionaries - check supportsDictionary() first\n", name());
@@ -457,6 +461,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
 
     const uint64_t perCall =
         std::max<uint64_t>(1, std::min<uint64_t>(backend.dictionaryCandidatesPerCall(), NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL));
+    const size_t batchesPerCall = std::max<size_t>(1, std::min<size_t>(backend.dictionaryBatchesPerCall(), NAMEBREAK_DICTIONARY_BATCHES_PER_CALL));
     std::vector<DictionaryBatch> pending;
     uint64_t pendingCount = 0, pendingEnd = start;
 
@@ -536,7 +541,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
             pendingCount += take;
             done += take;
             pendingEnd = leaf.firstNumber + done;
-            if (pendingCount >= perCall && !searchPending())
+            if ((pendingCount >= perCall || pending.size() >= batchesPerCall) && !searchPending())
                 return false;
         }
         return true;

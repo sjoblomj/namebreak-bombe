@@ -126,6 +126,7 @@ public:
     void endSearch() override { inner_.endSearch(); }
     bool supportsDictionary() const override { return inner_.supportsDictionary(); }
     uint64_t dictionaryCandidatesPerCall() const override { return inner_.dictionaryCandidatesPerCall(); }
+    size_t dictionaryBatchesPerCall() const override { return inner_.dictionaryBatchesPerCall(); }
     void beginDictionarySearch(const DictionaryConstants& constants) override {
         ++begun;
         inner_.beginDictionarySearch(constants);
@@ -335,6 +336,61 @@ static void testAgainstBruteForce(SearchBackend& backend) {
     check(withBasenames >= 30, "... " + std::to_string(withBasenames) + " of them recording basenames");
     if (kHashAMatchMask != 0xFFFFFFFFu)
         check(withHits >= 40, "... " + std::to_string(withHits) + " of them with hashA hits to compare");
+}
+
+// Many words, of every length from 1 to 12 characters, some with a '\':
+// enough that a batch of every word spans several of a GPU backend's thread
+// blocks in the builds that make them small (see CMakeLists.txt), which
+// search a whole batch's words in another order than a part of it.
+static void testManyWords(SearchBackend& backend) {
+    printf("--- many words ---\n");
+    std::mt19937 rng(7102026);
+    int mismatches = 0, found = 0;
+    const int rounds = 20;
+    for (int round = 0; round < rounds; ++round) {
+        DictionaryRequest req = freshRequest("many");
+        std::set<std::string> words;
+        const size_t wordCount = 50 + rng() % 251;
+        while (words.size() < wordCount)
+            words.insert(randomString(rng, rng() % 8 ? "ABCDEFGH" : "AB\\_", 1, 12));
+        req.pattern.words.assign(words.begin(), words.end());
+        req.pattern.separators = rng() % 2 ? std::vector<std::string>{""} : std::vector<std::string>{"", "_"};
+        req.pattern.minWords = 1;
+        req.pattern.maxWords = 1 + (int) (rng() % 2);
+        req.prefix = std::vector<std::string>{"", "REZ\\", "AB"}[rng() % 3];
+        req.suffix = std::vector<std::string>{"", ".WAV", "A LONG SUFFIX OF 25 CHARS"}[rng() % 3];
+        const std::vector<std::string> all = allCandidates(req.pattern);
+        if (rng() % 3 == 0) {
+            req.bounds.hasLower = true;
+            req.bounds.lower = req.prefix + all[rng() % all.size()];
+        }
+        const std::string planted = req.prefix + all[rng() % all.size()] + req.suffix;
+        req.targetHashA = hashOf(planted, 0x100);
+        req.targetHashB = round % 2 ? hashOf(planted, 0x200) : (uint32_t) rng();
+        req.checkBasename = true;
+        req.basenameKey = hashOf(basename(planted), 0x300);
+
+        const Expected e = expectedOf(req);
+        std::vector<std::string> hits;
+        const DictionaryResult r = run(backend, req, &hits);
+        bool ok = r.ok && r.found == !e.firstFound.empty();
+        if (ok && r.found) {
+            ok = r.filename == e.firstFound;
+            ++found;
+        } else if (ok) {
+            std::vector<std::string> got = hits, want = e.hits;
+            std::sort(got.begin(), got.end());
+            std::sort(want.begin(), want.end());
+            const std::vector<std::string> lines = readLines(req.basenamesFilePath);
+            ok = got == want && r.candidatesSearched == e.searched && std::set<std::string>(lines.begin(), lines.end()) == e.basenames;
+        }
+        if (!ok && ++mismatches <= 5)
+            fprintf(stderr, "  round %d: %zu words, %d-%d words a candidate, prefix '%s', suffix '%s': found %d/%d, hits %zu/%zu, searched %llu/%llu\n",
+                    round, wordCount, req.pattern.minWords, req.pattern.maxWords, req.prefix.c_str(), req.suffix.c_str(), r.found,
+                    !e.firstFound.empty(), hits.size(), e.hits.size(), (unsigned long long) r.candidatesSearched, (unsigned long long) e.searched);
+    }
+    check(mismatches == 0, std::to_string(rounds) + " searches of 50 to 300 words: as brute force (" + std::to_string(mismatches) + " differ)");
+    check(found >= 5, "... " + std::to_string(found) + " of them finding a planted match of both hashes");
 }
 
 // The Portuguese StarDat's credits file's sibling, with its real hashes.
@@ -604,19 +660,16 @@ int main(int argc, char* argv[]) {
     }
     std::string error;
     bool selfTestFailed = false;
-    std::unique_ptr<SearchBackend> backend = createBackend(backendName, error, &selfTestFailed);
+    std::unique_ptr<SearchBackend> backend = createDictionaryBackend(backendName, error, &selfTestFailed);
     if (!backend) {
         fprintf(stderr, "%s\n", error.c_str());
         return selfTestFailed ? 1 : 77;
-    }
-    if (!backend->supportsDictionary()) {
-        printf("the %s backend can't search dictionaries - skipped\n", backendName.c_str());
-        return 77;
     }
     prepareCryptTable(g_table);
     printf("backend %s, hashA bits compared %d\n", backendName.c_str(), NAMEBREAK_HASHA_MATCH_BITS);
 
     testAgainstBruteForce(*backend);
+    testManyWords(*backend);
     testRealHashes(*backend);
     testBasenamesFile(*backend);
     testEdges(*backend);

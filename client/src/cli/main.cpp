@@ -170,8 +170,8 @@ void printUsage(const char* argv0) {
                      "Reads the given --config file (default: %s, in the current directory) for\n"
                      "everything else; --mode and --backend, if given, override that file's own\n"
                      "'mode = ...'/'backend = ...'. Without either, the first backend listed that\n"
-                     "can run on this machine is used (in dictionary mode: cpu). -v/--version\n"
-                     "prints this build's version.\n",
+                     "can run on this machine is used (in dictionary mode, that can search\n"
+                     "dictionaries). -v/--version prints this build's version.\n",
             argv0, backends.c_str(), argv0, kDefaultConfigPath);
 }
 
@@ -335,8 +335,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "%s [dictionary]: %s\n", configPath.c_str(), error.c_str());
             return 1;
         }
-        // Only the CPU backends search dictionaries so far.
-        std::unique_ptr<SearchBackend> backend = createBackend(config.backend.empty() ? "cpu" : config.backend, error);
+        std::unique_ptr<SearchBackend> backend = createDictionaryBackend(config.backend, error);
         if (!backend) {
             fprintf(stderr, "%s\n", error.c_str());
             return 1;

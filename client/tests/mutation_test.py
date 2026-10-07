@@ -11,6 +11,14 @@ three checks that guard the search, on its own:
   integration        tests/search_integration_test.cpp
   stress             tests/search_stress_test.cpp
 
+And two more for a dictionary search: tests/dictionary_search_test.cpp,
+built with few of hashA's bits compared ("dictionary") and to make its GPU
+launches small ("dictionary-small" - see dictionary_search_test_small in
+CMakeLists.txt). The self-test there is both of createDictionaryBackend's:
+the row search's and, for a backend that can search dictionaries, the
+dictionary search's. A dictionary mutation is caught by those three - or
+some of them - and none of the others.
+
 Two more run on every copy too. tests/search_overflow_test.cpp
 ("overflow") covers what happens when a launch has more hits than it can
 record, which the other three rarely or never reach. And the stress test
@@ -34,7 +42,7 @@ One backend per run (--backend): cuda (the default), hip (the same code,
 compiled with HIP), opencl, metal (on a Mac) or cpu, each with its own list
 of mutations (--list).
 Needs the GPU the backend runs on, its toolchain or driver, and CMake. It
-copies CMakeLists.txt, src/ and tests/ as they are on disk into a work
+copies CMakeLists.txt, src/, tests/ and data/ as they are on disk into a work
 directory, so it tests uncommitted changes too and never touches build/.
 The CUDA list takes about fifteen minutes on a laptop i9-12900H and RTX 3080
 Ti.
@@ -74,6 +82,9 @@ MTL_KERNEL = "src/backends/metal/search.metal"
 MTL_HOST = "src/backends/metal/metal_backend.mm"
 CPU = "src/backends/cpu/cpu_backend.cpp"
 PRUNING = "src/backends/common/row_pruning.cpp"
+DICT_COMMON = "src/backends/common/dictionary_batch.cpp"
+CL_DICT_KERNEL = "src/backends/opencl/dictionary.cl"
+MTL_DICT_KERNEL = "src/backends/metal/dictionary.metal"
 
 
 @dataclass
@@ -146,6 +157,89 @@ ENGINE_PRUNING_MUTATIONS = [
              [(ENGINE, "params.pruneEntry = pruneEntry;", "params.pruneEntry = candidateStart;")],
              caught_by=("integration", "stress")),
 ]
+
+# A dictionary search's (engine/dictionary_search.h): caught by the
+# dictionary self-test, and by the dictionary search test built to make its
+# GPU launches small (see dictionary_search_test_small in CMakeLists.txt) -
+# whose thread blocks are a few words, so that its word lists span several,
+# and its launches have room for one hit of each kind. The test built with
+# the shipped geometry ("dictionary") has word lists too small for a thread
+# block's 8,192 words, so it can't see some of them.
+DICT_CAUGHT = ("self-test", "dictionary-small")
+
+# The word table, launch plan and hit checking every GPU backend shares
+# (backends/common/dictionary_batch.cpp).
+DICT_COMMON_MUTATIONS = [
+    Mutation("dictpack", "a word's characters past ASCII stored sign-extended, over the characters after them",
+             [(DICT_COMMON, "four |= (uint32_t) (unsigned char) word[i + j] << (8 * j);", "four |= (uint32_t) (int) word[i + j] << (8 * j);")],
+             caught_by=("self-test",)),
+    Mutation("dictbasenamestart", "a word's basename taken from its last '\\', not after it",
+             [(DICT_COMMON, "slash == std::string::npos ? 0 : (uint32_t) slash + 1, w});", "slash == std::string::npos ? 0 : (uint32_t) slash, w});")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictplanfloor", "a batch's last, partial segment left out of the launch",
+             [(DICT_COMMON, "segments += (batch.wordCount + (uint64_t) wordsPerSegment - 1) / wordsPerSegment;",
+               "segments += batch.wordCount / wordsPerSegment;")],
+             caught_by=DICT_CAUGHT),
+    Mutation("dictsuffixbasename", "the basename every candidate has, when the suffix has a '\\', never reported",
+             [(DICT_COMMON, "if (suffixBasenameMatches_ && !batches.empty())", "if (false)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    # Searching the words in another order, or launching a segment more than
+    # there are, must not change what's found.
+    Mutation("dictlongestfirst", "the word table in the order of their lengths, longest first", expect="harmless",
+             edits=[(DICT_COMMON, "return words[a].size() < words[b].size(); });", "return words[a].size() > words[b].size(); });")]),
+    Mutation("dictextrasegment", "an empty segment more after every batch whose words fill its segments", expect="harmless",
+             edits=[(DICT_COMMON, "segments += (batch.wordCount + (uint64_t) wordsPerSegment - 1) / wordsPerSegment;",
+                     "segments += batch.wordCount / wordsPerSegment + 1;")]),
+]
+
+CUDA_DICT_MUTATIONS = [
+    Mutation("dictlastword", "every segment's last word skipped",
+             [(KERNEL, "const uint32_t end = min(first + wordsPerSegment, batch.wordCount);",
+               "const uint32_t end = min(first + wordsPerSegment, batch.wordCount) - 1;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictbatchsearch", "a block's batch found one too early where segments start",
+             [(KERNEL, "if (__ldg(&batches[mid].firstSegment) <= segment)", "if (__ldg(&batches[mid].firstSegment) < segment)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictwhole", "a part of the list searched as if it were the whole of it, in the table's order",
+             [(KERNEL, "const bool wholeList = batch.wordCount == words.count;", "const bool wholeList = true;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictpositions", "a part of the list read from the list's start",
+             [(KERNEL, "__ldg(&words.positions[batch.firstWord + i])", "__ldg(&words.positions[i])")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictrest", "a word's third character of the last four never hashed",
+             [(KERNEL, "                if (rest > 2)\n                    step(four, 2);", "                if (rest > 3)\n                    step(four, 2);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictbyte", "the fourth character of every four hashed as the third",
+             [(KERNEL, "                step(four, 2);\n                step(four, 3);", "                step(four, 2);\n                step(four, 2);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictreset", "a word with a '\\' hashing its basename on from the batch's",
+             [(KERNEL, "            key1 = 0x7FED7FED;\n            key2 = 0xEEEEEEEE;", "            key1 = batch.basenameSeed1;\n            key2 = batch.basenameSeed2;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictfromslash", "a word's basename hashed from one character after where it starts",
+             [(KERNEL, "if (c >= basenameStart)", "if (c > basenameStart)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictfilter", "the suffix filter's bits read 31 to a word",
+             [(KERNEL, "if (!(filter[index / 32] >> (index % 32) & 1))", "if (!(filter[index / 32] >> (index % 31) & 1))")],
+             caught_by=("self-test", "dictionary")),
+    Mutation("dictsuffixkeys", "the basename hash's suffix hashed with hashA's keys",
+             [(KERNEL, "mpqStepPlus3(seed1, seed2, d_dictionarySuffixKeys[3 * i + (Basename ? 1 : 0)], d_dictionarySuffixKeys[3 * i + 2]);",
+               "mpqStepPlus3(seed1, seed2, d_dictionarySuffixKeys[3 * i], d_dictionarySuffixKeys[3 * i + 2]);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictlongsuffix", "a suffix longer than the kernels have compiled in hashed one character short",
+             [(KERNEL, "        for (int i = 0; i < suffixLen; ++i)\n            mpqStepPlus3(seed1, seed2, __ldg(&suffixKeys[3 * i + (Basename ? 1 : 0)])",
+               "        for (int i = 0; i + 1 < suffixLen; ++i)\n            mpqStepPlus3(seed1, seed2, __ldg(&suffixKeys[3 * i + (Basename ? 1 : 0)])")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictconstsuffix", "the suffix's keys never put in constant memory",
+             [(KERNEL, "if (!suffixKeys.empty() && suffixKeys.size() <= 3 * (size_t) kMaxSuffixSize)", "if (false)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictregrow", "a launch with more hits than room for them not searched again",
+             [(KERNEL, "        if (needed <= dictionaryHitCapacity_)\n            break;", "        if (true)\n            break;")],
+             caught_by=DICT_CAUGHT),
+    Mutation("dictcounts", "the hit counts not zeroed after a launch with hits",
+             [(KERNEL, "    CUDA_CHECK(cudaMemsetAsync(dictionaryCounts_, 0, 2 * sizeof(int), 0));\n    for (const std::vector<DictionaryHit>* hits",
+               "    for (const std::vector<DictionaryHit>* hits")],
+             caught_by=DICT_CAUGHT),
+] + DICT_COMMON_MUTATIONS
 
 CUDA_MUTATIONS = [
     # The lookup filter's mask.
@@ -287,7 +381,38 @@ CUDA_MUTATIONS = [
              edits=[(KERNEL, ">= groups * NAMEBREAK_LIST_MIN_PRUNED_PERCENT);", ">= 0);")]),
     Mutation("neverlisted", "no launch walking its lists", expect="harmless",
              edits=[(KERNEL, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
-] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS + CUDA_DICT_MUTATIONS
+
+OPENCL_DICT_MUTATIONS = [
+    Mutation("dictlastword", "every segment's last word skipped",
+             [(CL_DICT_KERNEL, "const uint end = min(first + wordsPerSegment, batch.wordCount);",
+               "const uint end = min(first + wordsPerSegment, batch.wordCount) - 1;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictbatchsearch", "a work-group's batch found one too early where segments start",
+             [(CL_DICT_KERNEL, "if (batches[mid].firstSegment <= segment)", "if (batches[mid].firstSegment < segment)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictwhole", "a part of the list searched as if it were the whole of it, in the table's order",
+             [(CL_DICT_KERNEL, "const bool wholeList = batch.wordCount == wordCount;", "const bool wholeList = true;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictrest", "a word's third character of the last four never hashed",
+             [(CL_DICT_KERNEL, "                if (rest > 2)\n                    STEP_CHAR(four, 2);", "                if (rest > 3)\n                    STEP_CHAR(four, 2);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictreset", "a word with a '\\' hashing its basename on from the batch's",
+             [(CL_DICT_KERNEL, "            key1 = 0x7FED7FEDu;\n            key2 = 0xEEEEEEEEu;\n            uint four = 0;",
+               "            uint four = 0;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictfilter", "the suffix filter's index shifting seed2's bits one too far",
+             [(CL_DICT_KERNEL, "#define FILTER_INDEX(seed1, seed2) (((seed1) & FILTER_STATE_MASK) | (((seed2) & FILTER_STATE_MASK) << FILTER_BITS))",
+               "#define FILTER_INDEX(seed1, seed2) (((seed1) & FILTER_STATE_MASK) | (((seed2) & FILTER_STATE_MASK) << (FILTER_BITS + 1)))")],
+             caught_by=("self-test", "dictionary")),
+    Mutation("dictsuffixkeys", "the basename hash's suffix hashed with hashA's keys",
+             [(CL_DICT_KERNEL, "STEP_PLUS3(seed1, seed2, suffixKeys[3 * i + which], suffixKeys[3 * i + 2]);",
+               "STEP_PLUS3(seed1, seed2, suffixKeys[3 * i], suffixKeys[3 * i + 2]);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictregrow", "a launch with more hits than room for them not searched again",
+             [(CL_HOST, "        if (needed <= dictionaryHitCapacity_)\n            break;", "        if (true)\n            break;")],
+             caught_by=DICT_CAUGHT),
+] + DICT_COMMON_MUTATIONS
 
 OPENCL_MUTATIONS = [
     # The lookup filter's mask.
@@ -411,7 +536,7 @@ OPENCL_MUTATIONS = [
              edits=[(CL_HOST, ">= groups * kListMinPrunedPercent);", ">= 0);")]),
     Mutation("neverlisted", "no launch walking its lists", expect="harmless",
              edits=[(CL_HOST, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
-] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + OPENCL_DICT_MUTATIONS
 
 # The Metal ones can only be run on a Mac (--backend metal).
 METAL_MUTATIONS = [
@@ -552,6 +677,14 @@ CPU_MUTATIONS = [
              [(CPU, "valid[d + 1] = valid[d + 1] && pruneStep_CPU(", "valid[d + 1] = pruneStep_CPU(")]),
     Mutation("cpurowinsert", "the text inserted after a row's own character not hashed",
              [(CPU, "        stepInserted(ctx.prefixDigits, rowS1, rowS2, rowPrune, ok);\n", "")]),
+    # A dictionary search's words shared out among the threads.
+    Mutation("dictitemend", "every work item's last word skipped",
+             [(CPU, "items.push_back({b, (uint32_t) from, (uint32_t) std::min<uint64_t>(batches[b].wordCount, from + wordsPerItem)});",
+               "items.push_back({b, (uint32_t) from, (uint32_t) std::min<uint64_t>(batches[b].wordCount, from + wordsPerItem) - 1});")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictcpusuffix", "the basename hash's suffix never hashed",
+             [(CPU, "                    for (unsigned char ch : suffix)\n                        stepBasename(ch);\n", "")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
 ] + ENGINE_PRUNING_MUTATIONS
 
 # Per backend: how to build it, what its createBackend name is, and its mutations.
@@ -580,23 +713,29 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::string why;
-    if (selfTestBackend(*backend, why)) {
-        printf("self-test passed\n");
-        return 0;
+    if (!selfTestBackend(*backend, why)) {
+        printf("self-test FAILED: %s\n", why.c_str());
+        return 1;
     }
-    printf("self-test FAILED: %s\n", why.c_str());
-    return 1;
+    if (backend->supportsDictionary() && !selfTestDictionaryBackend(*backend, why)) {
+        printf("self-test FAILED: dictionary search: %s\n", why.c_str());
+        return 1;
+    }
+    printf("self-test passed\n");
+    return 0;
 }
 '''
 
 TARGETS = ["search_integration_test", "search_stress_test", "search_overflow_test", "search_stress_test_small_launch",
-           "mutation_self_test_runner"]
+           "dictionary_search_test_dense", "dictionary_search_test_small", "mutation_self_test_runner"]
 CHECKS = [
     ("self-test", "mutation_self_test_runner"),
     ("integration", "search_integration_test"),
     ("stress", "search_stress_test"),
     ("overflow", "search_overflow_test"),
     ("stress-small", "search_stress_test_small_launch"),
+    ("dictionary", "dictionary_search_test_dense"),
+    ("dictionary-small", "dictionary_search_test_small"),
 ]
 
 
@@ -646,14 +785,15 @@ def prepare_base(work):
     base = work / "base"
     base.mkdir()
     shutil.copy2(CLIENT / "CMakeLists.txt", base)
-    for sub in ("src", "tests"):
+    for sub in ("src", "tests", "data"):
         shutil.copytree(CLIENT / sub, base / sub, ignore=shutil.ignore_patterns("__pycache__"))
     backends = base / "src/backends/backends.cpp"
     text = backends.read_text()
-    if text.count("selfTestBackend(*backend, why)") != 2:
-        raise ExperimentError("couldn't find createBackend's two calls to selfTestBackend in src/backends/backends.cpp - "
-                              "update prepare_base() in tests/mutation_test.py")
-    backends.write_text(text.replace("selfTestBackend(*backend, why)", "true"))
+    head = "bool passesSelfTests(SearchBackend& backend, bool dictionary, std::string& why) {\n"
+    if text.count(head) != 1:
+        raise ExperimentError("couldn't find passesSelfTests, which createBackend and createDictionaryBackend run the self-tests with, in "
+                              "src/backends/backends.cpp - update prepare_base() in tests/mutation_test.py")
+    backends.write_text(text.replace(head, head + "    (void) backend, (void) dictionary, (void) why;\n    return true;\n"))
     (base / "tests/mutation_self_test_runner.cpp").write_text(SELF_TEST_RUNNER)
     with open(base / "CMakeLists.txt", "a") as cmake:
         cmake.write("\n# Added by tests/mutation_test.py.\n"
@@ -698,6 +838,16 @@ def summarize(check, log_text, capture_text, exit_code, timed_out):
         m = re.search(r"(\d+) check\(s\) FAILED", log_text)
         if m:
             return f"{m.group(1)} check(s) failed"
+    elif check.startswith("dictionary"):
+        m = re.search(r"ALL (\d+) CHECKS PASSED", log_text)
+        if m:
+            return f"all {m.group(1)} checks passed"
+        m = re.search(r"(\d+) of (\d+) check\(s\) FAILED", log_text)
+        if m:
+            return f"{m.group(1)} of {m.group(2)} checks failed"
+        m = re.search(r"failed its self-test on this machine: (.*)", log_text)
+        if m:
+            return "self-test: " + m.group(1)[:90]
     else:
         m = re.search(r"(\d+) case\(s\), \d+ candidates, (\d+) hits verified, [\d.]+s, (\d+) failure\(s\)", log_text)
         if m:

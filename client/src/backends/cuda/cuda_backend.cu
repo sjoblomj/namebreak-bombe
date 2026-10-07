@@ -24,6 +24,7 @@
 #include "backends/cuda/hash_kernels.cuh"
 #include "backends/cuda/tuning.h"
 #include "engine/backend.h"
+#include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
 
@@ -590,6 +591,198 @@ void launchSearchFor(AlphabetSizeList<Sizes...>, bool listed, bool inserted, dim
         launchSearch<0, SuffixLen, false>(listed, blocks, trailingLen, shape, batches, targetA, bufs);
 }
 
+
+// --- Dictionary searches -----------------------------------------------------
+//
+// A dictionary search (engine/dictionary_search.h) hands the backend batches:
+// a leading part's hash states, followed by a run of the word list's words
+// and then the suffix - one candidate per word. dictionaryKernel hashes each
+// of them on from its batch's states: hashA, and if the search checks
+// basenames, the basename hash too (see backends/common/dictionary_batch.h,
+// which also has the host's side of it).
+
+// The word list, as DictionaryWordTable has it, on the GPU - a kernel
+// argument.
+struct DictionaryWords {
+    const uint32_t* chars;
+    const DictionaryWordEntry* entries;
+    const uint32_t* positions;
+    uint32_t count;
+};
+
+// What a dictionary launch reports: how many hits of each kind it had -
+// counts[0] hashA hits, counts[1] basename hits, every one of them, past
+// `capacity` too - and the first `capacity` of each. A launch that has more
+// is searched again, with room for them all (see runDictionaryBatches).
+struct DictionaryResults {
+    int* counts;
+    DictionaryHit* hashAHits;
+    DictionaryHit* basenameHits;
+    uint32_t capacity;
+};
+
+// The suffix's keys (dictionarySuffixKeys), for the kernels that have its
+// length compiled in - read at compile-time indices, which fold into their
+// instructions as constant-bank operands. A longer suffix's are read from
+// a buffer of the search's.
+__device__ __constant__ uint32_t d_dictionarySuffixKeys[3 * kMaxSuffixSize];
+
+// The batch block `segment` is in: the last of the launch's batches whose
+// first segment is at most `segment` (dictionaryBatchOfSegment on the host).
+__device__ __forceinline__ uint32_t dictionaryBatchOf(const DictionaryLaunchBatch* batches, uint32_t batchCount, uint32_t segment) {
+    uint32_t lo = 0, hi = batchCount - 1;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo + 1) / 2;
+        if (__ldg(&batches[mid].firstSegment) <= segment)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    return lo;
+}
+
+// One step of the hash, for a character whose key and value plus 3 are
+// known - mpqStep, its sums in another order (see dictionarySuffixKeys).
+__device__ __forceinline__ void mpqStepPlus3(uint32_t& seed1, uint32_t& seed2, uint32_t key, uint32_t ordPlus3) {
+    seed1 = key ^ (seed1 + seed2);
+    seed2 = seed1 + 33 * seed2 + ordPlus3;
+}
+
+// Byte b (0: the lowest) of `four`. On NVIDIA's GPUs one instruction (PRMT)
+// rather than a shift and a mask.
+__device__ __forceinline__ uint32_t extractByte(uint32_t four, int b) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return (four >> (8 * b)) & 0xFF;
+#else
+    return __byte_perm(four, 0, 0x4440 | b);
+#endif
+}
+
+// Whether the candidate whose word leaves the state at (seed1, seed2) - of
+// hashA, or if Basename, of the basename hash - matches `target`: if the
+// suffix filter `filter` lets it through, the suffix hashed in full.
+template<int SuffixLen, bool Basename>
+__device__ __forceinline__ bool dictionarySuffixMatches(uint32_t seed1, uint32_t seed2, const uint32_t* filter, const uint32_t* suffixKeys,
+                                                        int suffixLen, uint32_t target) {
+    const uint32_t index = lowBitsFilterIndex(seed1, seed2, kDictionaryFilterBits);
+    if (!(filter[index / 32] >> (index % 32) & 1))
+        return false;
+    if constexpr (SuffixLen == kRuntimeSuffix) {
+        for (int i = 0; i < suffixLen; ++i)
+            mpqStepPlus3(seed1, seed2, __ldg(&suffixKeys[3 * i + (Basename ? 1 : 0)]), __ldg(&suffixKeys[3 * i + 2]));
+    } else {
+        #pragma unroll
+        for (int i = 0; i < SuffixLen; ++i)
+            mpqStepPlus3(seed1, seed2, d_dictionarySuffixKeys[3 * i + (Basename ? 1 : 0)], d_dictionarySuffixKeys[3 * i + 2]);
+    }
+    return Basename ? seed1 == target : hashAMatches(seed1, target);
+}
+
+// One block per segment of the launch (see planDictionaryLaunch): up to
+// kDictionaryWordsPerThread * blockDim.x consecutive words of one batch, the
+// block's threads taking neighbouring words - in the word table's order
+// (by length, see DictionaryWordTable) if the batch has every word, in the
+// list's if not - each hashed from the batch's states, then the suffix,
+// where its filter lets it through. Records every hashA hit, and with
+// Basenames every basename hit, as (batch, word): the host rebuilds and
+// checks them.
+//
+// `cryptKeys` is the crypt table's hashA part (0x100) and then its basename
+// hash's part (0x300), 256 entries each, which the block copies into shared
+// memory, a character's two keys side by side: a word's characters are a
+// lookup each, different for every lane. `filters` is the suffix filters
+// (buildDictionarySuffixFilter), hashA's and then the basename hash's,
+// kDictionaryFilterWords each - into shared memory too.
+template<int SuffixLen, bool Basenames>
+__global__ void dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batches, uint32_t batchCount, DictionaryWords words,
+                                 const uint32_t* __restrict__ cryptKeys, const uint32_t* __restrict__ filters,
+                                 const uint32_t* __restrict__ suffixKeys, int suffixLen, uint32_t targetA, uint32_t basenameKey,
+                                 DictionaryResults results) {
+    __shared__ uint2 sKeys[256];
+    __shared__ uint32_t sFilterA[kDictionaryFilterWords];
+    __shared__ uint32_t sFilterBasename[Basenames ? kDictionaryFilterWords : 1];
+    __shared__ uint32_t sBatch;
+    for (int i = threadIdx.x; i < 256; i += blockDim.x)
+        sKeys[i] = make_uint2(__ldg(&cryptKeys[i]), __ldg(&cryptKeys[256 + i]));
+    for (int i = threadIdx.x; i < (int) kDictionaryFilterWords; i += blockDim.x) {
+        sFilterA[i] = __ldg(&filters[i]);
+        if constexpr (Basenames)
+            sFilterBasename[i] = __ldg(&filters[kDictionaryFilterWords + i]);
+    }
+    if (threadIdx.x == 0)
+        sBatch = dictionaryBatchOf(batches, batchCount, blockIdx.x);
+    __syncthreads();
+
+    const uint32_t batchIndex = sBatch;
+    const DictionaryLaunchBatch batch = batches[batchIndex];
+    const bool wholeList = batch.wordCount == words.count;
+    const uint32_t wordsPerSegment = kDictionaryWordsPerThread * blockDim.x;
+    const uint32_t first = (blockIdx.x - batch.firstSegment) * wordsPerSegment;
+    const uint32_t end = min(first + wordsPerSegment, batch.wordCount);
+    for (uint32_t i = first + threadIdx.x; i < end; i += blockDim.x) {
+        const uint4 entry = __ldg(reinterpret_cast<const uint4*>(&words.entries[wholeList ? i : __ldg(&words.positions[batch.firstWord + i])]));
+        const uint32_t offset = entry.x, length = entry.y, basenameStart = entry.z, index = entry.w;
+        uint32_t seed1 = batch.seed1, seed2 = batch.seed2;
+        uint32_t key1 = batch.basenameSeed1, key2 = batch.basenameSeed2;
+        if (!Basenames || basenameStart == 0) {
+            // Four characters at a time, as they're stored, and then the
+            // rest. The lanes of a warp mostly have words of the same length
+            // (see DictionaryWordTable), so they go round together.
+            auto step = [&](uint32_t four, int b) {
+                const uint32_t ch = extractByte(four, b);
+                const uint2 keys = sKeys[ch];
+                mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
+                if constexpr (Basenames)
+                    mpqStepPlus3(key1, key2, keys.y, ch + 3);
+            };
+            const uint32_t* chars = words.chars + offset;
+            const uint32_t* const fullEnd = chars + length / 4;
+            for (; chars != fullEnd; ++chars) {
+                const uint32_t four = __ldg(chars);
+                step(four, 0);
+                step(four, 1);
+                step(four, 2);
+                step(four, 3);
+            }
+            const uint32_t rest = length % 4;
+            if (rest != 0) {
+                const uint32_t four = __ldg(chars);
+                step(four, 0);
+                if (rest > 1)
+                    step(four, 1);
+                if (rest > 2)
+                    step(four, 2);
+            }
+        } else {
+            // A word with a '\': its basename starts over after the last one.
+            key1 = 0x7FED7FED;
+            key2 = 0xEEEEEEEE;
+            uint32_t four = 0;
+            for (uint32_t c = 0; c < length; ++c) {
+                if ((c & 3) == 0)
+                    four = __ldg(&words.chars[offset + c / 4]);
+                const uint32_t ch = extractByte(four, c & 3);
+                const uint2 keys = sKeys[ch];
+                mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
+                if (c >= basenameStart)
+                    mpqStepPlus3(key1, key2, keys.y, ch + 3);
+            }
+        }
+        if (dictionarySuffixMatches<SuffixLen, false>(seed1, seed2, sFilterA, suffixKeys, suffixLen, targetA)) {
+            const int slot = atomicAdd(&results.counts[0], 1);
+            if ((uint32_t) slot < results.capacity)
+                results.hashAHits[slot] = DictionaryHit{batchIndex, index};
+        }
+        if constexpr (Basenames) {
+            if (dictionarySuffixMatches<SuffixLen, true>(key1, key2, sFilterBasename, suffixKeys, suffixLen, basenameKey)) {
+                const int slot = atomicAdd(&results.counts[1], 1);
+                if ((uint32_t) slot < results.capacity)
+                    results.basenameHits[slot] = DictionaryHit{batchIndex, index};
+            }
+        }
+    }
+}
+
 namespace {
 
 class CudaBackend : public SearchBackend {
@@ -603,6 +796,17 @@ public:
             (void) cudaFree(groups_);
         if (rowMasks_)
             (void) cudaFree(rowMasks_);
+        freeDictionaryBuffers();
+        if (dictionaryCounts_)
+            (void) cudaFree(dictionaryCounts_);
+        if (pinnedDictionaryCounts_)
+            (void) cudaFreeHost(pinnedDictionaryCounts_);
+        if (dictionaryBatches_)
+            (void) cudaFree(dictionaryBatches_);
+        for (DictionaryHit* hits : {dictionaryHashAHits_, dictionaryBasenameHits_}) {
+            if (hits)
+                (void) cudaFree(hits);
+        }
     }
 
 #ifdef NAMEBREAK_HIP
@@ -625,6 +829,13 @@ public:
     // NAMEBREAK_ROWS_PER_LAUNCH rows, in one launch - see filteredRowsKernel.
     int maxBatchesPerCall() const override { return NAMEBREAK_BATCHES_PER_LAUNCH; }
     BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches) override;
+
+    // A dictionary search: one launch of dictionaryKernel per call.
+    bool supportsDictionary() const override { return true; }
+    uint64_t dictionaryCandidatesPerCall() const override { return NAMEBREAK_DICTIONARY_CANDIDATES_PER_LAUNCH; }
+    void beginDictionarySearch(const DictionaryConstants& constants) override;
+    DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
+    void endDictionarySearch() override;
 
 private:
     int alphabetSize_ = 0;
@@ -667,6 +878,34 @@ private:
     // Whether this search inserts text into the trailing part, and gets the
     // kernel that hashes it.
     bool inserted_ = false;
+
+    // A dictionary search's: the word list, the crypt table's keys and the
+    // suffix's (DictionaryWordTable, dictionarySuffixKeys) - uploaded by
+    // beginDictionarySearch and freed by endDictionarySearch - and what the
+    // kernel is launched with.
+    void freeDictionaryBuffers();
+    void launchDictionary(uint32_t batchCount, uint64_t segments);
+    DictionaryHitVerifier dictionaryVerifier_;
+    DictionaryWords dictionaryWords_ = {};
+    uint32_t* dictionaryCryptKeys_ = nullptr;
+    uint32_t* dictionaryFilters_ = nullptr;
+    uint32_t* dictionarySuffixKeys_ = nullptr;
+    int dictionarySuffixLen_ = 0;
+    bool dictionaryBasenames_ = false;
+    uint32_t dictionaryTargetA_ = 0;
+    uint32_t dictionaryBasenameKey_ = 0;
+    // Kept from one search to the next, grown as a launch needs: its
+    // batches (DictionaryLaunchBatch), the hit counts (and their copy in
+    // pinned host memory, read back behind the kernel), and the hits, room
+    // for dictionaryHitCapacity_ of each kind.
+    std::vector<DictionaryLaunchBatch> dictionaryLaunch_;
+    DictionaryLaunchBatch* dictionaryBatches_ = nullptr;
+    size_t dictionaryBatchesCapacity_ = 0;
+    int* dictionaryCounts_ = nullptr;
+    int* pinnedDictionaryCounts_ = nullptr;
+    DictionaryHit* dictionaryHashAHits_ = nullptr;
+    DictionaryHit* dictionaryBasenameHits_ = nullptr;
+    uint32_t dictionaryHitCapacity_ = 0;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -956,6 +1195,186 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
         ++kept;
     }
     outcome.hitCount = kept;
+    return outcome;
+}
+
+
+void CudaBackend::beginDictionarySearch(const DictionaryConstants& constants) {
+    freeDictionaryBuffers();
+    dictionaryVerifier_.begin(constants);
+    dictionaryBasenames_ = dictionaryVerifier_.candidatesHaveBasenames();
+    dictionaryTargetA_ = constants.targetHashA;
+    dictionaryBasenameKey_ = constants.basenameKey;
+    dictionarySuffixLen_ = (int) constants.suffix.size();
+
+    DictionaryWordTable table;
+    if (!makeDictionaryWordTable(constants.words, table)) {
+        // runDictionarySearch's word lists are far smaller.
+        fprintf(stderr, "INTERNAL ERROR: the word list is too long for the GPU's 32-bit offsets - exiting\n");
+        exit(1);
+    }
+    // At least an entry each, so that an empty table has its buffers too.
+    auto upload = [](const auto& host, auto*& device) {
+        using T = std::remove_const_t<std::remove_reference_t<decltype(*device)>>;
+        T* buffer = nullptr;
+        CUDA_CHECK(cudaMalloc(&buffer, std::max<size_t>(1, host.size()) * sizeof(T)));
+        if (!host.empty())
+            CUDA_CHECK(cudaMemcpy(buffer, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
+        device = buffer;
+    };
+    upload(table.chars, dictionaryWords_.chars);
+    upload(table.entries, dictionaryWords_.entries);
+    upload(table.positions, dictionaryWords_.positions);
+    dictionaryWords_.count = (uint32_t) constants.words.size();
+
+    std::vector<uint32_t> cryptKeys(constants.cryptTable + kHashAOffset, constants.cryptTable + kHashAOffset + 256);
+    cryptKeys.insert(cryptKeys.end(), constants.cryptTable + kFileKeyOffset, constants.cryptTable + kFileKeyOffset + 256);
+    upload(cryptKeys, dictionaryCryptKeys_);
+    // The suffix filters, hashA's and the basename hash's - each checked in
+    // full before it's used, as the row search's filter table is (see
+    // beginSearch): a wrong one could drop a match without any other sign.
+    std::vector<uint32_t> filters;
+    for (bool basename : {false, true}) {
+        const int offset = basename ? kFileKeyOffset : kHashAOffset;
+        const uint32_t target = basename ? constants.basenameKey : constants.targetHashA, mask = dictionaryFilterMask(basename);
+        const std::vector<uint32_t> filter = buildDictionarySuffixFilter(constants.suffix, constants.cryptTable, offset, target, mask);
+        std::string error;
+        if (!checkDictionarySuffixFilter(filter, constants.suffix, constants.cryptTable, offset, target, mask, std::random_device{}(), error))
+            refuseFilterTable("of the dictionary search's suffix failed its check", error);
+        filters.insert(filters.end(), filter.begin(), filter.end());
+    }
+    upload(filters, dictionaryFilters_);
+    // The suffix's keys: in a buffer for any length, and in
+    // d_dictionarySuffixKeys for the kernels that have its length compiled
+    // in (see dispatchSuffixLen).
+    const std::vector<uint32_t> suffixKeys = dictionarySuffixKeys(constants.suffix, constants.cryptTable);
+    upload(suffixKeys, dictionarySuffixKeys_);
+    if (!suffixKeys.empty() && suffixKeys.size() <= 3 * (size_t) kMaxSuffixSize)
+        CUDA_CHECK(cudaMemcpyToSymbol(d_dictionarySuffixKeys, suffixKeys.data(), suffixKeys.size() * sizeof(uint32_t)));
+
+    // The counts are 0 at every launch: zeroed here, and after every launch
+    // that had hits (see runDictionaryBatches).
+    if (!dictionaryCounts_)
+        CUDA_CHECK(cudaMalloc(&dictionaryCounts_, 2 * sizeof(int)));
+    if (!pinnedDictionaryCounts_)
+        CUDA_CHECK(cudaMallocHost((void**) &pinnedDictionaryCounts_, 2 * sizeof(int)));
+    CUDA_CHECK(cudaMemset(dictionaryCounts_, 0, 2 * sizeof(int)));
+    waiter_.beginSearch();
+}
+
+void CudaBackend::freeDictionaryBuffers() {
+    for (const void* buffer : {(const void*) dictionaryWords_.chars, (const void*) dictionaryWords_.entries,
+                               (const void*) dictionaryWords_.positions, (const void*) dictionaryCryptKeys_,
+                               (const void*) dictionaryFilters_, (const void*) dictionarySuffixKeys_}) {
+        if (buffer)
+            (void) cudaFree((void*) buffer);
+    }
+    dictionaryWords_ = {};
+    dictionaryCryptKeys_ = nullptr;
+    dictionaryFilters_ = nullptr;
+    dictionarySuffixKeys_ = nullptr;
+}
+
+void CudaBackend::endDictionarySearch() {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    freeDictionaryBuffers();
+}
+
+void CudaBackend::launchDictionary(uint32_t batchCount, uint64_t segments) {
+    const DictionaryResults results{dictionaryCounts_, dictionaryHashAHits_, dictionaryBasenameHits_, dictionaryHitCapacity_};
+    dispatchSuffixLen(dictionarySuffixLen_, [&](auto suffixC) {
+        using SuffixC = decltype(suffixC);
+        if (dictionaryBasenames_)
+            dictionaryKernel<SuffixC::value, true><<<(unsigned) segments, kDictionaryThreadsPerBlock>>>(
+                dictionaryBatches_, batchCount, dictionaryWords_, dictionaryCryptKeys_, dictionaryFilters_, dictionarySuffixKeys_,
+                dictionarySuffixLen_, dictionaryTargetA_, dictionaryBasenameKey_, results);
+        else
+            dictionaryKernel<SuffixC::value, false><<<(unsigned) segments, kDictionaryThreadsPerBlock>>>(
+                dictionaryBatches_, batchCount, dictionaryWords_, dictionaryCryptKeys_, dictionaryFilters_, dictionarySuffixKeys_,
+                dictionarySuffixLen_, dictionaryTargetA_, dictionaryBasenameKey_, results);
+    });
+    CUDA_CHECK(cudaGetLastError());
+    // The counts' copy is queued right behind the kernel - as the row
+    // search's results are (see runBatches).
+    CUDA_CHECK(cudaMemcpyAsync(pinnedDictionaryCounts_, dictionaryCounts_, 2 * sizeof(int), cudaMemcpyDeviceToHost, 0));
+}
+
+DictionaryOutcome CudaBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
+    DictionaryOutcome outcome;
+    if (batches.empty())
+        return outcome;
+    const uint32_t wordsPerSegment = (uint32_t) (kDictionaryWordsPerThread * kDictionaryThreadsPerBlock);
+    const uint64_t segments = planDictionaryLaunch(batches, wordsPerSegment, dictionaryLaunch_);
+    uint64_t candidates = 0;
+    for (const DictionaryBatch& batch : batches)
+        candidates += batch.wordCount;
+    if (segments > INT32_MAX || batches.size() > UINT32_MAX) {
+        // runDictionarySearch's calls are far smaller (dictionaryCandidatesPerCall).
+        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments - exiting\n", (unsigned long long) segments);
+        exit(1);
+    }
+    if (dictionaryLaunch_.size() > dictionaryBatchesCapacity_) {
+        if (dictionaryBatches_)
+            CUDA_CHECK(cudaFree(dictionaryBatches_));
+        dictionaryBatchesCapacity_ = std::max(dictionaryLaunch_.size(), 2 * dictionaryBatchesCapacity_);
+        CUDA_CHECK(cudaMalloc(&dictionaryBatches_, dictionaryBatchesCapacity_ * sizeof(DictionaryLaunchBatch)));
+    }
+    CUDA_CHECK(cudaMemcpy(dictionaryBatches_, dictionaryLaunch_.data(), dictionaryLaunch_.size() * sizeof(DictionaryLaunchBatch),
+                          cudaMemcpyHostToDevice));
+    if (!dictionaryHashAHits_) {
+        dictionaryHitCapacity_ = NAMEBREAK_DICTIONARY_HIT_CAPACITY;
+        CUDA_CHECK(cudaMalloc(&dictionaryHashAHits_, dictionaryHitCapacity_ * sizeof(DictionaryHit)));
+        CUDA_CHECK(cudaMalloc(&dictionaryBasenameHits_, dictionaryHitCapacity_ * sizeof(DictionaryHit)));
+    }
+
+    // Launched again, with room for every hit, as long as it had more than
+    // it had room for - which a real search, with a 32-bit hashA and key,
+    // practically never does.
+    int counts[2];
+    for (;;) {
+        const auto launched = std::chrono::steady_clock::now();
+        launchDictionary((uint32_t) dictionaryLaunch_.size(), segments);
+        waiter_.wait(candidates, launched, [] { CUDA_CHECK(cudaDeviceSynchronize()); });
+        counts[0] = pinnedDictionaryCounts_[0];
+        counts[1] = pinnedDictionaryCounts_[1];
+        if (counts[0] < 0 || counts[1] < 0 || (uint64_t) counts[0] > candidates || (uint64_t) counts[1] > candidates) {
+            fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu candidates reported %d and %d hits - exiting\n",
+                    (unsigned long long) candidates, counts[0], counts[1]);
+            exit(1);
+        }
+        const uint32_t needed = (uint32_t) std::max(counts[0], counts[1]);
+        if (needed <= dictionaryHitCapacity_)
+            break;
+        CUDA_CHECK(cudaFree(dictionaryHashAHits_));
+        CUDA_CHECK(cudaFree(dictionaryBasenameHits_));
+        dictionaryHitCapacity_ = std::max(needed, 2 * dictionaryHitCapacity_);
+        CUDA_CHECK(cudaMalloc(&dictionaryHashAHits_, dictionaryHitCapacity_ * sizeof(DictionaryHit)));
+        CUDA_CHECK(cudaMalloc(&dictionaryBasenameHits_, dictionaryHitCapacity_ * sizeof(DictionaryHit)));
+        CUDA_CHECK(cudaMemset(dictionaryCounts_, 0, 2 * sizeof(int)));
+    }
+    if (counts[0] == 0 && counts[1] == 0) {
+        dictionaryVerifier_.addHits(batches, {}, {}, outcome);
+        return outcome;
+    }
+
+    // The exception: hits to bring back, and the counts to zero again.
+    std::vector<DictionaryHit> hashAHits(counts[0]), basenameHits(counts[1]);
+    if (counts[0] > 0)
+        CUDA_CHECK(cudaMemcpy(hashAHits.data(), dictionaryHashAHits_, counts[0] * sizeof(DictionaryHit), cudaMemcpyDeviceToHost));
+    if (counts[1] > 0)
+        CUDA_CHECK(cudaMemcpy(basenameHits.data(), dictionaryBasenameHits_, counts[1] * sizeof(DictionaryHit), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemsetAsync(dictionaryCounts_, 0, 2 * sizeof(int), 0));
+    for (const std::vector<DictionaryHit>* hits : {&hashAHits, &basenameHits}) {
+        for (const DictionaryHit& hit : *hits) {
+            const DictionaryBatch* batch = hit.batch < batches.size() ? &batches[hit.batch] : nullptr;
+            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount) {
+                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u of batch %u, which it doesn't have - exiting\n", hit.word,
+                        hit.batch);
+                exit(1);
+            }
+        }
+    }
+    dictionaryVerifier_.addHits(batches, hashAHits, basenameHits, outcome);
     return outcome;
 }
 

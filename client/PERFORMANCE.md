@@ -604,6 +604,80 @@ will have grown (not measured again).
   - [ ] **The same for Metal**, whose list-walking kernel would cost about
     as much: the host's check is shared (`RowPruning::survives`).
 
+## Dictionary searches
+
+A dictionary search (README.md's [Dictionary mode](README.md#dictionary-mode))
+hands the backend batches - a leading part's hash states, a run of the word
+list's words and the suffix - rather than rows. The GPU kernels
+(`dictionaryKernel` in `cuda_backend.cu`, `dictionary.cl`,
+`dictionary.metal`) hash each word on from its batch's states, hashA and the
+basename hash together, and the suffix where a filter lets it through.
+There's no row trick to be had: every candidate is a word of its own, about
+8 characters, two hashes of them. Measured on the RTX 3080 Ti Laptop with
+`english-1` and the three StarCraft lists (66,276 words), two words a
+candidate, four separators, `MUSIC\BG` and `.WAV`, a basename key: 17.6
+billion candidates. Kernel times are Nsight Compute's for one launch of 2^28
+candidates at its fixed clocks, since the search's own rate followed how hot
+the GPU was (between 7.7 and 20 G candidates/s for the same build, in one
+afternoon).
+
+- [x] **A first kernel**: a thread per word, a block per segment of a
+  batch's words, a word's characters read a byte at a time and looked up
+  in the crypt table's two parts in shared memory. 30.66 ms a launch,
+  11.7 G candidates/s. The load/store unit was the limit (97%), and a warp's
+  lanes, with words of different lengths, were only 22 of 32 busy.
+- [x] **Words by length, four characters to a load.** The word table
+  (`DictionaryWordTable`) keeps the words in the order of their lengths -
+  which a batch of every word, nearly every batch, is searched in; a part
+  of the list is searched in the list's order - so a warp's lanes go round
+  together (31.4 of 32 busy), and four characters to a uint32, the two
+  hashes' keys side by side in shared memory: one 64-bit lookup a
+  character, a quarter of a load. 19.97 ms (-35%).
+- [x] **The suffix filter.** As the row search's lookup filter: the low
+  bits of the state after the suffix depend only on those before it, so a
+  table of 2^(2 * 7) bits per hash says whether the suffix can make a
+  match, and it's hashed in full for 1 candidate in 128 rather than all
+  (the warp still does whenever a lane needs it). With the suffix's keys
+  in constant memory and `+ 3` added in once per character: 18.58 ms. At
+  4, 5, 6, 7 and 8 bits: 17.60, 14.32, 14.15, 13.88 and 18.18 ms with the
+  final kernel - 8 bits' 16 KB of shared memory costs more than it saves.
+- [x] **Words per thread.** Every block finds its batch (a binary search,
+  by one thread, the others waiting at the barrier - 30% of their stalls)
+  and copies its tables. 1, 2, 4, 8, 16 and 32 words per thread: 27.77,
+  21.46, 18.58, 17.24, 16.54 and 14.14 ms; 32 shipped.
+- [x] **Whole four-character chunks, `__byte_perm`.** A word's full
+  chunks without a check per character, then the rest; a character out of
+  its chunk with one `PRMT`: 14.54 ms from 16.54 (-12%). The loop is now
+  about 10.5 instructions a character for both hashes.
+- [ ] **Tried, no better:** queueing the candidates the filter lets
+  through in shared memory and hashing their suffixes together at the end
+  of the block (14.26 ms against 14.14 - the queue costs what the warps
+  saved); the usual step, letting the compiler add `+ 3` per hash (15.40
+  against 14.54); walking a word's chunks by pointer (the same).
+- [x] **Where it stands:** 13.88 ms a launch, about 190 instructions a
+  candidate, issue slots 88% busy - about 20 G candidates/s on the CUDA
+  backend and 19.3 on OpenCL's with this list (same GPU, same afternoon),
+  against the first kernel's 11.7. `run_dictionary_bench` (up to two
+  words of `english-1` alone, 16.3 billion candidates, a basename key):
+  17.1 and 16.3 G candidates/s on CUDA and OpenCL with the GPU at 60-64 C,
+  10.9 and 10.4 at 85 C - and 0.20 on the CPU backend, 83 s, for which
+  the GPU takes under a second.
+- [ ] **Overlap the host with the GPU.** The engine builds a call's batches
+  (about 4,000 leading parts for a launch of 2^28) while the GPU waits,
+  and the GPU then runs while the engine waits. **Measured** with a
+  backend that hashes nothing: 85 ns a batch, 22 ms for the 255,561
+  batches of two words of `english-1` - under 3% of the GPU's time, and
+  the same share with three words, as it's per batch of every word. Would
+  take building the next call's batches during the launch, in the engine;
+  not worth it yet.
+- [ ] **Persistent blocks.** A block per segment pays for its batch's
+  binary search and its tables every 8,192 words; blocks that each search
+  many segments wouldn't (**estimated**: a few percent, from the
+  words-per-thread sweep's trend).
+- [ ] **Tune OpenCL and Metal** on their own: both have CUDA's values
+  (32 words per thread, 256 threads to a work-group); Metal's kernel has
+  only run emulated on the CPU.
+
 ## Tooling
 
 - [x] **`search_bench`** counted pruned candidates as searched and pruned
@@ -663,3 +737,12 @@ backend is self-tested before use (see the README). What's still open:
   - [x] **The other backends**: OpenCL (`--backend opencl`) and Metal
     (`--backend metal`, on a Mac) have their own mutations, and
     `--backend hip` runs CUDA's on the CUDA code compiled as HIP.
+  - [x] **Dictionary searches**: two more checks, `dictionary_search_test`
+    built with few of hashA's bits compared ("dictionary") and with small
+    GPU launches ("dictionary-small"), and the self-test runner runs the
+    dictionary self-test too. CUDA has 18 dictionary mutations and two
+    that must be harmless (the word table longest first, an empty segment
+    more), OpenCL 8 of its own; both share those of
+    `common/dictionary_batch.cpp`. Each caught by the checks it names -
+    CUDA's in 50 minutes. Running it also found that the copies lacked
+    `data/` (`english-1`), which the build has needed since dictionary mode.

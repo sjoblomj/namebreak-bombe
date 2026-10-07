@@ -114,7 +114,7 @@ struct DictionaryConstants {
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
     // Also compare each candidate's basename - its filename after the last
-    // '' - hashed as Storm makes a file's encryption key (hash type 3), to
+    // '\' - hashed as Storm makes a file's encryption key (hash type 3), to
     // basenameKey.
     bool checkBasename = false;
     uint32_t basenameKey = 0;
@@ -129,7 +129,7 @@ struct DictionaryBatch {
     uint32_t seed1 = 0;
     uint32_t seed2 = 0;
     // The basename hash's state after `leading`: hash type 3 of what follows
-    // its last '' (see dictionary_search.h's basenameHashState).
+    // its last '\' (see dictionary_search.h's continueBasenameHash).
     uint32_t basenameSeed1 = 0;
     uint32_t basenameSeed2 = 0;
     uint32_t firstWord = 0;
@@ -144,7 +144,10 @@ struct DictionaryOutcome {
     // Set once one of them also matches hashB.
     bool found = false;
     std::string foundFilename;
-    // The filename of every candidate whose basename matched basenameKey.
+    // The filename of every candidate whose basename matched basenameKey -
+    // or, if the suffix has a '\', and so every candidate has the same
+    // basename, of at least one of the call's candidates if it matched (see
+    // DictionaryHitVerifier, backends/common/dictionary_batch.h).
     std::vector<std::string> basenameHits;
 };
 
@@ -195,6 +198,9 @@ public:
     virtual bool supportsDictionary() const { return false; }
     // How many candidates one runDictionaryBatches() call should cover, about.
     virtual uint64_t dictionaryCandidatesPerCall() const { return 1u << 22; }
+    // How many batches one runDictionaryBatches() call gets at most - with
+    // few words, a call's candidates are many short batches.
+    virtual size_t dictionaryBatchesPerCall() const { return 1u << 16; }
     // Called once before a dictionary search's first runDictionaryBatches(),
     // and endDictionarySearch() once after its last.
     virtual void beginDictionarySearch(const DictionaryConstants& constants);

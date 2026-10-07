@@ -59,7 +59,21 @@ std::vector<std::string> backendNames() {
     return names;
 }
 
-std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
+namespace {
+
+// Whether `backend` passes its self-tests - with `dictionary`, the
+// dictionary search's too. If not, `why` says why.
+bool passesSelfTests(SearchBackend& backend, bool dictionary, std::string& why) {
+    if (!selfTestBackend(backend, why))
+        return false;
+    if (dictionary && !selfTestDictionaryBackend(backend, why)) {
+        why = "dictionary search: " + why;
+        return false;
+    }
+    return true;
+}
+
+std::unique_ptr<SearchBackend> create(const std::string& name, std::string& error, bool* selfTestFailed, bool dictionary) {
     if (selfTestFailed)
         *selfTestFailed = false;
     if (name.empty()) {
@@ -69,7 +83,13 @@ std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::strin
         for (const BackendEntry& entry : backendEntries()) {
             std::string why;
             std::unique_ptr<SearchBackend> backend = entry.make(why);
-            if (backend && selfTestBackend(*backend, why))
+            if (backend && dictionary && !backend->supportsDictionary()) {
+                // Not one to pick for a dictionary search - and not one that
+                // failed anything either.
+                reasons += std::string(reasons.empty() ? "" : "; ") + entry.name + ": can't search dictionaries";
+                continue;
+            }
+            if (backend && passesSelfTests(*backend, dictionary, why))
                 return backend;
             if (backend) {
                 // It could run, but searches wrongly here: say so, rather than
@@ -88,7 +108,10 @@ std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::strin
             std::unique_ptr<SearchBackend> backend = entry.make(why);
             if (!backend) {
                 error = "the " + name + " backend can't run on this machine: " + why;
-            } else if (!selfTestBackend(*backend, why)) {
+            } else if (dictionary && !backend->supportsDictionary()) {
+                error = "the " + name + " backend can't search dictionaries";
+                backend = nullptr;
+            } else if (!passesSelfTests(*backend, dictionary, why)) {
                 error = "the " + name + " backend failed its self-test on this machine: " + why;
                 if (selfTestFailed)
                     *selfTestFailed = true;
@@ -102,4 +125,14 @@ std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::strin
         names += std::string(names.empty() ? "" : ", ") + entry.name;
     error = "this build has no '" + name + "' backend (it has: " + names + ")";
     return nullptr;
+}
+
+} // namespace
+
+std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
+    return create(name, error, selfTestFailed, false);
+}
+
+std::unique_ptr<SearchBackend> createDictionaryBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
+    return create(name, error, selfTestFailed, true);
 }

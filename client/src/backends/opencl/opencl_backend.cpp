@@ -19,11 +19,14 @@
 #include <tuple>
 #include <vector>
 
+#include "backends/common/dictionary_batch.h"
 #include "backends/common/launch_waiter.h"
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
 #include "backends/common/row_pruning.h"
-#include "backends/opencl/search_kernel.h" // generated from search.cl - see CMakeLists.txt
+#include "backends/opencl/dictionary_kernel.h" // generated from dictionary.cl - see CMakeLists.txt
+#include "backends/opencl/search_kernel.h"     // generated from search.cl
+#include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
 
@@ -97,6 +100,15 @@ static_assert(sizeof(LaunchBatch) == 32 && sizeof(Hit) == 16 && offsetof(BatchRe
 // How many hits come back with the count, in the one read every launch needs.
 constexpr int kHitsReadWithCount = MAX_MATCHES < 16 ? MAX_MATCHES : 16;
 
+// A dictionary search's launches (dictionary.cl): how many candidates one
+// covers at most (SearchBackend::dictionaryCandidatesPerCall), how many words
+// of a batch one work-item hashes, and the work-group's size - unless the
+// device allows fewer. A segment of a launch is the last two's product.
+// The CUDA backend's values (see its tuning.h).
+constexpr uint64_t kDictionaryCandidatesPerLaunch = 1ull << 28;
+constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
+constexpr size_t kDictionaryWorkGroupSize = dictionaryThreadsPerBlockOr(256);
+
 std::string deviceInfoString(cl_device_id device, cl_device_info what) {
     size_t size = 0;
     clGetDeviceInfo(device, what, 0, nullptr, &size);
@@ -137,6 +149,15 @@ public:
             clReleaseKernel(entry.second.kernel);
             clReleaseProgram(entry.second.program);
         }
+        for (auto& entry : dictionaryKernels_) {
+            clReleaseKernel(entry.second.kernel);
+            clReleaseProgram(entry.second.program);
+        }
+        releaseDictionaryBuffers();
+        for (cl_mem buffer : {dictionaryBatches_, dictionaryCounts_, dictionaryHashAHits_, dictionaryBasenameHits_}) {
+            if (buffer)
+                clReleaseMemObject(buffer);
+        }
         for (cl_mem buffer : {results_, batches_, alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_, filterTable_, rowMasks_, inserted_})
             clReleaseMemObject(buffer);
         if (groups_)
@@ -157,6 +178,13 @@ public:
     int maxBatchesPerCall() const override { return kBatchesPerLaunch; }
     BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches) override;
 
+    // A dictionary search: one launch of dictionary.cl's kernel per call.
+    bool supportsDictionary() const override { return true; }
+    uint64_t dictionaryCandidatesPerCall() const override { return kDictionaryCandidatesPerLaunch; }
+    void beginDictionarySearch(const DictionaryConstants& constants) override;
+    DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
+    void endDictionarySearch() override { releaseDictionaryBuffers(); }
+
 private:
     struct CompiledKernel {
         cl_program program;
@@ -165,7 +193,12 @@ private:
     };
 
     const CompiledKernel& kernelFor(int trailingLen, bool listed);
+    const CompiledKernel& dictionaryKernel();
     void uploadGroups();
+    // Compiles `source` with `options`, ending the process if it doesn't.
+    cl_program buildProgram(const char* source, const std::string& options, const char* what);
+    cl_mem createBuffer(cl_mem_flags flags, size_t bytes);
+    void releaseDictionaryBuffers();
 
     cl_device_id device_;
     cl_context context_;
@@ -220,6 +253,31 @@ private:
     // runBatches) - or as SearchConstants::listWalking says.
     bool listed_ = false;
     SearchConstants::ListWalking listWalking_ = SearchConstants::ListWalking::Auto;
+
+    // A dictionary search's: the word list, the crypt table's keys, the
+    // suffix filters and the suffix's keys (backends/common/
+    // dictionary_batch.h) - made by beginDictionarySearch and released by
+    // endDictionarySearch - and what the kernel is compiled with.
+    DictionaryHitVerifier dictionaryVerifier_;
+    cl_mem dictionaryChars_ = nullptr, dictionaryEntries_ = nullptr, dictionaryPositions_ = nullptr;
+    cl_mem dictionaryCryptKeys_ = nullptr, dictionaryFilters_ = nullptr, dictionarySuffixKeys_ = nullptr;
+    cl_uint dictionaryWordCount_ = 0;
+    int dictionarySuffixLen_ = 0;
+    bool dictionaryBasenames_ = false;
+    cl_uint dictionaryTargetA_ = 0;
+    cl_uint dictionaryBasenameKey_ = 0;
+    // Compiled once per (suffix length, basenames) and kept, as the row
+    // search's kernels are.
+    std::map<std::pair<int, bool>, CompiledKernel> dictionaryKernels_;
+    // Kept from one search to the next, grown as a launch needs: its batches
+    // (DictionaryLaunchBatch), the hit counts, and the hits - room for
+    // dictionaryHitCapacity_ of each kind.
+    std::vector<DictionaryLaunchBatch> dictionaryLaunch_;
+    cl_mem dictionaryBatches_ = nullptr;
+    size_t dictionaryBatchesCapacity_ = 0;
+    cl_mem dictionaryCounts_ = nullptr;
+    cl_mem dictionaryHashAHits_ = nullptr, dictionaryBasenameHits_ = nullptr;
+    cl_uint dictionaryHitCapacity_ = 0;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -311,23 +369,13 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, b
         return found->second;
 
     cl_int err = CL_SUCCESS;
-    const char* source = kSearchKernelSource;
-    cl_program program = clCreateProgramWithSource(context_, 1, &source, nullptr, &err);
-    CL_CHECK(err);
     const std::string options = "-cl-std=CL1.2 -DALPHABET_SIZE=" + std::to_string(alphabetSize_) + " -DSUFFIX_LEN=" + std::to_string(suffixLen_) +
                                 " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES) +
                                 " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
                                 " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits) +
                                 " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread) + " -DROW_FLAG_BITS=" + std::to_string(kRowFlagBits) +
                                 " -DLISTED=" + (listed ? "1" : "0") + insertMacros_;
-    if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
-        size_t size = 0;
-        clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);
-        std::string log(size, '\0');
-        clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, size, log.data(), nullptr);
-        fprintf(stderr, "OpenCL: compiling the search kernel (%s) failed:\n%s\n", options.c_str(), log.c_str());
-        exit(1);
-    }
+    cl_program program = buildProgram(kSearchKernelSource, options, "search");
     CompiledKernel compiled;
     compiled.program = program;
     compiled.kernel = clCreateKernel(program, "searchRows", &err);
@@ -341,6 +389,21 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, b
         exit(1);
     }
     return kernels_.emplace(key, compiled).first->second;
+}
+
+cl_program OpenClBackend::buildProgram(const char* source, const std::string& options, const char* what) {
+    cl_int err = CL_SUCCESS;
+    cl_program program = clCreateProgramWithSource(context_, 1, &source, nullptr, &err);
+    CL_CHECK(err);
+    if (clBuildProgram(program, 1, &device_, options.c_str(), nullptr, nullptr) != CL_SUCCESS) {
+        size_t size = 0;
+        clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &size);
+        std::string log(size, '\0');
+        clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, size, log.data(), nullptr);
+        fprintf(stderr, "OpenCL: compiling the %s kernel (%s) failed:\n%s\n", what, options.c_str(), log.c_str());
+        exit(1);
+    }
+    return program;
 }
 
 // Brings the device's copy of the row groups' lists up to date with
@@ -501,6 +564,214 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
         ++kept;
     }
     outcome.hitCount = kept;
+    return outcome;
+}
+
+
+cl_mem OpenClBackend::createBuffer(cl_mem_flags flags, size_t bytes) {
+    cl_int err = CL_SUCCESS;
+    // At least a byte: an empty buffer isn't allowed, and a kernel argument
+    // needs one even when it's never read.
+    cl_mem buffer = clCreateBuffer(context_, flags, std::max<size_t>(1, bytes), nullptr, &err);
+    CL_CHECK(err);
+    return buffer;
+}
+
+void OpenClBackend::beginDictionarySearch(const DictionaryConstants& constants) {
+    if (!announcedDevice_) {
+        printf("OpenCL device: %s (%s)\n", deviceInfoString(device_, CL_DEVICE_NAME).c_str(),
+               deviceInfoString(device_, CL_DEVICE_VERSION).c_str());
+        announcedDevice_ = true;
+    }
+    releaseDictionaryBuffers();
+    dictionaryVerifier_.begin(constants);
+    dictionaryBasenames_ = dictionaryVerifier_.candidatesHaveBasenames();
+    dictionaryTargetA_ = constants.targetHashA;
+    dictionaryBasenameKey_ = constants.basenameKey;
+    dictionarySuffixLen_ = (int) constants.suffix.size();
+    dictionaryWordCount_ = (cl_uint) constants.words.size();
+
+    DictionaryWordTable table;
+    if (!makeDictionaryWordTable(constants.words, table)) {
+        // runDictionarySearch's word lists are far smaller.
+        fprintf(stderr, "INTERNAL ERROR: the word list is too long for the GPU's 32-bit offsets - exiting\n");
+        exit(1);
+    }
+    auto upload = [&](const auto& host, cl_mem& buffer) {
+        const size_t bytes = host.size() * sizeof(host[0]);
+        buffer = createBuffer(CL_MEM_READ_ONLY, bytes);
+        if (bytes)
+            CL_CHECK(clEnqueueWriteBuffer(queue_, buffer, CL_TRUE, 0, bytes, host.data(), 0, nullptr, nullptr));
+    };
+    static_assert(sizeof(DictionaryWordEntry) == sizeof(cl_uint4), "an entry is a uint4 in dictionary.cl");
+    upload(table.chars, dictionaryChars_);
+    upload(table.entries, dictionaryEntries_);
+    upload(table.positions, dictionaryPositions_);
+
+    std::vector<cl_uint> cryptKeys(constants.cryptTable + kHashAOffset, constants.cryptTable + kHashAOffset + 256);
+    cryptKeys.insert(cryptKeys.end(), constants.cryptTable + kFileKeyOffset, constants.cryptTable + kFileKeyOffset + 256);
+    upload(cryptKeys, dictionaryCryptKeys_);
+    // The suffix filters, hashA's and the basename hash's - each checked in
+    // full before it's used, as the row search's filter table is (see
+    // beginSearch): a wrong one could drop a match without any other sign.
+    std::vector<cl_uint> filters;
+    for (bool basename : {false, true}) {
+        const int offset = basename ? kFileKeyOffset : kHashAOffset;
+        const uint32_t target = basename ? constants.basenameKey : constants.targetHashA, mask = dictionaryFilterMask(basename);
+        const std::vector<uint32_t> filter = buildDictionarySuffixFilter(constants.suffix, constants.cryptTable, offset, target, mask);
+        std::string error;
+        if (!checkDictionarySuffixFilter(filter, constants.suffix, constants.cryptTable, offset, target, mask, std::random_device{}(), error))
+            refuseFilterTable("of the dictionary search's suffix failed its check", error);
+        filters.insert(filters.end(), filter.begin(), filter.end());
+    }
+    upload(filters, dictionaryFilters_);
+    upload(dictionarySuffixKeys(constants.suffix, constants.cryptTable), dictionarySuffixKeys_);
+
+    // The counts are 0 at every launch: zeroed here, and after every launch
+    // that had hits (see runDictionaryBatches).
+    if (!dictionaryCounts_)
+        dictionaryCounts_ = createBuffer(CL_MEM_READ_WRITE, 2 * sizeof(cl_int));
+    const cl_int zeros[2] = {0, 0};
+    CL_CHECK(clEnqueueWriteBuffer(queue_, dictionaryCounts_, CL_TRUE, 0, sizeof(zeros), zeros, 0, nullptr, nullptr));
+    waiter_.beginSearch();
+}
+
+void OpenClBackend::releaseDictionaryBuffers() {
+    for (cl_mem* buffer : {&dictionaryChars_, &dictionaryEntries_, &dictionaryPositions_, &dictionaryCryptKeys_, &dictionaryFilters_,
+                           &dictionarySuffixKeys_}) {
+        if (*buffer)
+            clReleaseMemObject(*buffer);
+        *buffer = nullptr;
+    }
+}
+
+const OpenClBackend::CompiledKernel& OpenClBackend::dictionaryKernel() {
+    const auto key = std::make_pair(dictionarySuffixLen_, dictionaryBasenames_);
+    auto found = dictionaryKernels_.find(key);
+    if (found != dictionaryKernels_.end())
+        return found->second;
+    const std::string options = "-cl-std=CL1.2 -DSUFFIX_LEN=" + std::to_string(dictionarySuffixLen_) +
+                                " -DBASENAMES=" + (dictionaryBasenames_ ? "1" : "0") +
+                                " -DWORDS_PER_THREAD=" + std::to_string(kDictionaryWordsPerThread) +
+                                " -DFILTER_BITS=" + std::to_string(kDictionaryFilterBits) +
+                                " -DFILTER_WORDS=" + std::to_string(kDictionaryFilterWords) +
+                                " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u";
+    CompiledKernel compiled;
+    compiled.program = buildProgram(kDictionaryKernelSource, options, "dictionary");
+    cl_int err = CL_SUCCESS;
+    compiled.kernel = clCreateKernel(compiled.program, "searchDictionary", &err);
+    CL_CHECK(err);
+    size_t kernelMax = 0;
+    CL_CHECK(clGetKernelWorkGroupInfo(compiled.kernel, device_, CL_KERNEL_WORK_GROUP_SIZE, sizeof(kernelMax), &kernelMax, nullptr));
+    compiled.workGroupSize = std::min(kDictionaryWorkGroupSize, kernelMax);
+    return dictionaryKernels_.emplace(key, compiled).first->second;
+}
+
+DictionaryOutcome OpenClBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
+    DictionaryOutcome outcome;
+    if (batches.empty())
+        return outcome;
+    const CompiledKernel& compiled = dictionaryKernel();
+    const uint32_t wordsPerSegment = (uint32_t) (kDictionaryWordsPerThread * compiled.workGroupSize);
+    const uint64_t segments = planDictionaryLaunch(batches, wordsPerSegment, dictionaryLaunch_);
+    uint64_t candidates = 0;
+    for (const DictionaryBatch& batch : batches)
+        candidates += batch.wordCount;
+    if (segments > UINT32_MAX || batches.size() > UINT32_MAX) {
+        // runDictionarySearch's calls are far smaller (dictionaryCandidatesPerCall).
+        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments - exiting\n", (unsigned long long) segments);
+        exit(1);
+    }
+    if (dictionaryLaunch_.size() > dictionaryBatchesCapacity_) {
+        if (dictionaryBatches_)
+            CL_CHECK(clReleaseMemObject(dictionaryBatches_));
+        dictionaryBatchesCapacity_ = std::max(dictionaryLaunch_.size(), 2 * dictionaryBatchesCapacity_);
+        dictionaryBatches_ = createBuffer(CL_MEM_READ_ONLY, dictionaryBatchesCapacity_ * sizeof(DictionaryLaunchBatch));
+    }
+    // Not waited for: the queue runs it before the kernel, and
+    // dictionaryLaunch_ isn't touched again until the launch is done.
+    CL_CHECK(clEnqueueWriteBuffer(queue_, dictionaryBatches_, CL_FALSE, 0, dictionaryLaunch_.size() * sizeof(DictionaryLaunchBatch),
+                                  dictionaryLaunch_.data(), 0, nullptr, nullptr));
+    if (!dictionaryHashAHits_) {
+        dictionaryHitCapacity_ = NAMEBREAK_DICTIONARY_HIT_CAPACITY;
+        dictionaryHashAHits_ = createBuffer(CL_MEM_READ_WRITE, dictionaryHitCapacity_ * sizeof(DictionaryHit));
+        dictionaryBasenameHits_ = createBuffer(CL_MEM_READ_WRITE, dictionaryHitCapacity_ * sizeof(DictionaryHit));
+    }
+
+    // Launched again, with room for every hit, as long as it had more than
+    // it had room for - which a real search, with a 32-bit hashA and key,
+    // practically never does.
+    cl_int counts[2] = {0, 0};
+    for (;;) {
+        cl_kernel kernel = compiled.kernel;
+        const cl_uint batchCount = (cl_uint) dictionaryLaunch_.size();
+        int arg = 0;
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryBatches_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(batchCount), &batchCount));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryChars_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryEntries_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryPositions_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(dictionaryWordCount_), &dictionaryWordCount_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryCryptKeys_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryFilters_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionarySuffixKeys_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(dictionaryTargetA_), &dictionaryTargetA_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(dictionaryBasenameKey_), &dictionaryBasenameKey_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryCounts_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryHashAHits_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryBasenameHits_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(dictionaryHitCapacity_), &dictionaryHitCapacity_));
+        // A work-group per segment.
+        const size_t local = compiled.workGroupSize;
+        const size_t global = (size_t) segments * local;
+        const LaunchWaiter::Clock::time_point launched = LaunchWaiter::Clock::now();
+        CL_CHECK(clEnqueueNDRangeKernel(queue_, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr));
+        CL_CHECK(clFlush(queue_)); // on its way to the device before this sleeps
+        waiter_.wait(candidates, launched, [&] {
+            CL_CHECK(clEnqueueReadBuffer(queue_, dictionaryCounts_, CL_TRUE, 0, sizeof(counts), counts, 0, nullptr, nullptr));
+        });
+        if (counts[0] < 0 || counts[1] < 0 || (uint64_t) counts[0] > candidates || (uint64_t) counts[1] > candidates) {
+            fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu candidates reported %d and %d hits - exiting\n",
+                    (unsigned long long) candidates, counts[0], counts[1]);
+            exit(1);
+        }
+        const cl_uint needed = (cl_uint) std::max(counts[0], counts[1]);
+        if (needed <= dictionaryHitCapacity_)
+            break;
+        CL_CHECK(clReleaseMemObject(dictionaryHashAHits_));
+        CL_CHECK(clReleaseMemObject(dictionaryBasenameHits_));
+        dictionaryHitCapacity_ = std::max(needed, 2 * dictionaryHitCapacity_);
+        dictionaryHashAHits_ = createBuffer(CL_MEM_READ_WRITE, dictionaryHitCapacity_ * sizeof(DictionaryHit));
+        dictionaryBasenameHits_ = createBuffer(CL_MEM_READ_WRITE, dictionaryHitCapacity_ * sizeof(DictionaryHit));
+        const cl_int zeros[2] = {0, 0};
+        CL_CHECK(clEnqueueWriteBuffer(queue_, dictionaryCounts_, CL_TRUE, 0, sizeof(zeros), zeros, 0, nullptr, nullptr));
+    }
+    if (counts[0] == 0 && counts[1] == 0) {
+        dictionaryVerifier_.addHits(batches, {}, {}, outcome);
+        return outcome;
+    }
+
+    // The exception: hits to bring back, and the counts to zero again.
+    std::vector<DictionaryHit> hashAHits(counts[0]), basenameHits(counts[1]);
+    if (counts[0] > 0)
+        CL_CHECK(clEnqueueReadBuffer(queue_, dictionaryHashAHits_, CL_TRUE, 0, counts[0] * sizeof(DictionaryHit), hashAHits.data(), 0, nullptr,
+                                     nullptr));
+    if (counts[1] > 0)
+        CL_CHECK(clEnqueueReadBuffer(queue_, dictionaryBasenameHits_, CL_TRUE, 0, counts[1] * sizeof(DictionaryHit), basenameHits.data(), 0,
+                                     nullptr, nullptr));
+    static const cl_int kZeros[2] = {0, 0};
+    CL_CHECK(clEnqueueWriteBuffer(queue_, dictionaryCounts_, CL_FALSE, 0, sizeof(kZeros), kZeros, 0, nullptr, nullptr));
+    for (const std::vector<DictionaryHit>* hits : {&hashAHits, &basenameHits}) {
+        for (const DictionaryHit& hit : *hits) {
+            const DictionaryBatch* batch = hit.batch < batches.size() ? &batches[hit.batch] : nullptr;
+            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount) {
+                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u of batch %u, which it doesn't have - exiting\n", hit.word,
+                        hit.batch);
+                exit(1);
+            }
+        }
+    }
+    dictionaryVerifier_.addHits(batches, hashAHits, basenameHits, outcome);
     return outcome;
 }
 

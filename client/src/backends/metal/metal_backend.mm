@@ -17,10 +17,13 @@
 #include <tuple>
 #include <vector>
 
+#include "backends/common/dictionary_batch.h"
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
 #include "backends/common/row_pruning.h"
-#include "backends/metal/search_kernel.h" // generated from search.metal - see CMakeLists.txt
+#include "backends/metal/dictionary_kernel.h" // generated from dictionary.metal - see CMakeLists.txt
+#include "backends/metal/search_kernel.h"     // generated from search.metal
+#include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
 
@@ -36,6 +39,25 @@ constexpr NSUInteger kPreferredThreadgroupSize = 256;
 // than OpenCL's whole group per thread, so that a batch still has enough
 // threads for the largest Apple GPUs. See PERFORMANCE.md.
 constexpr int kRowsPerThread = rowsPerThreadOr(25);
+
+// A dictionary search's launches (dictionary.metal): how many candidates one
+// covers at most (SearchBackend::dictionaryCandidatesPerCall) - a quarter
+// of CUDA's, as the row search's batches are - how many words of a batch
+// one thread hashes, and the threadgroup's size, unless the pipeline allows
+// fewer. A segment of a launch is the last two's product. Not tuned yet:
+// the CUDA backend's values (see its tuning.h).
+constexpr uint64_t kDictionaryCandidatesPerLaunch = 1ull << 26;
+constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
+constexpr NSUInteger kDictionaryThreadgroupSize = dictionaryThreadsPerBlockOr(256);
+
+// Must match DictionaryArgs in dictionary.metal.
+struct DictionaryArgs {
+    uint32_t batchCount;
+    uint32_t wordCount;
+    uint32_t targetA;
+    uint32_t basenameKey;
+    uint32_t capacity;
+};
 
 // Must match RowArgs in search.metal.
 struct RowArgs {
@@ -88,9 +110,20 @@ public:
     BatchOutcome runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) override;
     void endSearch() override {}
 
+    // A dictionary search: one launch of dictionary.metal's kernel per call.
+    bool supportsDictionary() const override { return true; }
+    uint64_t dictionaryCandidatesPerCall() const override { return kDictionaryCandidatesPerLaunch; }
+    void beginDictionarySearch(const DictionaryConstants& constants) override;
+    DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
+    void endDictionarySearch() override;
+
 private:
     id<MTLComputePipelineState> pipelineFor(int trailingLen, bool listed);
+    id<MTLComputePipelineState> dictionaryPipeline();
     void uploadGroups();
+    // A shared-storage buffer holding `bytes` bytes (at least one) - with
+    // `data` copied in, if given. Ends the process if it can't be made.
+    id<MTLBuffer> sharedBuffer(size_t bytes, const void* data = nullptr);
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
@@ -128,6 +161,28 @@ private:
     id<MTLBuffer> rowMasks_, groups_;
     size_t groupsUploaded_ = 0;
     uint64_t groupsGeneration_ = 0;
+
+    // A dictionary search's: the word list, the crypt table's keys, the
+    // suffix filters and the suffix's keys (backends/common/
+    // dictionary_batch.h) - made by beginDictionarySearch and let go by
+    // endDictionarySearch - and what the kernel is compiled with.
+    DictionaryHitVerifier dictionaryVerifier_;
+    id<MTLBuffer> dictionaryChars_, dictionaryEntries_, dictionaryPositions_;
+    id<MTLBuffer> dictionaryCryptKeys_, dictionaryFilters_, dictionarySuffixKeys_;
+    uint32_t dictionaryWordCount_ = 0;
+    int dictionarySuffixLen_ = 0;
+    bool dictionaryBasenames_ = false;
+    uint32_t dictionaryTargetA_ = 0;
+    uint32_t dictionaryBasenameKey_ = 0;
+    // Compiled once per (suffix length, basenames) and kept, as the row
+    // search's pipelines are.
+    std::map<std::pair<int, bool>, id<MTLComputePipelineState>> dictionaryPipelines_;
+    // Kept from one search to the next, grown as a launch needs: its batches
+    // (DictionaryLaunchBatch), the hit counts - 0 at every launch - and the
+    // hits, room for dictionaryHitCapacity_ of each kind.
+    std::vector<DictionaryLaunchBatch> dictionaryLaunch_;
+    id<MTLBuffer> dictionaryBatches_, dictionaryCounts_, dictionaryHashAHits_, dictionaryBasenameHits_;
+    uint32_t dictionaryHitCapacity_ = 0;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -357,6 +412,204 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
     // Past MAX_MATCHES nothing was recorded completely - the engine searches
     // the range again in halves. Either way, restore "matchCount is 0".
     *matchCount = 0;
+    return outcome;
+}
+
+
+id<MTLBuffer> MetalBackend::sharedBuffer(size_t bytes, const void* data) {
+    id<MTLBuffer> buffer = [device_ newBufferWithLength:std::max<size_t>(1, bytes) options:MTLResourceStorageModeShared];
+    if (!buffer) {
+        fprintf(stderr, "Metal: couldn't allocate a buffer of %zu bytes\n", bytes);
+        exit(1);
+    }
+    if (data && bytes)
+        memcpy(buffer.contents, data, bytes);
+    return buffer;
+}
+
+void MetalBackend::beginDictionarySearch(const DictionaryConstants& constants) {
+    if (!announcedDevice_) {
+        printf("Metal device: %s\n", device_.name.UTF8String);
+        announcedDevice_ = true;
+    }
+    dictionaryVerifier_.begin(constants);
+    dictionaryBasenames_ = dictionaryVerifier_.candidatesHaveBasenames();
+    dictionaryTargetA_ = constants.targetHashA;
+    dictionaryBasenameKey_ = constants.basenameKey;
+    dictionarySuffixLen_ = (int) constants.suffix.size();
+    dictionaryWordCount_ = (uint32_t) constants.words.size();
+
+    DictionaryWordTable table;
+    if (!makeDictionaryWordTable(constants.words, table)) {
+        // runDictionarySearch's word lists are far smaller.
+        fprintf(stderr, "INTERNAL ERROR: the word list is too long for the GPU's 32-bit offsets - exiting\n");
+        exit(1);
+    }
+    dictionaryChars_ = sharedBuffer(table.chars.size() * sizeof(uint32_t), table.chars.data());
+    dictionaryEntries_ = sharedBuffer(table.entries.size() * sizeof(DictionaryWordEntry), table.entries.data());
+    dictionaryPositions_ = sharedBuffer(table.positions.size() * sizeof(uint32_t), table.positions.data());
+
+    std::vector<uint32_t> cryptKeys(constants.cryptTable + kHashAOffset, constants.cryptTable + kHashAOffset + 256);
+    cryptKeys.insert(cryptKeys.end(), constants.cryptTable + kFileKeyOffset, constants.cryptTable + kFileKeyOffset + 256);
+    dictionaryCryptKeys_ = sharedBuffer(cryptKeys.size() * sizeof(uint32_t), cryptKeys.data());
+    // The suffix filters, hashA's and the basename hash's - each checked in
+    // full before it's used, as the row search's filter table is (see
+    // beginSearch): a wrong one could drop a match without any other sign.
+    std::vector<uint32_t> filters;
+    for (bool basename : {false, true}) {
+        const int offset = basename ? kFileKeyOffset : kHashAOffset;
+        const uint32_t target = basename ? constants.basenameKey : constants.targetHashA, mask = dictionaryFilterMask(basename);
+        const std::vector<uint32_t> filter = buildDictionarySuffixFilter(constants.suffix, constants.cryptTable, offset, target, mask);
+        std::string error;
+        if (!checkDictionarySuffixFilter(filter, constants.suffix, constants.cryptTable, offset, target, mask, std::random_device{}(), error))
+            refuseFilterTable("of the dictionary search's suffix failed its check", error);
+        filters.insert(filters.end(), filter.begin(), filter.end());
+    }
+    dictionaryFilters_ = sharedBuffer(filters.size() * sizeof(uint32_t), filters.data());
+    const std::vector<uint32_t> suffixKeys = dictionarySuffixKeys(constants.suffix, constants.cryptTable);
+    dictionarySuffixKeys_ = sharedBuffer(suffixKeys.size() * sizeof(uint32_t), suffixKeys.data());
+
+    // The counts are 0 at every launch: zeroed here, and after every launch
+    // that had hits (see runDictionaryBatches).
+    if (!dictionaryCounts_)
+        dictionaryCounts_ = sharedBuffer(2 * sizeof(int32_t));
+    memset(dictionaryCounts_.contents, 0, 2 * sizeof(int32_t));
+}
+
+void MetalBackend::endDictionarySearch() {
+    dictionaryChars_ = nil;
+    dictionaryEntries_ = nil;
+    dictionaryPositions_ = nil;
+    dictionaryCryptKeys_ = nil;
+    dictionaryFilters_ = nil;
+    dictionarySuffixKeys_ = nil;
+}
+
+id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
+    const auto key = std::make_pair(dictionarySuffixLen_, dictionaryBasenames_);
+    auto found = dictionaryPipelines_.find(key);
+    if (found != dictionaryPipelines_.end())
+        return found->second;
+
+    @autoreleasepool {
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        options.preprocessorMacros = @{
+            @"SUFFIX_LEN": @(dictionarySuffixLen_),
+            @"BASENAMES": @(dictionaryBasenames_ ? 1 : 0),
+            @"WORDS_PER_THREAD": @(kDictionaryWordsPerThread),
+            @"FILTER_BITS": @(kDictionaryFilterBits),
+            @"FILTER_WORDS": @(kDictionaryFilterWords),
+            @"HASHA_MATCH_MASK": @(kHashAMatchMask),
+        };
+        NSError* error = nil;
+        id<MTLLibrary> library = [device_ newLibraryWithSource:@(kDictionaryKernelSource) options:options error:&error];
+        if (!library) {
+            fprintf(stderr, "Metal: compiling the dictionary kernel (suffix %d) failed:\n%s\n", dictionarySuffixLen_,
+                    error.localizedDescription.UTF8String);
+            exit(1);
+        }
+        id<MTLFunction> function = [library newFunctionWithName:@"searchDictionary"];
+        id<MTLComputePipelineState> pipeline = [device_ newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) {
+            fprintf(stderr, "Metal: creating the dictionary pipeline failed: %s\n", error.localizedDescription.UTF8String);
+            exit(1);
+        }
+        dictionaryPipelines_[key] = pipeline;
+        return pipeline;
+    }
+}
+
+DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
+    DictionaryOutcome outcome;
+    if (batches.empty())
+        return outcome;
+    id<MTLComputePipelineState> pipeline = dictionaryPipeline();
+    const NSUInteger threadgroupSize = std::min(kDictionaryThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
+    const uint32_t wordsPerSegment = (uint32_t) (kDictionaryWordsPerThread * threadgroupSize);
+    const uint64_t segments = planDictionaryLaunch(batches, wordsPerSegment, dictionaryLaunch_);
+    uint64_t candidates = 0;
+    for (const DictionaryBatch& batch : batches)
+        candidates += batch.wordCount;
+    if (segments > UINT32_MAX || batches.size() > UINT32_MAX) {
+        // runDictionarySearch's calls are far smaller (dictionaryCandidatesPerCall).
+        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments - exiting\n", (unsigned long long) segments);
+        exit(1);
+    }
+    const size_t batchBytes = dictionaryLaunch_.size() * sizeof(DictionaryLaunchBatch);
+    if (!dictionaryBatches_ || dictionaryBatches_.length < batchBytes)
+        dictionaryBatches_ = sharedBuffer(std::max<size_t>(batchBytes, dictionaryBatches_ ? 2 * dictionaryBatches_.length : 0));
+    memcpy(dictionaryBatches_.contents, dictionaryLaunch_.data(), batchBytes);
+    if (!dictionaryHashAHits_) {
+        dictionaryHitCapacity_ = NAMEBREAK_DICTIONARY_HIT_CAPACITY;
+        dictionaryHashAHits_ = sharedBuffer(dictionaryHitCapacity_ * sizeof(DictionaryHit));
+        dictionaryBasenameHits_ = sharedBuffer(dictionaryHitCapacity_ * sizeof(DictionaryHit));
+    }
+
+    // Launched again, with room for every hit, as long as it had more than
+    // it had room for - which a real search, with a 32-bit hashA and key,
+    // practically never does.
+    auto* counts = static_cast<int32_t*>(dictionaryCounts_.contents);
+    for (;;) {
+        DictionaryArgs args;
+        args.batchCount = (uint32_t) dictionaryLaunch_.size();
+        args.wordCount = dictionaryWordCount_;
+        args.targetA = dictionaryTargetA_;
+        args.basenameKey = dictionaryBasenameKey_;
+        args.capacity = dictionaryHitCapacity_;
+        @autoreleasepool {
+            id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBytes:&args length:sizeof(args) atIndex:0];
+            [encoder setBuffer:dictionaryBatches_ offset:0 atIndex:1];
+            [encoder setBuffer:dictionaryChars_ offset:0 atIndex:2];
+            [encoder setBuffer:dictionaryEntries_ offset:0 atIndex:3];
+            [encoder setBuffer:dictionaryPositions_ offset:0 atIndex:4];
+            [encoder setBuffer:dictionaryCryptKeys_ offset:0 atIndex:5];
+            [encoder setBuffer:dictionaryFilters_ offset:0 atIndex:6];
+            [encoder setBuffer:dictionarySuffixKeys_ offset:0 atIndex:7];
+            [encoder setBuffer:dictionaryCounts_ offset:0 atIndex:8];
+            [encoder setBuffer:dictionaryHashAHits_ offset:0 atIndex:9];
+            [encoder setBuffer:dictionaryBasenameHits_ offset:0 atIndex:10];
+            // A threadgroup per segment.
+            [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger) segments, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupSize, 1, 1)];
+            [encoder endEncoding];
+            [commands commit];
+            [commands waitUntilCompleted];
+            if (commands.status == MTLCommandBufferStatusError) {
+                fprintf(stderr, "Metal: the dictionary kernel failed: %s\n", commands.error.localizedDescription.UTF8String);
+                exit(1);
+            }
+        }
+        if (counts[0] < 0 || counts[1] < 0 || (uint64_t) counts[0] > candidates || (uint64_t) counts[1] > candidates) {
+            fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu candidates reported %d and %d hits - exiting\n",
+                    (unsigned long long) candidates, counts[0], counts[1]);
+            exit(1);
+        }
+        const uint32_t needed = (uint32_t) std::max(counts[0], counts[1]);
+        if (needed <= dictionaryHitCapacity_)
+            break;
+        dictionaryHitCapacity_ = std::max(needed, 2 * dictionaryHitCapacity_);
+        dictionaryHashAHits_ = sharedBuffer(dictionaryHitCapacity_ * sizeof(DictionaryHit));
+        dictionaryBasenameHits_ = sharedBuffer(dictionaryHitCapacity_ * sizeof(DictionaryHit));
+        counts[0] = counts[1] = 0;
+    }
+
+    const auto* hashAHits = static_cast<const DictionaryHit*>(dictionaryHashAHits_.contents);
+    const auto* basenameHits = static_cast<const DictionaryHit*>(dictionaryBasenameHits_.contents);
+    const std::vector<DictionaryHit> hashA(hashAHits, hashAHits + counts[0]), basename(basenameHits, basenameHits + counts[1]);
+    counts[0] = counts[1] = 0;
+    for (const std::vector<DictionaryHit>* hits : {&hashA, &basename}) {
+        for (const DictionaryHit& hit : *hits) {
+            const DictionaryBatch* batch = hit.batch < batches.size() ? &batches[hit.batch] : nullptr;
+            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount) {
+                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u of batch %u, which it doesn't have - exiting\n", hit.word,
+                        hit.batch);
+                exit(1);
+            }
+        }
+    }
+    dictionaryVerifier_.addHits(batches, hashA, basename, outcome);
     return outcome;
 }
 
