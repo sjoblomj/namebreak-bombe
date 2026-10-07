@@ -25,6 +25,10 @@ pub struct User {
     /// The client release it last registered with - see `client_release`.
     /// `None` for a client from before protocol 1.1.0.
     pub client_release: Option<String>,
+    /// Like `ema_rate_per_sec`, of the dictionary targets' ranges it has
+    /// completed - a few hundred times lower on the same GPU, so it's kept
+    /// apart (see `ranges::claim_range`).
+    pub ema_dictionary_rate_per_sec: Option<f64>,
 }
 
 #[allow(dead_code)]
@@ -78,6 +82,37 @@ pub struct Target {
     /// The file's name without its directory - see
     /// `AdminCreateTargetRequest::base_file_name`. None: not known.
     pub base_file_name: Option<String>,
+    /// `"alphabet"`, or `"dictionary"` for a target whose candidates are made
+    /// of words - see `AdminCreateTargetRequest::dictionary` and
+    /// `dictionary.rs`. A dictionary target's ranges count candidate numbers
+    /// (see `DICTIONARY_ALPHABET_NAME`), and its `lower_bound`/`upper_bound`
+    /// are whole filenames, "" for none.
+    pub kind: String,
+    /// A dictionary target's word lists' names and separators, as JSON
+    /// arrays of strings (see `dictionary::parse_string_list`), and its word
+    /// counts. None for an alphabet target.
+    pub word_lists: Option<String>,
+    pub separators: Option<String>,
+    pub min_words: Option<i64>,
+    pub max_words: Option<i64>,
+    /// 1 to have clients send the basenames that match the encryption key -
+    /// see `AdminCreateTargetRequest::send_basenames`.
+    pub send_basenames: i64,
+    /// How many basenames clients have sent for it - see `ranges::record_basenames`.
+    pub basename_count: i64,
+}
+
+/// What a dictionary target's ranges (and carving cursor) have as their
+/// alphabet's name, with "" as the alphabet itself: their positions are
+/// candidate numbers (see `dictionary.rs`), and `candidate_len` is how many
+/// words the candidates have. With the empty alphabet, `alphabet::split_pos`
+/// and the rest keep a number whole, in the index - see `alphabet::block_size`.
+pub const DICTIONARY_ALPHABET_NAME: &str = "dictionary";
+
+impl Target {
+    pub fn is_dictionary(&self) -> bool {
+        self.kind == "dictionary"
+    }
 }
 
 #[allow(dead_code)]
@@ -147,6 +182,12 @@ pub struct Range {
 }
 
 impl Range {
+    /// A dictionary target's range, of candidate numbers - see
+    /// `DICTIONARY_ALPHABET_NAME`.
+    pub fn is_dictionary(&self) -> bool {
+        self.alphabet_name == DICTIONARY_ALPHABET_NAME
+    }
+
     pub fn start(&self) -> Pos {
         join_pos(&self.alphabet, self.candidate_len, self.start_block, self.start_index)
     }

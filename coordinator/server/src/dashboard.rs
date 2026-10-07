@@ -16,7 +16,10 @@ fn as_decimal<S: Serializer>(n: &Pos, serializer: S) -> Result<S::Ok, S::Error> 
     serializer.collect_str(n)
 }
 
+use std::sync::Arc;
+
 use crate::alphabet::{bound_indices_at_len, ceil_index, floor_index, index_to_candidate, join_pos, max_supported_len, space_size, Pos};
+use crate::dictionary::DictionaryTarget;
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Segment, SkipRange, Target};
 use crate::ranges::{count_within, owned_spans};
@@ -215,6 +218,52 @@ pub struct DashboardTarget {
     /// Candidates not covered by any range, between two consecutive
     /// `ranges` - see `gaps_between`.
     pub gaps: Vec<DashboardGap>,
+    /// `"alphabet"`, or `"dictionary"` for a target whose candidates are
+    /// made of words - which then has `dictionary`, and no alphabet,
+    /// pruning, insertions, priority or skip ranges. Its bounds are whole
+    /// filenames ("" for none), its ranges' `candidate_len` is how many words
+    /// their candidates have, and its cursor is where the next range will
+    /// start ("" once everything has been handed out).
+    pub kind: String,
+    pub dictionary: Option<DashboardDictionary>,
+}
+
+/// What a dictionary target's candidates are made of, and the basenames
+/// found for it - see `AdminCreateTargetRequest::dictionary`.
+#[derive(Serialize)]
+pub struct DashboardDictionary {
+    pub word_lists: Vec<String>,
+    /// How many different words the lists have together.
+    pub word_count: usize,
+    pub separators: Vec<String>,
+    pub min_words: i64,
+    pub max_words: i64,
+    /// Every candidate of those word counts, and how many of them the
+    /// target's bounds leave to search (see `dictionary::windows`).
+    #[serde(serialize_with = "as_decimal")]
+    pub total_count: Pos,
+    #[serde(serialize_with = "as_decimal")]
+    pub candidate_count: Pos,
+    /// See `AdminCreateTargetRequest::send_basenames`.
+    pub send_basenames: bool,
+    /// How many basenames clients have sent, and the latest
+    /// `DASHBOARD_BASENAMES` of them, newest first - all of them are at
+    /// `GET /api/v1/targets/{id}/basenames`.
+    pub basename_count: i64,
+    pub basenames: Vec<DashboardBasename>,
+}
+
+/// How many of a target's basenames the dashboard lists.
+const DASHBOARD_BASENAMES: i64 = 20;
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DashboardBasename {
+    pub basename: String,
+    /// "username@hostname" of whoever sent it first, and its backend - see
+    /// `DashboardRange::worker`.
+    pub reported_by: Option<String>,
+    pub reported_by_backend: Option<String>,
+    pub reported_at: i64,
 }
 
 /// A stretch of candidates between two consecutive ranges (in `ranges`'
@@ -492,6 +541,33 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         .map(|target| (target.id, target))
         .collect();
 
+    // Every dictionary target's words, to show its candidates by - see
+    // dictionary::DictionaryCache. Built once each, and held only here: the
+    // pool has a single connection, which the queries below need back.
+    let mut dictionaries: HashMap<i64, Arc<DictionaryTarget>> = HashMap::new();
+    {
+        let mut conn = state.pool.acquire().await?;
+        for target in settings_by_target.values().filter(|target| target.is_dictionary()) {
+            dictionaries.insert(target.id, state.config.dictionaries.get(&mut conn, target).await?);
+        }
+    }
+    // The latest of each dictionary target's basenames - a target can have
+    // a million, so they're read target by target, newest first, only as
+    // many as are shown (by idx_basenames_target), and counted as they come
+    // in (targets.basename_count) rather than here.
+    let mut basenames_by_target: HashMap<i64, Vec<DashboardBasename>> = HashMap::new();
+    for &target_id in dictionaries.keys() {
+        let latest = sqlx::query_as::<_, DashboardBasename>(
+            "SELECT b.basename, u.username || '@' || u.hostname AS reported_by, NULLIF(u.backend, '') AS reported_by_backend, b.reported_at \
+             FROM basenames b LEFT JOIN users u ON u.id = b.user_id WHERE b.target_id = ? ORDER BY b.id DESC LIMIT ?",
+        )
+        .bind(target_id)
+        .bind(DASHBOARD_BASENAMES)
+        .fetch_all(&state.pool)
+        .await?;
+        basenames_by_target.insert(target_id, latest);
+    }
+
     // The dashboard renders every target unconditionally, so there's no
     // filtering benefit to a per-target `WHERE target_id = ?` on the child
     // tables below - fetch each one whole (1 query apiece, independent of
@@ -569,6 +645,21 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         // Deleted since target_rows was read - leave it out, as the next refresh will.
         let Some(settings) = settings_by_target.remove(&id) else { continue };
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
+        if let Some(dictionary) = dictionaries.get(&id) {
+            let (cursor_candidate_len, cursor_number) = progress_by_target.get(&id).map_or((0, 0), |p| (p.0, p.1));
+            targets.push(dictionary_target(
+                settings,
+                dictionary,
+                range_rows,
+                cursor_candidate_len,
+                cursor_number as i64,
+                found_by,
+                found_by_backend,
+                found_at,
+                basenames_by_target.remove(&id).unwrap_or_default(),
+            ));
+            continue;
+        }
 
         let mut ranges: Vec<DashboardRange> = range_rows
             .into_iter()
@@ -691,10 +782,145 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             skip_ranges: skip_ranges_by_target.remove(&id).unwrap_or_default(),
             ranges,
             gaps,
+            kind: "alphabet".into(),
+            dictionary: None,
         });
     }
 
     Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await? }))
+}
+
+/// A dictionary target's `DashboardTarget` (see `DashboardTarget::kind`):
+/// its ranges' candidates are numbers, shown as the candidates' text, and
+/// its gaps and cursor follow the numbers, through its windows.
+#[allow(clippy::too_many_arguments)]
+fn dictionary_target(
+    target: Target,
+    dictionary: &DictionaryTarget,
+    range_rows: Vec<RangeRow>,
+    cursor_candidate_len: i64,
+    cursor_number: i64,
+    found_by: Option<String>,
+    found_by_backend: Option<String>,
+    found_at: Option<i64>,
+    basenames: Vec<DashboardBasename>,
+) -> DashboardTarget {
+    let space = &dictionary.space;
+    // Already in number order, as the query sorts them.
+    let ranges: Vec<(i64, i64, DashboardRange)> = range_rows
+        .into_iter()
+        .map(|row| {
+            let start = join_pos("", row.candidate_len, row.start_block, row.start_index) as i64;
+            let end = join_pos("", row.candidate_len, row.end_block, row.end_index) as i64;
+            let progress = row.progress_index.map(|p| join_pos("", row.candidate_len, row.progress_block, p) as i64);
+            let range = DashboardRange {
+                id: row.id,
+                status: row.status,
+                candidate_len: row.candidate_len,
+                candidate_count: (end - start) as Pos,
+                first_candidate: space.text(start),
+                last_candidate: space.text(end - 1),
+                progress_candidate: progress.map(|p| space.text(p)),
+                progress_percent: progress.map(|p| (p - start + 1) as f64 / (end - start) as f64 * 100.0),
+                worker: row.worker,
+                worker_backend: row.worker_backend,
+                assigned_at: row.assigned_at,
+                lease_expires_at: row.lease_expires_at,
+                completed_at: row.completed_at,
+                alphabet_name: String::new(),
+                alphabet: String::new(),
+                priority_range_id: None,
+                skip_range_id: None,
+            };
+            (start, end, range)
+        })
+        .collect();
+
+    // What the windows hold of [from, to), as (first, last, count).
+    let within_windows = |from: i64, to: i64| -> Option<(i64, i64, i64)> {
+        let pieces: Vec<(i64, i64)> =
+            dictionary.windows.iter().map(|w| (w.start.max(from), w.end.min(to))).filter(|(start, end)| start < end).collect();
+        let (first, last) = (pieces.first()?.0, pieces.last()?.1 - 1);
+        Some((first, last, pieces.iter().map(|(start, end)| end - start).sum()))
+    };
+    let mut gaps = Vec::new();
+    let mut reach = ranges.first().map_or(0, |r| r.1);
+    for pair in ranges.windows(2) {
+        let (previous, next) = (&pair[0], &pair[1]);
+        if let Some((first, last, count)) = within_windows(reach, next.0) {
+            gaps.push(DashboardGap {
+                after_range_id: previous.2.id,
+                first_len: space.word_count_of(first),
+                first_candidate: space.text(first),
+                last_len: space.word_count_of(last),
+                last_candidate: space.text(last),
+                count: count as Pos,
+            });
+        }
+        reach = reach.max(next.1);
+    }
+
+    // Where the next range will start: the cursor, or the next window's
+    // start if it's between windows - "" once there's none.
+    let next = dictionary.windows.iter().find(|w| w.end > cursor_number).map(|w| (w.words, cursor_number.max(w.start)));
+    let (cursor_candidate_len, cursor_candidate) = match next {
+        Some((words, number)) => (words, space.text(number)),
+        None => (cursor_candidate_len, String::new()),
+    };
+    let cursor = next.map_or(i64::MAX, |(_, number)| number);
+    let sweep_after_range_id = ranges.iter().take_while(|r| r.0 < cursor).last().map(|r| r.2.id);
+
+    DashboardTarget {
+        id: target.id,
+        name: target.name,
+        status: target.status,
+        lower_bound: target.lower_bound,
+        upper_bound: target.upper_bound,
+        hash_a_hex: format!("0x{:08X}", i64_to_u32(target.hash_a)),
+        hash_b_hex: format!("0x{:08X}", i64_to_u32(target.hash_b)),
+        encryption_key_hex: target.encryption_key.map(|key| format!("0x{:08X}", i64_to_u32(key))),
+        base_file_name: target.base_file_name,
+        prefix: target.prefix,
+        suffix: target.suffix,
+        prune_symbol_runs: false,
+        prune_unopened_brackets: false,
+        prune_whole_candidate: false,
+        max_backslash_count: 0,
+        min_backslash_count: 0,
+        prune_adjacent_backslashes: false,
+        insert_from_start: None,
+        insert_from_end: None,
+        found_filename: target.found_filename,
+        found_by,
+        found_by_backend,
+        found_at,
+        priority: target.priority,
+        description: target.description,
+        alphabet_name: String::new(),
+        alphabet: String::new(),
+        start_len: 1,
+        auto_priority: false,
+        cursor_candidate_len,
+        cursor_candidate,
+        sweep_after_range_id,
+        priority_ranges: Vec::new(),
+        skip_ranges: Vec::new(),
+        ranges: ranges.into_iter().map(|r| r.2).collect(),
+        gaps,
+        kind: "dictionary".into(),
+        dictionary: Some(DashboardDictionary {
+            word_lists: dictionary.word_lists.clone(),
+            word_count: space.words().len(),
+            separators: space.separators().to_vec(),
+            min_words: space.min_words(),
+            max_words: space.max_words(),
+            total_count: space.size() as Pos,
+            candidate_count: dictionary.window_candidates() as Pos,
+            send_basenames: target.send_basenames != 0,
+            basename_count: target.basename_count,
+            basenames,
+        }),
+    }
 }
 
 /// Every row `sql` selects (as `models::Segment`s), grouped by owner.

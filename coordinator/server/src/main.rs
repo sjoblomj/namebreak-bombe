@@ -4,6 +4,9 @@ mod canary;
 mod client_release;
 mod dashboard;
 mod db;
+mod dictionary;
+#[cfg(test)]
+mod dictionary_tests;
 mod error;
 mod handlers;
 mod likely_prefixes;
@@ -11,7 +14,8 @@ mod models;
 mod ranges;
 mod state;
 
-use axum::routing::{get, patch, post};
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, patch, post, put};
 use axum::Router;
 use state::{AppState, Inner, RangeConfig};
 use std::sync::Arc;
@@ -43,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/ranges/{id}/heartbeat", post(handlers::heartbeat))
         .route("/api/v1/ranges/{id}/complete", post(handlers::complete))
         .route("/api/v1/ranges/{id}/quit", post(handlers::quit))
+        .route("/api/v1/word-lists/{name}", get(handlers::word_list))
+        .route("/api/v1/targets/{id}/basenames", get(handlers::target_basenames))
         .route("/api/v1/status", get(handlers::status))
         .route("/api/v1/alphabets", get(handlers::alphabets))
         .route("/api/v1/admin/targets", post(handlers::admin_create_target))
@@ -52,6 +58,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/admin/targets/{id}/skip-ranges", post(handlers::admin_create_skip_range))
         .route("/api/v1/admin/skip-ranges/{id}", axum::routing::delete(handlers::admin_delete_skip_range))
         .route("/api/v1/admin/client-releases", get(handlers::admin_get_client_releases).put(handlers::admin_set_client_releases))
+        .route("/api/v1/admin/word-lists", get(handlers::admin_list_word_lists))
+        // A word list can be far bigger than the 2 MB a request body may
+        // otherwise have.
+        .route(
+            "/api/v1/admin/word-lists/{name}",
+            put(handlers::admin_put_word_list).delete(handlers::admin_delete_word_list).layer(DefaultBodyLimit::max(256 << 20)),
+        )
         .with_state(state);
 
     tracing::info!(%bind_addr, "starting namebreak coordinator server");

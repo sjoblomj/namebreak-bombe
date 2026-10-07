@@ -211,6 +211,18 @@
     font-size: 13px;
     margin-top: 6px;
   }
+  /* A dictionary target's basenames - see basenamesSection. */
+  .target-basenames {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 6px;
+  }
+  .target-basenames .basename-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    margin-top: 4px;
+  }
   .target-description :first-child { margin-top: 0; }
   .target-description :last-child { margin-bottom: 0; }
   .badge {
@@ -1133,14 +1145,32 @@
   }
 
   // Where the target's main sweep is: it carves its next range from here.
+  // A dictionary target's is the candidate its next range starts with -
+  // none once everything has been handed out.
   function sweepRow(t) {
     const tr = document.createElement('tr');
     tr.className = 'sweep-row';
     const td = document.createElement('td');
     td.colSpan = DETAIL_COLSPAN;
-    td.append('▶ Main sweep is here - next: ', candidateChip(t.cursor_candidate), ` (length ${t.cursor_candidate_len})`);
+    if (t.kind !== 'dictionary') {
+      td.append('▶ Main sweep is here - next: ', candidateChip(t.cursor_candidate), ` (length ${t.cursor_candidate_len})`);
+    } else if (t.cursor_candidate) {
+      td.append('▶ Next range starts at ', candidateChip(t.cursor_candidate), ` (${words(t.cursor_candidate_len)})`);
+    } else {
+      td.append('▶ Every candidate has been handed out');
+    }
     tr.appendChild(td);
     return tr;
+  }
+
+  function words(n) {
+    return n === 1 ? '1 word' : `${n} words`;
+  }
+
+  // A range's candidate length as the collapsed-row label says it - a
+  // dictionary target's is how many words its candidates have.
+  function lengthLabel(t, n) {
+    return t.kind === 'dictionary' ? words(n) : `length ${n}`;
   }
 
   function detailField(label, value, mono, title) {
@@ -1182,7 +1212,7 @@
   // folded - a status that briefly interrupts an otherwise-long run (e.g. a
   // reclaimed split), a gap or the sweep marker ends the run, so neither of
   // the latter two is ever hidden inside a collapsed one.
-  function groupRanges(items) {
+  function groupRanges(t, items) {
     const groups = [];
     let i = 0;
     while (i < items.length) {
@@ -1199,7 +1229,7 @@
       const run = items.slice(i, j).map((item) => item.range);
       if (run.length > COLLAPSE_THRESHOLD) {
         groups.push({ kind: 'range', range: run[0] });
-        groups.push({ kind: 'collapsed', status: run[0].status, candidateLen: run[0].candidate_len, hidden: run.slice(1, -1) });
+        groups.push({ kind: 'collapsed', status: run[0].status, lengthLabel: lengthLabel(t, run[0].candidate_len), hidden: run.slice(1, -1) });
         groups.push({ kind: 'range', range: run[run.length - 1] });
       } else {
         for (const r of run) groups.push({ kind: 'range', range: r });
@@ -1262,7 +1292,7 @@
         tr.remove();
         return;
       }
-      label.textContent = `${hidden.length} more ${statusWord(group.status)} · length ${group.candidateLen}`;
+      label.textContent = `${hidden.length} more ${statusWord(group.status)} · ${group.lengthLabel}`;
       const n = Math.min(REVEAL_BATCH, hidden.length);
       // When hidden.length <= REVEAL_BATCH, "first n" and "last n" reveal
       // the exact same set as "all" - no point offering three identical
@@ -1573,7 +1603,7 @@
     const table = document.createElement('table');
     const thead = document.createElement('thead');
     thead.innerHTML =
-      '<tr><th class="col-range">Range</th><th>Status</th><th>Len</th><th>First / last candidate</th>' +
+      `<tr><th class="col-range">Range</th><th>Status</th><th>${t.kind === 'dictionary' ? 'Words' : 'Len'}</th><th>First / last candidate</th>` +
       '<th class="col-count">Count</th><th class="col-worker">Worker</th>' +
       '<th class="col-assigned">Assigned</th><th class="col-completed">Completed</th></tr>';
     table.appendChild(thead);
@@ -1597,7 +1627,7 @@
     }
 
     const tbody = document.createElement('tbody');
-    for (const group of groupRanges(items)) {
+    for (const group of groupRanges(t, items)) {
       if (group.kind === 'range') {
         const [row, detailRow] = rangeRow(group.range);
         tbody.appendChild(row);
@@ -1658,6 +1688,10 @@
   function targetSettings(t) {
     const frag = document.createDocumentFragment();
     frag.appendChild(settingsLine('Prefix', [literalOrNone(t.prefix), ['Suffix: ', literalOrNone(t.suffix)]]));
+    if (t.dictionary) {
+      frag.appendChild(dictionarySettings(t.dictionary));
+      return frag;
+    }
 
     const rules = [];
     if (t.prune_symbol_runs) rules.push(hint('symbol runs', 'Skips candidates with 3+ consecutive non-alphanumeric, non-space characters'));
@@ -1689,6 +1723,55 @@
         'From 11 characters, the 2 (or from 12, 3) leading characters most words start with - in real filenames, then in English - get priority ranges of their own, one at a time')]));
     }
     return frag;
+  }
+
+  // What a dictionary target's candidates are made of: its word lists and
+  // separators, how many words a candidate has, and how many candidates
+  // that makes - all of them, and those its bounds leave.
+  function dictionarySettings(d) {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(settingsLine('Words', [
+      d.word_lists.map((name) => candidateChip(name)).flatMap((chip, i) => (i ? [' + ', chip] : [chip])),
+      `${fmtNum(d.word_count)} different words`,
+    ]));
+    const separators = d.separators.map((s) => (s === '' ? hint('none', 'Words written together') : candidateChip(s)));
+    const wordCounts = d.min_words === d.max_words ? words(d.min_words) : `${d.min_words} to ${d.max_words} words`;
+    frag.appendChild(settingsLine('Separators', [separators.flatMap((x, i) => (i ? [', ', x] : [x])), `${wordCounts} a candidate`]));
+    const candidates = d.candidate_count === d.total_count
+      ? `${fmtNum(d.candidate_count)}`
+      : `${fmtNum(d.candidate_count)} of ${fmtNum(d.total_count)} within the bounds`;
+    frag.appendChild(settingsLine('Candidates', [candidates]));
+    return frag;
+  }
+
+  // The basenames clients sent for a dictionary target (see dashboard.rs's
+  // DashboardDictionary) - the latest of them, with a link to all.
+  function basenamesSection(t) {
+    const d = t.dictionary;
+    const section = document.createElement('div');
+    section.className = 'target-basenames';
+    const head = d.send_basenames ? 'Basenames matching the encryption key' : 'Basenames matching the encryption key (no longer collected)';
+    if (d.basename_count === 0) {
+      section.textContent = `${head}: none yet`;
+      return section;
+    }
+    section.append(`${head}: ${fmtNum(d.basename_count)}`);
+    if (d.basename_count > d.basenames.length) section.append(` - the latest ${d.basenames.length} below`);
+    section.append(' · ');
+    const all = document.createElement('a');
+    all.href = `/api/v1/targets/${t.id}/basenames`;
+    all.textContent = 'all of them';
+    section.appendChild(all);
+    const list = document.createElement('div');
+    list.className = 'basename-list';
+    for (const b of d.basenames) {
+      const chip = candidateChip(b.basename);
+      const at = fmtTime(b.reported_at);
+      chip.title = `Sent by ${b.reported_by || 'unknown'}${b.reported_by_backend ? ' (' + b.reported_by_backend + ')' : ''}${at ? ' at ' + at.display : ''}`;
+      list.appendChild(chip);
+    }
+    section.appendChild(list);
+    return section;
   }
 
   function targetCard(t) {
@@ -1750,8 +1833,16 @@
 
     const bounds = document.createElement('div');
     bounds.className = 'target-bounds';
-    bounds.append(candidateChip(t.lower_bound), ' → ', candidateChip(t.upper_bound));
+    if (t.kind !== 'dictionary') {
+      bounds.append(candidateChip(t.lower_bound), ' → ', candidateChip(t.upper_bound));
+    } else if (t.lower_bound || t.upper_bound) {
+      // Whole filenames, either of which may be left out.
+      bounds.append(t.lower_bound ? candidateChip(t.lower_bound) : 'no lower bound', ' → ', t.upper_bound ? candidateChip(t.upper_bound) : 'no upper bound');
+    } else {
+      bounds.append('No bounds');
+    }
     card.appendChild(bounds);
+    if (t.dictionary && (t.dictionary.send_basenames || t.dictionary.basename_count > 0)) card.appendChild(basenamesSection(t));
 
     if (t.start_len > 1) {
       const startLen = document.createElement('div');

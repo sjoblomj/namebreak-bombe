@@ -828,6 +828,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "namebreak-protocol",
  "rand",
  "regex",

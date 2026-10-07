@@ -86,7 +86,20 @@ impl std::str::FromStr for Version {
 /// - 1.4.0 - `ClaimResponse::min_backslash_count`,
 ///   `ClaimResponse::prune_adjacent_backslashes`, and the text inserted into
 ///   candidates (`ClaimResponse::insert_from_start_text` and so on).
-pub const PROTOCOL_VERSION: Version = Version::new(1, 4, 0);
+/// - 1.5.0 - dictionary targets: a claim of one (`ClaimResponse::dictionary`
+///   and the fields after it), `GET /api/v1/word-lists/{name}`,
+///   `HeartbeatRequest::next_candidate_number`, and the basenames a client
+///   sends (`HeartbeatRequest::basenames` and so on). Older clients are
+///   never handed a dictionary target's work.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 5, 0);
+
+/// The first protocol version whose clients search dictionary targets.
+pub const DICTIONARY_SINCE: Version = Version::new(1, 5, 0);
+
+/// The most basenames one heartbeat, quit or completion may carry - see
+/// `HeartbeatRequest::basenames`. A client with more sends the rest with
+/// its next report. The client's `kMaxBasenamesPerReport` (net/protocol.h).
+pub const MAX_BASENAMES_PER_REPORT: usize = 5000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -187,6 +200,60 @@ pub struct ClaimResponse {
     /// throughput on completion without doing any index math itself.
     pub candidate_count: i64,
     pub lease_seconds: i64,
+    /// True for a dictionary target's range (see
+    /// `AdminCreateTargetRequest::dictionary`): its candidates are made of
+    /// words, numbered `first_candidate_number` up to (not including)
+    /// `end_candidate_number`, and the fields below say which. The pruning
+    /// rules, insertions and `alphabet` (empty) don't apply to it, and
+    /// `lower_bound_filename`/`upper_bound_filename` are its first and last
+    /// candidates' filenames, for showing - the search goes by the numbers.
+    /// Every field from here on is left out of an alphabet target's claim,
+    /// which older clients - whose parser takes no arrays - get.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dictionary: bool,
+    /// The word lists' names, in order. A client downloads one it doesn't
+    /// have (`GET /api/v1/word-lists/{name}`) - but uses the dictionary
+    /// compiled into it for `english-1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub word_lists: Option<Vec<String>>,
+    /// Each word list's checksum: of its words, read as the client reads
+    /// one, normalized, sorted and without duplicates - the client's
+    /// `wordListChecksum`, 16 hex digits. A client's copy must have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub word_list_checksums: Option<Vec<String>>,
+    /// The same of every list's words together, sorted, without duplicates -
+    /// the words the candidates are numbered with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub words_checksum: Option<String>,
+    /// Normalized, as are the prefix, suffix and bounds of a dictionary
+    /// target. "" writes words together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separators: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_words: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_words: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_candidate_number: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_candidate_number: Option<i64>,
+    /// The target's bounds, as whole filenames (inclusive): a candidate
+    /// outside them is skipped. Left out where there's none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename_lower_bound: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename_upper_bound: Option<String>,
+    /// Compare every candidate's basename to `encryption_key_hex` (hash type
+    /// 3 of what follows its last '\') and send the ones that match - see
+    /// `HeartbeatRequest::basenames`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub send_basenames: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key_hex: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -205,6 +272,21 @@ pub struct HeartbeatRequest {
     /// See `HeartbeatResponse::range_released`.
     #[serde(default)]
     pub last_hash_a_match_filename: Option<String>,
+    /// For a dictionary target's range, instead of the above: every
+    /// candidate numbered below this has been searched. The server's
+    /// progress checkpoint, as `last_hash_a_match_filename` is otherwise.
+    #[serde(default)]
+    pub next_candidate_number: Option<i64>,
+    /// Basenames that matched the encryption key since the client's last
+    /// report that got an answer (`send_basenames` - see `ClaimResponse`),
+    /// at most `MAX_BASENAMES_PER_REPORT`. The server keeps each one once per
+    /// target, whatever the rest of the report gets - even a 409, so the
+    /// client doesn't send them again after either; only a report that gets
+    /// no answer, or another error, leaves them to be sent with the next.
+    /// They're the target's, not the range's: ones left over from an earlier
+    /// range of the same target can come with any of its ranges' reports.
+    #[serde(default)]
+    pub basenames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +315,12 @@ pub struct HeartbeatResponse {
 pub struct QuitRequest {
     #[serde(default)]
     pub last_hash_a_match_filename: Option<String>,
+    /// See `HeartbeatRequest::next_candidate_number`.
+    #[serde(default)]
+    pub next_candidate_number: Option<i64>,
+    /// See `HeartbeatRequest::basenames`.
+    #[serde(default)]
+    pub basenames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +329,9 @@ pub struct CompleteRequest {
     pub filename: Option<String>,
     pub elapsed_seconds: f64,
     pub candidates_processed: i64,
+    /// See `HeartbeatRequest::basenames`.
+    #[serde(default)]
+    pub basenames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,7 +361,13 @@ pub struct AdminCreateTargetRequest {
     /// this alphabetical range at every candidate length in between (the two
     /// bounds don't need to be the same length as each other - e.g.
     /// "BLACKSMITH" to "CATAPULT" is valid).
+    ///
+    /// A dictionary target's bounds are whole filenames instead (prefix,
+    /// candidate and suffix), as the client's dictionary mode's are, and
+    /// either may be left out ("" or not given) for none.
+    #[serde(default)]
     pub lower_bound: String,
+    #[serde(default)]
     pub upper_bound: String,
     #[serde(default)]
     pub prune_symbol_runs: bool,
@@ -378,9 +475,47 @@ pub struct AdminCreateTargetRequest {
     /// dashboard; the search doesn't use it. Defaults to none.
     #[serde(default)]
     pub base_file_name: Option<String>,
+    /// Makes this a dictionary target: its candidates are made of words
+    /// rather than every string of an alphabet - see `DictionarySettings`.
+    /// The alphabet, the pruning rules, the insertions, `start_len` and
+    /// `auto_priority` are then not for it, nor are priority and skip ranges.
+    #[serde(default)]
+    pub dictionary: Option<DictionarySettings>,
+    /// For a dictionary target with an `encryption_key_hex`: have clients
+    /// compare every candidate's basename (what follows its last '\') to
+    /// the key, and send every one that matches, which the server keeps -
+    /// a file's name without its directory, found even when the directory
+    /// searched is the wrong one. About one candidate in 2^32 matches by
+    /// chance. Defaults to false: clients then don't compare basenames at all.
+    #[serde(default)]
+    pub send_basenames: bool,
+}
+
+/// What a dictionary target's candidates are made of. A candidate is
+/// `min_words` to `max_words` words, with a separator between each two:
+/// every word from the word lists (merged: normalized, sorted and without
+/// duplicates), every separator from `separators`. Its filename is prefix +
+/// candidate + suffix. They're numbered as the client's dictionary mode
+/// numbers them (client/src/engine/dictionary.h), and none of this can be
+/// changed once the target is made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictionarySettings {
+    /// Names of stored word lists (`PUT /api/v1/admin/word-lists/{name}`).
+    pub word_lists: Vec<String>,
+    /// At least one, each once - "" for words written together. Normalized
+    /// as the words are (letters uppercase, '/' as '\').
+    pub separators: Vec<String>,
+    #[serde(default = "default_min_words")]
+    pub min_words: i64,
+    /// At most 8, and no more candidates than 2^63.
+    pub max_words: i64,
 }
 
 fn default_start_len() -> i64 {
+    1
+}
+
+fn default_min_words() -> i64 {
     1
 }
 
@@ -489,6 +624,10 @@ pub struct AdminPatchTargetRequest {
     /// `encryption_key_hex`.
     #[serde(default, deserialize_with = "deserialize_present")]
     pub base_file_name: Option<Option<String>>,
+    /// See `AdminCreateTargetRequest::send_basenames`. Leave unset to leave it
+    /// unchanged. Applies to ranges claimed after the patch.
+    #[serde(default)]
+    pub send_basenames: Option<bool>,
 }
 
 /// Fast-tracks a specific, bounded slice of a target's search space ahead of
@@ -571,6 +710,22 @@ pub struct AdminDeletePriorityRangeResponse {
     /// Candidates kept as priority work because the main sweep is already
     /// past them.
     pub kept: i128,
+}
+
+/// A stored word list - what `PUT /api/v1/admin/word-lists/{name}` answers
+/// with, and `GET /api/v1/admin/word-lists` lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WordListInfo {
+    pub name: String,
+    /// How many different words it has, read as a client reads it.
+    pub word_count: i64,
+    /// See `ClaimResponse::word_list_checksums`.
+    pub checksum: String,
+    pub created_at: i64,
+    /// Line numbers of the lines a client skips: those with anything but
+    /// printable ASCII. Only in `PUT`'s answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_lines: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

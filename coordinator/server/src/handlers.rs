@@ -1,12 +1,13 @@
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
     AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
-    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, HeartbeatRequest, HeartbeatResponse, QuitRequest, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus,
-    Version, PROTOCOL_VERSION,
+    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, DictionarySettings, HeartbeatRequest, HeartbeatResponse, QuitRequest, RegisterRequest,
+    RegisterResponse, StatusResponse, TargetStatus, Version, WordListInfo, PROTOCOL_VERSION,
 };
 
 use crate::alphabet::{
@@ -15,8 +16,9 @@ use crate::alphabet::{
 };
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::client_release;
+use crate::dictionary::{self, FilenameBounds};
 use crate::error::AppError;
-use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User};
+use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME};
 use crate::ranges::{self, SegmentOwner};
 use crate::state::{generate_token, now_unix, AppState};
 
@@ -116,7 +118,8 @@ pub async fn heartbeat(
     Path(range_id): Path<i64>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
-    let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename).await?;
+    ranges::record_basenames(&state.pool, &user, range_id, &req.basenames).await?;
+    let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename, req.next_candidate_number).await?;
     Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, range_released: outcome.range_released }))
 }
 
@@ -126,7 +129,8 @@ pub async fn quit(
     Path(range_id): Path<i64>,
     Json(req): Json<QuitRequest>,
 ) -> Result<StatusCode, AppError> {
-    ranges::quit_range(&state.pool, &user, range_id, req.last_hash_a_match_filename.as_deref()).await?;
+    ranges::record_basenames(&state.pool, &user, range_id, &req.basenames).await?;
+    ranges::quit_range(&state.pool, &user, range_id, req.last_hash_a_match_filename.as_deref(), req.next_candidate_number).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -151,6 +155,7 @@ pub async fn complete(
     Path(range_id): Path<i64>,
     Json(req): Json<CompleteRequest>,
 ) -> Result<StatusCode, AppError> {
+    ranges::record_basenames(&state.pool, &user, range_id, &req.basenames).await?;
     let outcome = ranges::complete_range(
         &state.pool,
         &state.config,
@@ -281,6 +286,12 @@ pub async fn admin_create_target(
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
     }
+    if let Some(settings) = &req.dictionary {
+        return create_dictionary_target(&state, &req, settings).await;
+    }
+    if req.send_basenames {
+        return Err(AppError::BadRequest("send_basenames is for dictionary targets - an alphabet search doesn't compare basenames".into()));
+    }
     let encryption_key = req.encryption_key_hex.as_deref().map(parse_encryption_key).transpose()?;
     if let Some(name) = &req.base_file_name {
         validate_base_file_name(name)?;
@@ -384,6 +395,273 @@ pub async fn admin_create_target(
     Ok(Json(AdminCreateTargetResponse { target_id }))
 }
 
+/// The settings of `req` that only an alphabet target has, by name, if
+/// given - see `AdminCreateTargetRequest::dictionary`.
+fn alphabet_settings_given(req: &AdminCreateTargetRequest) -> Vec<&'static str> {
+    [
+        ("alphabet_name", req.alphabet_name.is_some()),
+        ("alphabet", req.alphabet.is_some()),
+        ("prune_symbol_runs", req.prune_symbol_runs),
+        ("prune_unopened_brackets", req.prune_unopened_brackets),
+        ("prune_whole_candidate", req.prune_whole_candidate),
+        ("max_backslash_count", req.max_backslash_count != 0),
+        ("min_backslash_count", req.min_backslash_count != 0),
+        ("prune_adjacent_backslashes", req.prune_adjacent_backslashes),
+        ("insert_from_start", req.insert_from_start.is_some()),
+        ("insert_from_end", req.insert_from_end.is_some()),
+        ("start_len", req.start_len != 1),
+        ("auto_priority", req.auto_priority),
+    ]
+    .into_iter()
+    .filter_map(|(name, given)| given.then_some(name))
+    .collect()
+}
+
+/// Rejects text a dictionary target's filenames can't have: anything but
+/// printable ASCII, which is all a word list's words can be made of - or
+/// more than 255 characters.
+fn validate_dictionary_text(what: &str, text: &str) -> Result<(), AppError> {
+    if !dictionary::is_printable_ascii(text) {
+        return Err(AppError::BadRequest(format!("{what} can only have printable ASCII characters (' ' to '~')")));
+    }
+    if text.len() > 255 {
+        return Err(AppError::BadRequest(format!("{what} can't be longer than 255 characters")));
+    }
+    Ok(())
+}
+
+/// `admin_create_target` for a dictionary target (`req.dictionary` - see
+/// `AdminCreateTargetRequest::dictionary`): its prefix, suffix, separators
+/// and bounds are normalized as the client normalizes them, its word lists
+/// read, and its candidates numbered (`dictionary::load`), so that a target
+/// whose candidates can't be numbered, or whose bounds leave none, is
+/// refused here rather than handing out nothing. Its cursor starts at the
+/// first window.
+async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetRequest, settings: &DictionarySettings) -> Result<Json<AdminCreateTargetResponse>, AppError> {
+    let alphabet_settings = alphabet_settings_given(req);
+    if !alphabet_settings.is_empty() {
+        return Err(AppError::BadRequest(format!("{} isn't for a dictionary target", alphabet_settings.join(", "))));
+    }
+    let encryption_key = req.encryption_key_hex.as_deref().map(parse_encryption_key).transpose()?;
+    if let Some(name) = &req.base_file_name {
+        validate_base_file_name(name)?;
+    }
+    if req.send_basenames && encryption_key.is_none() {
+        return Err(AppError::BadRequest("send_basenames needs an encryption_key_hex to compare the basenames to".into()));
+    }
+    let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
+    let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
+    for (what, text) in [("prefix", &req.prefix), ("suffix", &req.suffix), ("lower_bound", &req.lower_bound), ("upper_bound", &req.upper_bound)] {
+        validate_dictionary_text(what, text)?;
+    }
+    for separator in &settings.separators {
+        validate_dictionary_text("a separator", separator)?;
+    }
+    let prefix = dictionary::normalize(&req.prefix);
+    let suffix = dictionary::normalize(&req.suffix);
+    let separators: Vec<String> = settings.separators.iter().map(|s| dictionary::normalize(s)).collect();
+    let bound = |b: &str| (!b.is_empty()).then(|| dictionary::normalize(b));
+    let bounds = FilenameBounds { lower: bound(&req.lower_bound), upper: bound(&req.upper_bound) };
+    if let (Some(lower), Some(upper)) = (&bounds.lower, &bounds.upper) {
+        if lower > upper {
+            return Err(AppError::BadRequest(format!("lower_bound '{lower}' sorts after upper_bound '{upper}'")));
+        }
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let loaded = dictionary::load(&mut tx, &settings.word_lists, &separators, settings.min_words, settings.max_words, &prefix, &suffix, bounds.clone()).await?;
+    let first = loaded.windows[0];
+    let now = now_unix();
+    let as_json = |list: &[String]| serde_json::to_string(list).expect("a list of strings serializes");
+    let target_id: i64 = sqlx::query_scalar(
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, alphabet_name, alphabet, status, priority, description, \
+         start_len, encryption_key, base_file_name, kind, word_lists, separators, min_words, max_words, send_basenames, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'active', ?, ?, 1, ?, ?, 'dictionary', ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(&req.name)
+    .bind(&prefix)
+    .bind(&suffix)
+    .bind(u32_to_i64(hash_a))
+    .bind(u32_to_i64(hash_b))
+    .bind(bounds.lower.as_deref().unwrap_or(""))
+    .bind(bounds.upper.as_deref().unwrap_or(""))
+    .bind(DICTIONARY_ALPHABET_NAME)
+    .bind(req.priority)
+    .bind(&req.description)
+    .bind(encryption_key.map(u32_to_i64))
+    .bind(&req.base_file_name)
+    .bind(as_json(&settings.word_lists))
+    .bind(as_json(&separators))
+    .bind(settings.min_words)
+    .bind(settings.max_words)
+    .bind(req.send_basenames as i64)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, 0, ?, ?, '')")
+        .bind(target_id)
+        .bind(first.words)
+        .bind(first.start)
+        .bind(DICTIONARY_ALPHABET_NAME)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    tracing::info!(target_id, candidates = loaded.window_candidates(), words = loaded.space.words().len(), "created a dictionary target");
+    Ok(Json(AdminCreateTargetResponse { target_id }))
+}
+
+/// Rejects a name a word list can't have: 1 to 64 letters, digits, '.',
+/// '-' and '_', starting with a letter or digit - safe as a client's file
+/// name, as it's cached under it.
+fn validate_word_list_name(name: &str) -> Result<(), AppError> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+        && name.as_bytes()[0].is_ascii_alphanumeric();
+    if !valid {
+        return Err(AppError::BadRequest("a word list's name is 1 to 64 letters, digits, '.', '-' and '_', starting with a letter or digit".into()));
+    }
+    Ok(())
+}
+
+/// Stores a word list under `name`, the request's body as it is: one word
+/// per line, read as a client reads one (see `dictionary::parse_word_list`).
+/// A list never changes once stored - a client caches it by its name - so
+/// the same name again is only accepted with the very same file (and then
+/// changes nothing); a different list needs a different name. The
+/// `english-` names are the dictionaries built into the server and the
+/// client (`english-1` - see `dictionary::store_built_in`), and can't be
+/// uploaded.
+pub async fn admin_put_word_list(State(state): State<AppState>, _admin: AdminAuth, Path(name): Path<String>, body: Bytes) -> Result<Json<WordListInfo>, AppError> {
+    validate_word_list_name(&name)?;
+    if dictionary::is_built_in_name(&name) {
+        return Err(AppError::BadRequest(format!(
+            "the english- names are the dictionaries built into the server and the client - {} is there already, so give this list another name",
+            dictionary::ENGLISH_1
+        )));
+    }
+    let (words, skipped_lines) = dictionary::parse_word_list(&body);
+    let words = dictionary::sorted_unique(words);
+    if words.is_empty() {
+        return Err(AppError::BadRequest("the word list has no words".into()));
+    }
+    let checksum = dictionary::checksum(&words);
+
+    let mut tx = state.pool.begin().await?;
+    let existing: Option<(Vec<u8>, i64)> = sqlx::query_as("SELECT content, created_at FROM word_lists WHERE name = ?").bind(&name).fetch_optional(&mut *tx).await?;
+    let created_at = match existing {
+        Some((content, _)) if content != body.as_ref() => {
+            return Err(AppError::Conflict(format!("there's already a word list named '{name}', with other contents - a word list never changes, so give this one another name")));
+        }
+        Some((_, created_at)) => created_at,
+        None => {
+            let now = now_unix();
+            sqlx::query("INSERT INTO word_lists (name, content, word_count, checksum, created_at) VALUES (?, ?, ?, ?, ?)")
+                .bind(&name)
+                .bind(body.as_ref())
+                .bind(words.len() as i64)
+                .bind(dictionary::hex64(checksum))
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            now
+        }
+    };
+    tx.commit().await?;
+    Ok(Json(WordListInfo { name, word_count: words.len() as i64, checksum: dictionary::hex64(checksum), created_at, skipped_lines }))
+}
+
+/// Every stored word list, by name.
+pub async fn admin_list_word_lists(State(state): State<AppState>, _admin: AdminAuth) -> Result<Json<Vec<WordListInfo>>, AppError> {
+    let rows: Vec<(String, i64, String, i64)> =
+        sqlx::query_as("SELECT name, word_count, checksum, created_at FROM word_lists ORDER BY name").fetch_all(&state.pool).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(name, word_count, checksum, created_at)| WordListInfo { name, word_count, checksum, created_at, skipped_lines: Vec::new() })
+            .collect(),
+    ))
+}
+
+/// The dictionary targets (by id) whose candidates are made of word list `name`.
+async fn targets_using_word_list(conn: &mut sqlx::SqliteConnection, name: &str) -> Result<Vec<i64>, AppError> {
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT id, word_lists FROM targets WHERE kind = 'dictionary'").fetch_all(&mut *conn).await?;
+    let mut using = Vec::new();
+    for (id, lists) in rows {
+        if dictionary::parse_string_list(lists.as_deref())?.iter().any(|list| list == name) {
+            using.push(id);
+        }
+    }
+    Ok(using)
+}
+
+/// Deletes a word list no target uses - but not one built in.
+pub async fn admin_delete_word_list(State(state): State<AppState>, _admin: AdminAuth, Path(name): Path<String>) -> Result<StatusCode, AppError> {
+    if dictionary::is_built_in_name(&name) {
+        return Err(AppError::BadRequest(format!("{name} is built into the server - it can't be deleted")));
+    }
+    let mut tx = state.pool.begin().await?;
+    let using = targets_using_word_list(&mut tx, &name).await?;
+    if !using.is_empty() {
+        let ids: Vec<String> = using.iter().map(i64::to_string).collect();
+        return Err(AppError::Conflict(format!("the word list '{name}' is used by target {} - delete those first", ids.join(", "))));
+    }
+    let deleted = sqlx::query("DELETE FROM word_lists WHERE name = ?").bind(&name).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    if deleted == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A stored word list, exactly as uploaded - for a client to search a
+/// dictionary target with (see `ClaimResponse::word_lists`).
+pub async fn word_list(State(state): State<AppState>, AuthedUser(_user): AuthedUser, Path(name): Path<String>) -> Result<Response, AppError> {
+    let content: Vec<u8> = sqlx::query_scalar("SELECT content FROM word_lists WHERE name = ?").bind(&name).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], content).into_response())
+}
+
+/// How many basenames `target_basenames` reads at a time.
+pub(crate) const BASENAMES_PAGE: i64 = 10_000;
+
+/// Every basename clients found matching a target's encryption key (see
+/// `AdminCreateTargetRequest::send_basenames`), one per line, in the order
+/// they were first reported. Public, like the dashboard, which shows only
+/// the latest of them and links here for the rest. There can be a million
+/// of them (three words of english-1), so they're read and sent a page of
+/// `BASENAMES_PAGE` at a time: the database - one connection, which every
+/// claim and heartbeat needs too - is only held for a page's query, and
+/// only a page is ever in memory, however slowly the list is downloaded.
+pub async fn target_basenames(State(state): State<AppState>, Path(target_id): Path<i64>) -> Result<Response, AppError> {
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM targets WHERE id = ? AND is_virtual = 0").bind(target_id).fetch_optional(&state.pool).await?;
+    exists.ok_or(AppError::NotFound)?;
+    let pool = state.pool.clone();
+    // The pages, each after the last row of the one before - None once
+    // there's none left.
+    let pages = futures_util::stream::unfold(Some(0i64), move |after| {
+        let pool = pool.clone();
+        async move {
+            let after = after?;
+            let rows: Result<Vec<(i64, String)>, sqlx::Error> =
+                sqlx::query_as("SELECT id, basename FROM basenames WHERE target_id = ? AND id > ? ORDER BY id LIMIT ?")
+                    .bind(target_id)
+                    .bind(after)
+                    .bind(BASENAMES_PAGE)
+                    .fetch_all(&pool)
+                    .await;
+            match rows {
+                Ok(rows) if rows.is_empty() => None,
+                Ok(rows) => {
+                    let next = (rows.len() as i64 == BASENAMES_PAGE).then(|| rows.last().expect("not empty").0);
+                    let text: String = rows.into_iter().map(|(_, basename)| basename + "\n").collect();
+                    Some((Ok::<_, std::io::Error>(text), next))
+                }
+                Err(err) => Some((Err(std::io::Error::other(err)), None)),
+            }
+        }
+    });
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], axum::body::Body::from_stream(pages)).into_response())
+}
+
 /// Resolves an `alphabet_name` patch into the `(alphabet_name, alphabet)` pair
 /// to store, validating it the same way `admin_create_target` validates a
 /// brand-new target: the name must be one of `PREDEFINED_ALPHABETS`, and the
@@ -464,11 +742,12 @@ pub async fn admin_patch_target(
         && req.auto_priority.is_none()
         && req.encryption_key_hex.is_none()
         && req.base_file_name.is_none()
+        && req.send_basenames.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of name, status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
              prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start, \
-             insert_from_end, start_len, auto_priority, encryption_key_hex or base_file_name must be provided"
+             insert_from_end, start_len, auto_priority, encryption_key_hex, base_file_name or send_basenames must be provided"
                 .into(),
         ));
     }
@@ -476,6 +755,42 @@ pub async fn admin_patch_target(
     let encryption_key = req.encryption_key_hex.as_ref().map(|hex| hex.as_deref().map(parse_encryption_key).transpose()).transpose()?;
     if let Some(Some(name)) = &req.base_file_name {
         validate_base_file_name(name)?;
+    }
+
+    // A dictionary target has none of an alphabet target's search settings,
+    // and only it compares basenames - see AdminCreateTargetRequest::dictionary.
+    let existing = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    if existing.is_dictionary() {
+        let alphabet_settings: Vec<&str> = [
+            ("alphabet_name", req.alphabet_name.is_some()),
+            ("alphabet", req.alphabet.is_some()),
+            ("prune_symbol_runs", req.prune_symbol_runs.is_some()),
+            ("prune_unopened_brackets", req.prune_unopened_brackets.is_some()),
+            ("prune_whole_candidate", req.prune_whole_candidate.is_some()),
+            ("max_backslash_count", req.max_backslash_count.is_some()),
+            ("min_backslash_count", req.min_backslash_count.is_some()),
+            ("prune_adjacent_backslashes", req.prune_adjacent_backslashes.is_some()),
+            ("insert_from_start", req.insert_from_start.is_some()),
+            ("insert_from_end", req.insert_from_end.is_some()),
+            ("start_len", req.start_len.is_some()),
+            ("auto_priority", req.auto_priority.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect();
+        if !alphabet_settings.is_empty() {
+            return Err(AppError::BadRequest(format!("{} isn't for a dictionary target", alphabet_settings.join(", "))));
+        }
+        // What the target ends up with.
+        let has_key = match encryption_key {
+            Some(key) => key.is_some(),
+            None => existing.encryption_key.is_some(),
+        };
+        if req.send_basenames.unwrap_or(existing.send_basenames != 0) && !has_key {
+            return Err(AppError::BadRequest("send_basenames needs an encryption_key_hex to compare the basenames to".into()));
+        }
+    } else if req.send_basenames == Some(true) {
+        return Err(AppError::BadRequest("send_basenames is for dictionary targets - an alphabet search doesn't compare basenames".into()));
     }
 
     let (alphabet_name, alphabet) = if req.alphabet_name.is_some() || req.alphabet.is_some() {
@@ -526,7 +841,7 @@ pub async fn admin_patch_target(
          prune_symbol_runs = COALESCE(?, prune_symbol_runs), prune_unopened_brackets = COALESCE(?, prune_unopened_brackets), \
          prune_whole_candidate = COALESCE(?, prune_whole_candidate), max_backslash_count = COALESCE(?, max_backslash_count), \
          min_backslash_count = COALESCE(?, min_backslash_count), prune_adjacent_backslashes = COALESCE(?, prune_adjacent_backslashes), \
-         start_len = COALESCE(?, start_len), auto_priority = COALESCE(?, auto_priority) \
+         start_len = COALESCE(?, start_len), auto_priority = COALESCE(?, auto_priority), send_basenames = COALESCE(?, send_basenames) \
          WHERE id = ? AND status != 'solved'",
     )
     .bind(&req.name)
@@ -543,6 +858,7 @@ pub async fn admin_patch_target(
     .bind(req.prune_adjacent_backslashes.map(i64::from))
     .bind(req.start_len)
     .bind(req.auto_priority.map(i64::from))
+    .bind(req.send_basenames.map(i64::from))
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
@@ -628,6 +944,9 @@ pub async fn admin_create_priority_range(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound)?;
+    if target.is_dictionary() {
+        return Err(AppError::BadRequest("a dictionary target has no priority ranges - its candidates aren't strings of an alphabet".into()));
+    }
 
     let cap = max_supported_len(&target.alphabet);
     if req.length > cap {
@@ -743,6 +1062,9 @@ pub async fn admin_create_skip_range(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound)?;
+    if target.is_dictionary() {
+        return Err(AppError::BadRequest("a dictionary target has no skip ranges - its candidates aren't strings of an alphabet".into()));
+    }
     let skip_range_id = ranges::create_skip_range(&mut tx, &target, &req.pattern, req.length, &req.reason, now_unix()).await?;
     tx.commit().await?;
     Ok(Json(AdminCreateSkipRangeResponse { skip_range_id }))
@@ -831,6 +1153,7 @@ mod tests {
         let config = crate::state::RangeConfig {
             target_chunk_seconds: 1.0,
             default_rate_per_sec: 1.0,
+            default_dictionary_rate_per_sec: 1.0,
             min_chunk_candidates: 1,
             max_chunk_candidates: 1,
             lease_seconds: 60,
@@ -840,6 +1163,7 @@ mod tests {
             canary_seconds: 5.0,
             stall_release_seconds: 60,
             likely_prefixes: Default::default(),
+            dictionaries: Default::default(),
         };
         AppState(std::sync::Arc::new(crate::state::Inner { pool, admin_token: "t".into(), config }))
     }

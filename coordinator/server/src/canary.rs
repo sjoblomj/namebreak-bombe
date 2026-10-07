@@ -88,8 +88,10 @@ pub async fn maybe_claim(
     }
     // A real target the client searches as it is, whose prefix, suffix,
     // alphabet and pruning the canary copies - the one it would most likely
-    // get work from.
-    let templates = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' AND is_virtual = 0 ORDER BY priority DESC, created_at ASC")
+    // get work from. Never a dictionary target, which has no alphabet.
+    let templates = sqlx::query_as::<_, Target>(
+        "SELECT * FROM targets WHERE status = 'active' AND is_virtual = 0 AND kind = 'alphabet' ORDER BY priority DESC, created_at ASC",
+    )
         .fetch_all(&mut *tx)
         .await?;
     let Some(template) =

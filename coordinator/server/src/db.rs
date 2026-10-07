@@ -12,5 +12,6 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         .connect_with(options)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    crate::dictionary::store_built_in(&pool).await?;
     Ok(pool)
 }

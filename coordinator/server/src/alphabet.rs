@@ -237,7 +237,15 @@ pub fn index_width(alphabet: &str) -> i64 {
 /// How many candidates share one leading prefix (one block) at `len`. The
 /// whole length's space for a length no longer than `index_width` - there's
 /// only ever block 0 there.
+///
+/// The empty alphabet is a dictionary target's (see
+/// `models::DICTIONARY_ALPHABET_NAME`), whose positions are candidate
+/// numbers that fit an `i64` whole: one block holds them all, so a number is
+/// stored as block 0 and itself.
 pub fn block_size(alphabet: &str, len: i64) -> Pos {
+    if alphabet.is_empty() {
+        return 1 << 63;
+    }
     space_size(alphabet, len.min(index_width(alphabet)))
 }
 

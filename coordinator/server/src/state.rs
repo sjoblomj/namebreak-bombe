@@ -1,5 +1,6 @@
 use sqlx::SqlitePool;
 
+use crate::dictionary::DictionaryCache;
 use crate::likely_prefixes::LikelyPrefixes;
 use std::sync::Arc;
 
@@ -26,6 +27,10 @@ impl std::ops::Deref for AppState {
 pub struct RangeConfig {
     pub target_chunk_seconds: f64,
     pub default_rate_per_sec: f64,
+    /// `default_rate_per_sec` for a dictionary target's ranges, measured
+    /// apart - see `User::ema_dictionary_rate_per_sec`. A GPU searches about
+    /// 20 billion a second, a CPU about 0.2.
+    pub default_dictionary_rate_per_sec: f64,
     pub min_chunk_candidates: i64,
     pub max_chunk_candidates: i64,
     /// How long a claimed range stays leased after the last sign of life
@@ -54,6 +59,9 @@ pub struct RangeConfig {
     /// What automatic priority ranges are made from - see
     /// `likely_prefixes.rs`. Counted once, when the server starts.
     pub likely_prefixes: Arc<LikelyPrefixes>,
+    /// Dictionary targets' words, numbers and windows - see `dictionary.rs`.
+    /// Built the first time each is needed.
+    pub dictionaries: Arc<DictionaryCache>,
 }
 
 impl RangeConfig {
@@ -71,6 +79,7 @@ impl RangeConfig {
         RangeConfig {
             target_chunk_seconds: env_f64("TARGET_CHUNK_SECONDS", 900.0),
             default_rate_per_sec: env_f64("DEFAULT_RATE_PER_SEC", 500_000_000.0),
+            default_dictionary_rate_per_sec: env_f64("DEFAULT_DICTIONARY_RATE_PER_SEC", 1_000_000_000.0),
             min_chunk_candidates: env_i64("MIN_CHUNK_CANDIDATES", 1_000_000),
             max_chunk_candidates: env_i64("MAX_CHUNK_CANDIDATES", 1_000_000_000_000_000),
             lease_seconds: env_i64("LEASE_SECONDS", 6 * 60 * 60),
@@ -80,6 +89,7 @@ impl RangeConfig {
             canary_probability: env_f64("CANARY_PROBABILITY", 0.33),
             canary_seconds: env_f64("CANARY_SECONDS", 5.0),
             likely_prefixes: Arc::new(LikelyPrefixes::load()),
+            dictionaries: Default::default(),
         }
     }
 }
