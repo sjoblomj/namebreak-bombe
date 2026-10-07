@@ -230,11 +230,13 @@ set_source_files_properties(src/common/version.cpp PROPERTIES COMPILE_DEFINITION
 
 if(NAMEBREAK_NETWORK)
     add_library(namebreak_net STATIC
+        src/net/basename_outbox.cpp
         src/net/coordinator_runner.cpp
         src/net/coordinator_client.cpp
         src/net/http_client.cpp
         src/net/protocol.cpp
-        src/net/update_check.cpp)
+        src/net/update_check.cpp
+        src/net/word_lists.cpp)
     target_link_libraries(namebreak_net PUBLIC namebreak_common CURL::libcurl)
 endif()
 
@@ -418,6 +420,47 @@ else()
     namebreak_test_executable(version_test tests/version_test.cpp namebreak_common)
 endif()
 namebreak_test(version_test version_test)
+
+# Dictionary targets end to end: the coordinator server (../coordinator,
+# built with cargo) and this client in coordinator mode, over HTTP on
+# localhost - see the script. namebreak_heartbeat_1s is the program with a
+# heartbeat every second instead of every minute, for the part that has the
+# server go away and come back. Needs cargo and Python 3; skipped without.
+if(NAMEBREAK_NETWORK)
+    add_library(namebreak_net_heartbeat_1s STATIC
+        src/net/basename_outbox.cpp
+        src/net/coordinator_runner.cpp
+        src/net/coordinator_client.cpp
+        src/net/http_client.cpp
+        src/net/protocol.cpp
+        src/net/update_check.cpp
+        src/net/word_lists.cpp)
+    target_compile_definitions(namebreak_net_heartbeat_1s PRIVATE NAMEBREAK_HEARTBEAT_INTERVAL_SECONDS=1)
+    target_link_libraries(namebreak_net_heartbeat_1s PUBLIC namebreak_common CURL::libcurl)
+    add_executable(namebreak_heartbeat_1s src/cli/main.cpp)
+    target_compile_definitions(namebreak_heartbeat_1s PRIVATE NAMEBREAK_WITH_NETWORK)
+    target_link_libraries(namebreak_heartbeat_1s PRIVATE namebreak_net_heartbeat_1s)
+    set_target_properties(namebreak_heartbeat_1s PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    find_program(CARGO_EXECUTABLE cargo)
+    find_program(PYTHON3_EXECUTABLE python3)
+    if(CARGO_EXECUTABLE AND PYTHON3_EXECUTABLE)
+        namebreak_test(coordinator-dictionary ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_dictionary_test.py
+            --client $<TARGET_FILE:namebreak> --client-heartbeat-1s $<TARGET_FILE:namebreak_heartbeat_1s>
+            --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
+        set_tests_properties(coordinator-dictionary PROPERTIES TIMEOUT 900)
+    endif()
+endif()
+
+# The coordinator client's pure parts: the protocol's JSON
+# (src/net/protocol.h), the basenames waiting to be sent
+# (src/net/basename_outbox.h) and a dictionary claim's word lists
+# (src/net/word_lists.h). No network access.
+if(NAMEBREAK_NETWORK)
+    foreach(test protocol_test basename_outbox_test word_lists_test)
+        namebreak_test_executable(${test} tests/${test}.cpp namebreak_net)
+        namebreak_test(${test} ${test})
+    endforeach()
+endif()
 
 # End-to-end correctness check for runSearch() itself, against a brute-force
 # reference - see the file. Every backend is tested with its shipped tuning

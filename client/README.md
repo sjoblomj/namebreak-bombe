@@ -36,8 +36,11 @@ unknown name lists the ones the build has.
   `MAX_CANDIDATE_LEN`, 16 characters).
 - **`coordinator`** - registers with a central coordinator server, claims a
   range of a shared target's search space, searches it, and reports back;
-  repeats until stopped. See [`../coordinator/README.md`](../coordinator/README.md)
-  for the server side and how this mode is configured.
+  repeats until stopped. A target is searched by alphabet, as `bounded` mode
+  searches, or by words, as `dictionary` mode does (see [Dictionary targets
+  in coordinator mode](#dictionary-targets-in-coordinator-mode)). See
+  [`../coordinator/README.md`](../coordinator/README.md) for the server side
+  and how this mode is configured.
 - **`dictionary`** - searches candidates made of words: one word, or several
   with separators between them, from a dictionary compiled into the program
   (`english-1`) and word lists of your own - and, given the file's
@@ -157,7 +160,9 @@ They all go in one directory -
 missing. `bounded`/`continuous` mode writes `matches.txt` there (or
 `matches-<matches_name>.txt`), `dictionary` mode the same and two more files
 (see [Dictionary mode](#dictionary-mode)), and `coordinator` mode one
-`matches-<target name>.txt` per target.
+`matches-<target name>.txt` per target - and, for a dictionary target, the
+basenames not sent yet and the word lists it downloaded (see [Dictionary
+targets in coordinator mode](#dictionary-targets-in-coordinator-mode)).
 
 ## Dictionary mode
 
@@ -269,6 +274,43 @@ self-test of its own first (`selfTestDictionaryBackend`,
 the backend must find before it's used. See [Dictionary searches on the
 GPU](#dictionary-searches-on-the-gpu) for how the kernels go about it.
 
+### Dictionary targets in coordinator mode
+
+A coordinator target can be a dictionary target (see the coordinator
+README's "Dictionary targets"): a claim of one hands out a range of candidate
+numbers, with the word lists, separators, word counts and bounds to number
+them by, and the client searches them as dictionary mode does, on the same
+backend - which the first dictionary range runs the dictionary self-test on,
+falling back to the cpu backend if it fails it. It needs protocol 1.5 (this
+client's, `kProtocolVersion` in `src/net/protocol.h`); older clients never
+get one.
+
+- **Word lists.** `english-1` is the one compiled in. Any other list the
+  server has is downloaded the first time a claim names it, and kept in
+  `word-lists/<name>.txt` in the matches directory; a claim carries each
+  list's checksum, and a copy without it is downloaded again. The merged
+  words have to have the checksum the claim gives them too - otherwise the
+  client hands the range back rather than search other candidates than the
+  server numbered (`src/net/word_lists.h`).
+- **Progress.** Heartbeats (every minute) and a quit say how far the search
+  has got as a candidate number - every candidate below it has been searched -
+  so the server checkpoints a dictionary range at every heartbeat, and a quit
+  hands back exactly the rest.
+- **Basenames.** When the target asks for them (its `send_basenames`), every
+  candidate whose basename matches its encryption key is sent with the next
+  heartbeat, quit or completion. Until a report gets through, they wait in
+  `unsent-basenames-<target name>.txt` in the matches directory, which is
+  cleared as reports get through - so if the server can't be reached, they
+  go with the next report that is, and if the client stops first, with the
+  next range of that target it gets (`src/net/basename_outbox.h`). The
+  server keeps them whatever else it answers (a 409 included), so only a
+  report that gets no answer, or another error, leaves them waiting.
+
+The dictionary engine itself is unchanged by this: a range is a
+`DictionaryRequest` with an `endNumber`, without a basenames or progress
+file, and with `DictionarySearchHooks` (`src/engine/dictionary_search.h`)
+telling the coordinator loop each basename and how far it has got.
+
 ## Compiling
 
 Requires CMake (3.24 or later), the CUDA Toolkit (`nvcc`), a CUDA-capable
@@ -335,9 +377,21 @@ launch plan and hit checking the GPU backends share), `dictionary-search-*`
 (the dictionary self-test, then whole searches on each backend against brute
 force - also with one candidate in 256 a hit, and with few candidates and
 batches per call, stopped and resumed part way, the GPU kernels' thread
-blocks a few words each, room for a single hit and a one-bit suffix filter)
-and `dictionary-cli-*` (the program itself). The search is
-built in several configurations for this (different GPU window, launch
+blocks a few words each, room for a single hit and a one-bit suffix filter,
+and cut into ranges of numbers as a coordinator hands them out) and
+`dictionary-cli-*` (the program itself). The coordinator client's own parts
+have `protocol_test` (the JSON, an
+alphabet claim as older clients read it and a dictionary claim with its
+arrays), `basename_outbox_test` (the basenames waiting to be sent, also
+while one thread adds and another sends) and `word_lists_test` (a claim's
+word lists: compiled in, kept, downloaded and checked); and
+`coordinator-dictionary` (`tests/coordinator_dictionary_test.py`, when
+cargo and Python 3 are there) runs the real server, `../coordinator`, against
+the program in coordinator mode: quitting part way through a dictionary
+range, searching dictionary and alphabet targets to the end, and the server
+going away and coming back while basenames wait to be sent (with
+`namebreak_heartbeat_1s`, built to heartbeat every second). The search
+itself is built in several configurations for the tests (different GPU window, launch
 sizes and rows per thread, the stress tests' weaker match, a one-bit
 filter), each with its own
 compile of the CUDA backend - the build runs them in parallel.
@@ -379,7 +433,7 @@ backends' tests actually run there.
 | `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU; and the dictionary search, `runDictionarySearch()`, with its word lists |
 | `src/backends/` | What the search runs its batches on (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
-| `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `NAMEBREAK_NETWORK=OFF`) |
+| `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop, and a dictionary target's word lists and unsent basenames (left out by `NAMEBREAK_NETWORK=OFF`) |
 | `src/cli/` | The console program's `main()` |
 | `src/gui/win32/` | The Windows GUI (Windows only) |
 | `tests/` | Correctness tests and benchmarks (`ctest`, `run_search_bench`), and the mutation experiment (`mutation_test.py`, `run_mutation_test`) |

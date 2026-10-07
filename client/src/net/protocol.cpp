@@ -1,9 +1,10 @@
 // Minimal hand-rolled JSON encode/decode for exactly the flat request/
 // response shapes in protocol.h - no general-purpose JSON library, since the
 // whole wire surface this client needs is a handful of fixed, flat objects
-// (string/number/bool/null fields only, no nesting) - in keeping with the
-// rest of this codebase (hand-rolled MPQ hashing, alphabet indexing, etc.)
-// rather than pulling in an external dependency for this small a job.
+// (string/number/bool/null fields and arrays of strings only, no nesting) -
+// in keeping with the rest of this codebase (hand-rolled MPQ hashing,
+// alphabet indexing, etc.) rather than pulling in an external dependency for
+// this small a job.
 #include "net/protocol.h"
 
 #include <cctype>
@@ -39,11 +40,13 @@ std::string escapeJsonString(const std::string& s) {
 }
 
 // One value out of a flat JSON object - only the shapes this protocol's
-// responses actually use (string, number, true/false, null). No arrays or
-// nested objects: none of the structs in protocol.h need them.
+// responses actually use (string, number, true/false, null, and an array of
+// strings - a dictionary claim's word lists and separators). No nested
+// objects: none of the structs in protocol.h need them.
 struct JsonValue {
-    enum class Kind { String, Number, True, False, Null } kind = Kind::Null;
+    enum class Kind { String, Number, True, False, Null, Array } kind = Kind::Null;
     std::string text; // raw (already-unescaped) string, or the number's literal text
+    std::vector<std::string> items; // an array's strings
 
     bool isNull() const { return kind == Kind::Null; }
     bool asBool() const { return kind == Kind::True; }
@@ -158,6 +161,21 @@ private:
             out.kind = JsonValue::Kind::String;
             return parseString(out.text);
         }
+        if (consume('[')) {
+            out.kind = JsonValue::Kind::Array;
+            skipWs();
+            if (consume(']'))
+                return true;
+            while (true) {
+                skipWs();
+                std::string item;
+                if (!parseString(item)) return false; // only arrays of strings
+                out.items.push_back(std::move(item));
+                skipWs();
+                if (consume(',')) continue;
+                return consume(']');
+            }
+        }
         if (consumeLiteral("true"))  { out.kind = JsonValue::Kind::True;  return true; }
         if (consumeLiteral("false")) { out.kind = JsonValue::Kind::False; return true; }
         if (consumeLiteral("null"))  { out.kind = JsonValue::Kind::Null;  return true; }
@@ -170,7 +188,7 @@ private:
             out.text = s_.substr(start, i_ - start);
             return true;
         }
-        return false; // an object/array value - not needed by any struct here
+        return false; // an object value - not needed by any struct here
     }
 };
 
@@ -205,6 +223,77 @@ bool getOptionalInt64(const std::map<std::string, JsonValue>& obj, const std::st
     return obj.find(key) == obj.end() || getInt64(obj, key, out);
 }
 
+// Like getString, but a missing key (or null) leaves `out` untouched.
+bool getOptionalString(const std::map<std::string, JsonValue>& obj, const std::string& key, std::string& out) {
+    auto it = obj.find(key);
+    return it == obj.end() || it->second.isNull() || getString(obj, key, out);
+}
+
+// Like getOptionalString, into an optional: empty if missing or null.
+bool getOptionalString(const std::map<std::string, JsonValue>& obj, const std::string& key, std::optional<std::string>& out) {
+    out.reset();
+    auto it = obj.find(key);
+    if (it == obj.end() || it->second.isNull())
+        return true;
+    std::string value;
+    if (!getString(obj, key, value))
+        return false;
+    out = value;
+    return true;
+}
+
+// An array of strings - false if missing, or anything else.
+bool getStringArray(const std::map<std::string, JsonValue>& obj, const std::string& key, std::vector<std::string>& out) {
+    auto it = obj.find(key);
+    if (it == obj.end() || it->second.kind != JsonValue::Kind::Array) return false;
+    out = it->second.items;
+    return true;
+}
+
+// A dictionary claim's fields (see ClaimResponse::dictionary) - every one
+// of them needed once `dictionary` is true, none of them before.
+bool getDictionaryClaim(const std::map<std::string, JsonValue>& obj, ClaimResponse& out) {
+    if (!getOptionalBool(obj, "dictionary", out.dictionary)) return false;
+    if (!out.dictionary) return true;
+    return getStringArray(obj, "word_lists", out.wordLists) &&
+           getStringArray(obj, "word_list_checksums", out.wordListChecksums) &&
+           out.wordListChecksums.size() == out.wordLists.size() &&
+           getString(obj, "words_checksum", out.wordsChecksum) &&
+           getStringArray(obj, "separators", out.separators) &&
+           getInt64(obj, "min_words", out.minWords) &&
+           getInt64(obj, "max_words", out.maxWords) &&
+           getInt64(obj, "first_candidate_number", out.firstCandidateNumber) &&
+           getInt64(obj, "end_candidate_number", out.endCandidateNumber) &&
+           out.firstCandidateNumber >= 0 && out.endCandidateNumber >= out.firstCandidateNumber &&
+           getOptionalString(obj, "filename_lower_bound", out.filenameLowerBound) &&
+           getOptionalString(obj, "filename_upper_bound", out.filenameUpperBound) &&
+           getOptionalBool(obj, "send_basenames", out.sendBasenames) &&
+           getOptionalString(obj, "encryption_key_hex", out.encryptionKeyHex) &&
+           (!out.sendBasenames || !out.encryptionKeyHex.empty());
+}
+
+// A JSON array of `items`.
+std::string jsonStringArray(const std::vector<std::string>& items) {
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) out += ",";
+        out += escapeJsonString(items[i]);
+    }
+    return out + "]";
+}
+
+// The fields a heartbeat, quit and completion share beyond the first:
+// `next_candidate_number` if there is one, and `basenames` if any - left out
+// otherwise, so that a report is what it was before protocol 1.5.
+std::string progressAndBasenames(const std::optional<int64_t>& nextCandidateNumber, const std::vector<std::string>& basenames) {
+    std::string out;
+    if (nextCandidateNumber)
+        out += ",\"next_candidate_number\":" + std::to_string(*nextCandidateNumber);
+    if (!basenames.empty())
+        out += ",\"basenames\":" + jsonStringArray(basenames);
+    return out;
+}
+
 // An insertion, as `name`_text and `name`_position - nothing inserted if
 // the text is missing or empty.
 bool getOptionalInsertion(const std::map<std::string, JsonValue>& obj, const std::string& name, Insertion& out) {
@@ -230,6 +319,7 @@ std::string toJson(const RegisterRequest& req) {
 std::string toJson(const HeartbeatRequest& req) {
     std::string out = "{\"last_hash_a_match_filename\":";
     out += req.lastHashAMatchFilename ? escapeJsonString(*req.lastHashAMatchFilename) : "null";
+    out += progressAndBasenames(req.nextCandidateNumber, req.basenames);
     out += "}";
     return out;
 }
@@ -237,6 +327,7 @@ std::string toJson(const HeartbeatRequest& req) {
 std::string toJson(const QuitRequest& req) {
     std::string out = "{\"last_hash_a_match_filename\":";
     out += req.lastHashAMatchFilename ? escapeJsonString(*req.lastHashAMatchFilename) : "null";
+    out += progressAndBasenames(req.nextCandidateNumber, req.basenames);
     out += "}";
     return out;
 }
@@ -249,6 +340,7 @@ std::string toJson(const CompleteRequest& req) {
     out += req.filename ? escapeJsonString(*req.filename) : "null";
     out += ",\"elapsed_seconds\":" + std::to_string(req.elapsedSeconds);
     out += ",\"candidates_processed\":" + std::to_string(req.candidatesProcessed);
+    out += progressAndBasenames(std::nullopt, req.basenames);
     out += "}";
     return out;
 }
@@ -282,7 +374,8 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getString(obj, "upper_bound_filename", out.upperBoundFilename) &&
            getString(obj, "alphabet", out.alphabet) &&
            getInt64( obj, "candidate_count", out.candidateCount) &&
-           getInt64( obj, "lease_seconds", out.leaseSeconds);
+           getInt64( obj, "lease_seconds", out.leaseSeconds) &&
+           getDictionaryClaim(obj, out);
 }
 
 bool parseHeartbeatResponse(const std::string& body, HeartbeatResponse& out) {

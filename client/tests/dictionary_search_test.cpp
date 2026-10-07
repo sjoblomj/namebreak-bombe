@@ -192,7 +192,7 @@ static Expected expectedOf(const DictionaryRequest& req) {
     Expected e;
     const std::vector<std::string> all = allCandidates(req.pattern);
     e.total = all.size();
-    for (uint64_t n = req.startNumber; n < all.size(); ++n) {
+    for (uint64_t n = req.startNumber; n < std::min<uint64_t>(all.size(), req.endNumber); ++n) {
         const std::string filename = req.prefix + all[n] + req.suffix;
         if (!req.bounds.contains(filename))
             continue;
@@ -648,6 +648,112 @@ static void testStopAndResume(SearchBackend& backend) {
     }
 }
 
+// A search cut into consecutive ranges of numbers, as the coordinator hands
+// them out (each [startNumber, endNumber)), with every hook, and neither a
+// basenames nor a progress file: together, the ranges find what one search
+// of everything does, each searching only its own candidates; the progress
+// they report only grows, up to their end; and the basenames come through
+// onBasenameMatch alone.
+static void testRangesAndHooks(SearchBackend& backend) {
+    printf("--- ranges of numbers, with hooks ---\n");
+    std::mt19937 rng(20261008);
+    int mismatches = 0, rangesRun = 0, withBasenames = 0, found = 0;
+    for (int round = 0; round < 60; ++round) {
+        DictionaryRequest whole = randomRequest(rng, round);
+        whole.startNumber = 0;
+        whole.basenamesFilePath.clear();
+        whole.progressFilePath.clear();
+        const Expected e = expectedOf(whole);
+
+        // Cut points: 0, a few random ones, the end.
+        std::vector<uint64_t> cuts = {0, e.total};
+        for (int i = (int) (rng() % 5); i > 0; --i)
+            cuts.push_back(rng() % (e.total + 1));
+        std::sort(cuts.begin(), cuts.end());
+
+        std::vector<std::string> hits;
+        std::set<std::string> basenames;
+        uint64_t searched = 0;
+        std::string firstFound;
+        bool ok = true;
+        for (size_t i = 0; i + 1 < cuts.size() && firstFound.empty(); ++i) {
+            DictionaryRequest range = whole;
+            range.startNumber = cuts[i];
+            range.endNumber = cuts[i + 1];
+            const Expected inRange = expectedOf(range);
+            std::vector<uint64_t> progress;
+            std::vector<std::string> rangeHits, rangeBasenames;
+            DictionarySearchHooks hooks;
+            hooks.onPartialMatch = [&](const std::string& hit) { rangeHits.push_back(hit); };
+            hooks.onBasenameMatch = [&](const std::string& basename, const std::string& filename) {
+                rangeBasenames.push_back(basename);
+                ok = ok && basenameOf(filename) == basename;
+            };
+            hooks.onProgress = [&](uint64_t next) { progress.push_back(next); };
+            const DictionaryResult r = runDictionarySearch(backend, range, nullptr, hooks);
+            ++rangesRun;
+            ok = ok && r.ok && !r.aborted && r.found == !inRange.firstFound.empty();
+            if (r.found) {
+                ok = ok && r.filename == inRange.firstFound;
+                firstFound = r.filename;
+                ++found;
+            } else {
+                std::vector<std::string> got = rangeHits, want = inRange.hits;
+                std::sort(got.begin(), got.end());
+                std::sort(want.begin(), want.end());
+                ok = ok && got == want && r.candidatesSearched == inRange.searched && r.nextNumber == range.endNumber;
+                ok = ok && !progress.empty() && progress.back() == range.endNumber;
+                const std::set<std::string> rangeSet(rangeBasenames.begin(), rangeBasenames.end());
+                ok = ok && rangeSet.size() == rangeBasenames.size() && rangeSet == inRange.basenames && r.basenameHits == rangeSet.size();
+            }
+            ok = ok && std::is_sorted(progress.begin(), progress.end()) &&
+                 std::all_of(progress.begin(), progress.end(), [&](uint64_t n) { return n >= range.startNumber && n <= range.endNumber; });
+            hits.insert(hits.end(), rangeHits.begin(), rangeHits.end());
+            basenames.insert(rangeBasenames.begin(), rangeBasenames.end());
+            searched += r.candidatesSearched;
+        }
+        // Without files to write, there are none.
+        const std::string dir = std::filesystem::path(whole.outputFilePath).parent_path().string();
+        ok = ok && !std::filesystem::exists(dir + "/basenames.txt") && !std::filesystem::exists(dir + "/wordnumber.txt");
+        if (firstFound.empty()) {
+            ok = ok && e.firstFound.empty() && searched == e.searched && basenames == e.basenames;
+            std::sort(hits.begin(), hits.end());
+            std::vector<std::string> want = e.hits;
+            std::sort(want.begin(), want.end());
+            ok = ok && hits == want;
+            withBasenames += e.basenames.empty() ? 0 : 1;
+        } else {
+            ok = ok && firstFound == e.firstFound;
+        }
+        if (!ok && ++mismatches <= 5)
+            fprintf(stderr, "  round %d: %zu ranges over %llu candidates differ from brute force\n", round, cuts.size() - 1,
+                    (unsigned long long) e.total);
+    }
+    check(mismatches == 0, std::to_string(rangesRun) + " ranges of 60 random searches: as brute force (" + std::to_string(mismatches) + " differ)");
+    check(found >= 10, "... " + std::to_string(found) + " of the searches finding a planted match of both hashes");
+    check(withBasenames >= 10, "... " + std::to_string(withBasenames) + " of them reporting basenames");
+
+    // A range past the end is empty; one ending past it stops at it.
+    DictionaryRequest req = freshRequest("past-the-end");
+    req.pattern.words = {"A", "B"};
+    req.pattern.separators = {""};
+    req.pattern.maxWords = 2;
+    req.targetHashA = 1;
+    req.basenamesFilePath.clear();
+    req.progressFilePath.clear();
+    req.startNumber = 4;
+    req.endNumber = 100;
+    DictionaryResult r = run(backend, req);
+    check(r.ok && r.candidatesSearched == 2 && r.nextNumber == 6, "a range ending past the last candidate: to the last one");
+    req.startNumber = 7;
+    r = run(backend, req);
+    check(r.ok && r.candidatesSearched == 0 && r.nextNumber == 6, "a range past the end: nothing");
+    req.startNumber = 3;
+    req.endNumber = 3;
+    r = run(backend, req);
+    check(r.ok && r.candidatesSearched == 0 && r.nextNumber == 3, "an empty range: nothing");
+}
+
 int main(int argc, char* argv[]) {
     std::string backendName;
     for (int i = 1; i < argc; ++i) {
@@ -674,6 +780,7 @@ int main(int argc, char* argv[]) {
     testBasenamesFile(*backend);
     testEdges(*backend);
     testStopAndResume(*backend);
+    testRangesAndHooks(*backend);
 
     std::filesystem::remove_all(kDir);
     if (g_failures) {

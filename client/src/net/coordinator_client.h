@@ -47,7 +47,7 @@ public:
     // Conflict, `out`/`error` are unset - there's nothing more to read, the
     // caller already knows what happened.
     enum class HeartbeatOutcome { Ok, Conflict, Error };
-    HeartbeatOutcome heartbeat(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, HeartbeatResponse& out, std::string& error);
+    HeartbeatOutcome heartbeat(int64_t rangeId, const HeartbeatRequest& req, HeartbeatResponse& out, std::string& error);
 
     // Distinguishes a 409 (this range's ownership already moved on - e.g. a
     // network outage during heartbeating outlasted the lease and the server
@@ -63,7 +63,11 @@ public:
     // and how far it got (see QuitRequest). Conflict (409) means the range
     // wasn't ours any more anyway - see heartbeat().
     enum class QuitOutcome { Ok, Conflict, Error };
-    QuitOutcome quit(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, std::string& error);
+    QuitOutcome quit(int64_t rangeId, const QuitRequest& req, std::string& error);
+
+    // Downloads the stored word list `name` (GET /api/v1/word-lists/{name})
+    // into `text`, as the server has it.
+    bool downloadWordList(const std::string& name, std::string& text, std::string& error);
 
 private:
     std::string baseUrl_;

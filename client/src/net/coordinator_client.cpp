@@ -68,8 +68,7 @@ bool CoordinatorClient::claim(std::optional<ClaimResponse>& out, std::string& er
     return true;
 }
 
-CoordinatorClient::HeartbeatOutcome CoordinatorClient::heartbeat(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, HeartbeatResponse& out, std::string& error) {
-    HeartbeatRequest req{lastHashAMatchFilename};
+CoordinatorClient::HeartbeatOutcome CoordinatorClient::heartbeat(int64_t rangeId, const HeartbeatRequest& req, HeartbeatResponse& out, std::string& error) {
     std::string url = baseUrl_ + "/api/v1/ranges/" + std::to_string(rangeId) + "/heartbeat";
     HttpResponse resp = http_.post(url, {authHeader(token_)}, toJson(req));
     if (resp.status == 0) {
@@ -90,8 +89,7 @@ CoordinatorClient::HeartbeatOutcome CoordinatorClient::heartbeat(int64_t rangeId
     return HeartbeatOutcome::Ok;
 }
 
-CoordinatorClient::QuitOutcome CoordinatorClient::quit(int64_t rangeId, const std::optional<std::string>& lastHashAMatchFilename, std::string& error) {
-    QuitRequest req{lastHashAMatchFilename};
+CoordinatorClient::QuitOutcome CoordinatorClient::quit(int64_t rangeId, const QuitRequest& req, std::string& error) {
     std::string url = baseUrl_ + "/api/v1/ranges/" + std::to_string(rangeId) + "/quit";
     HttpResponse resp = http_.post(url, {authHeader(token_)}, toJson(req));
     if (resp.status == 0) {
@@ -123,4 +121,18 @@ CoordinatorClient::CompleteOutcome CoordinatorClient::complete(int64_t rangeId, 
         return (resp.status >= 500 || resp.status == 429) ? CompleteOutcome::TransientError : CompleteOutcome::Error;
     }
     return CompleteOutcome::Ok;
+}
+
+bool CoordinatorClient::downloadWordList(const std::string& name, std::string& text, std::string& error) {
+    HttpResponse resp = http_.get(baseUrl_ + "/api/v1/word-lists/" + name, {authHeader(token_)});
+    if (resp.status == 0) {
+        error = "request failed: " + resp.error;
+        return false;
+    }
+    if (!resp.ok()) {
+        error = "downloading word list " + name + " failed (HTTP " + std::to_string(resp.status) + "): " + parseErrorMessage(resp.body);
+        return false;
+    }
+    text = std::move(resp.body);
+    return true;
 }

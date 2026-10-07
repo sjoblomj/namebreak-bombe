@@ -1,9 +1,11 @@
 #ifndef NAMEBREAK_NET_PROTOCOL_H
 #define NAMEBREAK_NET_PROTOCOL_H
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "engine/candidate.h"
 
@@ -27,7 +29,14 @@
 // when it quits with a range in hand (see QuitRequest).
 // 1.4.0: ClaimResponse's min_backslash_count, prune_adjacent_backslashes,
 // and the text inserted into candidates (insert_from_start_text and so on).
-constexpr const char* kProtocolVersion = "1.4.0";
+// 1.5.0: dictionary targets (ClaimResponse::dictionary and the fields after
+// it), word lists downloaded from the server, progress reported by
+// candidate number, and the basenames sent with every report.
+constexpr const char* kProtocolVersion = "1.5.0";
+
+// The most basenames one heartbeat, quit or completion carries - the
+// server's MAX_BASENAMES_PER_REPORT. Any more wait for the next report.
+constexpr size_t kMaxBasenamesPerReport = 5000;
 
 struct RegisterRequest {
     std::string username;
@@ -86,6 +95,33 @@ struct ClaimResponse {
     std::string alphabet;
     int64_t candidateCount = 0;
     int64_t leaseSeconds = 0;
+
+    // A dictionary target's range (all optional in the response, and only
+    // ever in a dictionary target's claim): its candidates are made of the
+    // word lists' words (merged - normalized, sorted and without
+    // duplicates), with the separators between them, numbered
+    // [firstCandidateNumber, endCandidateNumber) as a dictionary search
+    // numbers them (engine/dictionary.h). The pruning rules, insertions and
+    // alphabet don't apply; lowerBoundFilename/upperBoundFilename are only
+    // the first and last candidates' filenames, for showing. A word list's
+    // copy here must have the checksum the server gives (wordListChecksum of
+    // its sorted words, wordlist.h), as must the merged words.
+    bool dictionary = false;
+    std::vector<std::string> wordLists;
+    std::vector<std::string> wordListChecksums;
+    std::string wordsChecksum;
+    std::vector<std::string> separators;
+    int64_t minWords = 0;
+    int64_t maxWords = 0;
+    int64_t firstCandidateNumber = 0;
+    int64_t endCandidateNumber = 0;
+    // The target's bounds, as whole filenames - absent for none.
+    std::optional<std::string> filenameLowerBound;
+    std::optional<std::string> filenameUpperBound;
+    // Compare every candidate's basename to encryptionKeyHex and send the
+    // ones that match (HeartbeatRequest::basenames).
+    bool sendBasenames = false;
+    std::string encryptionKeyHex;
 };
 
 struct HeartbeatRequest {
@@ -97,6 +133,14 @@ struct HeartbeatRequest {
     // paused client necessarily would, is what lets the server notice and
     // eventually release a stalled range (see HeartbeatResponse::rangeReleased).
     std::optional<std::string> lastHashAMatchFilename;
+    // A dictionary target's range's progress instead: every candidate
+    // numbered below this has been searched.
+    std::optional<int64_t> nextCandidateNumber;
+    // Basenames that matched the key since the last report that got an
+    // answer - at most kMaxBasenamesPerReport. The server keeps them
+    // whatever else it answers, a 409 included; only a report that gets no
+    // answer, or another error, needs to send them again.
+    std::vector<std::string> basenames;
 };
 
 struct HeartbeatResponse {
@@ -119,6 +163,9 @@ struct HeartbeatResponse {
 // the range's lease has expired.
 struct QuitRequest {
     std::optional<std::string> lastHashAMatchFilename;
+    // As HeartbeatRequest's.
+    std::optional<int64_t> nextCandidateNumber;
+    std::vector<std::string> basenames;
 };
 
 struct CompleteRequest {
@@ -126,6 +173,8 @@ struct CompleteRequest {
     std::optional<std::string> filename;
     double elapsedSeconds = 0;
     int64_t candidatesProcessed = 0;
+    // As HeartbeatRequest's.
+    std::vector<std::string> basenames;
 };
 
 std::string toJson(const RegisterRequest&  req);

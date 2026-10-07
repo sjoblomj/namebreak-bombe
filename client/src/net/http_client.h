@@ -40,6 +40,11 @@ public:
     // (see HttpResponse::effectiveUrl), as update_check.cpp needs.
     HttpResponse head(const std::string& url, long timeoutSeconds = kDefaultTimeoutSeconds);
 
+    // A GET of `url`'s body, with `headers` - for a word list, which can be
+    // megabytes, hence the longer default timeout.
+    static constexpr long kDownloadTimeoutSeconds = 300;
+    HttpResponse get(const std::string& url, const std::vector<std::string>& headers, long timeoutSeconds = kDownloadTimeoutSeconds);
+
 private:
     void* curl_; // CURL*, opaque here so this header doesn't need <curl/curl.h>
 };

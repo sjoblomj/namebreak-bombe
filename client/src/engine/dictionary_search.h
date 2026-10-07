@@ -60,8 +60,10 @@ struct DictionaryRequest {
     bool checkBasename = false;
     uint32_t basenameKey = 0;
     // The number of the first candidate to search - every one before it is
-    // taken as searched (see the progress file below).
+    // taken as searched (see the progress file below) - and of the first not
+    // to: a coordinator range is the candidates [startNumber, endNumber).
     uint64_t startNumber = 0;
+    uint64_t endNumber = UINT64_MAX;
     // Where the words came from, for the summary at the start - e.g.
     // "english-1 + words.txt".
     std::string wordSource;
@@ -69,10 +71,11 @@ struct DictionaryRequest {
     // SearchRequest::outputFilePath.
     std::string outputFilePath = "matches.txt";
     // Every basename that matched basenameKey, one per line, each once -
-    // appended to, never replaced.
+    // appended to, never replaced. Empty for none: a coordinator range's go
+    // to onBasenameMatch only (see runDictionarySearch).
     std::string basenamesFilePath = "basenames.txt";
     // The progress file - see writeDictionaryProgress. Written this often,
-    // whenever the search pauses, and when it ends.
+    // whenever the search pauses, and when it ends. Empty for none.
     std::string progressFilePath = "wordnumber.txt";
     std::chrono::milliseconds progressInterval{30000};
     // How often a line of progress is printed.
@@ -88,12 +91,27 @@ struct DictionaryResult {
     std::string filename;
     // True if abortRequested stopped the search.
     bool aborted = false;
-    // Every candidate numbered below this has been searched.
+    // Every candidate numbered below this has been searched - endNumber (or
+    // the number of candidates there are) once all of them have.
     uint64_t nextNumber = 0;
     // How many candidates were hashed (those the bounds skipped aren't).
     uint64_t candidatesSearched = 0;
     // How many basename matches were found (each basename counted once).
     uint64_t basenameHits = 0;
+};
+
+// What a dictionary search tells its caller as it goes - each optional, and
+// each called on the thread running the search.
+struct DictionarySearchHooks {
+    // With every hashA match's filename.
+    std::function<void(const std::string& filename)> onPartialMatch;
+    // With every basename that matched the key, the first time it does in
+    // this search - and the filename it matched in.
+    std::function<void(const std::string& basename, const std::string& filename)> onBasenameMatch;
+    // After every call to the backend, and at the end, with the search's
+    // DictionaryResult::nextNumber so far: every candidate numbered below it
+    // has been searched.
+    std::function<void(uint64_t nextNumber)> onProgress;
 };
 
 // Runs a dictionary search on `backend`, which must supportsDictionary(). The
@@ -103,20 +121,23 @@ struct DictionaryResult {
 DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryRequest& req, std::atomic<bool>* abortRequested = nullptr,
                                      std::function<void(const std::string&)> onPartialMatch = nullptr,
                                      const std::atomic<bool>* pauseRequested = nullptr);
+// The same, with every hook.
+DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryRequest& req, std::atomic<bool>* abortRequested,
+                                     const DictionarySearchHooks& hooks, const std::atomic<bool>* pauseRequested = nullptr);
 
-// How many of `space`'s candidates numbered `startNumber` or later have a
-// filename (prefix + candidate + suffix) within `bounds` - what a search from
-// there hashes.
+// How many of `space`'s candidates numbered from `startNumber` up to (not
+// including) `endNumber` have a filename (prefix + candidate + suffix) within
+// `bounds` - what a search of them hashes.
 uint64_t countDictionaryCandidates(const DictionarySpace& space, const std::string& prefix, const std::string& suffix,
-                                   const FilenameBounds& bounds, uint64_t startNumber);
+                                   const FilenameBounds& bounds, uint64_t startNumber, uint64_t endNumber = UINT64_MAX);
 
 // `seconds` for a human: "6s", "4m05s", "1h02m03s", "2d03h04m" - or "?" if
 // it's negative or absurdly long.
 std::string formatDuration(double seconds);
 
 // Identifies everything that decides which candidates a search checks and
-// what it looks for - every field of `req` but the start, the file paths and
-// the intervals. A search may only be resumed from a progress file written
+// what it looks for - every field of `req` but the start and end, the file
+// paths and the intervals. A search may only be resumed from a progress file written
 // by one with the same fingerprint. 16 hex digits.
 std::string dictionaryFingerprint(const DictionaryRequest& req);
 

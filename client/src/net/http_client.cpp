@@ -71,6 +71,40 @@ HttpResponse HttpClient::post(const std::string& url, const std::vector<std::str
     return resp;
 }
 
+HttpResponse HttpClient::get(const std::string& url, const std::vector<std::string>& headers, long timeoutSeconds) {
+    HttpResponse resp;
+    auto* curl = static_cast<CURL*>(curl_);
+    if (!curl) {
+        resp.error = "failed to initialize libcurl";
+        return resp;
+    }
+
+    curl_slist* headerList = nullptr;
+    for (const auto& h : headers) headerList = curl_slist_append(headerList, h.c_str());
+
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L); // see post()
+    CURLcode rc = curl_easy_perform(curl);
+    curl_slist_free_all(headerList);
+
+    if (rc != CURLE_OK) {
+        resp.error = curl_easy_strerror(rc);
+        return resp;
+    }
+
+    long httpStatus = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpStatus);
+    resp.status = httpStatus;
+    return resp;
+}
+
 HttpResponse HttpClient::head(const std::string& url, long timeoutSeconds) {
     HttpResponse resp;
     auto* curl = static_cast<CURL*>(curl_);

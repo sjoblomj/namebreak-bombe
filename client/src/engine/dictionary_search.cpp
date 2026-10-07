@@ -79,18 +79,18 @@ struct Leaf {
     uint32_t wordCount;
 };
 
-// Walks a dictionary search's candidates from a start number, in number
-// order, as the runs of them within the bounds: depth first, one level per
-// word and the separator after it, down to the last word. A leading part the
-// bounds put wholly outside is skipped, and one they put wholly inside
-// isn't compared again below it. Without onLeaf, it only counts the
-// candidates (and doesn't descend into a part wholly inside at all); without
-// a crypt table, it doesn't hash.
+// Walks a dictionary search's candidates from a start number up to (not
+// including) an end number, in number order, as the runs of them within the
+// bounds: depth first, one level per word and the separator after it, down
+// to the last word. A leading part the bounds put wholly outside is skipped,
+// and one they put wholly inside isn't compared again below it. Without
+// onLeaf, it only counts the candidates (and doesn't descend into a part
+// wholly inside at all); without a crypt table, it doesn't hash.
 class Walker {
 public:
     Walker(const DictionarySpace& space, const std::string& prefix, const std::string& suffix, const FilenameBounds& bounds,
-           uint64_t start, const uint32_t* cryptTable, std::function<bool(const Leaf&)> onLeaf)
-        : space_(space), prefix_(prefix), suffix_(suffix), bounds_(bounds), start_(start), cryptTable_(cryptTable),
+           uint64_t start, uint64_t end, const uint32_t* cryptTable, std::function<bool(const Leaf&)> onLeaf)
+        : space_(space), prefix_(prefix), suffix_(suffix), bounds_(bounds), start_(start), end_(end), cryptTable_(cryptTable),
           onLeaf_(std::move(onLeaf)) {}
 
     // False if onLeaf stopped the walk.
@@ -103,7 +103,7 @@ public:
             hashA = continueHash(hashA, prefix_, kHashAOffset, cryptTable_);
             basename = continueBasenameHash(basename, prefix_, cryptTable_);
         }
-        for (int k = space_.minWords(); k <= space_.maxWords(); ++k) {
+        for (int k = space_.minWords(); k <= space_.maxWords() && space_.blockStart(k) < end_; ++k) {
             if (!visit(space_.blockStart(k), space_.blockSize(k), k - 1, prefix_, hashA, basename,
                        verdict == FilenameBounds::Verdict::Inside))
                 return false;
@@ -119,10 +119,10 @@ private:
     // `pairsLeft` more words and separators, and the last word.
     bool visit(uint64_t nodeStart, uint64_t nodeSize, int pairsLeft, const std::string& text, HashState hashA, HashState basename,
                bool inside) {
-        if (nodeStart + nodeSize <= start_)
+        if (nodeStart + nodeSize <= start_ || nodeStart >= end_)
             return true;
         if (!onLeaf_ && inside) {
-            counted_ += nodeStart + nodeSize - std::max(nodeStart, start_);
+            counted_ += std::min(nodeStart + nodeSize, end_) - std::max(nodeStart, start_);
             return true;
         }
         if (pairsLeft == 0)
@@ -134,7 +134,7 @@ private:
         const uint64_t childSize = nodeSize / pairs;
         // A child is a word and the separator after it - the separator
         // turning faster.
-        for (uint64_t c = start_ > nodeStart ? (start_ - nodeStart) / childSize : 0; c < pairs; ++c) {
+        for (uint64_t c = start_ > nodeStart ? (start_ - nodeStart) / childSize : 0; c < pairs && nodeStart + c * childSize < end_; ++c) {
             const std::string& word = words[c / separators.size()];
             const std::string& separator = separators[c % separators.size()];
             const std::string childText = text + word + separator;
@@ -162,13 +162,14 @@ private:
         const std::vector<std::string>& words = space_.words();
         const uint32_t wordCount = (uint32_t) words.size();
         const uint32_t first = start_ > nodeStart ? (uint32_t) (start_ - nodeStart) : 0;
+        const uint32_t last = end_ - nodeStart < wordCount ? (uint32_t) (end_ - nodeStart) : wordCount; // exclusive
         if (inside)
-            return emit(nodeStart, leading, hashA, basename, first, wordCount - first);
+            return emit(nodeStart, leading, hashA, basename, first, last - first);
         // Cut through by a bound: each candidate is compared, and every run
         // of them within the bounds handed on.
         uint32_t runStart = first;
-        for (uint32_t i = first; i <= wordCount; ++i) {
-            const bool within = i < wordCount && bounds_.contains(leading + words[i] + suffix_);
+        for (uint32_t i = first; i <= last; ++i) {
+            const bool within = i < last && bounds_.contains(leading + words[i] + suffix_);
             if (within)
                 continue;
             if (i > runStart && !emit(nodeStart, leading, hashA, basename, runStart, i - runStart))
@@ -193,13 +194,15 @@ private:
     const std::string& suffix_;
     const FilenameBounds& bounds_;
     uint64_t start_;
+    uint64_t end_;
     const uint32_t* cryptTable_;
     std::function<bool(const Leaf&)> onLeaf_;
     uint64_t counted_ = 0;
 };
 
 // Keeps the basenames file: every basename that matched, once each - those
-// already in the file from an earlier search included.
+// already in the file from an earlier search included. Without a file (an
+// empty path), only remembers which it has had.
 class BasenameWriter {
 public:
     ~BasenameWriter() {
@@ -209,6 +212,8 @@ public:
 
     bool open(const std::string& path, std::string& error) {
         path_ = path;
+        if (path.empty())
+            return true;
         std::filesystem::path dir = std::filesystem::path(path).parent_path();
         if (!dir.empty()) {
             std::error_code ec;
@@ -238,7 +243,7 @@ public:
     bool add(const std::string& basename) {
         if (!seen_.insert(basename).second)
             return false;
-        if (fprintf(file_, "%s\n", basename.c_str()) < 0 || fflush(file_) != 0)
+        if (file_ && (fprintf(file_, "%s\n", basename.c_str()) < 0 || fflush(file_) != 0))
             fprintf(stderr, "ERROR: cannot record the basename %s in %s: %s\n", basename.c_str(), path_.c_str(), strerror(errno));
         return true;
     }
@@ -284,8 +289,8 @@ std::string formatDuration(double seconds) {
 }
 
 uint64_t countDictionaryCandidates(const DictionarySpace& space, const std::string& prefix, const std::string& suffix,
-                                   const FilenameBounds& bounds, uint64_t startNumber) {
-    Walker walker(space, prefix, suffix, bounds, startNumber, nullptr, nullptr);
+                                   const FilenameBounds& bounds, uint64_t startNumber, uint64_t endNumber) {
+    Walker walker(space, prefix, suffix, bounds, startNumber, endNumber, nullptr, nullptr);
     walker.run();
     return walker.counted();
 }
@@ -367,6 +372,13 @@ bool readDictionaryProgress(const std::string& path, DictionaryProgress& out, bo
 
 DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryRequest& req, std::atomic<bool>* abortRequested,
                                      std::function<void(const std::string&)> onPartialMatch, const std::atomic<bool>* pauseRequested) {
+    DictionarySearchHooks hooks;
+    hooks.onPartialMatch = std::move(onPartialMatch);
+    return runDictionarySearch(backend, req, abortRequested, hooks, pauseRequested);
+}
+
+DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryRequest& req, std::atomic<bool>* abortRequested,
+                                     const DictionarySearchHooks& hooks, const std::atomic<bool>* pauseRequested) {
     DictionaryResult result;
     auto fail = [&](const std::string& error) {
         result.ok = false;
@@ -391,8 +403,9 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     prepareCryptTable(cryptTable);
 
     const std::string fingerprint = dictionaryFingerprint(req);
-    const uint64_t start = std::min(req.startNumber, space.size());
-    const uint64_t toSearch = countDictionaryCandidates(space, req.prefix, req.suffix, req.bounds, start);
+    const uint64_t end = std::min(req.endNumber, space.size());
+    const uint64_t start = std::min(req.startNumber, end);
+    const uint64_t toSearch = countDictionaryCandidates(space, req.prefix, req.suffix, req.bounds, start, end);
 
     auto describeNumber = [&](uint64_t number) {
         return number < space.size() ? "'" + space.textOf(number) + "'" : std::string("(the end)");
@@ -412,14 +425,19 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
     if (req.checkBasename) {
-        printf("basename key: '%X' - matching basenames go to %s\n", req.basenameKey, req.basenamesFilePath.c_str());
+        printf("basename key: '%X' - matching basenames go to %s\n", req.basenameKey,
+               req.basenamesFilePath.empty() ? "the coordinator" : req.basenamesFilePath.c_str());
         printf("basename matches expected by chance: %.3g (one per 4,294,967,296 candidates)\n", (double) toSearch / 4294967296.0);
     }
     printf("candidates: %llu in all, numbered 0 to %llu\n", (unsigned long long) space.size(),
            (unsigned long long) (space.size() - 1));
+    if (end < space.size())
+        printf("searching numbers %llu to %llu %s\n", (unsigned long long) start, (unsigned long long) (end - (end > start)),
+               describeNumber(end - (end > start)).c_str());
     printf("starting at number %llu %s - %llu candidates to search within the bounds\n", (unsigned long long) start,
            describeNumber(start).c_str(), (unsigned long long) toSearch);
-    printf("progress file: %s\n", req.progressFilePath.c_str());
+    if (!req.progressFilePath.empty())
+        printf("progress file: %s\n", req.progressFilePath.c_str());
     fflush(stdout);
 
     DictionaryConstants constants;
@@ -437,6 +455,8 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     auto lastProgress = startTime, lastStatus = startTime;
     bool progressWarned = false;
     auto saveProgress = [&]() {
+        if (req.progressFilePath.empty())
+            return;
         std::string writeError;
         if (writeDictionaryProgress(req.progressFilePath, {fingerprint, result.nextNumber}, space.size(),
                                     result.nextNumber < space.size() ? space.textOf(result.nextNumber) : "", writeError)) {
@@ -476,7 +496,8 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
         }
         if (pauseRequested && pauseRequested->load(std::memory_order_relaxed)) {
             saveProgress();
-            printf("[paused] progress saved to %s\n", req.progressFilePath.c_str());
+            if (!req.progressFilePath.empty())
+                printf("[paused] progress saved to %s\n", req.progressFilePath.c_str());
             fflush(stdout);
             while (pauseRequested->load(std::memory_order_relaxed)) {
                 if (abortRequested && abortRequested->load(std::memory_order_relaxed)) {
@@ -495,16 +516,20 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
 
         for (const std::string& hit : outcome.hits) {
             printf("%s\n", hit.c_str());
-            if (onPartialMatch)
-                onPartialMatch(hit);
+            if (hooks.onPartialMatch)
+                hooks.onPartialMatch(hit);
         }
         for (const std::string& hit : outcome.basenameHits) {
             const std::string basename = basenameOf(hit);
             if (basenames.add(basename)) {
                 ++result.basenameHits;
                 printf("BASENAME MATCH: %s (in %s)\n", basename.c_str(), hit.c_str());
+                if (hooks.onBasenameMatch)
+                    hooks.onBasenameMatch(basename, hit);
             }
         }
+        if (hooks.onProgress)
+            hooks.onProgress(result.nextNumber);
         if (outcome.found) {
             matches.found(outcome.foundFilename);
             printf("%s\n", outcome.foundFilename.c_str());
@@ -525,7 +550,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
         return true;
     };
 
-    Walker walker(space, req.prefix, req.suffix, req.bounds, start, cryptTable, [&](const Leaf& leaf) {
+    Walker walker(space, req.prefix, req.suffix, req.bounds, start, end, cryptTable, [&](const Leaf& leaf) {
         uint32_t done = 0;
         while (done < leaf.wordCount) {
             const uint32_t take = (uint32_t) std::min<uint64_t>(leaf.wordCount - done, perCall - pendingCount);
@@ -549,7 +574,9 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     if (walker.run() && searchPending()) {
         // Every candidate searched - and those after the last one within the
         // bounds count as searched too.
-        result.nextNumber = space.size();
+        result.nextNumber = end;
+        if (hooks.onProgress)
+            hooks.onProgress(result.nextNumber);
     }
     backend.endDictionarySearch();
     matches.flush();
