@@ -1,0 +1,5 @@
+# The words of the dictionary-cli tests (see CMakeLists.txt).
+crdt
+lst
+map
+zerg

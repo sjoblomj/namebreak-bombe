@@ -12,15 +12,23 @@
 // appends a match of both hashes to found.txt beside them): all of them live
 // in one directory (config.conf's `matches_dir`, default kDefaultMatchesDir,
 // relative to the current working directory unless absolute), created on
-// first use. A local search writes matches.txt there; each coordinator
-// target gets its own matches-<target name>.txt, so concurrent/successive
-// targets don't clobber each other's matches.
+// first use. A local search writes matches.txt there, or
+// matches-<matches_name>.txt with a `matches_name`; each coordinator target
+// gets its own matches-<target name>.txt, so concurrent/successive targets
+// don't clobber each other's matches.
 
 inline constexpr const char* kDefaultMatchesDir = "matches";
 
 // The matches file for `targetName` (a coordinator target's name) in
 // `matchesDir` - or, if `targetName` is empty, the local search's.
 std::string matchesFilePath(const std::string& matchesDir, const std::string& targetName);
+
+// `<base>.txt` in `matchesDir` - or, with a `searchName`, `<base>-<searchName>.txt`,
+// with every character of the name but alnum, '.', '-' and '_' made '_' so
+// that it can't name another directory. matchesFilePath is
+// namedFilePath(matchesDir, "matches", targetName); a local search's
+// `matches_name` names its files this way.
+std::string namedFilePath(const std::string& matchesDir, const std::string& base, const std::string& searchName);
 
 // Reads up to the last `maxLines` lines of `path` (oldest first, without
 // their "\n" or "\r\n") - empty if it doesn't exist (yet). Reads only the end

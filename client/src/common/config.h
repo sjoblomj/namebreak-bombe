@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/matches_file.h"
+#include "engine/dictionary_search.h"
 #include "engine/search.h"
 
 // Where namebreak reads its config from absent a --config <file> argument -
@@ -21,12 +22,13 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 
 // namebreak's on-disk config.conf - read from "./config.conf" (the current
 // working directory) unless overridden via --config <file>. A flat key=value
-// file with exactly two possible [section] headers:
+// file with three possible [section] headers:
 //   [search]      - bounded/continuous parameters (mode picks which of the
 //                   two actually runs; both take the same parameters)
 //   [coordinator] - coordinator-mode parameters (see coordinator_runner.h)
+//   [dictionary]  - dictionary-mode parameters (see buildDictionaryRequest)
 // plus four keys allowed before any section: `mode = continuous|bounded|
-// coordinator` (overridable by passing --mode <mode> - see main()),
+// coordinator|dictionary` (overridable by passing --mode <mode> - see main()),
 // `matches_dir = <directory>` (optional - see matches_file.h),
 // `backend = <name>` (optional, overridable by --backend <name> - see
 // backends/backends.h; unset, the first one that can run here), and
@@ -42,6 +44,11 @@ struct ConfigFile {
     bool checkForUpdates = true;
     std::map<std::string, std::string> search;
     std::map<std::string, std::string> coordinator;
+    // Unlike the other sections, its values are as written - not unquoted -
+    // since a list value like `separators = "", "_"` quotes each item, and
+    // so starts and ends with a '"' of its own. buildDictionaryRequest
+    // unquotes the values that aren't lists.
+    std::map<std::string, std::string> dictionary;
 };
 
 // Returns false with a human-readable `error` (including path:line) on any
@@ -53,6 +60,34 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
 // Returns false with `error` set if a required key is missing or a value
 // doesn't parse.
 bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest& out, std::string& error);
+
+// Builds a DictionaryRequest from `config`'s [dictionary] section (and
+// matches_dir), reading its word lists - any line one of them skips is
+// described in `warnings`. Returns false with `error` set if a required key
+// is missing, a value doesn't parse, a word list can't be read, or - with
+// resume_from_last_candidate - the progress file is from a different search.
+//
+// Keys (see README.md's "Dictionary mode"):
+//   builtin_dictionary  english-1 (the default) or none
+//   dictionaries        more word lists, a list of file paths
+//   min_words           default 1
+//   max_words           required
+//   separators          a list, default "" (words written together)
+//   prefix, suffix      required
+//   lower_bound, upper_bound   whole filenames, optional
+//   hash_a, hash_b      required
+//   encryption_key      optional, the raw key: hash type 3 of the basename
+//   record_basenames    default true with an encryption_key, else false
+//   matches_name        names the files: matches-<name>.txt, ...
+//   resume_from_last_candidate   default false
+// A list is items separated by commas, each either "quoted" - kept as it
+// is, spaces and commas included - or not, and then trimmed.
+bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, std::vector<std::string>& warnings, std::string& error);
+
+// Reads a list value as described above buildDictionaryRequest. False, with
+// `error` set, on an empty unquoted item, an unterminated quote, or text
+// after a quoted item before the next comma. An empty value is no items.
+bool parseConfigList(const std::string& value, std::vector<std::string>& out, std::string& error);
 
 // Inserts `key = value` right after `[sectionName]`'s header line in the
 // file at `path`, leaving every other line untouched - used to persist an

@@ -1,5 +1,6 @@
 #include "common/config.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <fstream>
@@ -8,6 +9,7 @@
 
 #include "common/string_util.h"
 #include "engine/candidate.h"
+#include "engine/wordlist.h"
 
 namespace {
 
@@ -218,8 +220,11 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 currentSection = &out.search;
             } else if (name == "coordinator") {
                 currentSection = &out.coordinator;
+            } else if (name == "dictionary") {
+                currentSection = &out.dictionary;
             } else {
-                error = path + ":" + std::to_string(lineNo) + ": unknown section [" + name + "] (expected [search] or [coordinator])";
+                error = path + ":" + std::to_string(lineNo) + ": unknown section [" + name +
+                        "] (expected [search], [coordinator] or [dictionary])";
                 return false;
             }
             continue;
@@ -231,7 +236,8 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
             return false;
         }
         std::string key = trim(trimmed.substr(0, eq));
-        std::string value = unquote(trim(trimmed.substr(eq + 1)));
+        std::string rawValue = trim(trimmed.substr(eq + 1));
+        std::string value = unquote(rawValue);
         if (key.empty()) {
             error = path + ":" + std::to_string(lineNo) + ": empty key";
             return false;
@@ -252,12 +258,12 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 out.checkForUpdates = value == "true";
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search] or [coordinator] section (only 'mode', 'matches_dir', 'backend' and "
-                        "'check_for_updates' are allowed before any section)";
+                        "' must be inside a [search], [coordinator] or [dictionary] section (only 'mode', 'matches_dir', 'backend' "
+                        "and 'check_for_updates' are allowed before any section)";
                 return false;
             }
         } else {
-            (*currentSection)[key] = value;
+            (*currentSection)[key] = currentSection == &out.dictionary ? rawValue : value;
         }
     }
     return true;
@@ -284,6 +290,7 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     std::string insertFromStartStr = r.getOptional("insert_from_start", "");
     std::string insertFromEndStr = r.getOptional("insert_from_end", "");
     std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
+    std::string matchesName = r.getOptional("matches_name", "");
 
     std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
@@ -346,7 +353,7 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     out.lowerBound = removePrefixAndSuffix(lowerFilename, prefix, suffix);
     out.upperBound = removePrefixAndSuffix(upperFilename, prefix, suffix);
     out.continuous = continuous;
-    out.outputFilePath = matchesFilePath(config.matchesDir, "");
+    out.outputFilePath = namedFilePath(config.matchesDir, "matches", matchesName);
 
     // Without a start_candidate, from the beginning: the shortest candidates
     // in continuous mode (an empty start candidate, see SearchRequest), the
@@ -365,6 +372,186 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
             printf("Resuming from the last match in %s: %s%s%s\n", out.outputFilePath.c_str(), prefix.c_str(),
                    insertIntoCandidate(lastMatch, out.insertFromStart, out.insertFromEnd).c_str(), suffix.c_str());
             out.startCandidate = lastMatch;
+        }
+    }
+    return true;
+}
+
+bool parseConfigList(const std::string& value, std::vector<std::string>& out, std::string& error) {
+    out.clear();
+    if (trim(value).empty())
+        return true;
+    size_t i = 0;
+    for (;;) {
+        // One item: up to the next comma, or a quoted one.
+        while (i < value.size() && (value[i] == ' ' || value[i] == '\t'))
+            ++i;
+        if (i < value.size() && value[i] == '"') {
+            const size_t close = value.find('"', i + 1);
+            if (close == std::string::npos) {
+                error = "unterminated quote in '" + value + "'";
+                return false;
+            }
+            out.push_back(value.substr(i + 1, close - i - 1));
+            i = close + 1;
+            while (i < value.size() && (value[i] == ' ' || value[i] == '\t'))
+                ++i;
+            if (i < value.size() && value[i] != ',') {
+                error = "expected a comma after the quoted item \"" + out.back() + "\" in '" + value + "'";
+                return false;
+            }
+        } else {
+            const size_t comma = std::min(value.find(',', i), value.size());
+            const std::string item = trim(value.substr(i, comma - i));
+            if (item.empty()) {
+                error = "empty item in '" + value + "' - quote it (\"\") if it's meant to be empty";
+                return false;
+            }
+            out.push_back(item);
+            i = comma;
+        }
+        if (i >= value.size())
+            return true;
+        ++i; // the comma
+    }
+}
+
+bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, std::vector<std::string>& warnings, std::string& error) {
+    out = DictionaryRequest();
+    ConfigSectionReader r(config.dictionary);
+    std::string maxWordsStr, prefix, suffix, hashAHex, hashBHex;
+    std::string builtin = unquote(r.getOptional("builtin_dictionary", kEnglish1));
+    std::string dictionariesStr = r.getOptional("dictionaries", "");
+    std::string minWordsStr = unquote(r.getOptional("min_words", "1"));
+    if (!r.getRequired("max_words", maxWordsStr, error)) return false;
+    std::string separatorsStr = r.getOptional("separators", "\"\"");
+    if (!r.getRequired("prefix", prefix, error)) return false;
+    if (!r.getRequired("suffix", suffix, error)) return false;
+    const bool hasLower = config.dictionary.count("lower_bound") > 0, hasUpper = config.dictionary.count("upper_bound") > 0;
+    std::string lowerStr = unquote(r.getOptional("lower_bound", ""));
+    std::string upperStr = unquote(r.getOptional("upper_bound", ""));
+    if (!r.getRequired("hash_a", hashAHex, error)) return false;
+    if (!r.getRequired("hash_b", hashBHex, error)) return false;
+    std::string keyHex = unquote(r.getOptional("encryption_key", ""));
+    std::string recordStr = unquote(r.getOptional("record_basenames", ""));
+    std::string matchesName = unquote(r.getOptional("matches_name", ""));
+    std::string resumeStr = unquote(r.getOptional("resume_from_last_candidate", "false"));
+
+    std::string unknown = r.firstUnknownKey();
+    if (!unknown.empty()) {
+        error = "unknown key '" + unknown + "' in [dictionary] section";
+        return false;
+    }
+    maxWordsStr = unquote(maxWordsStr);
+    prefix = unquote(prefix);
+    suffix = unquote(suffix);
+    hashAHex = unquote(hashAHex);
+    hashBHex = unquote(hashBHex);
+
+    auto parseCount = [&](const std::string& key, const std::string& value, int& count) {
+        if (value.empty() || value.size() > 3 || value.find_first_not_of("0123456789") != std::string::npos) {
+            error = "invalid " + key + ": '" + value + "' (expected a number)";
+            return false;
+        }
+        count = std::stoi(value);
+        return true;
+    };
+    if (!parseCount("min_words", minWordsStr, out.pattern.minWords) || !parseCount("max_words", maxWordsStr, out.pattern.maxWords))
+        return false;
+    if (!hexToU32(hashAHex, out.targetHashA)) {
+        error = "invalid hash_a: " + hashAHex;
+        return false;
+    }
+    if (!hexToU32(hashBHex, out.targetHashB)) {
+        error = "invalid hash_b: " + hashBHex;
+        return false;
+    }
+    const bool hasKey = !keyHex.empty();
+    if (hasKey && !hexToU32(keyHex, out.basenameKey)) {
+        error = "invalid encryption_key: " + keyHex;
+        return false;
+    }
+    out.checkBasename = hasKey;
+    if (!recordStr.empty() && !parseBool(recordStr, out.checkBasename)) {
+        error = "invalid record_basenames: '" + recordStr + "' (expected true/false)";
+        return false;
+    }
+    if (out.checkBasename && !hasKey) {
+        error = "record_basenames needs an encryption_key to compare the basenames to";
+        return false;
+    }
+    bool resume = false;
+    if (!parseBool(resumeStr, resume)) {
+        error = "invalid resume_from_last_candidate: '" + resumeStr + "' (expected true/false)";
+        return false;
+    }
+
+    std::vector<std::string> separators, dictionaries;
+    if (!parseConfigList(separatorsStr, separators, error)) {
+        error = "invalid separators: " + error;
+        return false;
+    }
+    if (!parseConfigList(dictionariesStr, dictionaries, error)) {
+        error = "invalid dictionaries: " + error;
+        return false;
+    }
+    for (std::string& separator : separators)
+        out.pattern.separators.push_back(normalizeMpqName(separator));
+
+    // The words: the built-in dictionary's and every list's, together.
+    std::vector<std::string> words;
+    if (builtin != "none") {
+        if (!isBuiltinWordList(builtin)) {
+            error = "unknown builtin_dictionary '" + builtin + "' (expected " + kEnglish1 + " or none)";
+            return false;
+        }
+        words = builtinWordList(builtin);
+        out.wordSource = builtin;
+    }
+    for (const std::string& path : dictionaries) {
+        if (!loadWordListFile(path, words, warnings, error))
+            return false;
+        out.wordSource += (out.wordSource.empty() ? "" : " + ") + path;
+    }
+    out.pattern.words = sortedUniqueWords(std::move(words));
+    if (out.pattern.words.empty()) {
+        error = "no words to search - builtin_dictionary is none, and the dictionaries have none";
+        return false;
+    }
+    DictionarySpace space;
+    if (!DictionarySpace::create(out.pattern, space, error))
+        return false;
+
+    out.prefix = normalizeMpqName(prefix);
+    out.suffix = normalizeMpqName(suffix);
+    out.bounds.hasLower = hasLower;
+    out.bounds.lower = normalizeMpqName(lowerStr);
+    out.bounds.hasUpper = hasUpper;
+    out.bounds.upper = normalizeMpqName(upperStr);
+    if (hasLower && hasUpper && out.bounds.upper < out.bounds.lower) {
+        error = "lower_bound '" + lowerStr + "' sorts after upper_bound '" + upperStr + "'";
+        return false;
+    }
+
+    out.outputFilePath = namedFilePath(config.matchesDir, "matches", matchesName);
+    out.basenamesFilePath = namedFilePath(config.matchesDir, "basenames", matchesName);
+    out.progressFilePath = namedFilePath(config.matchesDir, "wordnumber", matchesName);
+
+    if (resume) {
+        DictionaryProgress progress;
+        bool exists = false;
+        if (!readDictionaryProgress(out.progressFilePath, progress, exists, error))
+            return false;
+        if (!exists) {
+            printf("resume_from_last_candidate: no progress file %s yet - starting from the beginning\n", out.progressFilePath.c_str());
+        } else if (progress.fingerprint != dictionaryFingerprint(out)) {
+            error = "resume_from_last_candidate: " + out.progressFilePath +
+                    " is from a search with different settings (words, separators, word counts, prefix, suffix, bounds, hashes or "
+                    "encryption key) - remove it, or set resume_from_last_candidate = false, to start this one from the beginning";
+            return false;
+        } else {
+            out.startNumber = progress.next;
+            printf("Resuming from number %llu, from %s\n", (unsigned long long) progress.next, out.progressFilePath.c_str());
         }
     }
     return true;

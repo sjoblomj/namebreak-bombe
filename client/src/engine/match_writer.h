@@ -56,6 +56,12 @@ private:
     bool warned_ = false;
 };
 
+// Replaces what `path` holds with `contents`: written to a file next to it,
+// which is then renamed over it - so a reader (the GUI, once a second) gets
+// what it held before or `contents`, never part of either. False, with
+// `error` set, if it can't be written.
+bool replaceFileContents(const std::string& path, const std::string& contents, std::string& error);
+
 // The file a search whose matches file is `matchesPath` appends its
 // both-hashes matches to: found.txt, in the same directory.
 std::string foundFilePath(const std::string& matchesPath);

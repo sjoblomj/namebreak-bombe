@@ -37,6 +37,18 @@ public:
 
     void endSearch() override {}
 
+    // A dictionary search, hashing every candidate's whole filename from
+    // scratch - none of the batches' hash states - so it shares nothing
+    // with the engine but the words.
+    bool supportsDictionary() const override { return true; }
+    uint64_t dictionaryCandidatesPerCall() const override { return 1u << 20; }
+    void beginDictionarySearch(const DictionaryConstants& constants) override {
+        dictionary_ = constants;
+        cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
+        dictionary_.cryptTable = cryptTable_.data();
+    }
+    DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
+
 private:
     // One step of the MPQ hash recurrence, with the crypt table at `offset`
     // (0x100 for hashA, 0x200 for hashB).
@@ -59,7 +71,31 @@ private:
     uint32_t targetB_ = 0;
     PruneRules rules_;
     std::vector<TrailingInsertion> insertions_;
+    DictionaryConstants dictionary_;
 };
+
+DictionaryOutcome ReferenceBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
+    DictionaryOutcome outcome;
+    for (const DictionaryBatch& batch : batches) {
+        for (uint32_t i = 0; i < batch.wordCount; ++i) {
+            const std::string filename = batch.leading + dictionary_.words[batch.firstWord + i] + dictionary_.suffix;
+            if (hashAMatches(hashFromScratch(filename, 0x100), dictionary_.targetHashA)) {
+                outcome.hits.push_back(filename);
+                if (!outcome.found && hashFromScratch(filename, 0x200) == dictionary_.targetHashB) {
+                    outcome.found = true;
+                    outcome.foundFilename = filename;
+                }
+            }
+            if (dictionary_.checkBasename) {
+                const size_t slash = filename.rfind('\\');
+                const std::string basename = slash == std::string::npos ? filename : filename.substr(slash + 1);
+                if (hashFromScratch(basename, 0x300) == dictionary_.basenameKey)
+                    outcome.basenameHits.push_back(filename);
+            }
+        }
+    }
+    return outcome;
+}
 
 BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) {
     BatchOutcome outcome;

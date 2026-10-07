@@ -22,12 +22,26 @@ bool writeLine(const std::string& path, const char* mode, const std::string& lin
     return ok;
 }
 
-// Replaces what `path` holds with `line`: written to a file next to it,
-// which is then renamed over it - so a reader (the GUI, once a second) gets
-// the previous line or this one, never part of one.
-bool replaceWithLine(const std::string& path, const std::string& line, std::string& error) {
+// Writes `contents` to `path`, replacing what it held - in text mode, as
+// writeLine does, so a line break is "\r\n" on Windows.
+bool writeContents(const std::string& path, const std::string& contents, std::string& error) {
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) {
+        error = "fopen " + path + ": " + strerror(errno);
+        return false;
+    }
+    bool ok = fwrite(contents.data(), 1, contents.size(), f) == contents.size();
+    ok = fclose(f) == 0 && ok;
+    if (!ok)
+        error = "cannot write " + path + ": " + strerror(errno);
+    return ok;
+}
+
+} // namespace
+
+bool replaceFileContents(const std::string& path, const std::string& contents, std::string& error) {
     const std::string tmp = path + ".tmp";
-    if (!writeLine(tmp, "w", line, error))
+    if (!writeContents(tmp, contents, error))
         return false;
     std::error_code ec;
     // Windows won't rename over a file another process has open - as the GUI
@@ -42,7 +56,14 @@ bool replaceWithLine(const std::string& path, const std::string& line, std::stri
             return true;
     }
     std::filesystem::remove(tmp, ec);
-    return writeLine(path, "w", line, error);
+    return writeContents(path, contents, error);
+}
+
+namespace {
+
+// Replaces what `path` holds with `line` - see replaceFileContents.
+bool replaceWithLine(const std::string& path, const std::string& line, std::string& error) {
+    return replaceFileContents(path, line + "\n", error);
 }
 
 } // namespace

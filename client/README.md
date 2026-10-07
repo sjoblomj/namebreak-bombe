@@ -18,7 +18,7 @@ suffix** - the prefix and suffix are fixed, known strings (e.g. `REZ\` and
 
 ## Modes
 
-`namebreak` runs in one of three modes, set via `config.conf`'s `mode = ...`
+`namebreak` runs in one of four modes, set via `config.conf`'s `mode = ...`
 (or overridden by passing `--mode <mode>`, e.g. `build/namebreak --mode bounded`).
 A different config file can be used instead of `config.conf` via
 `--config <file>`.
@@ -38,6 +38,12 @@ unknown name lists the ones the build has.
   range of a shared target's search space, searches it, and reports back;
   repeats until stopped. See [`../coordinator/README.md`](../coordinator/README.md)
   for the server side and how this mode is configured.
+- **`dictionary`** - searches candidates made of words: one word, or several
+  with separators between them, from a dictionary compiled into the program
+  (`english-1`) and word lists of your own - and, given the file's
+  encryption key, records every candidate whose basename matches it. See
+  [Dictionary mode](#dictionary-mode). It runs on the CPU backends only, so
+  far.
 
 Exit code is `0` if both hashes matched, `2` if the search space was
 exhausted without a match, `1` on any setup/config error.
@@ -94,7 +100,7 @@ pause/resume the search.` on startup when it is.
 file given with `--config <file>`, every time it starts; without one it
 stops and says what the smallest working one looks like (the Windows GUI
 runs its setup dialog instead, and writes one). It's a flat `key = value`
-file with up to two `[section]` blocks; `#`-led lines and blank lines are
+file with up to three `[section]` blocks; `#`-led lines and blank lines are
 ignored, and a value only needs `"..."` quoting if it has meaningful
 leading/trailing whitespace (a literal `\` needs no escaping).
 
@@ -132,6 +138,7 @@ resume_from_last_candidate = true
 | `prune_adjacent_backslashes` | no (default `false`) | Skip candidates with two `\` next to each other - including a `\` at the very start of the candidate when `prefix` ends with one. |
 | `insert_from_start` / `insert_from_end` | no | Text inserted into every candidate, as `text, position` (e.g. `\, 3`; quote the text if it has leading or trailing spaces, `" A ", 3`; at most 16 characters): after the candidate's first `position` characters, or before its last `position`. A candidate shorter than the position gets nothing inserted; both are placed on the candidate's own characters, and where they meet `insert_from_start` comes first. `lower_bound`, `upper_bound` and the length a search covers are without them; the filenames it reports, `start_candidate` and the matches file it resumes from are with them. The pruning rules check inserted text like the candidate's own characters, except text inserted after its last character, which is part of the suffix. See [Inserted text](#inserted-text) for what it costs. |
 | `prune_whole_candidate` | no (default `false`) | Apply `prune_symbol_runs`, `prune_unopened_brackets`, `max_backslash_count`, `min_backslash_count` and `prune_adjacent_backslashes` to every character of a candidate but the last, instead of only to its leading characters (all but the last five or so). About a fifth fewer candidates are searched, and a search is about 10% faster on a GPU - see [Design decisions](#design-decisions). |
+| `matches_name` | no | Names the matches file: `matches-<matches_name>.txt` instead of `matches.txt`, so that searches for different files don't share one. Characters other than letters, digits, `.`, `-` and `_` become `_`. |
 
 `[coordinator]` keys (`coordinator` mode only) are `server_url` (required),
 plus optional `username`, `hostname` (auto-detected and interactively
@@ -148,8 +155,108 @@ replaced, so a later search writing the same matches file can't lose it.
 They all go in one directory -
 `matches/` in the current directory, or whatever a top-level
 `matches_dir = <directory>` line (next to `mode`) says; it's created if
-missing. `bounded`/`continuous` mode writes `matches.txt` there, and
-`coordinator` mode one `matches-<target name>.txt` per target.
+missing. `bounded`/`continuous` mode writes `matches.txt` there (or
+`matches-<matches_name>.txt`), `dictionary` mode the same and two more files
+(see [Dictionary mode](#dictionary-mode)), and `coordinator` mode one
+`matches-<target name>.txt` per target.
+
+## Dictionary mode
+
+Instead of every string of an alphabet, `mode = dictionary` searches
+candidates made of words: one word, or several with a separator between each
+two, every word from the same list and every separator from the same list.
+With the words `CRDT` and `LST` and the separators `""` and `_`, the
+two-word candidates include `CRDTLST`, `CRDT_LST` and `LST_CRDT`. A
+filename is still prefix + candidate + suffix.
+
+For example, the basename of a credits file whose directory isn't known -
+no prefix, so only the basename can match, by its encryption key:
+
+```ini
+mode = dictionary
+
+[dictionary]
+dictionaries = lists/starcraft-words.txt
+max_words = 2
+separators = "", "_", "-", " "
+prefix = ""
+suffix = .txt
+hash_a = 0xC4F43358
+hash_b = 0x7694C48D
+encryption_key = 0x4565C467
+matches_name = sc-ptbr-credits
+resume_from_last_candidate = true
+```
+
+`[dictionary]` keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `builtin_dictionary` | no (default `english-1`) | The dictionary compiled into the program, or `none` to search only `dictionaries`. `english-1` is 63,875 English words - see below. |
+| `dictionaries` | no | More word lists, as a list of files (relative to the current directory, unless absolute): one word per line. Spaces and tabs around a word are dropped; blank lines and lines starting with `#` are skipped; a line with anything but printable ASCII is skipped, with a warning. The words of every list and the built-in dictionary are searched together, each once. |
+| `min_words` / `max_words` | `max_words` yes (`min_words` default `1`) | How many words a candidate has: every count from `min_words` to `max_words` (at most 8), fewest first. |
+| `separators` | no (default `""`) | What goes between two words, as a list: `""` writes them together. `"\"` makes the words before it directories. |
+| `prefix` / `suffix` | yes | The fixed parts of the filename around the candidate. |
+| `lower_bound` / `upper_bound` | no | Whole filenames (inclusive) bounding the search alphabetically - typically an unknown file's neighbours in the archive. Either may be left out. |
+| `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex. |
+| `encryption_key` | no | The file's raw encryption key, hex: hash type 3 of its basename, before the adjustment for its position and size in the archive (mpqcli's `encryption-key-raw`, the coordinator's `encryption_key_hex`). Every candidate whose basename - what follows the filename's last `\` - hashes to it is recorded. |
+| `record_basenames` | no (default `true` with an `encryption_key`, else `false`) | Whether to record those basenames. `true` needs an `encryption_key`. |
+| `matches_name` | no | Names the files the search writes, as in `[search]`. |
+| `resume_from_last_candidate` | no (default `false`) | Carry on from the progress file (see below). |
+
+As everywhere, letters are made uppercase and `/` made `\` - in the words,
+separators, prefix, suffix and bounds - since that's how Storm hashes a name.
+
+A list (`dictionaries`, `separators`) is items separated by commas, each
+either `"quoted"` - kept exactly, spaces and commas included - or not, and
+then trimmed. `""` is an empty item; an empty unquoted one is an error.
+
+**The numbers.** Every candidate has a number, counting from 0 the way an
+odometer counts, with a wheel per word and per separator: all one-word
+candidates first, then all two-word ones, and so on; within those, the
+first word turns slowest, then the separator after it, and the last word
+fastest. The words are sorted, so the candidates of each word count come in
+alphabetical order of their first word. The numbers depend only on the
+words, the separators and the word counts - not on the bounds, prefix or
+suffix. The search prints how many candidates there are in all, and how
+many it will search within the bounds.
+
+**The bounds** compare whole filenames. A word that already puts every
+filename starting with it outside the bounds is skipped, with everything
+after it; one that puts every such filename inside isn't compared again.
+Only the few words a bound cuts through - with `REZ\CRDT_LST.TXT` as the
+lower bound, `REZ\CRDT...` is both inside (`REZ\CRDT_MAP.TXT`) and outside
+(`REZ\CRDTAARDVARK.TXT`) - have their candidates compared one by one.
+
+**What it writes**, in `matches_dir`, named with `matches_name` if given:
+
+- `matches.txt` - the most recent Hash-A match, as in the other modes, and
+  `found.txt` for a match of both hashes, where the search stops.
+- `basenames.txt` - with `record_basenames`, every basename that matched the
+  encryption key, one per line, each once (those already in the file
+  included). A basename match is only 32 bits, so about one candidate in
+  4,294,967,296 matches by chance: the search prints how many to expect
+  before it starts. With two words of `english-1` that's a handful; with
+  three, about a million - narrow the search, or turn `record_basenames`
+  off, if that's not what you want.
+- `wordnumber.txt` - the progress file: every candidate numbered below
+  `next` has been searched. Written every 30 seconds, when the search is
+  paused, and when it ends. It also has a fingerprint of everything that
+  decides which candidates are searched and what's looked for (the words,
+  separators, word counts, prefix, suffix, bounds, hashes and encryption
+  key): `resume_from_last_candidate = true` refuses to resume from a file
+  with another fingerprint, rather than skip candidates the changed search
+  never searched.
+
+**`english-1`** is every all-lowercase ASCII word of Debian's `wamerican`
+word list (from SCOWL) - see `data/english-1.LICENSE.txt` for where it comes
+from and its licence. It never changes: a different list would be
+`english-2`, so a search numbered over one can't be resumed over another.
+
+The basename alone is often worth searching for: with an encryption key and
+the wrong directory - or none, `prefix` empty - the hashes never match, but
+the right basename still lands in `basenames.txt`, leaving only the
+directory to find.
 
 ## Compiling
 
@@ -210,7 +317,12 @@ known-answer test (`listfile-*`), which must find each of the 6,407 names of
 a real StarCraft listfile (`tests/data/sc-listfile.txt`) from its two hashes,
 in a small search planted around it - with hashes from the test's own copy
 of the MPQ hash, so it also catches a bug the client's hashing shares with
-every other test. The search is
+every other test. Dictionary mode has its own: `dictionary_test` (numbering,
+bounds and counting against brute force), `wordlist_test` (which pins
+`english-1`), `dictionary-search-*` (whole searches on each backend that can
+search dictionaries against brute force - also with one candidate in 256 a
+hit, and with few candidates per call, stopped and resumed part way) and
+`dictionary-cli-*` (the program itself). The search is
 built in several configurations for this (different GPU window, launch
 sizes and rows per thread, the stress tests' weaker match, a one-bit
 filter), each with its own
@@ -250,7 +362,7 @@ backends' tests actually run there.
 
 | Directory | What's in it |
 |---|---|
-| `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU |
+| `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU; and the dictionary search, `runDictionarySearch()`, with its word lists |
 | `src/backends/` | What the search runs its batches on (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
 | `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop (left out by `NAMEBREAK_NETWORK=OFF`) |
@@ -258,6 +370,7 @@ backends' tests actually run there.
 | `src/gui/win32/` | The Windows GUI (Windows only) |
 | `tests/` | Correctness tests and benchmarks (`ctest`, `run_search_bench`), and the mutation experiment (`mutation_test.py`, `run_mutation_test`) |
 | `scripts/` | The generator for the GUI's embedded icon |
+| `data/` | `english-1`, the dictionary compiled into the program |
 
 Includes are written relative to `src/` (e.g. `#include "engine/search.h"`).
 

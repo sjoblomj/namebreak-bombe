@@ -26,7 +26,11 @@ std::string sanitizeForFilename(const std::string& name) {
 } // namespace
 
 std::string matchesFilePath(const std::string& matchesDir, const std::string& targetName) {
-    std::string name = targetName.empty() ? "matches.txt" : "matches-" + sanitizeForFilename(targetName) + ".txt";
+    return namedFilePath(matchesDir, "matches", targetName);
+}
+
+std::string namedFilePath(const std::string& matchesDir, const std::string& base, const std::string& searchName) {
+    std::string name = searchName.empty() ? base + ".txt" : base + "-" + sanitizeForFilename(searchName) + ".txt";
     if (matchesDir.empty())
         return name;
     char last = matchesDir.back();

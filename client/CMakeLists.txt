@@ -122,6 +122,9 @@ set(SEARCH_SOURCES
     src/engine/match_writer.cpp
     src/engine/mpq_hash.cpp
     src/engine/candidate.cpp
+    src/engine/dictionary.cpp
+    src/engine/dictionary_search.cpp
+    src/engine/wordlist.cpp
     src/backends/backends.cpp
     src/backends/self_test.cpp
     src/backends/common/launch_waiter.cpp
@@ -158,6 +161,25 @@ if(WITH_OPENCL)
     list(APPEND SEARCH_SOURCES src/backends/opencl/opencl_backend.cpp)
     embed_kernel(src/backends/opencl/search.cl backends/opencl/search_kernel.h kSearchKernelSource)
 endif()
+
+# embed_word_list(<word list file> <header to generate, under generated/> <C++ name>)
+# A dictionary compiled into the program (src/engine/wordlist.h), as an
+# array of its words. The file must have nothing but lowercase a-z words, one
+# per line, so that no word needs escaping.
+function(embed_word_list file header symbol)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${file})
+    file(READ ${file} WORDS)
+    string(REGEX MATCH "[^a-z\n]" BAD_CHARACTER "${WORDS}")
+    if(BAD_CHARACTER)
+        message(FATAL_ERROR "${file} must have only lowercase a-z words, one per line")
+    endif()
+    string(STRIP "${WORDS}" WORDS)
+    string(REPLACE "\n" "\",\n\"" WORDS_BODY "${WORDS}")
+    set(WORDS_FILE ${file})
+    set(WORDS_SYMBOL ${symbol})
+    configure_file(src/engine/embedded_word_list.h.in ${CMAKE_BINARY_DIR}/generated/${header} @ONLY)
+endfunction()
+embed_word_list(data/english-1.txt engine/english_1_words.h kEnglish1Words)
 
 # namebreak_search_library(<name> [<compile definition>...])
 function(namebreak_search_library name)
@@ -290,6 +312,60 @@ endforeach()
 # catches a backend that searches wrongly - CPU backends wrapped in broken ones.
 namebreak_test_executable(self_test_test tests/self_test_test.cpp namebreak_search)
 namebreak_test(self_test_test self_test_test)
+
+# The word lists of a dictionary search (src/engine/wordlist.h), english-1
+# pinned among them. CPU only.
+namebreak_test_executable(wordlist_test tests/wordlist_test.cpp namebreak_search)
+namebreak_test(wordlist_test wordlist_test)
+
+# A dictionary search's numbering, bounds, hash helpers, counting,
+# fingerprint and progress file (src/engine/dictionary.h,
+# dictionary_search.h), against brute force. CPU only.
+namebreak_test_executable(dictionary_test tests/dictionary_test.cpp namebreak_search)
+namebreak_test(dictionary_test dictionary_test)
+
+# runDictionarySearch (src/engine/dictionary_search.h) end to end on every
+# backend that can search dictionaries, against brute force - as built, with
+# few of hashA's bits compared (so that there are hits to compare), and with
+# also few candidates per call to the backend, on several threads (so that
+# a search is split into many calls, and stopped and resumed part way).
+set(DICTIONARY_BACKENDS cpu reference)
+namebreak_test_executable(dictionary_search_test tests/dictionary_search_test.cpp namebreak_search)
+foreach(backend IN LISTS DICTIONARY_BACKENDS)
+    namebreak_test(dictionary-search-${backend} dictionary_search_test --backend ${backend})
+endforeach()
+if(NAMEBREAK_TEST_VARIANTS)
+    namebreak_search_library(namebreak_search_dictionary_dense NAMEBREAK_HASHA_MATCH_BITS=8)
+    namebreak_test_executable(dictionary_search_test_dense tests/dictionary_search_test.cpp namebreak_search_dictionary_dense)
+    namebreak_search_library(namebreak_search_dictionary_small NAMEBREAK_HASHA_MATCH_BITS=8 NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL=97
+                             NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=16)
+    namebreak_test_executable(dictionary_search_test_small tests/dictionary_search_test.cpp namebreak_search_dictionary_small)
+    foreach(backend IN LISTS DICTIONARY_BACKENDS)
+        namebreak_test(dictionary-search-${backend}-dense dictionary_search_test_dense --backend ${backend})
+        namebreak_test(dictionary-search-${backend}-small dictionary_search_test_small --backend ${backend})
+    endforeach()
+endif()
+
+# The program itself in dictionary mode (src/cli/main.cpp), on the config
+# tests/data/dictionary_cli.conf.in makes: finding REZ\CRDT_LST.TXT (exit
+# code 0); not finding it, with the wrong hashB and mode given with --mode;
+# and a config without max_words.
+# dictionary_cli_test(<name> <mode> <hashB> <max_words line> <pass regex or ""> [<argument>...])
+function(dictionary_cli_test name mode hash_b max_words regex)
+    set(DICTIONARY_CLI_MODE ${mode})
+    set(DICTIONARY_CLI_HASH_B ${hash_b})
+    set(DICTIONARY_CLI_MAX_WORDS ${max_words})
+    set(DICTIONARY_CLI_WORDS ${CMAKE_SOURCE_DIR}/tests/data/dictionary_cli_words.txt)
+    configure_file(tests/data/dictionary_cli.conf.in ${CMAKE_BINARY_DIR}/testrun/${name}/config.conf @ONLY)
+    namebreak_test(${name} namebreak --config config.conf ${ARGN})
+    if(regex)
+        set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
+    endif()
+endfunction()
+dictionary_cli_test(dictionary-cli-found dictionary 0xE6B2B01C "max_words = 2" "")
+dictionary_cli_test(dictionary-cli-not-found bounded 0x00000000 "max_words = 2" "Searched every candidate - no match of both hashes"
+                    --mode dictionary)
+dictionary_cli_test(dictionary-cli-bad-config dictionary 0xE6B2B01C "" "missing required key 'max_words'")
 
 # Where buildSearchRequest (src/common/config.h) starts a search -
 # start_candidate and resume_from_last_candidate. CPU only.

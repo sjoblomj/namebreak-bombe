@@ -1,7 +1,8 @@
 // The console entry point: parses --mode/--config, reads the config file
 // and runs whichever mode it asks for, with a pause key listener on an
 // interactive terminal. Everything it runs lives elsewhere - runSearch()
-// (search.h) for bounded/continuous mode, runCoordinator()
+// (search.h) for bounded/continuous mode, runDictionarySearch()
+// (dictionary_search.h) for dictionary mode, runCoordinator()
 // (coordinator_runner.h) for coordinator mode - so the tests and the Windows
 // GUI link the same code without this file.
 
@@ -17,6 +18,7 @@
 #include "common/config.h"
 #include "common/platform.h"
 #include "common/version.h"
+#include "engine/dictionary_search.h"
 #include "engine/search.h"
 #ifdef NAMEBREAK_WITH_NETWORK
 #include "net/coordinator_runner.h"
@@ -163,12 +165,13 @@ void printUsage(const char* argv0) {
     std::string backends;
     for (const std::string& name : backendNames())
         backends += (backends.empty() ? "" : "|") + name;
-    fprintf(stderr, "Usage: %s [--mode continuous|bounded|coordinator] [--config <file>] [--backend %s]\n"
+    fprintf(stderr, "Usage: %s [--mode continuous|bounded|coordinator|dictionary] [--config <file>] [--backend %s]\n"
                      "       %s -v|--version\n"
                      "Reads the given --config file (default: %s, in the current directory) for\n"
                      "everything else; --mode and --backend, if given, override that file's own\n"
                      "'mode = ...'/'backend = ...'. Without either, the first backend listed that\n"
-                     "can run on this machine is used. -v/--version prints this build's version.\n",
+                     "can run on this machine is used (in dictionary mode: cpu). -v/--version\n"
+                     "prints this build's version.\n",
             argv0, backends.c_str(), argv0, kDefaultConfigPath);
 }
 
@@ -190,7 +193,8 @@ void printMissingConfigHelp(const std::string& configPath) {
             "    server_url = %s\n"
             "\n"
             "To search on your own instead (mode = bounded or continuous), see the [search]\n"
-            "settings in README.md's \"Configuring\" section.\n",
+            "settings in README.md's \"Configuring\" section, and for mode = dictionary its\n"
+            "\"Dictionary mode\" section.\n",
             (ec ? configPath : where.string()).c_str(), kDefaultConfigPath, kDefaultServerUrl);
 }
 
@@ -223,12 +227,13 @@ int main(int argc, char* argv[]) {
             backendOverride = argv[++i];
         } else if (arg == "--mode") {
             if (i + 1 >= argc) {
-                fprintf(stderr, "--mode requires an argument (continuous, bounded, or coordinator)\n");
+                fprintf(stderr, "--mode requires an argument (continuous, bounded, coordinator, or dictionary)\n");
                 return 1;
             }
             modeOverride = argv[++i];
-            if (modeOverride != "continuous" && modeOverride != "bounded" && modeOverride != "coordinator") {
-                fprintf(stderr, "--mode must be one of continuous, bounded, or coordinator (got '%s')\n", modeOverride.c_str());
+            if (modeOverride != "continuous" && modeOverride != "bounded" && modeOverride != "coordinator" &&
+                modeOverride != "dictionary") {
+                fprintf(stderr, "--mode must be one of continuous, bounded, coordinator, or dictionary (got '%s')\n", modeOverride.c_str());
                 return 1;
             }
         } else {
@@ -254,8 +259,8 @@ int main(int argc, char* argv[]) {
         config.backend = backendOverride;
 
     std::string mode = !modeOverride.empty() ? modeOverride : config.mode;
-    if (mode != "continuous" && mode != "bounded" && mode != "coordinator") {
-        fprintf(stderr, "Unknown or missing mode '%s' - expected continuous, bounded, or coordinator "
+    if (mode != "continuous" && mode != "bounded" && mode != "coordinator" && mode != "dictionary") {
+        fprintf(stderr, "Unknown or missing mode '%s' - expected continuous, bounded, coordinator, or dictionary "
                          "(set %s's 'mode = ...', or pass --mode <mode>)\n",
                 mode.c_str(), configPath.c_str());
         return 1;
@@ -315,6 +320,34 @@ int main(int argc, char* argv[]) {
         return exitCode;
     }
 #endif
+
+    if (mode == "dictionary") {
+        DictionaryRequest dictReq;
+        std::vector<std::string> warnings;
+        bool built = buildDictionaryRequest(config, dictReq, warnings, error);
+        // A list full of unusable lines would bury everything else.
+        constexpr size_t kMaxWarnings = 20;
+        for (size_t i = 0; i < warnings.size() && i < kMaxWarnings; ++i)
+            fprintf(stderr, "warning: %s\n", warnings[i].c_str());
+        if (warnings.size() > kMaxWarnings)
+            fprintf(stderr, "warning: ... and %zu more lines skipped\n", warnings.size() - kMaxWarnings);
+        if (!built) {
+            fprintf(stderr, "%s [dictionary]: %s\n", configPath.c_str(), error.c_str());
+            return 1;
+        }
+        // Only the CPU backends search dictionaries so far.
+        std::unique_ptr<SearchBackend> backend = createBackend(config.backend.empty() ? "cpu" : config.backend, error);
+        if (!backend) {
+            fprintf(stderr, "%s\n", error.c_str());
+            return 1;
+        }
+        DictionaryResult result = runDictionarySearch(*backend, dictReq, nullptr, nullptr, &g_paused);
+        if (!result.ok) {
+            fprintf(stderr, "%s\n", result.error.c_str());
+            return 1;
+        }
+        return result.found ? 0 : 2;
+    }
 
     SearchRequest req;
     if (!buildSearchRequest(config, mode == "continuous", req, error)) {

@@ -15,6 +15,7 @@
 
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
+#include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
 
@@ -250,8 +251,20 @@ public:
 
     void endSearch() override {}
 
+    // A dictionary search: each candidate's last word and the suffix hashed
+    // on from its batch's state, on every core.
+    bool supportsDictionary() const override { return true; }
+    uint64_t dictionaryCandidatesPerCall() const override { return 1u << 24; }
+    void beginDictionarySearch(const DictionaryConstants& constants) override {
+        dictionary_ = constants;
+        cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
+        dictionary_.cryptTable = cryptTable_.data();
+    }
+    DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
+
 private:
     unsigned threadCount_;
+    DictionaryConstants dictionary_;
     HitVerifier verifier_;
     int alphabetSize_ = 0;
     std::string alphabet_;
@@ -355,6 +368,111 @@ BatchOutcome CpuBackend::runBatches(int trailingLen, const std::vector<BatchRequ
     for (const ThreadHits& mine : found) {
         for (size_t i = 0; i < mine.trailingIndices.size(); ++i)
             verifier_.addHits({mine.trailingIndices[i]}, trailingLen, requests[mine.batches[i]].params, outcome);
+    }
+    return outcome;
+}
+
+DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
+    const std::vector<std::string>& words = dictionary_.words;
+    const std::string& suffix = dictionary_.suffix;
+    const uint32_t* table = cryptTable_.data();
+    const uint32_t targetA = dictionary_.targetHashA;
+    const bool checkBasename = dictionary_.checkBasename;
+    const uint32_t basenameKey = dictionary_.basenameKey;
+
+    // Work items: slices of one batch's words, about eight per thread, taken
+    // in turn as the threads finish (as in runBatches).
+    uint64_t totalCount = 0;
+    for (const DictionaryBatch& batch : batches)
+        totalCount += batch.wordCount;
+    const uint64_t threads = std::min<uint64_t>(threadCount_, std::max<uint64_t>(1, totalCount / kMinCandidatesPerThread));
+    const uint64_t wordsPerItem = std::max<uint64_t>(1, (totalCount + threads * 8 - 1) / (threads * 8));
+    struct Item {
+        size_t batch;
+        uint32_t from, to; // words [from, to) of the batch's, counted from its first
+    };
+    std::vector<Item> items;
+    for (size_t b = 0; b < batches.size(); ++b) {
+        for (uint64_t from = 0; from < batches[b].wordCount; from += wordsPerItem)
+            items.push_back({b, (uint32_t) from, (uint32_t) std::min<uint64_t>(batches[b].wordCount, from + wordsPerItem)});
+    }
+
+    // Each thread's hits, as (batch, word) - hashA hits and basename hits.
+    struct Hits {
+        std::vector<std::pair<size_t, uint32_t>> hashA, basename;
+    };
+    std::vector<Hits> found(threads);
+    std::atomic<size_t> next{0};
+    auto work = [&](Hits& mine) {
+        for (size_t i = next++; i < items.size(); i = next++) {
+            const DictionaryBatch& batch = batches[items[i].batch];
+            for (uint32_t w = batch.firstWord + items[i].from; w < batch.firstWord + items[i].to; ++w) {
+                const std::string& word = words[w];
+                uint32_t s1 = batch.seed1, s2 = batch.seed2;
+                for (unsigned char ch : word)
+                    mpqStep(s1, s2, table[0x100 + ch], ch);
+                for (unsigned char ch : suffix)
+                    mpqStep(s1, s2, table[0x100 + ch], ch);
+                if (hashAMatches(s1, targetA))
+                    mine.hashA.push_back({items[i].batch, w});
+                if (checkBasename) {
+                    uint32_t k1 = batch.basenameSeed1, k2 = batch.basenameSeed2;
+                    auto stepBasename = [&](unsigned char ch) {
+                        if (ch == '\\') {
+                            k1 = kInitialHashState.first;
+                            k2 = kInitialHashState.second;
+                        } else {
+                            mpqStep(k1, k2, table[kFileKeyOffset + ch], ch);
+                        }
+                    };
+                    for (unsigned char ch : word)
+                        stepBasename(ch);
+                    for (unsigned char ch : suffix)
+                        stepBasename(ch);
+                    if (k1 == basenameKey)
+                        mine.basename.push_back({items[i].batch, w});
+                }
+            }
+        }
+    };
+    if (threads == 1) {
+        work(found[0]);
+    } else {
+        std::vector<std::thread> workers;
+        for (uint64_t t = 1; t < threads; ++t)
+            workers.emplace_back(work, std::ref(found[t]));
+        work(found[0]);
+        for (std::thread& worker : workers)
+            worker.join();
+    }
+
+    // Every hit, hashed again from scratch, to check the batch's state against
+    // it (as HitVerifier does) - and each hashA hit's hashB.
+    DictionaryOutcome outcome;
+    for (const Hits& mine : found) {
+        for (const auto& hit : mine.hashA) {
+            const std::string filename = batches[hit.first].leading + words[hit.second] + suffix;
+            const uint32_t hashA = continueHash(kInitialHashState, filename, kHashAOffset, table).first;
+            if (!hashAMatches(hashA, targetA)) {
+                printf("WARNING: hashA mismatch for '%s' - the batch's state gave a hit, the full filename hashes to 0x%08X\n",
+                       filename.c_str(), hashA);
+                continue;
+            }
+            outcome.hits.push_back(filename);
+            if (!outcome.found && continueHash(kInitialHashState, filename, kHashBOffset, table).first == dictionary_.targetHashB) {
+                outcome.found = true;
+                outcome.foundFilename = filename;
+            }
+        }
+        for (const auto& hit : mine.basename) {
+            const std::string filename = batches[hit.first].leading + words[hit.second] + suffix;
+            if (continueBasenameHash(kInitialHashState, filename, table).first != basenameKey) {
+                printf("WARNING: basename hash mismatch for '%s' - the batch's state gave a hit, the full filename doesn't\n",
+                       filename.c_str());
+                continue;
+            }
+            outcome.basenameHits.push_back(filename);
+        }
     }
     return outcome;
 }

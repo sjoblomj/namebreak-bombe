@@ -180,8 +180,29 @@ static void testMatchWriter() {
     }
 }
 
+static void testFilePaths() {
+    printf("namedFilePath and matchesFilePath:\n");
+    check(namedFilePath("matches", "basenames", "") == "matches/basenames.txt", "no name: <base>.txt");
+    check(namedFilePath("matches", "wordnumber", "credits") == "matches/wordnumber-credits.txt", "a name: <base>-<name>.txt");
+    check(namedFilePath("m/", "basenames", "x") == "m/basenames-x.txt" && namedFilePath("m\\", "basenames", "x") == "m\\basenames-x.txt",
+          "a directory ending in a separator: no second one");
+    check(namedFilePath("", "basenames", "x") == "basenames-x.txt", "no directory: the current one");
+    check(namedFilePath("m", "basenames", "../a\\b c") == "m/basenames-.._a_b_c.txt", "a name with path separators: made safe");
+    check(matchesFilePath("m", "") == "m/matches.txt" && matchesFilePath("m", "REZ\\X") == "m/matches-REZ_X.txt",
+          "matchesFilePath: namedFilePath with base matches");
+    // replaceFileContents, which the progress file is written with.
+    std::filesystem::create_directories(kDir);
+    std::string error;
+    check(replaceFileContents(kPath, "one\ntwo\n", error), "replaceFileContents: written");
+    std::ifstream in(kPath);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    check(text == "one\ntwo\n" && !std::filesystem::exists(kPath + ".tmp"), "... replacing what was there, no temporary file left");
+    check(!replaceFileContents(kDir + "/no/such/dir/file.txt", "x", error) && !error.empty(), "... false, saying why, where it can't be");
+}
+
 int main() {
     testMatchWriter();
+    testFilePaths();
 
     printf("readLastLines:\n");
     std::filesystem::remove(kPath);

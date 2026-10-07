@@ -103,6 +103,51 @@ struct BatchOutcome {
     std::string foundFilename;
 };
 
+// Everything that stays the same for a whole dictionary search
+// (dictionary_search.h).
+struct DictionaryConstants {
+    // The words a candidate's last word is one of - DictionaryBatch::firstWord
+    // indexes them.
+    std::vector<std::string> words;
+    std::string suffix;
+    const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
+    uint32_t targetHashA = 0;
+    uint32_t targetHashB = 0;
+    // Also compare each candidate's basename - its filename after the last
+    // '' - hashed as Storm makes a file's encryption key (hash type 3), to
+    // basenameKey.
+    bool checkBasename = false;
+    uint32_t basenameKey = 0;
+};
+
+// One leading part of a dictionary search's candidates - its prefix, and its
+// words and separators but the last word - followed by each of the words
+// [firstWord, firstWord + wordCount) and then the suffix.
+struct DictionaryBatch {
+    std::string leading;
+    // hashA's state after `leading` (see mpqHashWithPrefixCache_CPU).
+    uint32_t seed1 = 0;
+    uint32_t seed2 = 0;
+    // The basename hash's state after `leading`: hash type 3 of what follows
+    // its last '' (see dictionary_search.h's basenameHashState).
+    uint32_t basenameSeed1 = 0;
+    uint32_t basenameSeed2 = 0;
+    uint32_t firstWord = 0;
+    uint32_t wordCount = 0;
+};
+
+// What one runDictionaryBatches() call found - every hit, in no particular
+// order.
+struct DictionaryOutcome {
+    // The filename of every hashA hit.
+    std::vector<std::string> hits;
+    // Set once one of them also matches hashB.
+    bool found = false;
+    std::string foundFilename;
+    // The filename of every candidate whose basename matched basenameKey.
+    std::vector<std::string> basenameHits;
+};
+
 class SearchBackend {
 public:
     virtual ~SearchBackend() = default;
@@ -144,6 +189,18 @@ public:
     // search each batch again on its own. The default calls runBatch() for
     // each.
     virtual BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches);
+
+    // Dictionary searches (dictionary_search.h) - only on the backends that
+    // say they can. The others never get these calls.
+    virtual bool supportsDictionary() const { return false; }
+    // How many candidates one runDictionaryBatches() call should cover, about.
+    virtual uint64_t dictionaryCandidatesPerCall() const { return 1u << 22; }
+    // Called once before a dictionary search's first runDictionaryBatches(),
+    // and endDictionarySearch() once after its last.
+    virtual void beginDictionarySearch(const DictionaryConstants& constants);
+    // Hashes every candidate of every batch.
+    virtual DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches);
+    virtual void endDictionarySearch() {}
 };
 
 
