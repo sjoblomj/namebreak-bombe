@@ -39,9 +39,11 @@ and its canaries found out of those handed to it (see below).
 The **Introduction** tab explains what namebreaking is. The open tab is kept
 in the URL's `#fragment`, so `/#volunteers` links straight to it.
 Plain HTML/CSS/JS (`server/static/dashboard.html`, embedded into the binary at
-compile time), polling `GET /api/v1/dashboard` every 8s - no build step, no
-framework. `GET /api/v1/dashboard` and `GET /` are both public (no auth),
-matching `GET /api/v1/status`.
+compile time), which loads `GET /api/v1/dashboard` once each time it's opened
+(or reloaded) - no build step, no framework. With desktop notifications on,
+it checks the much smaller `GET /api/v1/status` every minute for finds, and
+loads the dashboard's data again when there's one. `GET /api/v1/dashboard`
+and `GET /` are both public (no auth), matching `GET /api/v1/status`.
 
 See the top-level plan/design notes for the full rationale; the short version:
 
@@ -492,17 +494,26 @@ them, one per line, in the order they came.
 
 There can be a lot of them: about one candidate in 2^32 matches a key by
 chance, so a target of three words of `english-1` with four separators
-(4.2 * 10^15 candidates) gets about a million, at about 106 bytes each in
-the database - some 100 MB, a tenth of the 1 GB Fly volume. The server is
-built for that many: each report adds at most 5,000, in one transaction; a
-target's count is kept as they come (`targets.basename_count`) rather than
-counted; the dashboard reads only the latest 20 of each target (by
-`idx_basenames_target`); and the full list is read and sent 10,000 at a time
-(`BASENAMES_PAGE`), so it's never all in memory, and the database - one
-connection, which every claim and heartbeat needs too - is only held for a
-page's query, however slowly the list is downloaded. Two words make only a
-handful; `send_basenames` is off by default, so a target only collects them
-when it's asked to.
+(4.2 * 10^15 candidates) gets about a million - 31 MB as text. So they're
+kept compressed (`server/src/basenames.rs`): each report's new ones as one
+gzip member (`basename_reports`), and an 8-byte hash of each
+(`basename_hashes`) to keep each once. Measured with a million of them sent
+240 a heartbeat, as a GPU client sends them: 33 MB in the database - 17 MB
+of reports and 15 MB of hashes - where a row each took 100 MB; the Fly
+volume is 1 GB. The server is built for that many: each report adds at most
+5,000, in one transaction; a target's count is kept as they come
+(`targets.basename_count`) rather than counted; the dashboard reads only a
+target's latest reports, for its 20 latest basenames; and the full list is
+read and sent 20 reports at a time (`BASENAME_REPORTS_PAGE`), so it's never
+all in memory, and the database - one connection, which every claim and
+heartbeat needs too - is only held for a page's query, however slowly the
+list is downloaded. Two words make only a handful; `send_basenames` is off
+by default, so a target only collects them when it's asked to.
+
+Every answer is gzipped for a client that says it takes gzip
+(`Accept-Encoding` - a browser, `curl --compressed`, the client's word list
+downloads): the full list of a million basenames is then 11 MB rather than
+31, and the dashboard's JSON and the word lists shrink about as much.
 
 Skip part of a target's search space (see **Skip ranges** above), or
 prioritize part of it:

@@ -1,6 +1,7 @@
-//! Human-facing dashboard: a static page (served at `GET /`) that polls
-//! `GET /api/v1/dashboard` for target/range/worker data. No build step, no JS
-//! framework - the page is a single self-contained file embedded at compile time.
+//! Human-facing dashboard: a static page (served at `GET /`) that loads
+//! `GET /api/v1/dashboard` for target/range/worker data each time it's opened
+//! (see the coordinator README). No build step, no JS framework - the page is
+//! a single self-contained file embedded at compile time.
 
 use std::collections::HashMap;
 
@@ -256,7 +257,7 @@ pub struct DashboardDictionary {
 /// How many of a target's basenames the dashboard lists.
 const DASHBOARD_BASENAMES: i64 = 20;
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize)]
 pub struct DashboardBasename {
     pub basename: String,
     /// "username@hostname" of whoever sent it first, and its backend - see
@@ -552,19 +553,29 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         }
     }
     // The latest of each dictionary target's basenames - a target can have
-    // a million, so they're read target by target, newest first, only as
-    // many as are shown (by idx_basenames_target), and counted as they come
-    // in (targets.basename_count) rather than here.
+    // a million, so they're read target by target, from its latest reports
+    // only (by idx_basename_reports_target - each report has at least one),
+    // and counted as they come in (targets.basename_count) rather than here.
     let mut basenames_by_target: HashMap<i64, Vec<DashboardBasename>> = HashMap::new();
     for &target_id in dictionaries.keys() {
-        let latest = sqlx::query_as::<_, DashboardBasename>(
-            "SELECT b.basename, u.username || '@' || u.hostname AS reported_by, NULLIF(u.backend, '') AS reported_by_backend, b.reported_at \
-             FROM basenames b LEFT JOIN users u ON u.id = b.user_id WHERE b.target_id = ? ORDER BY b.id DESC LIMIT ?",
+        #[allow(clippy::type_complexity)]
+        let reports: Vec<(Vec<u8>, Option<String>, Option<String>, i64)> = sqlx::query_as(
+            "SELECT r.names, u.username || '@' || u.hostname, NULLIF(u.backend, ''), r.reported_at \
+             FROM basename_reports r LEFT JOIN users u ON u.id = r.user_id WHERE r.target_id = ? ORDER BY r.id DESC LIMIT ?",
         )
         .bind(target_id)
         .bind(DASHBOARD_BASENAMES)
         .fetch_all(&state.pool)
         .await?;
+        let mut latest = Vec::new();
+        for (names, reported_by, reported_by_backend, reported_at) in reports {
+            for basename in crate::basenames::decompress(&names)?.into_iter().rev() {
+                if latest.len() == DASHBOARD_BASENAMES as usize {
+                    break;
+                }
+                latest.push(DashboardBasename { basename, reported_by: reported_by.clone(), reported_by_backend: reported_by_backend.clone(), reported_at });
+            }
+        }
         basenames_by_target.insert(target_id, latest);
     }
 

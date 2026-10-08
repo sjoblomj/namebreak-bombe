@@ -122,8 +122,18 @@ async fn complete(state: &AppState, user: &User, range_id: i64, found: Option<&s
     handlers::complete(State(state.clone()), AuthedUser(user.clone()), Path(range_id), Json(req)).await
 }
 
+/// A target's basenames, in the order they came, with who sent each and
+/// with which range - out of their compressed reports.
 async fn basenames(state: &AppState, target_id: i64) -> Vec<(String, i64, i64)> {
-    sqlx::query_as("SELECT basename, user_id, range_id FROM basenames WHERE target_id = ? ORDER BY id").bind(target_id).fetch_all(&state.pool).await.unwrap()
+    let reports: Vec<(Vec<u8>, i64, i64, i64)> =
+        sqlx::query_as("SELECT names, user_id, range_id, count FROM basename_reports WHERE target_id = ? ORDER BY id").bind(target_id).fetch_all(&state.pool).await.unwrap();
+    let mut all = Vec::new();
+    for (names, user_id, range_id, count) in reports {
+        let names = crate::basenames::decompress(&names).unwrap();
+        assert_eq!(names.len() as i64, count, "a report's count is how many it has");
+        all.extend(names.into_iter().map(|name| (name, user_id, range_id)));
+    }
+    all
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -511,6 +521,8 @@ async fn basenames_are_kept_once_per_target_from_every_kind_of_report() {
 
     ranges::delete_target(&state.pool, id).await.unwrap();
     assert!(basenames(&state, id).await.is_empty(), "deleted with their target");
+    let hashes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM basename_hashes WHERE target_id = ?").bind(id).fetch_one(&state.pool).await.unwrap();
+    assert_eq!(hashes, 0, "... and so are their hashes");
 }
 
 #[tokio::test]
@@ -569,26 +581,105 @@ async fn every_basename_is_listed_a_page_at_a_time() {
     let listed = |state: AppState| async move { body_text(handlers::target_basenames(State(state), Path(id)).await.unwrap()).await };
     assert_eq!(listed(state.clone()).await, "", "none yet");
 
-    // Two pages and a bit, then exactly three: the last page full, and then
-    // none after it.
-    let page = handlers::BASENAMES_PAGE as usize;
-    for (count, label) in [(2 * page + 7, "two pages and a bit"), (3 * page, "exactly three pages")] {
-        sqlx::query("DELETE FROM basenames").execute(&state.pool).await.unwrap();
+    // Reports of different sizes: two pages and a bit, then exactly three -
+    // the last page full, and then none after it.
+    let page = handlers::BASENAME_REPORTS_PAGE as usize;
+    for (reports, label) in [(2 * page + 7, "two pages and a bit"), (3 * page, "exactly three pages")] {
+        sqlx::query("DELETE FROM basename_reports").execute(&state.pool).await.unwrap();
+        sqlx::query("DELETE FROM basename_hashes").execute(&state.pool).await.unwrap();
+        let mut expected = String::new();
         let mut tx = state.pool.begin().await.unwrap();
-        for i in 0..count {
+        for r in 0..reports {
             // Not in name order, so that it's the order they came in that shows.
-            sqlx::query("INSERT INTO basenames (target_id, basename, user_id, range_id, reported_at) VALUES (?, ?, ?, 0, 0)")
-                .bind(id)
-                .bind(format!("N{:06}.WAV", (i * 7919) % count))
-                .bind(client.id)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
+            let names: Vec<String> = (0..1 + r % 13).map(|i| format!("R{:03}N{:02}.WAV", (r * 37) % reports, 12 - i)).collect();
+            expected.extend(names.iter().map(|n| format!("{n}\n")));
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            crate::basenames::store(&mut tx, id, client.id, 0, 0, &names).await.unwrap();
         }
         tx.commit().await.unwrap();
-        let expected: String = (0..count).map(|i| format!("N{:06}.WAV\n", (i * 7919) % count)).collect();
         assert!(listed(state.clone()).await == expected, "{label}: every one, once, in the order they came");
     }
+}
+
+#[tokio::test]
+async fn basenames_are_stored_compressed() {
+    let state = state(20.0).await;
+    put_list(&state, "nato", WORDS).await.unwrap();
+    let id = create(&state, serde_json::json!({"encryption_key_hex": "0x1234", "send_basenames": true})).await.unwrap();
+    let client = user(&state, "u", "1.5.0").await;
+    let c = claim(&state, &client).await.unwrap();
+    // Like three-word basenames: three of a few thousand words.
+    let words: Vec<String> = (0..3000).map(|i| format!("W{}{}", ["ALPHA", "BRAVO", "ECHO", "TANGO"][i % 4], i * 7)).collect();
+    let many: Vec<String> =
+        (0..MAX_BASENAMES_PER_REPORT).map(|i| format!("{}_{}-{}.WAV", words[i % 3000], words[(i * 7 + i / 3000) % 3000], words[i * 13 % 3000])).collect();
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, basenames: many.clone() };
+    heartbeat(&state, &client, c.range_id, req).await.unwrap();
+    let (stored, count): (i64, i64) =
+        sqlx::query_as("SELECT SUM(LENGTH(names)), SUM(count) FROM basename_reports WHERE target_id = ?").bind(id).fetch_one(&state.pool).await.unwrap();
+    let text: usize = many.iter().map(|n| n.len() + 1).sum();
+    assert_eq!(count as usize, many.len());
+    assert!(stored as usize * 2 < text, "{stored} bytes stored for {text} of text");
+    let hashes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM basename_hashes WHERE target_id = ?").bind(id).fetch_one(&state.pool).await.unwrap();
+    assert_eq!(hashes as usize, many.len(), "a hash each, to keep each once");
+    // A report with only ones the target has already stores nothing.
+    heartbeat(&state, &client, c.range_id, report(None, &[many[0].as_str(), many[1].as_str()])).await.unwrap();
+    let reports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM basename_reports WHERE target_id = ?").bind(id).fetch_one(&state.pool).await.unwrap();
+    assert_eq!(reports, 1);
+}
+
+/// `uri` through the whole router, with `accept_encoding` if any - its
+/// Content-Encoding and body.
+async fn get_through_router(state: &AppState, uri: &str, accept_encoding: Option<&str>, token: Option<&str>) -> (Option<String>, Vec<u8>) {
+    use tower::ServiceExt;
+    let mut request = axum::http::Request::get(uri);
+    if let Some(encoding) = accept_encoding {
+        request = request.header("Accept-Encoding", encoding);
+    }
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = crate::router(state.clone()).oneshot(request.body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let encoding = response.headers().get("Content-Encoding").map(|v| v.to_str().unwrap().to_string());
+    (encoding, axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+}
+
+fn gunzip(bytes: &[u8]) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(bytes).read_to_string(&mut text).unwrap();
+    text
+}
+
+#[tokio::test]
+async fn big_answers_are_gzipped_for_whoever_takes_gzip() {
+    let state = state(20.0).await;
+    put_list(&state, "nato", WORDS).await.unwrap();
+    let id = create(&state, serde_json::json!({"encryption_key_hex": "0x1234", "send_basenames": true})).await.unwrap();
+    let client = user(&state, "u", "1.5.0").await;
+    let c = claim(&state, &client).await.unwrap();
+    let many: Vec<String> = (0..2000).map(|i| format!("SOME_LONGER_NAME_{i:05}.WAV")).collect();
+    heartbeat(&state, &client, c.range_id, HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, basenames: many.clone() })
+        .await
+        .unwrap();
+    let all: String = many.iter().map(|n| format!("{n}\n")).collect();
+
+    let uri = format!("/api/v1/targets/{id}/basenames");
+    let (encoding, body) = get_through_router(&state, &uri, None, None).await;
+    assert_eq!((encoding, String::from_utf8(body).unwrap()), (None, all.clone()), "plain to whoever doesn't ask");
+    let (encoding, body) = get_through_router(&state, &uri, Some("gzip, deflate, br, zstd"), None).await;
+    assert_eq!(encoding.as_deref(), Some("gzip"));
+    assert!(body.len() * 3 < all.len(), "{} bytes for {}", body.len(), all.len());
+    assert_eq!(gunzip(&body), all, "gzipped to whoever asks");
+
+    let (encoding, body) = get_through_router(&state, "/api/v1/dashboard", Some("gzip"), None).await;
+    assert_eq!(encoding.as_deref(), Some("gzip"));
+    assert!(serde_json::from_str::<serde_json::Value>(&gunzip(&body)).is_ok(), "the dashboard's JSON too");
+
+    // A client's download of a word list (which libcurl asks to be gzipped).
+    let (encoding, body) = get_through_router(&state, "/api/v1/word-lists/english-1", Some("gzip"), Some(&client.token)).await;
+    assert_eq!(encoding.as_deref(), Some("gzip"));
+    assert!(gunzip(&body).as_bytes() == include_bytes!("../../../client/data/english-1.txt"));
 }
 
 #[tokio::test]

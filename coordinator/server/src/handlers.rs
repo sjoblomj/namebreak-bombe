@@ -3,6 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::StreamExt;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
     AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
@@ -620,45 +621,58 @@ pub async fn word_list(State(state): State<AppState>, AuthedUser(_user): AuthedU
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], content).into_response())
 }
 
-/// How many basenames `target_basenames` reads at a time.
-pub(crate) const BASENAMES_PAGE: i64 = 10_000;
+/// How many reports' basenames (see `basenames.rs`) `target_basenames`
+/// reads at a time - each at most `MAX_BASENAMES_PER_REPORT`, usually a few
+/// hundred.
+pub(crate) const BASENAME_REPORTS_PAGE: i64 = 20;
 
 /// Every basename clients found matching a target's encryption key (see
 /// `AdminCreateTargetRequest::send_basenames`), one per line, in the order
 /// they were first reported. Public, like the dashboard, which shows only
 /// the latest of them and links here for the rest. There can be a million
-/// of them (three words of english-1), so they're read and sent a page of
-/// `BASENAMES_PAGE` at a time: the database - one connection, which every
-/// claim and heartbeat needs too - is only held for a page's query, and
-/// only a page is ever in memory, however slowly the list is downloaded.
+/// of them (three words of english-1), so they're read and sent
+/// `BASENAME_REPORTS_PAGE` reports at a time: the database - one connection,
+/// which every claim and heartbeat needs too - is only held for a page's
+/// query, and only a page is ever in memory, however slowly the list is
+/// downloaded. Gzipped for a client that takes it (see `main::router`): a
+/// million are 31 MB, gzipped about 11.
 pub async fn target_basenames(State(state): State<AppState>, Path(target_id): Path<i64>) -> Result<Response, AppError> {
     let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM targets WHERE id = ? AND is_virtual = 0").bind(target_id).fetch_optional(&state.pool).await?;
     exists.ok_or(AppError::NotFound)?;
     let pool = state.pool.clone();
     // The pages, each after the last row of the one before - None once
-    // there's none left.
+    // there's none left. Fused, as the gzip encoder (see main::router) asks
+    // for more after the end.
     let pages = futures_util::stream::unfold(Some(0i64), move |after| {
         let pool = pool.clone();
         async move {
             let after = after?;
-            let rows: Result<Vec<(i64, String)>, sqlx::Error> =
-                sqlx::query_as("SELECT id, basename FROM basenames WHERE target_id = ? AND id > ? ORDER BY id LIMIT ?")
+            let rows: Result<Vec<(i64, Vec<u8>)>, sqlx::Error> =
+                sqlx::query_as("SELECT id, names FROM basename_reports WHERE target_id = ? AND id > ? ORDER BY id LIMIT ?")
                     .bind(target_id)
                     .bind(after)
-                    .bind(BASENAMES_PAGE)
+                    .bind(BASENAME_REPORTS_PAGE)
                     .fetch_all(&pool)
                     .await;
-            match rows {
-                Ok(rows) if rows.is_empty() => None,
-                Ok(rows) => {
-                    let next = (rows.len() as i64 == BASENAMES_PAGE).then(|| rows.last().expect("not empty").0);
-                    let text: String = rows.into_iter().map(|(_, basename)| basename + "\n").collect();
-                    Some((Ok::<_, std::io::Error>(text), next))
+            let page = rows.map_err(std::io::Error::other).and_then(|rows| {
+                let next = (rows.len() as i64 == BASENAME_REPORTS_PAGE).then(|| rows.last().expect("a full page").0);
+                let mut text = String::new();
+                for (_, names) in &rows {
+                    for name in crate::basenames::decompress(names).map_err(|err| std::io::Error::other(format!("{err:?}")))? {
+                        text += &name;
+                        text.push('\n');
+                    }
                 }
-                Err(err) => Some((Err(std::io::Error::other(err)), None)),
+                Ok((text, next))
+            });
+            match page {
+                Ok((text, _)) if text.is_empty() => None,
+                Ok((text, next)) => Some((Ok::<_, std::io::Error>(text), next)),
+                Err(err) => Some((Err(err), None)),
             }
         }
-    });
+    })
+    .fuse();
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], axum::body::Body::from_stream(pages)).into_response())
 }
 

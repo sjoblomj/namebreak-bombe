@@ -1,5 +1,6 @@
 mod alphabet;
 mod auth;
+mod basenames;
 mod canary;
 mod client_release;
 mod dashboard;
@@ -17,6 +18,7 @@ mod state;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post, put};
 use axum::Router;
+use tower_http::compression::CompressionLayer;
 use state::{AppState, Inner, RangeConfig};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,8 +40,20 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState(Arc::new(Inner { pool, admin_token, config }));
 
     spawn_reclaim_task(state.clone());
+    let app = router(state);
 
-    let app = Router::new()
+    tracing::info!(%bind_addr, "starting namebreak coordinator server");
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Every route. Responses are gzipped for a client that says it takes gzip
+/// (Accept-Encoding) - a browser, curl --compressed, and the client's word
+/// list downloads: the dashboard's JSON, a target's basenames (a million
+/// are 31 MB, gzipped about 11) and a word list are worth it.
+pub fn router(state: AppState) -> Router {
+    Router::new()
         .route("/", get(dashboard::dashboard_page))
         .route("/api/v1/dashboard", get(dashboard::dashboard_data))
         .route("/api/v1/register", post(handlers::register))
@@ -65,12 +79,8 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/admin/word-lists/{name}",
             put(handlers::admin_put_word_list).delete(handlers::admin_delete_word_list).layer(DefaultBodyLimit::max(256 << 20)),
         )
-        .with_state(state);
-
-    tracing::info!(%bind_addr, "starting namebreak coordinator server");
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .layer(CompressionLayer::new())
+        .with_state(state)
 }
 
 fn spawn_reclaim_task(state: AppState) {

@@ -1580,7 +1580,7 @@ pub async fn complete_range(
 /// Keeps the basenames a client reported with a heartbeat, quit or
 /// completion of `range_id` (see `HeartbeatRequest::basenames`), for the
 /// range's target: each one once per target, with whoever reported it first
-/// and in which range. Called before anything else the report does, and
+/// and in which range - compressed, see `basenames.rs`. Called before anything else the report does, and
 /// committed on its own, so they're kept whatever the rest of it gets - a
 /// 409 included, which the client then counts as delivered too. From
 /// whoever reports them, as a find is (see `complete_range`): they're facts
@@ -1605,24 +1605,15 @@ pub async fn record_basenames(pool: &SqlitePool, user: &User, range_id: i64, bas
         tracing::warn!(range_id, user_id = user.id, "basenames reported for an alphabet target, ignoring");
         return Ok(());
     }
-    let now = now_unix();
-    let mut kept = 0u64;
+    let mut valid: Vec<&str> = Vec::with_capacity(basenames.len());
     for basename in basenames {
         if basename.is_empty() || basename.len() > 255 || basename.contains('\\') || !crate::dictionary::is_printable_ascii(basename) {
             tracing::warn!(range_id, user_id = user.id, basename, "a reported basename can't be one, ignoring");
             continue;
         }
-        kept += sqlx::query("INSERT OR IGNORE INTO basenames (target_id, basename, user_id, range_id, reported_at) VALUES (?, ?, ?, ?, ?)")
-            .bind(target_id)
-            .bind(basename)
-            .bind(user.id)
-            .bind(range_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        valid.push(basename);
     }
-    sqlx::query("UPDATE targets SET basename_count = basename_count + ? WHERE id = ?").bind(kept as i64).bind(target_id).execute(&mut *tx).await?;
+    let kept = crate::basenames::store(&mut tx, target_id, user.id, range_id, now_unix(), &valid).await?;
     tx.commit().await?;
     tracing::info!(range_id, user_id = user.id, reported = basenames.len(), new = kept, "basenames reported");
     Ok(())
@@ -1786,7 +1777,8 @@ pub async fn delete_target(pool: &SqlitePool, target_id: i64) -> Result<bool, Ap
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM ranges WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM target_progress WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM basenames WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM basename_reports WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM basename_hashes WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM priority_range_segments WHERE priority_range_id IN (SELECT id FROM priority_ranges WHERE target_id = ?)")
         .bind(target_id)
         .execute(&mut *tx)
