@@ -400,6 +400,21 @@ dictionary_cli_test(dictionary-cli-found dictionary 0xE6B2B01C "max_words = 2" "
 dictionary_cli_test(dictionary-cli-not-found bounded 0x00000000 "max_words = 2" "Searched every candidate - no match of both hashes"
                     --mode dictionary)
 dictionary_cli_test(dictionary-cli-bad-config dictionary 0xE6B2B01C "" "missing required key 'max_words'")
+dictionary_cli_test(dictionary-cli-no-basenames dictionary 0xE6B2B01C "max_words = 2\nrecord_basenames = false" "")
+# The basenames file those runs leave (record_basenames, on by default with
+# an encryption key): the find's basename, or - turned off - no file.
+foreach(run found no-basenames)
+    file(REMOVE ${CMAKE_BINARY_DIR}/testrun/dictionary-cli-${run}/matches/basenames-credits.txt)
+    set_tests_properties(dictionary-cli-${run} PROPERTIES FIXTURES_SETUP dictionary-cli-${run}-ran)
+endforeach()
+add_test(NAME dictionary-cli-basenames-file
+    COMMAND ${CMAKE_COMMAND} -DFILE=matches/basenames-credits.txt -DEXPECTED=CRDT_LST.TXT -P ${CMAKE_SOURCE_DIR}/tests/check_basenames_file.cmake
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/dictionary-cli-found)
+set_tests_properties(dictionary-cli-basenames-file PROPERTIES FIXTURES_REQUIRED dictionary-cli-found-ran)
+add_test(NAME dictionary-cli-no-basenames-file
+    COMMAND ${CMAKE_COMMAND} -DFILE=matches/basenames-credits.txt -P ${CMAKE_SOURCE_DIR}/tests/check_basenames_file.cmake
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/dictionary-cli-no-basenames)
+set_tests_properties(dictionary-cli-no-basenames-file PROPERTIES FIXTURES_REQUIRED dictionary-cli-no-basenames-ran)
 
 # Where buildSearchRequest (src/common/config.h) starts a search -
 # start_candidate and resume_from_last_candidate. CPU only.
