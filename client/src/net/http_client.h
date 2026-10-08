@@ -41,7 +41,8 @@ public:
     HttpResponse head(const std::string& url, long timeoutSeconds = kDefaultTimeoutSeconds);
 
     // A GET of `url`'s body, with `headers` - for a word list, which can be
-    // megabytes, hence the longer default timeout.
+    // megabytes, hence the longer default timeout. Takes it compressed if the
+    // server will send it so, and undoes that.
     static constexpr long kDownloadTimeoutSeconds = 300;
     HttpResponse get(const std::string& url, const std::vector<std::string>& headers, long timeoutSeconds = kDownloadTimeoutSeconds);
 

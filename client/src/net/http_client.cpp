@@ -85,6 +85,10 @@ HttpResponse HttpClient::get(const std::string& url, const std::vector<std::stri
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    // Takes the body compressed in whichever way this libcurl can undo (""
+    // asks for all of them), and hands it on undone - a word list is about
+    // a third of its size gzipped.
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
