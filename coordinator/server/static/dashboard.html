@@ -87,6 +87,7 @@
     margin-right: 6px;
   }
   .subhead.stale #status-dot { background: var(--pending); }
+  .subhead .active-now { margin-top: 4px; }
   .notify {
     margin-left: 14px;
   }
@@ -643,7 +644,7 @@
 </head>
 <body>
   <h1>namebreak coordinator</h1>
-  <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span></div>
+  <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span><div class="active-now" id="active-now" title="Ranges being searched right now" hidden></div></div>
   <nav class="page-tabs tab-bar" id="page-tabs" role="tablist">
     <button type="button" class="tab-btn" role="tab" data-page="targets">Targets</button>
     <button type="button" class="tab-btn" role="tab" data-page="matches">Matches</button>
@@ -862,6 +863,7 @@
   const targetsEl = document.getElementById('targets');
   const statusEl  = document.getElementById('status-text');
   const subheadEl = document.querySelector('.subhead');
+  const activeNowEl = document.getElementById('active-now');
 
   // Displayed as "YYYY-mm-dd HH:MM:ss" in the viewer's own local timezone
   // (whatever the browser reports); the full ISO-8601 string (UTC, with T, Z
@@ -2056,6 +2058,8 @@
       const now = fmtTime(Math.floor(Date.now() / 1000));
       statusEl.textContent = 'updated ' + now.display;
       statusEl.title = now.iso;
+      activeNowEl.textContent = 'Active now: ' + fmtNum(data.active_ranges || 0);
+      activeNowEl.hidden = false;
     } catch (err) {
       subheadEl.classList.add('stale');
       statusEl.textContent = 'update failed (' + err.message + ') - reload to retry';

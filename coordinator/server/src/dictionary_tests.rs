@@ -816,6 +816,7 @@ async fn the_dashboard_shows_a_dictionary_target() {
     let dashboard = crate::dashboard::dashboard_data(State(state.clone())).await.unwrap().0;
     let t = dashboard.targets.iter().find(|t| t.id == id).unwrap();
     assert_eq!(t.kind, "dictionary");
+    assert_eq!(dashboard.active_ranges, 1, "only the range still being searched");
     assert_eq!((t.alphabet_name.as_str(), t.lower_bound.as_str(), t.upper_bound.as_str()), ("", "", "MUSIC\\DELTA_ECHO.WAV"));
     let d = t.dictionary.as_ref().unwrap();
     assert_eq!((d.word_lists.clone(), d.word_list_word_counts.clone()), (vec!["nato".to_string()], vec![5]));

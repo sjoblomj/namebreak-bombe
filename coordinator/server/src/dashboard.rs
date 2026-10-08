@@ -32,6 +32,9 @@ pub struct DashboardResponse {
     /// Everyone who has claimed work or found a name, most candidates
     /// searched first - see `volunteers`.
     pub volunteers: Vec<DashboardVolunteer>,
+    /// How many ranges are being searched right now (in progress), across
+    /// every target.
+    pub active_ranges: i64,
 }
 
 /// One username's contribution, across every hostname it has registered
@@ -805,7 +808,12 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         });
     }
 
-    Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await? }))
+    let active_ranges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ranges r JOIN targets t ON t.id = r.target_id WHERE r.status = 'in_progress' AND t.is_virtual = 0",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await?, active_ranges }))
 }
 
 /// A dictionary target's `DashboardTarget` (see `DashboardTarget::kind`):
