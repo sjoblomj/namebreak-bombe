@@ -279,12 +279,14 @@ pub struct HeartbeatRequest {
     pub next_candidate_number: Option<i64>,
     /// Basenames that matched the encryption key since the client's last
     /// report that got an answer (`send_basenames` - see `ClaimResponse`),
-    /// at most `MAX_BASENAMES_PER_REPORT`. The server keeps each one once per
-    /// target, whatever the rest of the report gets - even a 409, so the
-    /// client doesn't send them again after either; only a report that gets
-    /// no answer, or another error, leaves them to be sent with the next.
-    /// They're the target's, not the range's: ones left over from an earlier
-    /// range of the same target can come with any of its ranges' reports.
+    /// at most `MAX_BASENAMES_PER_REPORT`. `next_candidate_number` is never
+    /// past one the client has found and not sent (with this report or one
+    /// that got an answer), so everything the server takes as searched has
+    /// had its basenames delivered; and a completion only goes once the rest
+    /// fit in it. The server keeps each one once per target, whatever the
+    /// rest of the report gets - even a 409, so the client doesn't send them
+    /// again after either; only a report that gets no answer, or another
+    /// error, leaves them to be sent with the next.
     #[serde(default)]
     pub basenames: Vec<String>,
 }

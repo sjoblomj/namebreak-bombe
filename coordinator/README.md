@@ -478,10 +478,15 @@ canary made from one.
 
 **Basenames.** A client sends the basenames it finds with its next
 heartbeat, quit or completion, at most 5,000 a report
-(`MAX_BASENAMES_PER_REPORT`), and keeps the ones the server hasn't got yet in
-a file (`unsent-basenames-<target>.txt` in its matches directory), which it
-clears as reports get through - so one that fails, or that the client quits
-before, leaves them for the next report of a range of that target. The
+(`MAX_BASENAMES_PER_REPORT`), keeping the ones the server hasn't got yet in
+memory until a report gets through. A report never says the search has got
+further than a basename it doesn't carry: its `next_candidate_number` is at
+most where the first one it leaves waiting was found. A completion says the
+whole range was searched, so the client sends more than it can carry in
+heartbeats first, one straight after another. So whatever happens to the
+client - a crash, a quit, a lost connection - a basename the server never
+got lies in a part of the range it will hand out again, and is found again:
+none is ever missed, and the client keeps no files of them. The
 server keeps each basename once per target, with who sent it first and in
 which range, whatever else the report gets - a 409 included, as it's a fact
 about the target, like a find - so a client counts them delivered on any
