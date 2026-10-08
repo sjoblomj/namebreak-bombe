@@ -621,6 +621,19 @@ pub async fn word_list(State(state): State<AppState>, AuthedUser(_user): AuthedU
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], content).into_response())
 }
 
+/// One of a dictionary target's word lists, exactly as uploaded - public,
+/// like the dashboard, whose Dictionary tab shows it. Only the lists a
+/// target uses: any other is NotFound here, however it's spelled.
+pub async fn target_word_list(State(state): State<AppState>, Path((target_id, name)): Path<(i64, String)>) -> Result<Response, AppError> {
+    let lists: Option<Option<String>> =
+        sqlx::query_scalar("SELECT word_lists FROM targets WHERE id = ? AND kind = 'dictionary' AND is_virtual = 0").bind(target_id).fetch_optional(&state.pool).await?;
+    if !dictionary::parse_string_list(lists.ok_or(AppError::NotFound)?.as_deref())?.contains(&name) {
+        return Err(AppError::NotFound);
+    }
+    let content: Vec<u8> = sqlx::query_scalar("SELECT content FROM word_lists WHERE name = ?").bind(&name).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], content).into_response())
+}
+
 /// How many reports' basenames (see `basenames.rs`) `target_basenames`
 /// reads at a time - each at most `MAX_BASENAMES_PER_REPORT`, usually a few
 /// hundred.

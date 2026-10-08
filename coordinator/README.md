@@ -493,9 +493,13 @@ about the target, like a find - so a client counts them delivered on any
 answer but an error. A basename that can't be one (empty, longer than 255
 characters, with a `\` or anything but printable ASCII) is left out, and
 nothing else is done with them: they're kept for whoever searches them. The
-dashboard shows how many a target has and the latest 20, and `GET
+dashboard marks a dictionary target with a Dictionary badge, and gives it a
+Basenames tab - all of them, up to the first 100,000 - and a Dictionary tab
+with its word lists' words (`english-1` is only mentioned). `GET
 /api/v1/targets/{id}/basenames` (public, like the dashboard) lists all of
-them, one per line, in the order they came.
+them, one per line, in the order they came, and `GET
+/api/v1/targets/{id}/word-lists/{name}` (public too) a word list the target
+uses, as uploaded.
 
 There can be a lot of them: about one candidate in 2^32 matches a key by
 chance, so a target of three words of `english-1` with four separators

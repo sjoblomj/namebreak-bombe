@@ -26,6 +26,7 @@
     --in-progress: #d97706;
     --completed: #16a34a;
     --skipped: #7c3aed;
+    --dictionary: #0d9488;
     --solved-bg: #fff8e1;
     --solved-border: #f5c518;
     --solved-text: #7a5b00;
@@ -52,6 +53,7 @@
       --in-progress: #e0a13a;
       --completed: #3ecf6e;
       --skipped: #a78bfa;
+      --dictionary: #14b8a6;
       --solved-bg: #2c2405;
       --solved-border: #caa314;
       --solved-text: #ffd75e;
@@ -211,18 +213,30 @@
     font-size: 13px;
     margin-top: 6px;
   }
-  /* A dictionary target's basenames - see basenamesSection. */
-  .target-basenames {
+  /* A dictionary target's Basenames and Dictionary tabs - see
+     basenamesPanel and dictionaryPanel. */
+  .word-panel {
     color: var(--muted);
     font-size: 12px;
-    margin-top: 6px;
+    padding-top: 10px;
   }
-  .target-basenames .basename-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px 8px;
-    margin-top: 4px;
+  .word-panel .word-list-head { margin-top: 12px; }
+  .word-panel .word-list-head:first-child { margin-top: 0; }
+  .word-panel .word-list-head .name { font-family: var(--mono); color: var(--text); font-weight: 600; }
+  .word-panel .words {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    background: var(--detail-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin: 6px 0 0;
+    max-height: 320px;
+    overflow: auto;
+    white-space: pre;
   }
+  .word-panel .note { margin-top: 10px; }
   .target-description :first-child { margin-top: 0; }
   .target-description :last-child { margin-bottom: 0; }
   .badge {
@@ -243,6 +257,7 @@
   .badge.status-in_progress { background: var(--in-progress); }
   .badge.status-completed { background: var(--completed); }
   .badge.status-skipped { background: var(--skipped); }
+  .badge.kind-dictionary { background: var(--dictionary); }
   /* Black in both themes; the border keeps it visible on the dark card. */
   .badge.status-gap { background: #000; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18); }
   .priority-chip {
@@ -1545,46 +1560,42 @@
     return section;
   }
 
-  // Builds the two-tab "Progress" / "Priority ranges" switcher used when a
-  // target has priority ranges to show alongside its main range table.
-  // Starts on the Progress tab; clicking a tab swaps which panel has the
-  // "active" class (CSS handles the actual show/hide).
-  function targetTabs(progressPanel, priorityPanel) {
+  // Builds a target's tab switcher: `tabs` is [{label, panel, onOpen}], the
+  // first one open to start with. Clicking a tab swaps which panel has the
+  // "active" class (CSS handles the actual show/hide), and calls its onOpen
+  // (if any) the first time - for a tab that loads what it shows.
+  function targetTabs(tabs) {
     const wrap = document.createElement('div');
     wrap.className = 'target-tabs';
 
     const bar = document.createElement('div');
     bar.className = 'tab-bar';
-
-    const progressBtn = document.createElement('button');
-    progressBtn.type = 'button';
-    progressBtn.className = 'tab-btn active';
-    progressBtn.textContent = 'Progress';
-    bar.appendChild(progressBtn);
-
-    const priorityBtn = document.createElement('button');
-    priorityBtn.type = 'button';
-    priorityBtn.className = 'tab-btn';
-    priorityBtn.textContent = 'Priority ranges';
-    bar.appendChild(priorityBtn);
-
     wrap.appendChild(bar);
 
-    progressPanel.classList.add('tab-panel', 'active');
-    priorityPanel.classList.add('tab-panel');
-    wrap.appendChild(progressPanel);
-    wrap.appendChild(priorityPanel);
-
-    function activate(btn, panel) {
-      for (const b of [progressBtn, priorityBtn]) b.classList.remove('active');
-      for (const p of [progressPanel, priorityPanel]) p.classList.remove('active');
-      btn.classList.add('active');
-      panel.classList.add('active');
+    for (const tab of tabs) {
+      tab.button = document.createElement('button');
+      tab.button.type = 'button';
+      tab.button.className = 'tab-btn';
+      tab.button.textContent = tab.label;
+      bar.appendChild(tab.button);
+      tab.panel.classList.add('tab-panel');
+      wrap.appendChild(tab.panel);
     }
 
-    progressBtn.addEventListener('click', () => activate(progressBtn, progressPanel));
-    priorityBtn.addEventListener('click', () => activate(priorityBtn, priorityPanel));
+    function activate(tab) {
+      for (const t of tabs) {
+        t.button.classList.toggle('active', t === tab);
+        t.panel.classList.toggle('active', t === tab);
+      }
+      if (tab.onOpen) {
+        const onOpen = tab.onOpen;
+        tab.onOpen = null;
+        onOpen();
+      }
+    }
 
+    for (const tab of tabs) tab.button.addEventListener('click', () => activate(tab));
+    activate(tabs[0]);
     return wrap;
   }
 
@@ -1744,34 +1755,141 @@
     return frag;
   }
 
-  // The basenames clients sent for a dictionary target (see dashboard.rs's
-  // DashboardDictionary) - the latest of them, with a link to all.
-  function basenamesSection(t) {
-    const d = t.dictionary;
-    const section = document.createElement('div');
-    section.className = 'target-basenames';
-    const head = d.send_basenames ? 'Basenames matching the encryption key' : 'Basenames matching the encryption key (no longer collected)';
-    if (d.basename_count === 0) {
-      section.textContent = `${head}: none yet`;
-      return section;
+  // How many lines of a word list or of the basenames a tab shows - the
+  // rest are a download away. A target can have a million basenames, more
+  // than a page should hold.
+  const MAX_LISTED_LINES = 100000;
+
+  // Fetches `url` (plain text, one entry a line) into `pre`, at most
+  // MAX_LISTED_LINES of it - reading no more of the answer than that - and
+  // says in `status` how many were read and where the rest are.
+  async function loadLines(url, pre, status) {
+    status.textContent = 'Loading…';
+    try {
+      const resp = await fetch(url, { cache: 'no-store' });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let text = '';
+      let lines = 0;
+      let more = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        for (const c of chunk) if (c === '\n') ++lines;
+        text += chunk;
+        if (lines > MAX_LISTED_LINES) {
+          more = true;
+          reader.cancel();
+          break;
+        }
+      }
+      text += decoder.decode();
+      let shown = text.split(/\r?\n/).filter((line) => line.trim() !== '');
+      if (shown.length > MAX_LISTED_LINES) {
+        shown = shown.slice(0, MAX_LISTED_LINES);
+        more = true;
+      }
+      pre.textContent = shown.join('\n');
+      pre.hidden = shown.length === 0;
+      status.replaceChildren();
+      if (more) {
+        const all = document.createElement('a');
+        all.href = url;
+        all.textContent = 'download them all';
+        status.append(`The first ${fmtNum(shown.length)} - `, all);
+      } else if (shown.length === 0) {
+        status.textContent = 'None.';
+      }
+    } catch (err) {
+      status.textContent = 'Loading failed (' + err.message + ').';
     }
-    section.append(`${head}: ${fmtNum(d.basename_count)}`);
-    if (d.basename_count > d.basenames.length) section.append(` - the latest ${d.basenames.length} below`);
-    section.append(' · ');
+  }
+
+  // A panel that loads `url` into a scrollable list when `load` is called.
+  function lazyLines(url) {
+    const frag = document.createDocumentFragment();
+    const pre = document.createElement('pre');
+    pre.className = 'words';
+    pre.hidden = true;
+    const status = document.createElement('div');
+    status.className = 'note';
+    frag.append(pre, status);
+    return { frag, load: () => loadLines(url, pre, status) };
+  }
+
+  // The basenames clients sent for a dictionary target (see dashboard.rs's
+  // DashboardDictionary) - all of them, in the order they were first sent,
+  // loaded when the tab is first opened.
+  function basenamesPanel(t) {
+    const d = t.dictionary;
+    const panel = document.createElement('div');
+    panel.className = 'word-panel';
+    const head = document.createElement('div');
+    head.textContent = d.send_basenames
+      ? 'Basenames matching the encryption key, as clients find them'
+      : 'Basenames matching the encryption key - no longer collected';
+    panel.appendChild(head);
+    if (d.basename_count === 0) {
+      head.append(': none yet.');
+      return { panel, load: null };
+    }
+    head.append(`: ${fmtNum(d.basename_count)} · `);
     const all = document.createElement('a');
     all.href = `/api/v1/targets/${t.id}/basenames`;
-    all.textContent = 'all of them';
-    section.appendChild(all);
-    const list = document.createElement('div');
-    list.className = 'basename-list';
-    for (const b of d.basenames) {
-      const chip = candidateChip(b.basename);
-      const at = fmtTime(b.reported_at);
-      chip.title = `Sent by ${b.reported_by || 'unknown'}${b.reported_by_backend ? ' (' + b.reported_by_backend + ')' : ''}${at ? ' at ' + at.display : ''}`;
-      list.appendChild(chip);
+    all.textContent = 'download';
+    head.appendChild(all);
+    if (d.basenames.length > 0) {
+      const latest = d.basenames[0];
+      const at = fmtTime(latest.reported_at);
+      head.append(` · latest sent by ${latest.reported_by || 'unknown'}${at ? ' at ' + at.display : ''}`);
     }
-    section.appendChild(list);
-    return section;
+    const lines = lazyLines(`/api/v1/targets/${t.id}/basenames`);
+    panel.appendChild(lines.frag);
+    return { panel, load: lines.load };
+  }
+
+  // The word lists a dictionary target's candidates are made of, each
+  // loaded when the tab is first opened - but not english-1, the dictionary
+  // built into the client and the server, which is only mentioned.
+  function dictionaryPanel(t) {
+    const d = t.dictionary;
+    const panel = document.createElement('div');
+    panel.className = 'word-panel';
+    const loads = [];
+    let builtIn = null;
+    d.word_lists.forEach((name, i) => {
+      const count = d.word_list_word_counts ? d.word_list_word_counts[i] : null;
+      if (name === 'english-1') {
+        builtIn = count;
+        return;
+      }
+      const head = document.createElement('div');
+      head.className = 'word-list-head';
+      const nameEl = document.createElement('span');
+      nameEl.className = 'name';
+      nameEl.textContent = name;
+      head.appendChild(nameEl);
+      if (count != null) head.append(` - ${fmtNum(count)} words`);
+      head.append(' · ');
+      const link = document.createElement('a');
+      link.href = `/api/v1/targets/${t.id}/word-lists/${encodeURIComponent(name)}`;
+      link.textContent = 'download';
+      head.appendChild(link);
+      panel.appendChild(head);
+      const lines = lazyLines(link.href);
+      panel.appendChild(lines.frag);
+      loads.push(lines.load);
+    });
+    if (builtIn !== null) {
+      const note = document.createElement('div');
+      note.className = 'note';
+      note.append('Also uses ', candidateChip('english-1'),
+        `, the${builtIn ? ' ' + fmtNum(builtIn) + '-word' : ''} English dictionary built into namebreak - not listed here.`);
+      panel.appendChild(note);
+    }
+    return { panel, load: loads.length ? () => loads.forEach((load) => load()) : null };
   }
 
   function targetCard(t) {
@@ -1786,6 +1904,13 @@
     name.title = 'id ' + t.id;
     head.appendChild(name);
     head.appendChild(statusBadge(t.status));
+    if (t.kind === 'dictionary') {
+      const kind = document.createElement('span');
+      kind.className = 'badge kind-dictionary';
+      kind.textContent = 'Dictionary';
+      kind.title = 'Candidates made of words from word lists';
+      head.appendChild(kind);
+    }
     if (t.priority) {
       const prio = document.createElement('span');
       prio.className = 'priority-chip';
@@ -1842,7 +1967,6 @@
       bounds.append('No bounds');
     }
     card.appendChild(bounds);
-    if (t.dictionary && (t.dictionary.send_basenames || t.dictionary.basename_count > 0)) card.appendChild(basenamesSection(t));
 
     if (t.start_len > 1) {
       const startLen = document.createElement('div');
@@ -1880,16 +2004,23 @@
       card.appendChild(banner);
     }
 
-    // A target with priority ranges gets a Progress/Priority ranges tab
-    // switcher; one without goes straight to the range table, exactly as
-    // before - no tabs shown when there's nothing to tab against.
+    // A target with priority ranges gets a Priority ranges tab, and a
+    // dictionary target Basenames (if it collects them, or did) and
+    // Dictionary tabs, next to its Progress; one with none of those goes
+    // straight to the range table - no tabs shown when there's nothing to
+    // tab against.
+    const tabs = [{ label: 'Progress', panel: rangesContent(t) }];
     const prioritySection = priorityRangeSection(t);
-    const progress = rangesContent(t);
-    if (prioritySection) {
-      card.appendChild(targetTabs(progress, prioritySection));
-    } else {
-      card.appendChild(progress);
+    if (prioritySection) tabs.push({ label: 'Priority ranges', panel: prioritySection });
+    if (t.dictionary) {
+      if (t.dictionary.send_basenames || t.dictionary.basename_count > 0) {
+        const basenames = basenamesPanel(t);
+        tabs.push({ label: `Basenames (${fmtNum(t.dictionary.basename_count)})`, panel: basenames.panel, onOpen: basenames.load });
+      }
+      const dictionary = dictionaryPanel(t);
+      tabs.push({ label: 'Dictionary', panel: dictionary.panel, onOpen: dictionary.load });
     }
+    card.appendChild(tabs.length > 1 ? targetTabs(tabs) : tabs[0].panel);
     return card;
   }
 

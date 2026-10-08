@@ -63,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ranges/{id}/quit", post(handlers::quit))
         .route("/api/v1/word-lists/{name}", get(handlers::word_list))
         .route("/api/v1/targets/{id}/basenames", get(handlers::target_basenames))
+        .route("/api/v1/targets/{id}/word-lists/{name}", get(handlers::target_word_list))
         .route("/api/v1/status", get(handlers::status))
         .route("/api/v1/alphabets", get(handlers::alphabets))
         .route("/api/v1/admin/targets", post(handlers::admin_create_target))

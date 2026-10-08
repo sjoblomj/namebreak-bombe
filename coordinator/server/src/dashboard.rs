@@ -234,6 +234,10 @@ pub struct DashboardTarget {
 #[derive(Serialize)]
 pub struct DashboardDictionary {
     pub word_lists: Vec<String>,
+    /// How many words each of `word_lists` has (the same word can be in
+    /// more than one) - the lists themselves are at
+    /// `GET /api/v1/targets/{id}/word-lists/{name}`.
+    pub word_list_word_counts: Vec<i64>,
     /// How many different words the lists have together.
     pub word_count: usize,
     pub separators: Vec<String>,
@@ -557,6 +561,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     // only (by idx_basename_reports_target - each report has at least one),
     // and counted as they come in (targets.basename_count) rather than here.
     let mut basenames_by_target: HashMap<i64, Vec<DashboardBasename>> = HashMap::new();
+    let word_list_word_counts: HashMap<String, i64> =
+        if dictionaries.is_empty() { HashMap::new() } else { sqlx::query_as("SELECT name, word_count FROM word_lists").fetch_all(&state.pool).await?.into_iter().collect() };
     for &target_id in dictionaries.keys() {
         #[allow(clippy::type_complexity)]
         let reports: Vec<(Vec<u8>, Option<String>, Option<String>, i64)> = sqlx::query_as(
@@ -668,6 +674,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
                 found_by_backend,
                 found_at,
                 basenames_by_target.remove(&id).unwrap_or_default(),
+                &word_list_word_counts,
             ));
             continue;
         }
@@ -815,6 +822,7 @@ fn dictionary_target(
     found_by_backend: Option<String>,
     found_at: Option<i64>,
     basenames: Vec<DashboardBasename>,
+    word_list_word_counts: &HashMap<String, i64>,
 ) -> DashboardTarget {
     let space = &dictionary.space;
     // Already in number order, as the query sorts them.
@@ -921,6 +929,7 @@ fn dictionary_target(
         kind: "dictionary".into(),
         dictionary: Some(DashboardDictionary {
             word_lists: dictionary.word_lists.clone(),
+            word_list_word_counts: dictionary.word_lists.iter().map(|name| word_list_word_counts.get(name).copied().unwrap_or(0)).collect(),
             word_count: space.words().len(),
             separators: space.separators().to_vec(),
             min_words: space.min_words(),

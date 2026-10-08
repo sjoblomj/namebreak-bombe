@@ -206,6 +206,18 @@ async fn a_client_downloads_a_word_list_as_it_was_uploaded() {
 }
 
 #[tokio::test]
+async fn anyone_can_download_the_word_lists_a_target_uses() {
+    let state = state(1.0).await;
+    put_list(&state, "nato", b"alpha\r\nbravo\n").await.unwrap();
+    put_list(&state, "secret", b"hidden\n").await.unwrap();
+    let id = create(&state, serde_json::json!({})).await.unwrap();
+    let get = |target_id: i64, name: &str| handlers::target_word_list(State(state.clone()), Path((target_id, name.to_string())));
+    assert_eq!(body_text(get(id, "nato").await.unwrap()).await, "alpha\r\nbravo\n");
+    assert!(matches!(get(id, "secret").await, Err(AppError::NotFound)), "not a list this target uses");
+    assert!(matches!(get(id + 1, "nato").await, Err(AppError::NotFound)), "no such target");
+}
+
+#[tokio::test]
 async fn a_word_list_a_target_uses_cant_be_deleted() {
     let state = state(1.0).await;
     put_list(&state, "nato", WORDS).await.unwrap();
@@ -806,7 +818,7 @@ async fn the_dashboard_shows_a_dictionary_target() {
     assert_eq!(t.kind, "dictionary");
     assert_eq!((t.alphabet_name.as_str(), t.lower_bound.as_str(), t.upper_bound.as_str()), ("", "", "MUSIC\\DELTA_ECHO.WAV"));
     let d = t.dictionary.as_ref().unwrap();
-    assert_eq!(d.word_lists, vec!["nato".to_string()]);
+    assert_eq!((d.word_lists.clone(), d.word_list_word_counts.clone()), (vec!["nato".to_string()], vec![5]));
     assert_eq!((d.word_count, d.min_words, d.max_words, d.send_basenames), (5, 1, 2, true));
     assert_eq!(d.separators, vec!["".to_string(), "_".to_string()]);
     // One-word: all 5 (DELTA, ECHO... ECHO.WAV sorts after DELTA_ECHO.WAV,
