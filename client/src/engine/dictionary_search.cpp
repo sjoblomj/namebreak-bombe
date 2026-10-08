@@ -524,6 +524,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
             if (basenames.add(basename)) {
                 ++result.basenameHits;
                 printf("BASENAME MATCH: %s (in %s)\n", basename.c_str(), hit.c_str());
+                fflush(stdout);
                 if (hooks.onBasenameMatch)
                     hooks.onBasenameMatch(basename, hit);
             }

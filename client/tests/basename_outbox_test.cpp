@@ -1,17 +1,14 @@
-// BasenameOutbox (net/basename_outbox.h): the basenames a coordinator client
-// found for a dictionary target that the server hasn't got yet - kept in a
-// file that's cleared as reports get through, and read back by the next
-// range of the target. Including while the search adds to it on one thread
-// and the heartbeats send from it on another. No network access.
-//
-// Writes files under ./basename_outbox_test/ - ctest runs this from its own
-// directory under build/testrun/.
+// BasenameOutbox (net/basename_outbox.h): what a dictionary range's reports
+// to the coordinator say - the basenames found that the server hasn't got,
+// and how far the search has got, never past a basename a report leaves
+// waiting. Including while the search adds on one thread and the heartbeats
+// send from another. No network access, no files.
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,91 +28,112 @@ static void check(bool ok, const std::string& what) {
     }
 }
 
-static const std::string kDir = "basename_outbox_test";
+using Names = std::vector<std::string>;
 
-static std::string readFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    std::ostringstream text;
-    text << in.rdbuf();
-    return text.str();
-}
+static void testReports() {
+    printf("--- reports ---\n");
+    BasenameOutbox outbox(1000);
+    BasenameOutbox::Report r = outbox.peek(2);
+    check(r.basenames.empty() && r.next == 1000, "nothing yet: no basenames, and nothing searched past the start");
 
-static void testFile() {
-    printf("--- the file ---\n");
-    std::filesystem::remove_all(kDir);
-    const std::string path = BasenameOutbox::pathFor(kDir, "sc/music bg");
-    check(path == kDir + "/unsent-basenames-sc_music_bg.txt", "one file per target, its name made safe: " + path);
-
-    BasenameOutbox outbox;
-    std::string error;
-    check(outbox.open(path, error) && outbox.size() == 0, "no file yet: nothing waiting");
-    check(!std::filesystem::exists(path), "... and none made by opening");
-
+    // A backend call [1000, 1500) finds A and B; then [1500, 2000) finds C
+    // and D; then [2000, 2600) nothing.
     outbox.add("A.WAV");
     outbox.add("B.WAV");
-    outbox.add("A.WAV");
-    check(outbox.size() == 2 && readFile(path) == "A.WAV\nB.WAV\n", "added, each once, in the file as they come");
-    check(outbox.peek(1) == std::vector<std::string>{"A.WAV"} && outbox.peek(10) == std::vector<std::string>{"A.WAV", "B.WAV"},
-          "peek: the oldest, as many as asked and there are");
-
-    // A report carrying the two goes out; the search finds another meanwhile.
-    const std::vector<std::string> sent = outbox.peek(10);
+    outbox.setProgress(1500);
     outbox.add("C.WAV");
-    outbox.remove(sent.size());
-    check(outbox.peek(10) == std::vector<std::string>{"C.WAV"} && readFile(path) == "C.WAV\n", "the sent ones dropped, the one found meanwhile kept");
+    outbox.add("D.WAV");
+    outbox.setProgress(2000);
+    outbox.setProgress(2600);
+    r = outbox.peek(10);
+    check(r.basenames == Names{"A.WAV", "B.WAV", "C.WAV", "D.WAV"} && r.next == 2600, "all of them fit: all the progress");
+    r = outbox.peek(3);
+    check(r.basenames == Names{"A.WAV", "B.WAV", "C.WAV"} && r.next == 1500,
+          "D left out: no further than where it was found - the start of its call");
+    r = outbox.peek(1);
+    check(r.basenames == Names{"A.WAV"} && r.next == 1000, "B left out, found in the first call: nothing searched at all");
 
-    BasenameOutbox later;
-    check(later.open(path, error) && later.peek(10) == std::vector<std::string>{"C.WAV"}, "a later range of the target finds it waiting");
-    later.remove(1);
-    check(later.size() == 0 && !std::filesystem::exists(path), "everything sent: the file is gone");
-    later.remove(1);
-    check(later.size() == 0, "removing from nothing is nothing");
+    // A report of the first three got through.
+    outbox.remove(3);
+    r = outbox.peek(1);
+    check(r.basenames == Names{"D.WAV"} && r.next == 2600 && outbox.size() == 1, "the rest: D, and all the progress");
+    outbox.add("E.WAV");
+    r = outbox.peek(1);
+    check(r.basenames == Names{"D.WAV"} && r.next == 2600, "E found in the call now running, from 2600: D's report can say 2600");
+    outbox.remove(1);
+    outbox.remove(5);
+    check(outbox.size() == 0 && outbox.peek(1).next == 2600, "removing more than there are leaves none");
 
-    std::filesystem::create_directories(kDir);
-    std::ofstream(path, std::ios::binary) << "X.WAV\r\n\nY.WAV\nX.WAV\nZ.WAV";
-    BasenameOutbox crlf;
-    check(crlf.open(path, error) && crlf.peek(10) == std::vector<std::string>{"X.WAV", "Y.WAV", "Z.WAV"},
-          "a file from elsewhere: CRLF, blank lines, duplicates and no last newline read right");
-
-    // A file that can't be written: still kept in memory, and sent.
-    std::ofstream(kDir + "/not-a-directory") << "x";
-    BasenameOutbox unwritable;
-    check(unwritable.open(kDir + "/not-a-directory/unsent.txt", error), "a path that can't be written: opens, as there's nothing in it");
-    unwritable.add("W.WAV");
-    check(unwritable.peek(10) == std::vector<std::string>{"W.WAV"}, "... and what's added is still sent");
+    outbox.setProgress(2100);
+    check(outbox.peek(1).next == 2600, "progress never goes back");
+    outbox.add("SAME.WAV");
+    outbox.add("SAME.WAV");
+    check(outbox.size() == 2, "the search hands on each basename once - the outbox keeps what it's given");
 }
 
+// The search's thread finds basenames and moves on, a call at a time; the
+// sender's peeks, "sends" and removes. Every report has to leave nothing
+// found below its number undelivered, and every basename has to be
+// delivered once, in order.
 static void testThreads() {
-    printf("--- a search adding while heartbeats send ---\n");
-    std::filesystem::remove_all(kDir);
-    BasenameOutbox outbox;
-    std::string error;
-    outbox.open(BasenameOutbox::pathFor(kDir, "threads"), error);
-    const int count = 2000;
+    printf("--- a search adding while reports send ---\n");
+    const uint64_t start = 5000;
+    BasenameOutbox outbox(start);
+    // Every basename found, in order, with its call's start as the search
+    // knows it.
+    std::vector<std::pair<std::string, uint64_t>> found;
+    std::mutex foundMutex;
     std::atomic<bool> done{false};
+    const int calls = 3000;
     std::thread search([&]() {
-        for (int i = 0; i < count; ++i)
-            outbox.add("N" + std::to_string(i) + ".WAV");
+        uint64_t next = start;
+        for (int call = 0; call < calls; ++call) {
+            for (int i = 0; i < call % 4; ++i) {
+                const std::string name = "C" + std::to_string(call) + "_" + std::to_string(i) + ".WAV";
+                {
+                    std::lock_guard<std::mutex> lock(foundMutex);
+                    found.emplace_back(name, next);
+                }
+                outbox.add(name);
+            }
+            next += 1000;
+            outbox.setProgress(next);
+        }
         done = true;
     });
     std::vector<std::string> delivered;
+    bool everReportedPast = false, backwards = false;
+    uint64_t lastNext = start;
     while (!done || outbox.size() > 0) {
-        const std::vector<std::string> sent = outbox.peek(37);
-        delivered.insert(delivered.end(), sent.begin(), sent.end());
-        outbox.remove(sent.size());
+        const size_t max = 1 + delivered.size() % 7;
+        const BasenameOutbox::Report report = outbox.peek(max);
+        // The first basename found that neither this report carries nor one
+        // before it did - if there's one - has to be at or past the report's
+        // number (the ones after it were found no earlier).
+        {
+            std::lock_guard<std::mutex> lock(foundMutex);
+            const size_t firstUnsent = delivered.size() + report.basenames.size();
+            if (firstUnsent < found.size())
+                everReportedPast = everReportedPast || found[firstUnsent].second < report.next;
+        }
+        backwards = backwards || report.next < lastNext;
+        lastNext = report.next;
+        delivered.insert(delivered.end(), report.basenames.begin(), report.basenames.end());
+        outbox.remove(report.basenames.size());
     }
     search.join();
-    bool inOrder = (int) delivered.size() == count;
-    for (int i = 0; inOrder && i < count; ++i)
-        inOrder = delivered[i] == "N" + std::to_string(i) + ".WAV";
-    check(inOrder, std::to_string(delivered.size()) + " of " + std::to_string(count) + " delivered, each once, in order");
-    check(!std::filesystem::exists(outbox.path()), "... and the file gone at the end");
+    bool inOrder = delivered.size() == found.size();
+    for (size_t i = 0; inOrder && i < delivered.size(); ++i)
+        inOrder = delivered[i] == found[i].first;
+    check(inOrder, std::to_string(delivered.size()) + " basenames delivered, each once, in the order found");
+    check(!everReportedPast, "no report ever said the search got past a basename it didn't carry and wasn't delivered");
+    check(!backwards, "nor went back");
+    check(outbox.peek(1).next == start + 1000ull * calls, "and at the end, all the progress");
 }
 
 int main() {
-    testFile();
+    testReports();
     testThreads();
-    std::filesystem::remove_all(kDir);
     if (g_failures) {
         fprintf(stderr, "%d of %d check(s) FAILED\n", g_failures, g_checks);
         return 1;

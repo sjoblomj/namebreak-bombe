@@ -2,52 +2,67 @@
 #define NAMEBREAK_NET_BASENAME_OUTBOX_H
 
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
 
-// The basenames a coordinator client has found for a target (see
-// ClaimResponse::sendBasenames) that the server hasn't got yet: the ones
-// found since the last report - heartbeat, quit or completion - that got an
-// answer. Kept in a file per target, one per line, oldest first, which is
-// cleared as reports get through - so a basename isn't lost when one
-// doesn't, nor when the client quits or stops before sending it: the next
-// report of a range of the same target sends what's left.
+// What a dictionary range's reports to the coordinator say (see
+// ClaimResponse::sendBasenames): how far its search has got, and the
+// basenames it has found that the server hasn't got yet - those found since
+// the last report that got an answer (heartbeat, quit or completion).
+//
+// A report never says the search has got further than a basename it doesn't
+// carry: the server takes everything below a report's number as searched,
+// and would never hand it out again - so a basename found there that never
+// reached it (the client crashed, say) would be missed for good. Each
+// basename is kept with how far the search had got when it was found (the
+// first number of the backend call that found it), and a report that can't
+// carry them all - at most kMaxBasenamesPerReport - says the search has got
+// no further than that of the first one it leaves out. The rest of the
+// range is searched again then, if it comes to that, and the basenames found
+// again: they're kept in memory only, never in a file.
 //
 // The search adds to it on one thread while the heartbeats send from it on
 // another; one report at a time sends (`peek`, then `remove` once it got an
 // answer), and the search only ever adds after what was peeked.
 class BasenameOutbox {
 public:
-    // The file for `targetName`'s in `matchesDir`:
-    // unsent-basenames-<target name>.txt (see namedFilePath, matches_file.h).
-    static std::string pathFor(const std::string& matchesDir, const std::string& targetName);
+    // A range whose search starts at number `start`.
+    explicit BasenameOutbox(uint64_t start) : progress_(start) {}
 
-    // Reads what an earlier search left in `path`, if anything - a missing
-    // file is an empty outbox. False, with `error` set, if it can't be read.
-    bool open(const std::string& path, std::string& error);
-
-    // Adds `basename` at the end, unless it's waiting already, and appends
-    // it to the file - which is created then. A warning if it can't be
-    // written; it's still sent.
+    // The search found `basename`, in the backend call it's in now - which
+    // starts where `setProgress` last said.
     void add(const std::string& basename);
 
-    // The oldest `max` (or fewer) waiting, to send.
-    std::vector<std::string> peek(size_t max) const;
+    // Every candidate numbered below `next` has been searched, and every
+    // basename found among them added.
+    void setProgress(uint64_t next);
 
-    // Drops the oldest `count` - those a report just got to the server -
-    // and rewrites the file with the rest, or removes it if there are none.
+    struct Report {
+        std::vector<std::string> basenames;
+        // How far a report carrying `basenames` may say the search has got:
+        // the progress, or where the first basename left waiting was found.
+        uint64_t next = 0;
+    };
+    // The oldest `max` (or fewer) basenames waiting, to send - and the
+    // progress a report carrying them may claim.
+    Report peek(size_t max) const;
+
+    // Drops the oldest `count` - those a report just got to the server.
     void remove(size_t count);
 
     size_t size() const;
-    const std::string& path() const { return path_; }
 
 private:
-    void rewrite();
+    struct Waiting {
+        std::string basename;
+        uint64_t foundAt;
+    };
 
     mutable std::mutex mutex_;
-    std::string path_;
-    std::vector<std::string> waiting_;
+    uint64_t progress_;
+    std::vector<Waiting> waiting_;
 };
 
 #endif // NAMEBREAK_NET_BASENAME_OUTBOX_H

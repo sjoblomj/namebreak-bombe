@@ -13,14 +13,14 @@ Phase 2 - searching to the end: a dictionary target with a planted name
 (english-1 and a word list of the test's own, which the client downloads
 once and then keeps), another one searched through without a find, and an
 alphabet target, all in one run. The finds have to be reported, every
-basename matching a key sent - none left waiting in the client's files -
-and the dashboard has to show it all.
+basename matching a key sent - none ever written to a file - and the
+dashboard has to show it all.
 
 Phase 3 - the server goes away: with a client that heartbeats every second
 (--client-heartbeat-1s), the server is stopped while the client searches a
 range, before it finds a basename. The heartbeats fail, and the basename
-waits in its file - until the server is back, when the next heartbeat
-sends it, with how far the search has got.
+waits - until the server is back, when the next heartbeat sends it, with
+how far the search has got.
 
 Phase 4 - a completion that doesn't get through: the server is stopped
 while the client searches a range, which it finishes - with a basename
@@ -31,10 +31,19 @@ Phase 5 - the range taken away: the server is stopped while the client
 searches a range, and, while it's away, the range is given to someone else.
 Back, the server answers the client's next heartbeat, which carries the
 basename found meanwhile, with a 409 - having kept the basename all the
-same, which the client then doesn't send again.
+same.
+
+Phase 6 - more basenames than a report carries, with a client that sends at
+most one a report and heartbeats every ten seconds (--client-one-basename),
+and pairs of candidates whose basenames share a key: a quit carries the
+first of two, and doesn't say the search got past the second - which the
+rest of the range, handed out again, finds; a range finished with two waiting
+sends the first in a heartbeat before its completion carries the second; and
+after the server's been away, the second goes right after the first, rather
+than a heartbeat later.
 
     coordinator_dictionary_test.py --client <namebreak> --client-heartbeat-1s <namebreak built so>
-                                   --coordinator <coordinator dir> [--backend cpu]
+                                   --client-one-basename <namebreak built so> --coordinator <coordinator dir> [--backend cpu]
 
 Builds the server with cargo first. Runs in a directory of its own under
 the current one.
@@ -223,6 +232,16 @@ def basenames(server, target_id):
     return server.get("/api/v1/targets/%d/basenames" % target_id).split()
 
 
+def found(client, basename):
+    """Whether `client` has found `basename` - it says so as it does."""
+    return "BASENAME MATCH: " + basename + " " in client.text()
+
+
+def basename_files(client):
+    """Files a client keeps basenames in - which it never should."""
+    return [f for f in os.listdir(client.matches) if "basename" in f] if os.path.isdir(client.matches) else []
+
+
 def wait_for(what, condition, client, timeout=300):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -246,22 +265,13 @@ def phase1(server, client_binary, workdir, backend, english):
     })["target_id"]
 
     client = Client(client_binary, workdir, server, backend, "client1")
-    unsent = os.path.join(client.matches, "unsent-basenames-big.txt")
-
-    def found_key():
-        try:
-            with open(unsent) as f:
-                return key_basename in f.read().split()
-        except FileNotFoundError:
-            return False
-
-    wait_for("the second range's basename", found_key, client)
+    wait_for("the second range's basename", lambda: found(client, key_basename), client)
     check(any(r["status"] == "in_progress" and r["candidate_len"] == 2 for r in server.target(big)["ranges"]),
           "the basename found part way through the two-word range")
     check(client.quit() == 0, "the client quits when told to")
     output = client.text()
     check("told the coordinator it's searched every candidate numbered below" in output, "... telling the server how far it got")
-    check(not os.path.exists(unsent), "... the basename sent with it, and its file gone")
+    check(basename_files(client) == [], "... and no basename kept in a file")
     check(key_basename in basenames(server, big), "the server has the basename")
 
     t = server.target(big)
@@ -330,8 +340,7 @@ def phase2(server, client_binary, workdir, backend, english, own_words):
           "the test's word list downloaded once, english-1 not at all")
     cache = os.path.join(client.matches, "word-lists")
     check(sorted(os.listdir(cache)) == ["own.txt"], "... and kept: %s" % sorted(os.listdir(cache)))
-    leftovers = [f for f in os.listdir(client.matches) if f.startswith("unsent-basenames-")]
-    check(leftovers == [], "no basename left waiting to be sent: %s" % leftovers)
+    check(basename_files(client) == [], "no basename written to a file: %s" % basename_files(client))
 
     d = server.target(found)["dictionary"]
     check(d["word_lists"] == ["english-1", "own"] and d["separators"] == ["", "_"] and d["min_words"] == 1 and d["max_words"] == 2,
@@ -354,27 +363,18 @@ def phase3(server, client_binary, workdir, backend, english):
     key_number = len(english) + 8000 * len(separators) * len(english)
 
     client = Client(client_binary, workdir, server, backend, "client3")
-    unsent = os.path.join(client.matches, "unsent-basenames-outage.txt")
     wait_for("the two-word range", lambda: any(r["status"] == "in_progress" and r["candidate_len"] == 2 for r in server.target(outage)["ranges"]),
              client)
     range_id = next(r["id"] for r in server.target(outage)["ranges"] if r["candidate_len"] == 2)
     server.stop()
 
-    def waiting():
-        try:
-            with open(unsent) as f:
-                return key_basename in f.read().split()
-        except FileNotFoundError:
-            return False
-
-    wait_for("the basename, while the server's away", waiting, client)
+    wait_for("the basename, while the server's away", lambda: found(client, key_basename), client)
     failures_then = client.text().count("heartbeat failed")
     time.sleep(3)
     check(client.text().count("heartbeat failed") >= failures_then + 2, "the heartbeats fail while the server's away")
-    check(waiting(), "... and the basename waits in its file")
 
     server = server.restarted()
-    wait_for("the basename to be sent", lambda: not os.path.exists(unsent), client, timeout=60)
+    wait_for("the basename to be sent", lambda: key_basename in basenames(server, outage), client, timeout=60)
     check(key_basename in basenames(server, outage), "the server back: the next heartbeat sent it: %s" % basenames(server, outage))
     # The two-word range starts at the first two-word candidate, numbered
     # after the one-word ones.
@@ -406,16 +406,14 @@ def phase4(server, client_binary, workdir, backend, english):
         "encryption_key_hex": hex32(mpq_hash(key_basename, 0x300)), "send_basenames": True, "priority": 30,
     })["target_id"]
     client = Client(client_binary, workdir, server, backend, "client4")
-    unsent = os.path.join(client.matches, "unsent-basenames-late.txt")
     wait_for("the two-word range", lambda: (two_word_range(server, late) or {}).get("status") == "in_progress", client)
     range_id = two_word_range(server, late)["id"]
     server.stop()
 
     wait_for("a completion that doesn't get through", lambda: "failed to report completion" in client.text(), client)
-    with open(unsent) as f:
-        check(key_basename in f.read().split(), "the range searched while the server's away, its basename waiting")
+    check(found(client, key_basename), "the range searched while the server's away, its basename found")
     server = server.restarted()
-    wait_for("the completion to get through", lambda: not os.path.exists(unsent), client, timeout=120)
+    wait_for("the completion to get through", lambda: key_basename in basenames(server, late), client, timeout=120)
     check(key_basename in basenames(server, late), "the server back: the completion got through, with the basename")
     done = next(r for r in server.target(late)["ranges"] if r["id"] == range_id)
     check(done["status"] == "completed", "... and the range completed")
@@ -438,19 +436,11 @@ def phase5(server, client_binary, workdir, backend, english):
     })["target_id"]
     other = server.request("POST", "/api/v1/register", {"username": "other", "hostname": "elsewhere", "backend": "cpu", "protocol_version": "1.5.0"})
     client = Client(client_binary, workdir, server, backend, "client5")
-    unsent = os.path.join(client.matches, "unsent-basenames-taken.txt")
     wait_for("the two-word range", lambda: (two_word_range(server, taken) or {}).get("status") == "in_progress", client)
     range_id = two_word_range(server, taken)["id"]
     server.stop()
 
-    def waiting():
-        try:
-            with open(unsent) as f:
-                return key_basename in f.read().split()
-        except FileNotFoundError:
-            return False
-
-    wait_for("the basename, while the server's away", waiting, client)
+    wait_for("the basename, while the server's away", lambda: found(client, key_basename), client)
     with sqlite3.connect(os.path.join(workdir, "coordinator.db")) as db:
         db.execute("UPDATE ranges SET assigned_user_id = ?, last_assigned_user_id = ? WHERE id = ?", (other["user_id"], other["user_id"], range_id))
     server = server.restarted()
@@ -458,9 +448,75 @@ def phase5(server, client_binary, workdir, backend, english):
     check(key_basename in basenames(server, taken), "the heartbeat got a 409 - and the server kept its basename")
     reported = [b for b in server.target(taken)["dictionary"]["basenames"] if b["basename"] == key_basename]
     check(reported and reported[0]["reported_by"] == "e2e@test", "... as this client's")
-    check(not os.path.exists(unsent), "... which the client doesn't keep to send again")
     check(next(r for r in server.target(taken)["ranges"] if r["id"] == range_id)["worker"] == "other@elsewhere", "the range stays the other's")
     check(client.quit() == 0, "the client quits when told to")
+    return server
+
+
+def phase6(server, client_binary, workdir, backend, english):
+    print("--- phase 6: more basenames than a report carries ---", flush=True)
+    separators = ["", "_", "-", " "]
+    # Two pairs of english-1's two-word candidates whose basenames share a key
+    # - found by searching for them once, as english-1 never changes - each
+    # early in its range.
+    extolled, extolled_key = ["EXTOLLED_CORPSE.WAV", "EXTOLLED_HISTAMINE.WAV"], 0x91635E69
+    pearliest, pearliest_key = ["PEARLIEST_BALLERINA.WAV", "PEARLIEST_MULLED.WAV"], 0x659422A8
+    check(all(mpq_hash(b, 0x300) == extolled_key for b in extolled) and all(mpq_hash(b, 0x300) == pearliest_key for b in pearliest),
+          "each pair's basenames share a key")
+
+    def two_word_target(name, first_word, key, priority, first_words=12000):
+        return server.admin("POST", "/api/v1/admin/targets", {
+            "name": name, "prefix": "music\\", "suffix": ".wav", "hash_a_hex": "0x0000000B", "hash_b_hex": "0x0000000C",
+            "dictionary": {"word_lists": ["english-1"], "separators": separators, "max_words": 2},
+            "lower_bound": "MUSIC\\" + first_word, "upper_bound": "MUSIC\\" + english[english.index(first_word) + first_words] + "~",
+            "encryption_key_hex": hex32(key), "send_basenames": True, "priority": priority,
+        })["target_id"]
+
+    # A quit with both waiting carries the first, and says the search got no
+    # further than where the second was found.
+    capped = two_word_target("capped", "EXTOLLED", extolled_key, 50)
+    client = Client(client_binary, workdir, server, backend, "client6")
+    wait_for("both basenames found", lambda: all(found(client, b) for b in extolled), client)
+    check(client.quit() == 0, "the client quits with both waiting - before its first heartbeat")
+    check(basenames(server, capped) == extolled[:1], "the quit carried the first, as a report has room for one: %s" % basenames(server, capped))
+
+    # The rest of the range, handed out again, has the second.
+    client = Client(client_binary, workdir, server, backend, "client7")
+    wait_for("the second basename, found again", lambda: extolled[1] in basenames(server, capped), client, timeout=120)
+    check(basenames(server, capped)[:2] == extolled, "the rest of the range, handed out again, found the second - the quit hadn't said it was searched")
+    check(client.quit() == 0, "the client quits when told to")
+    server.admin("PATCH", "/api/v1/admin/targets/%d" % capped, {"status": "paused"})
+
+    # A range finished with both waiting: the first goes in a heartbeat, then
+    # the completion carries the second.
+    server.admin("PUT", "/api/v1/admin/word-lists/pair", raw=b"pearliest_ballerina\npearliest_mulled\nsome\nother\nwords\n")
+    flush = server.admin("POST", "/api/v1/admin/targets", {
+        "name": "flush", "prefix": "music\\", "suffix": ".wav", "hash_a_hex": "0x0000000D", "hash_b_hex": "0x0000000E",
+        "dictionary": {"word_lists": ["pair"], "separators": [""], "max_words": 1},
+        "encryption_key_hex": hex32(pearliest_key), "send_basenames": True, "priority": 60,
+    })["target_id"]
+    client = Client(client_binary, workdir, server, backend, "client8")
+    wait_for("the range completed", lambda: [r["status"] for r in server.target(flush)["ranges"]] == ["completed"], client, timeout=60)
+    check(basenames(server, flush) == pearliest, "both delivered: %s" % basenames(server, flush))
+    check(client.quit() == 0, "the client quits when told to")
+    check("sending the 2 basenames found before completing it" in client.text(), "... the first in a heartbeat before the completion")
+
+    # Both found while the server's away: once it's back, the second goes
+    # right after the first, rather than a heartbeat (ten seconds) later -
+    # in a range long enough (six billion candidates, half a minute on the
+    # cpu backend) that its completion can't carry it first.
+    drain = two_word_target("drain", "PEARLIEST", pearliest_key, 70, first_words=23000)
+    client = Client(client_binary, workdir, server, backend, "client9")
+    wait_for("the two-word range", lambda: (two_word_range(server, drain) or {}).get("status") == "in_progress", client)
+    server.stop()
+    wait_for("both basenames found, while the server's away", lambda: all(found(client, b) for b in pearliest), client)
+    server = server.restarted()
+    wait_for("the first basename sent", lambda: basenames(server, drain)[:1] == pearliest[:1], client, timeout=60)
+    first_at = time.time()
+    wait_for("the second basename sent", lambda: basenames(server, drain)[:2] == pearliest, client, timeout=60)
+    check(time.time() - first_at < 5, "the second sent %.1f s after the first - not a heartbeat later" % (time.time() - first_at))
+    check(client.quit() == 0, "the client quits when told to")
+    server.admin("PATCH", "/api/v1/admin/targets/%d" % drain, {"status": "paused"})
     return server
 
 
@@ -468,6 +524,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", required=True)
     parser.add_argument("--client-heartbeat-1s", required=True)
+    parser.add_argument("--client-one-basename", required=True)
     parser.add_argument("--coordinator", required=True)
     # The cpu backend: phase 1 needs a range to take long enough to quit it
     # part way, which on a GPU it doesn't.
@@ -507,6 +564,7 @@ def main():
         server = phase3(server, os.path.abspath(args.client_heartbeat_1s), workdir, args.backend, english)
         server = phase4(server, client_binary, workdir, args.backend, english)
         server = phase5(server, os.path.abspath(args.client_heartbeat_1s), workdir, args.backend, english)
+        server = phase6(server, os.path.abspath(args.client_one_basename), workdir, args.backend, english)
     except Failed as failure:
         print("FAILED: %s" % failure, flush=True)
         return 1

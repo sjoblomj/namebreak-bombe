@@ -240,21 +240,30 @@ struct RangeResult {
 struct RangeSearch {
     // Runs the search, on the calling thread; `abort` stops it.
     std::function<RangeResult(std::atomic<bool>& abort)> run;
-    // How far it has got, as a report says it (see HeartbeatRequest): the
-    // latest Hash A match's filename, or a dictionary range's candidate
-    // number. Called from the heartbeat thread while `run` runs.
-    std::function<void(std::optional<std::string>& lastHashAMatch, std::optional<int64_t>& nextCandidateNumber)> progress;
-    // The target's basenames waiting to be sent, if it's a dictionary
-    // target - null otherwise.
+    // An alphabet range's progress, as a report says it (see
+    // HeartbeatRequest): its latest Hash A match's filename. Called from the
+    // heartbeat thread while `run` runs.
+    std::function<void(std::optional<std::string>& lastHashAMatch)> progress;
+    // A dictionary range's progress and the basenames waiting to be sent -
+    // null for an alphabet range.
     BasenameOutbox* outbox = nullptr;
     // Where a match it finds is recorded (see MatchWriter).
     std::string outputFilePath;
 };
 
-// The basenames a report carries: the oldest of those waiting in `outbox`
-// (none without one).
-std::vector<std::string> basenamesToSend(const BasenameOutbox* outbox) {
-    return outbox ? outbox->peek(kMaxBasenamesPerReport) : std::vector<std::string>();
+// What a report (a HeartbeatRequest or QuitRequest) of `search` says: a
+// dictionary range's progress and the basenames it carries - never further
+// than the first basename it leaves waiting (see BasenameOutbox) - or an
+// alphabet range's latest Hash A match.
+template <class Report>
+void fillReport(const RangeSearch& search, Report& req) {
+    if (search.outbox) {
+        BasenameOutbox::Report report = search.outbox->peek(kMaxBasenamesPerReport);
+        req.nextCandidateNumber = (int64_t) report.next;
+        req.basenames = std::move(report.basenames);
+    } else {
+        search.progress(req.lastHashAMatchFilename);
+    }
 }
 
 // After a report that carried `sent` got an answer that means the server
@@ -274,15 +283,14 @@ std::string describeProgress(const QuitRequest& req) {
 
 // Tells the server this client is quitting with `rangeId` unfinished, so
 // that what's left of it is handed out again straight away rather than once
-// its lease expires - see QuitRequest. `req` says how far the search got,
-// if it got anywhere, and carries the basenames waiting in `outbox`. One
-// attempt only: the user asked to quit, and if the server can't be reached
-// the lease still runs out as before - and the basenames wait in their file
-// for the next range of the target.
-void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t rangeId, QuitRequest req, BasenameOutbox* outbox) {
+// its lease expires - see QuitRequest. `req` says how far the search got, if
+// it got anywhere, and carries the basenames waiting in `outbox` (see
+// fillReport). One attempt only: the user asked to quit, and if the server
+// can't be reached the lease still runs out as before. Either way, any
+// basename it didn't get is in what's handed out again.
+void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t rangeId, const QuitRequest& req, BasenameOutbox* outbox) {
     CoordinatorClient quitClient(args.serverUrl);
     quitClient.setToken(token);
-    req.basenames = basenamesToSend(outbox);
     const bool progressed = req.lastHashAMatchFilename || req.nextCandidateNumber;
     std::string err;
     switch (quitClient.quit(rangeId, req, err)) {
@@ -304,6 +312,62 @@ void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t r
                     (long long) rangeId, err.c_str());
             break;
     }
+}
+
+// Sends the basenames of a finished dictionary range that are more than its
+// completion can carry, in heartbeats of kMaxBasenamesPerReport - each saying
+// the search has got no further than the first basename it leaves waiting
+// (see fillReport) - retried until they get an answer, as a completion is.
+// False if the range can't be completed after all: the server says it isn't
+// this client's any more, or released it (its target solved, say), or the
+// client is quitting. Whatever wasn't sent then is in what the server hands
+// out again.
+bool sendBasenamesBeforeCompleting(const CoordinatorArgs& args, CoordinatorClient& client, const ClaimResponse& claim, BasenameOutbox& outbox,
+                                   const std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
+    if (outbox.size() <= kMaxBasenamesPerReport)
+        return true;
+    printf("[coordinator] range %lld: sending the %zu basenames found before completing it, %zu at a time\n", (long long) claim.rangeId, outbox.size(),
+           kMaxBasenamesPerReport);
+    RetryBackoff backoff(std::chrono::seconds(args.pollIntervalSecs));
+    while (outbox.size() > kMaxBasenamesPerReport) {
+        HeartbeatRequest req;
+        BasenameOutbox::Report report = outbox.peek(kMaxBasenamesPerReport);
+        req.nextCandidateNumber = (int64_t) report.next;
+        req.basenames = std::move(report.basenames);
+        HeartbeatResponse resp;
+        std::string err;
+        switch (client.heartbeat(claim.rangeId, req, resp, err)) {
+            case CoordinatorClient::HeartbeatOutcome::Ok:
+                outbox.remove(req.basenames.size());
+                backoff.reset();
+                if (resp.rangeReleased) {
+                    printf("[coordinator] range %lld: released by the coordinator before it could be completed\n", (long long) claim.rangeId);
+                    return false;
+                }
+                break;
+            case CoordinatorClient::HeartbeatOutcome::Conflict:
+                outbox.remove(req.basenames.size());
+                printf("[coordinator] range %lld: no longer assigned to us - the rest of it is someone else's to search\n", (long long) claim.rangeId);
+                return false;
+            case CoordinatorClient::HeartbeatOutcome::Error: {
+                if (quitRequested && quitRequested->load(std::memory_order_relaxed)) {
+                    fprintf(stderr, "[coordinator] range %lld: quitting with %zu basenames not sent - the part of the range they're in is handed out again\n",
+                            (long long) claim.rangeId, outbox.size());
+                    return false;
+                }
+                auto cap = backoff.cap();
+                auto sleepFor = backoff.nextSleep();
+                std::string msg = "[coordinator] range " + std::to_string(claim.rangeId) + ": failed to send basenames, retrying in " +
+                                  std::to_string(sleepFor.count()) + "s (backoff cap " + std::to_string(cap.count()) + "s): " + err;
+                fprintf(stderr, "%s\n", msg.c_str());
+                if (callbacks && callbacks->onStatus)
+                    callbacks->onStatus(msg);
+                interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(sleepFor), quitRequested);
+                break;
+            }
+        }
+    }
+    return true;
 }
 
 // Runs one claimed range: spawns the heartbeat thread, runs `search` on the
@@ -361,16 +425,21 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
         CoordinatorClient hbClient(args.serverUrl);
         hbClient.setToken(token);
         std::unique_lock<std::mutex> lock(stopMutex);
-        while (!stopCv.wait_for(lock, std::chrono::seconds(kHeartbeatIntervalSeconds), [&] { return stopRequested; })) {
+        // Set when more basenames are waiting than a heartbeat carries: the
+        // next one goes at once, rather than hold the range's progress back
+        // (see fillReport) for another interval.
+        bool sendAgainNow = false;
+        while (!stopCv.wait_for(lock, std::chrono::seconds(sendAgainNow ? 0 : kHeartbeatIntervalSeconds), [&] { return stopRequested; })) {
             HeartbeatRequest req;
-            search.progress(req.lastHashAMatchFilename, req.nextCandidateNumber);
-            req.basenames = basenamesToSend(search.outbox);
+            fillReport(search, req);
             lock.unlock();
+            sendAgainNow = false;
             HeartbeatResponse resp;
             std::string err;
             switch (hbClient.heartbeat(claim.rangeId, req, resp, err)) {
                 case CoordinatorClient::HeartbeatOutcome::Ok:
                     basenamesDelivered(search.outbox, req.basenames);
+                    sendAgainNow = req.basenames.size() == kMaxBasenamesPerReport && search.outbox->size() > 0;
                     if (resp.rangeReleased) {
                         // The server doesn't say why (target solved elsewhere, or
                         // this range stalled too long - see HeartbeatResponse's
@@ -466,7 +535,7 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
             // reportQuit.
             printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
             QuitRequest req;
-            search.progress(req.lastHashAMatchFilename, req.nextCandidateNumber);
+            fillReport(search, req);
             reportQuit(args, token, claim.rangeId, req, search.outbox);
         } else if (externallyQuit) {
             printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
@@ -479,8 +548,9 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
             printf("[coordinator] range %lld: aborted - target was already solved by someone else\n", (long long) claim.rangeId);
         }
         if (search.outbox && search.outbox->size() > 0)
-            printf("[coordinator] range %lld: %zu basename(s) not sent yet - kept in %s for the next range of this target\n",
-                   (long long) claim.rangeId, search.outbox->size(), search.outbox->path().c_str());
+            printf("[coordinator] range %lld: %zu basename(s) not sent - the server hasn't been told the search got past them, so "
+                   "they'll be found again when that part of the range is searched again\n",
+                   (long long) claim.rangeId, search.outbox->size());
         if (callbacks && callbacks->onRangeFinished)
             callbacks->onRangeFinished(false);
         return;
@@ -496,13 +566,20 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
 
     CoordinatorClient completeClient(args.serverUrl);
     completeClient.setToken(token);
+    // A completion says the whole range has been searched, so it can only
+    // carry the last of its basenames: more than a report holds go first,
+    // in heartbeats. A find is reported all the same - the server takes it
+    // from anyone.
+    if (search.outbox && !sendBasenamesBeforeCompleting(args, completeClient, claim, *search.outbox, quitRequested, callbacks) && !result.found)
+        return;
     CompleteRequest completeReq;
     completeReq.found = result.found;
     if (result.found)
         completeReq.filename = result.filename;
     completeReq.elapsedSeconds = elapsedSeconds;
     completeReq.candidatesProcessed = claim.candidateCount;
-    completeReq.basenames = basenamesToSend(search.outbox);
+    if (search.outbox)
+        completeReq.basenames = search.outbox->peek(kMaxBasenamesPerReport).basenames;
 
     // Retried until it gets a real answer: a lost report either leaves the
     // range to wait out its whole lease before being redone, or - worse -
@@ -552,9 +629,6 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
             fprintf(stderr, "[coordinator] range %lld: failed to report completion: %s\n", (long long) claim.rangeId, err.c_str());
             break;
     }
-    if (search.outbox && search.outbox->size() > 0)
-        printf("[coordinator] range %lld: %zu basename(s) not sent yet - kept in %s for the next range of this target\n", (long long) claim.rangeId,
-               search.outbox->size(), search.outbox->path().c_str());
 }
 
 // An alphabet target's range: runSearch over its candidates, its progress
@@ -583,7 +657,7 @@ void runAlphabetRange(SearchBackend& backend, const CoordinatorArgs& args, const
         }, pauseRequested);
         return RangeResult{found.ok, found.error, found.found, found.filename, found.aborted};
     };
-    search.progress = [&](std::optional<std::string>& last, std::optional<int64_t>&) {
+    search.progress = [&](std::optional<std::string>& last) {
         std::lock_guard<std::mutex> lock(lastMatchMutex);
         last = lastHashAMatch;
     };
@@ -637,8 +711,8 @@ bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::stri
     for (const std::string& name : claim.wordLists)
         req.wordSource += (req.wordSource.empty() ? "" : " + ") + name;
     req.outputFilePath = matchesFilePath(matchesDir, claim.targetName);
-    // The basenames go to the server, by way of the outbox; the server keeps
-    // the progress.
+    // The basenames go to the server, by way of the outbox (see
+    // BasenameOutbox) - never to a file; the server keeps the progress.
     req.basenamesFilePath.clear();
     req.progressFilePath.clear();
     return true;
@@ -646,16 +720,13 @@ bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::stri
 
 // A dictionary target's range: its words (downloaded if need be), and
 // runDictionarySearch over its numbers, its progress the number it has got
-// to, and the basenames it finds sent with every report. False if it can't
-// be searched at all - the range is handed back, and the caller should wait
-// a while before claiming again, rather than be handed the same one.
+// to, and the basenames it finds sent with every report - kept in memory
+// until then (see BasenameOutbox). False if it can't be searched at all -
+// the range is handed back, and the caller should wait a while before
+// claiming again, rather than be handed the same one.
 bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args, const std::string& token, const ClaimResponse& claim,
                         const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
-    BasenameOutbox outbox;
     std::string error;
-    if (!outbox.open(BasenameOutbox::pathFor(args.matchesDir, claim.targetName), error))
-        fprintf(stderr, "[coordinator] warning: %s - basenames an earlier range left there aren't sent\n", error.c_str());
-
     CoordinatorClient downloadClient(args.serverUrl);
     downloadClient.setToken(token);
     std::vector<std::string> words, downloaded;
@@ -673,7 +744,7 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
                        toDictionaryRequest(claim, words, args.matchesDir, req, error) && (backend = backends.get(error)) != nullptr;
     if (!ready) {
         fprintf(stderr, "[coordinator] range %lld: can't search it (%s) - handing it back\n", (long long) claim.rangeId, error.c_str());
-        reportQuit(args, token, claim.rangeId, QuitRequest(), &outbox);
+        reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr);
         return false;
     }
     for (const std::string& name : downloaded)
@@ -690,19 +761,18 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
         callbacks->onRangeClaimed(claim, shown);
     }
 
-    std::atomic<uint64_t> nextNumber{req.startNumber};
+    // The search hands on every basename found in a backend call before
+    // saying it has got past the call - see BasenameOutbox.
+    BasenameOutbox outbox(req.startNumber);
     RangeSearch search;
     search.outbox = &outbox;
     search.outputFilePath = req.outputFilePath;
     search.run = [&](std::atomic<bool>& abort) {
         DictionarySearchHooks hooks;
         hooks.onBasenameMatch = [&](const std::string& basename, const std::string&) { outbox.add(basename); };
-        hooks.onProgress = [&](uint64_t next) { nextNumber.store(next, std::memory_order_relaxed); };
+        hooks.onProgress = [&](uint64_t next) { outbox.setProgress(next); };
         DictionaryResult found = runDictionarySearch(*backend, req, &abort, hooks, pauseRequested);
         return RangeResult{found.ok, found.error, found.found, found.filename, found.aborted};
-    };
-    search.progress = [&](std::optional<std::string>&, std::optional<int64_t>& next) {
-        next = (int64_t) nextNumber.load(std::memory_order_relaxed);
     };
     runRange(args, token, claim, search, pauseRequested, quitRequested, callbacks);
     return true;

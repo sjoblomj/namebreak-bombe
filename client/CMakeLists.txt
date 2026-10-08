@@ -423,29 +423,42 @@ namebreak_test(version_test version_test)
 
 # Dictionary targets end to end: the coordinator server (../coordinator,
 # built with cargo) and this client in coordinator mode, over HTTP on
-# localhost - see the script. namebreak_heartbeat_1s is the program with a
-# heartbeat every second instead of every minute, for the part that has the
-# server go away and come back. Needs cargo and Python 3; skipped without.
+# localhost - see the script. Needs cargo and Python 3; skipped without. It
+# runs the program as it is, and built two other ways:
+#   namebreak_heartbeat_1s             a heartbeat every second instead of
+#                                      every minute, for the parts that have
+#                                      the server go away and come back
+#   namebreak_one_basename_per_report  at most one basename a report (rather
+#                                      than 5,000), and a heartbeat every 10
+#                                      seconds - for the parts with more
+#                                      basenames than a report carries
 if(NAMEBREAK_NETWORK)
-    add_library(namebreak_net_heartbeat_1s STATIC
-        src/net/basename_outbox.cpp
-        src/net/coordinator_runner.cpp
-        src/net/coordinator_client.cpp
-        src/net/http_client.cpp
-        src/net/protocol.cpp
-        src/net/update_check.cpp
-        src/net/word_lists.cpp)
-    target_compile_definitions(namebreak_net_heartbeat_1s PRIVATE NAMEBREAK_HEARTBEAT_INTERVAL_SECONDS=1)
-    target_link_libraries(namebreak_net_heartbeat_1s PUBLIC namebreak_common CURL::libcurl)
-    add_executable(namebreak_heartbeat_1s src/cli/main.cpp)
-    target_compile_definitions(namebreak_heartbeat_1s PRIVATE NAMEBREAK_WITH_NETWORK)
-    target_link_libraries(namebreak_heartbeat_1s PRIVATE namebreak_net_heartbeat_1s)
-    set_target_properties(namebreak_heartbeat_1s PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    # namebreak_test_program(<name> <definition>...): the program, its
+    # coordinator code compiled with the definitions.
+    function(namebreak_test_program name)
+        add_library(${name}_net STATIC
+            src/net/basename_outbox.cpp
+            src/net/coordinator_runner.cpp
+            src/net/coordinator_client.cpp
+            src/net/http_client.cpp
+            src/net/protocol.cpp
+            src/net/update_check.cpp
+            src/net/word_lists.cpp)
+        target_compile_definitions(${name}_net PRIVATE ${ARGN})
+        target_link_libraries(${name}_net PUBLIC namebreak_common CURL::libcurl)
+        add_executable(${name} src/cli/main.cpp)
+        target_compile_definitions(${name} PRIVATE NAMEBREAK_WITH_NETWORK)
+        target_link_libraries(${name} PRIVATE ${name}_net)
+        set_target_properties(${name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    endfunction()
+    namebreak_test_program(namebreak_heartbeat_1s NAMEBREAK_HEARTBEAT_INTERVAL_SECONDS=1)
+    namebreak_test_program(namebreak_one_basename_per_report NAMEBREAK_HEARTBEAT_INTERVAL_SECONDS=10 NAMEBREAK_MAX_BASENAMES_PER_REPORT=1)
     find_program(CARGO_EXECUTABLE cargo)
     find_program(PYTHON3_EXECUTABLE python3)
     if(CARGO_EXECUTABLE AND PYTHON3_EXECUTABLE)
         namebreak_test(coordinator-dictionary ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_dictionary_test.py
             --client $<TARGET_FILE:namebreak> --client-heartbeat-1s $<TARGET_FILE:namebreak_heartbeat_1s>
+            --client-one-basename $<TARGET_FILE:namebreak_one_basename_per_report>
             --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
         set_tests_properties(coordinator-dictionary PROPERTIES TIMEOUT 900)
     endif()

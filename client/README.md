@@ -298,13 +298,18 @@ get one.
   hands back exactly the rest.
 - **Basenames.** When the target asks for them (its `send_basenames`), every
   candidate whose basename matches its encryption key is sent with the next
-  heartbeat, quit or completion. Until a report gets through, they wait in
-  `unsent-basenames-<target name>.txt` in the matches directory, which is
-  cleared as reports get through - so if the server can't be reached, they
-  go with the next report that is, and if the client stops first, with the
-  next range of that target it gets (`src/net/basename_outbox.h`). The
-  server keeps them whatever else it answers (a 409 included), so only a
-  report that gets no answer, or another error, leaves them waiting.
+  heartbeat, quit or completion, at most 5,000 a report. Until a report gets
+  through they wait in memory - never in a file - so if the server can't be
+  reached, they go with the next report that is. A report never says the
+  search got further than a basename it doesn't carry, and a completion
+  (the whole range searched) only goes once the rest fit in it - more go in
+  heartbeats first, one straight after another
+  (`src/net/basename_outbox.h`). So a basename the server never got is
+  always in a part of the range it will hand out again, and found again,
+  however the client stops: nothing is missed, and nothing is left on the
+  user's disk. The server keeps them whatever else it answers (a 409
+  included), so only a report that gets no answer, or another error, leaves
+  them waiting.
 
 The dictionary engine itself is unchanged by this: a range is a
 `DictionaryRequest` with an `endNumber`, without a basenames or progress
@@ -382,15 +387,21 @@ and cut into ranges of numbers as a coordinator hands them out) and
 `dictionary-cli-*` (the program itself). The coordinator client's own parts
 have `protocol_test` (the JSON, an
 alphabet claim as older clients read it and a dictionary claim with its
-arrays), `basename_outbox_test` (the basenames waiting to be sent, also
-while one thread adds and another sends) and `word_lists_test` (a claim's
-word lists: compiled in, kept, downloaded and checked); and
-`coordinator-dictionary` (`tests/coordinator_dictionary_test.py`, when
-cargo and Python 3 are there) runs the real server, `../coordinator`, against
-the program in coordinator mode: quitting part way through a dictionary
-range, searching dictionary and alphabet targets to the end, and the server
-going away and coming back while basenames wait to be sent (with
-`namebreak_heartbeat_1s`, built to heartbeat every second). The search
+arrays), `basename_outbox_test` (the basenames waiting to be sent, and that
+no report says the search got past one it doesn't carry - also while one
+thread adds and another sends) and `word_lists_test` (a claim's word lists:
+compiled in, kept, downloaded and checked); and `coordinator-dictionary`
+(`tests/coordinator_dictionary_test.py`, when cargo and Python 3 are there)
+runs the real server, `../coordinator`, against the program in coordinator
+mode: quitting part way through a dictionary range, searching dictionary
+and alphabet targets to the end, the server going away and coming back
+while basenames wait to be sent (with `namebreak_heartbeat_1s`, built to
+heartbeat every second), and more basenames than a report carries (with
+`namebreak_one_basename_per_report`, built to carry one, and pairs of
+`english-1` candidates whose basenames share a key): a quit carrying the
+first of two whose range, handed out again, finds the second; a completion
+after the first is sent in a heartbeat; and a backlog sent one heartbeat
+straight after another. The search
 itself is built in several configurations for the tests (different GPU window, launch
 sizes and rows per thread, the stress tests' weaker match, a one-bit
 filter), each with its own
@@ -433,7 +444,7 @@ backends' tests actually run there.
 | `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU; and the dictionary search, `runDictionarySearch()`, with its word lists |
 | `src/backends/` | What the search runs its batches on (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
-| `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop, and a dictionary target's word lists and unsent basenames (left out by `NAMEBREAK_NETWORK=OFF`) |
+| `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop, and a dictionary target's word lists and the basenames waiting to be sent (left out by `NAMEBREAK_NETWORK=OFF`) |
 | `src/cli/` | The console program's `main()` |
 | `src/gui/win32/` | The Windows GUI (Windows only) |
 | `tests/` | Correctness tests and benchmarks (`ctest`, `run_search_bench`), and the mutation experiment (`mutation_test.py`, `run_mutation_test`) |

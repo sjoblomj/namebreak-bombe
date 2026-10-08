@@ -35,8 +35,14 @@
 constexpr const char* kProtocolVersion = "1.5.0";
 
 // The most basenames one heartbeat, quit or completion carries - the
-// server's MAX_BASENAMES_PER_REPORT. Any more wait for the next report.
-constexpr size_t kMaxBasenamesPerReport = 5000;
+// server's MAX_BASENAMES_PER_REPORT. Any more wait for the next report (see
+// BasenameOutbox, net/basename_outbox.h). Set lower at compile time by a test
+// build (see CMakeLists.txt), to have more waiting than a report carries
+// without finding thousands.
+#ifndef NAMEBREAK_MAX_BASENAMES_PER_REPORT
+#define NAMEBREAK_MAX_BASENAMES_PER_REPORT 5000
+#endif
+constexpr size_t kMaxBasenamesPerReport = NAMEBREAK_MAX_BASENAMES_PER_REPORT;
 
 struct RegisterRequest {
     std::string username;
@@ -137,9 +143,10 @@ struct HeartbeatRequest {
     // numbered below this has been searched.
     std::optional<int64_t> nextCandidateNumber;
     // Basenames that matched the key since the last report that got an
-    // answer - at most kMaxBasenamesPerReport. The server keeps them
-    // whatever else it answers, a 409 included; only a report that gets no
-    // answer, or another error, needs to send them again.
+    // answer - at most kMaxBasenamesPerReport, and nextCandidateNumber never
+    // past one left out (see BasenameOutbox). The server keeps them whatever
+    // else it answers, a 409 included; only a report that gets no answer, or
+    // another error, needs to send them again.
     std::vector<std::string> basenames;
 };
 
