@@ -626,6 +626,8 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
         }
         if (hooks.onProgress)
             hooks.onProgress(result.nextNumber);
+        if (hooks.onCount)
+            hooks.onCount(result.candidatesSearched, toSearch);
         if (outcome.found) {
             matches.found(outcome.foundFilename);
             printf("%s\n", outcome.foundFilename.c_str());

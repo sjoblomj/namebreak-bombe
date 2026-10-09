@@ -8,12 +8,13 @@
 // rather than requiring a WinMain() - which also means this GUI can honor the
 // same --config <file> the CLI does (kDefaultConfigPath, config.h).
 //
-// Supports all three of the CLI's modes (coordinator/bounded/continuous) -
-// which one actually runs is read from config.conf's own `mode = ...`
-// exactly like the CLI, with no --mode override here (there'd be nowhere to
-// type it - see the first-run setup dialog, which has a Coordinator tab and
-// a Local Search tab covering bounded/continuous together, since they share
-// the same [search] config keys and only differ in that one value).
+// Supports all four of the CLI's modes (coordinator/bounded/continuous/
+// dictionary) - which one actually runs is read from config.conf's own
+// `mode = ...` exactly like the CLI, with no --mode override here (there'd
+// be nowhere to type it - see the first-run setup dialog, which has a
+// Coordinator tab, a Local Search tab covering bounded/continuous together,
+// since they share the same [search] config keys and only differ in that
+// one value, and a Local Dictionary tab).
 //
 // This file is the main window and tray icon; the rest of the GUI is:
 //   app_config    loading the config, running the setup dialog if needed
@@ -104,8 +105,8 @@ std::deque<std::string> g_recentMatches;
 std::string g_recentMatchesPath;
 
 // Set once in main() after prepareConfig() succeeds, never touched again -
-// "coordinator", "bounded", or "continuous" (window title, Quit's
-// confirmation wording).
+// "coordinator", "bounded", "continuous" or "dictionary" (window title,
+// Quit's confirmation wording).
 std::string g_activeMode;
 
 // ---------------------------------------------------------------------
@@ -206,6 +207,8 @@ void requestQuit(HWND hwnd) {
         return; // already shutting down - ignore a repeat click
     const char* message = g_activeMode == "coordinator"
                                ? "Quit namebreak? This stops searching now; the coordinator is told how far the current range got, and hands out the rest again."
+                           : g_activeMode == "dictionary"
+                               ? "Quit namebreak? This stops the search now. How far it got is saved, for a search with Resume from last candidate to carry on from."
                                : "Quit namebreak? This stops the search now.";
     int result = MessageBoxA(hwnd, message, "Confirm Quit", MB_YESNO | MB_ICONQUESTION);
     if (result != IDYES)
@@ -233,7 +236,9 @@ void updateUiFromSharedState() {
     std::string targetName, outputFilePath, statusText;
     std::string alphabet, prefix, suffix, lowerBound, upperBound;
     Insertion insertFromStart, insertFromEnd;
-    bool hasActiveRange, rangeJustFinished;
+    double progressFraction;
+    bool hasActiveRange, rangeJustFinished, searchEnded;
+    std::vector<std::string> newBasenames;
     {
         std::lock_guard<std::mutex> lock(g_status.mutex);
         targetName = g_status.targetName;
@@ -246,9 +251,12 @@ void updateUiFromSharedState() {
         insertFromEnd = g_status.insertFromEnd;
         lowerBound = g_status.lowerBound;
         upperBound = g_status.upperBound;
+        progressFraction = g_status.progressFraction;
         hasActiveRange = g_status.hasActiveRange;
+        searchEnded = g_status.searchEnded;
         rangeJustFinished = g_status.rangeJustFinished;
         g_status.rangeJustFinished = false; // one-shot edge, consumed here
+        newBasenames.swap(g_status.newBasenames);
     }
 
     bool paused = g_pauseRequested.load(std::memory_order_relaxed);
@@ -272,8 +280,10 @@ void updateUiFromSharedState() {
     // for bounded-shaped work, which has a fixed finish line to measure
     // against - a coordinator range, or local bounded mode (see
     // onRangeClaimed/runLocalSearch, which leave lowerBound empty exactly
-    // when there isn't one: continuous mode, or nothing running yet).
-    bool determinate = hasActiveRange && !lowerBound.empty();
+    // when there isn't one: continuous mode, or nothing running yet) - and
+    // for a local dictionary search, which says how far it has got itself
+    // (progressFraction).
+    bool determinate = hasActiveRange && (progressFraction >= 0 || !lowerBound.empty());
     if (determinate) {
         LONG_PTR style = GetWindowLongPtr(g_hwndProgress, GWL_STYLE);
         if (style & PBS_MARQUEE) {
@@ -286,13 +296,15 @@ void updateUiFromSharedState() {
         // exists), and pausing simply stops new matches from arriving, so
         // this naturally freezes/resumes with no extra bookkeeping.
         double fraction = 0.0;
-        if (!latestMatch.empty()) {
+        if (progressFraction >= 0) {
+            fraction = progressFraction;
+        } else if (!latestMatch.empty()) {
             double f = matchProgressFraction(latestMatch, prefix, suffix, insertFromStart, insertFromEnd, alphabet, lowerBound, upperBound);
             if (f >= 0.0)
                 fraction = f;
         }
         SendMessage(g_hwndProgress, PBM_SETPOS, (WPARAM) (fraction * 100.0), 0);
-    } else if (rangeJustFinished) {
+    } else if (rangeJustFinished || searchEnded) {
         // Continuous-mode runs (see runLocalSearch) never set a determinate
         // range, so the bar sits in marquee style for their entire run -
         // marquee has to be turned off explicitly here too, not just above.
@@ -316,12 +328,16 @@ void updateUiFromSharedState() {
         g_recentMatchesPath = outputFilePath;
         matchesChanged = true;
     }
-    if (!latestMatch.empty() && (g_recentMatches.empty() || g_recentMatches.back() != latestMatch)) {
-        g_recentMatches.push_back(latestMatch);
+    auto addMatchLine = [&](const std::string& line) {
+        g_recentMatches.push_back(line);
         if (g_recentMatches.size() > kMaxMatchLines)
             g_recentMatches.pop_front();
         matchesChanged = true;
-    }
+    };
+    if (!latestMatch.empty() && (g_recentMatches.empty() || g_recentMatches.back() != latestMatch))
+        addMatchLine(latestMatch);
+    for (const std::string& basename : newBasenames)
+        addMatchLine("Basename: " + basename);
     if (matchesChanged) {
         std::string joined;
         for (const std::string& match : g_recentMatches) {
@@ -348,8 +364,11 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
     SendMessage(g_hwndProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
     SendMessage(g_hwndProgress, PBM_SETMARQUEE, TRUE, 100);
 
-    CreateWindowExA(0, "STATIC", "Hash A matches (most recent last):", WS_CHILD | WS_VISIBLE, 10, 95, 300, 18, hwnd, nullptr, hInstance,
-                     nullptr);
+    // A dictionary search with an encryption key finds basenames that match
+    // it too, which go in the same box.
+    CreateWindowExA(0, "STATIC",
+                     g_activeMode == "dictionary" ? "Hash A matches and basenames (most recent last):" : "Hash A matches (most recent last):",
+                     WS_CHILD | WS_VISIBLE, 10, 95, 470, 18, hwnd, nullptr, hInstance, nullptr);
     g_hwndMatches = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 115, 470, 280,
                                      hwnd, nullptr, hInstance, nullptr);
@@ -445,11 +464,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             removeTrayIcon();
             if (!g_quitting) {
                 std::string lastStatus;
+                bool ended;
                 {
                     std::lock_guard<std::mutex> lock(g_status.mutex);
                     lastStatus = g_status.statusText;
+                    ended = g_status.searchEnded;
                 }
-                MessageBoxA(hwnd, ("namebreak stopped unexpectedly: " + lastStatus).c_str(), "namebreak", MB_OK | MB_ICONERROR);
+                if (ended)
+                    MessageBoxA(hwnd, ("namebreak finished: " + lastStatus).c_str(), "namebreak", MB_OK | MB_ICONINFORMATION);
+                else
+                    MessageBoxA(hwnd, ("namebreak stopped unexpectedly: " + lastStatus).c_str(), "namebreak", MB_OK | MB_ICONERROR);
             }
             DestroyWindow(hwnd);
             return 0;

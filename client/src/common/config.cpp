@@ -573,6 +573,12 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
     return true;
 }
 
+std::string quoteDictionaryValue(const std::string& text) {
+    if (text.empty() || std::isspace((unsigned char) text.front()) || std::isspace((unsigned char) text.back()) || unquote(text) != text)
+        return "\"" + text + "\"";
+    return text;
+}
+
 bool appendKeyToConfigSection(const std::string& path, const std::string& sectionName, const std::string& key, const std::string& value) {
     std::ifstream in(path);
     if (!in)
@@ -634,7 +640,9 @@ bool ensureConfigForMode(const std::string& path, const std::string& mode, const
         error = loadErr;
         return false;
     }
-    const std::map<std::string, std::string>& existingSection = (sectionName == "coordinator") ? existing.coordinator : existing.search;
+    const std::map<std::string, std::string>& existingSection = sectionName == "coordinator" ? existing.coordinator
+                                                               : sectionName == "dictionary"  ? existing.dictionary
+                                                                                              : existing.search;
 
     for (const auto& kv : keys) {
         if (kv.second.empty())

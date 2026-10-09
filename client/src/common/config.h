@@ -92,6 +92,12 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 // after a quoted item before the next comma. An empty value is no items.
 bool parseConfigList(const std::string& value, std::vector<std::string>& out, std::string& error);
 
+// `text` as a value of the [dictionary] section, which keeps its values as
+// written (see ConfigFile): in quotes if it's empty, has whitespace at
+// either end, or is itself in quotes - so it reads back as `text`. Not for
+// a list, whose items are quoted each on their own.
+std::string quoteDictionaryValue(const std::string& text);
+
 // Inserts `key = value` right after `[sectionName]`'s header line in the
 // file at `path`, leaving every other line untouched - used to persist an
 // interactively-confirmed value

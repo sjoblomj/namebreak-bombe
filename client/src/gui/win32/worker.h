@@ -4,13 +4,15 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "gui/win32/app_config.h"
 #include "gui/win32/win32.h"
 
 namespace gui {
 
-// Fired once the worker thread's runCoordinator()/runSearch() call returns,
+// Fired once the worker thread's runCoordinator()/runSearch()/
+// runDictionarySearch() call returns,
 // whichever mode this run is in - see workerThreadMain. (WM_APP + 1 is the
 // main window's tray icon message.)
 constexpr UINT WM_APP_WORKER_STOPPED = WM_APP + 2;
@@ -46,11 +48,23 @@ struct SharedStatus {
     Insertion insertFromEnd;
     std::string lowerBound; // candidate-only (no prefix/suffix)
     std::string upperBound; // candidate-only
+    // How far a local dictionary search has got, from 0 to 1 - it counts its
+    // own candidates (DictionarySearchHooks::onCount), so this is used as it
+    // is, rather than worked out from the matches file. -1 for any other
+    // search, and a coordinator's dictionary range, which has neither (see
+    // runDictionaryRange) and so shows the marquee style.
+    double progressFraction = -1;
     bool hasActiveRange = false;
     // Set true by onRangeFinished, consumed (cleared back to false) the next
     // time the UI timer reads this struct - a one-shot "a range just ended"
     // edge, not a level, so the progress bar only snaps to 100% once.
     bool rangeJustFinished = false;
+    // Basenames a local dictionary search has found since the UI timer last
+    // took them (and cleared this) - for the matches box.
+    std::vector<std::string> newBasenames;
+    // A local search ran to its end - found the file, or searched every
+    // candidate - rather than stopping on an error.
+    bool searchEnded = false;
     std::string statusText = "Starting...";
 };
 
@@ -64,8 +78,8 @@ extern std::atomic<bool> g_finishRangeThenPause;
 extern std::atomic<bool> g_quitRequested;
 
 // The worker thread's body: runs whichever mode was configured (see
-// AppConfig) - on a background thread, since both runCoordinator() and
-// runSearch() block for the life of the run. Always ends with a
+// AppConfig) - on a background thread, since runCoordinator(), runSearch()
+// and runDictionarySearch() all block for the life of the run. Always ends with a
 // WM_APP_WORKER_STOPPED post to `notifyWindow` (see MainWndProc) - never any
 // other Win32 call from here, same rule SharedStatus's own comment already
 // states for the coordinator callbacks (worker.cpp).

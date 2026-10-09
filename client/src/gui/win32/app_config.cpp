@@ -10,6 +10,7 @@ namespace {
 
 using gui::SetupDialogFields;
 using gui::kTabCoordinator;
+using gui::kTabDictionary;
 using gui::kTabLocalSearch;
 
 bool configHasServerUrl(const ConfigFile& config) {
@@ -29,7 +30,27 @@ bool isConfigReady(const ConfigFile& config) {
         std::string error;
         return buildSearchRequest(config, config.mode == "continuous", probe, error);
     }
+    // Only its required keys: anything else wrong with it (a word list gone,
+    // a progress file from another search) is said in a message box rather
+    // than by showing the setup again, which can't change a key already set
+    // (see ensureConfigForMode).
+    if (config.mode == "dictionary") {
+        for (const char* key : {"max_words", "prefix", "suffix", "hash_a", "hash_b"}) {
+            auto it = config.dictionary.find(key);
+            if (it == config.dictionary.end() || it->second.empty())
+                return false;
+        }
+        return true;
+    }
     return false;
+}
+
+// A [dictionary] value as written, without the quotes quoteDictionaryValue
+// adds.
+std::string unquoteDictionaryValue(const std::string& value) {
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+        return value.substr(1, value.size() - 2);
+    return value;
 }
 
 } // namespace
@@ -75,7 +96,35 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         fields.pruneAdjacentBackslashes = get(config.search, "prune_adjacent_backslashes", "false") == "true";
         fields.insertFromStart = get(config.search, "insert_from_start", "");
         fields.insertFromEnd = get(config.search, "insert_from_end", "");
-        fields.initialTab = (loaded && (config.mode == "bounded" || config.mode == "continuous")) ? kTabLocalSearch : kTabCoordinator;
+        // The lists as written, list syntax and all; the rest without quotes.
+        auto getDict = [&](const std::string& key, const std::string& fallback) {
+            const std::string value = get(config.dictionary, key, fallback);
+            return value == fallback ? value : unquoteDictionaryValue(value);
+        };
+        gui::DictionaryFields& dict = fields.dictionary;
+        dict.builtinDictionary = getDict("builtin_dictionary", "english-1") != "none";
+        dict.dictionaries = get(config.dictionary, "dictionaries", dict.dictionaries);
+        dict.minWords = getDict("min_words", dict.minWords);
+        dict.maxWords = getDict("max_words", dict.maxWords);
+        dict.separators = get(config.dictionary, "separators", dict.separators);
+        dict.tails = get(config.dictionary, "tails", dict.tails);
+        dict.prefix = getDict("prefix", "");
+        dict.suffix = getDict("suffix", "");
+        dict.lowerBound = getDict("lower_bound", "");
+        dict.upperBound = getDict("upper_bound", "");
+        dict.hashA = getDict("hash_a", "");
+        dict.hashB = getDict("hash_b", "");
+        dict.encryptionKey = getDict("encryption_key", "");
+        dict.recordBasenames = getDict("record_basenames", "true") == "true";
+        dict.recordHashAMatches = getDict("record_hasha_matches", "false") == "true";
+        dict.matchesName = getDict("matches_name", "");
+        dict.resume = getDict("resume_from_last_candidate", "true") == "true";
+        fields.matchesDir = loaded ? config.matchesDir : kDefaultMatchesDir;
+
+        fields.initialTab = !loaded                                                      ? kTabCoordinator
+                            : config.mode == "bounded" || config.mode == "continuous" ? kTabLocalSearch
+                            : config.mode == "dictionary"                             ? kTabDictionary
+                                                                                      : kTabCoordinator;
         fields.initialContinuous = loaded && config.mode == "continuous";
 
         if (!showSetupDialog(hInstance, fields))
@@ -90,6 +139,8 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
                                             {"hostname", fields.hostname},
                                             {"poll_interval_secs", fields.pollIntervalSecs}},
                                            writeError);
+        } else if (fields.mode == "dictionary") {
+            writeOk = ensureConfigForMode(configPath, "dictionary", "dictionary", gui::dictionaryConfigKeys(fields.dictionary), writeError);
         } else {
             writeOk = ensureConfigForMode(configPath, fields.mode, "search",
                                            {{"alphabet", fields.alphabet},
@@ -132,6 +183,23 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         if (!buildSearchRequest(config, config.mode == "continuous", outConfig.searchRequest, error)) {
             MessageBoxA(nullptr, (configPath + " [search]: " + error).c_str(), "namebreak", MB_OK | MB_ICONERROR);
             return false;
+        }
+    } else if (config.mode == "dictionary") {
+        std::vector<std::string> warnings;
+        const bool built = buildDictionaryRequest(config, outConfig.dictionaryRequest, warnings, error);
+        if (!built) {
+            MessageBoxA(nullptr, (configPath + " [dictionary]: " + error).c_str(), "namebreak", MB_OK | MB_ICONERROR);
+            return false;
+        }
+        // Lines of the word lists skipped - the search goes ahead without them.
+        if (!warnings.empty()) {
+            constexpr size_t kMaxWarnings = 10;
+            std::string text = "Some lines of the word lists are skipped:\r\n";
+            for (size_t i = 0; i < warnings.size() && i < kMaxWarnings; ++i)
+                text += "\r\n" + warnings[i];
+            if (warnings.size() > kMaxWarnings)
+                text += "\r\n... and " + std::to_string(warnings.size() - kMaxWarnings) + " more";
+            MessageBoxA(nullptr, text.c_str(), "namebreak", MB_OK | MB_ICONWARNING);
         }
     } else {
         MessageBoxA(nullptr, ("Unknown or missing mode in " + configPath).c_str(), "namebreak", MB_OK | MB_ICONERROR);

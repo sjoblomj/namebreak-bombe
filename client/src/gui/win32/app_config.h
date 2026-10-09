@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include "engine/dictionary_search.h"
 #include "engine/search.h"
 #include "gui/win32/win32.h"
 #include "net/coordinator_runner.h"
@@ -10,14 +11,16 @@
 namespace gui {
 
 // What the rest of the GUI needs to actually run, whichever mode was
-// configured - exactly one of coordinatorArgs/searchRequest is meaningful,
-// selected by `mode` (see workerThreadMain).
+// configured - exactly one of coordinatorArgs/searchRequest/
+// dictionaryRequest is meaningful, selected by `mode` (see
+// workerThreadMain).
 struct AppConfig {
     std::string mode;
     // config.conf's `backend` - empty for the first one that can run here.
     std::string backend;
     CoordinatorArgs coordinatorArgs;
     SearchRequest searchRequest;
+    DictionaryRequest dictionaryRequest;
 };
 
 // Loads `configPath`, running the setup dialog first if it's missing or

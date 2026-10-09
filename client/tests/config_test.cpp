@@ -358,6 +358,35 @@ static void testDictionaryResume() {
     std::filesystem::remove(progressPath);
 }
 
+// What the Windows GUI's setup writes for dictionary mode.
+static void testEnsureDictionaryConfig() {
+    printf("--- ensureConfigForMode with [dictionary] ---\n");
+    check(quoteDictionaryValue("") == "\"\"" && quoteDictionaryValue(" A") == "\" A\"" && quoteDictionaryValue("\"A\"") == "\"\"A\"\"" &&
+              quoteDictionaryValue("REZ\\") == "REZ\\",
+          "quoteDictionaryValue quotes an empty value, edge whitespace and quotes - nothing else");
+    writeFile(kWords, "zerg\ncrdt\nlst\n");
+    const std::vector<std::pair<std::string, std::string>> keys = {
+        {"builtin_dictionary", "none"}, {"dictionaries", kWords}, {"max_words", "2"}, {"separators", "\"\", \"_\""},
+        {"prefix", quoteDictionaryValue("")}, {"suffix", quoteDictionaryValue(" .txt")}, {"lower_bound", ""},
+        {"hash_a", "0x1"}, {"hash_b", "0x2"},
+    };
+    for (bool exists : {false, true}) {
+        const std::string path = kDir + "/ensure-dictionary.conf";
+        std::filesystem::remove(path);
+        if (exists)
+            writeFile(path, "mode = coordinator\n[dictionary]\nmax_words = 3\n");
+        std::string error;
+        ConfigFile config;
+        DictionaryRequest req;
+        const bool written = ensureConfigForMode(path, "dictionary", "dictionary", keys, error);
+        check(written && loadConfigFile(path, config, error) && config.mode == "dictionary" && buildDict(config, req, error) &&
+                  req.prefix.empty() && req.suffix == " .TXT" && req.pattern.separators == std::vector<std::string>({"", "_"}) &&
+                  !req.bounds.hasLower && req.pattern.words.size() == 3,
+              std::string(exists ? "into a file with a [dictionary] section" : "a new file") + ": reads back as written (" + error + ")");
+        check(req.pattern.maxWords == (exists ? 3 : 2), exists ? "... keeping a value it already has" : "... every value");
+    }
+}
+
 int main() {
     printf("--- without resume_from_last_candidate ---\n");
     writeMatches("REZ\\QQQ.WAV"); // must be ignored
@@ -486,6 +515,7 @@ int main() {
     testLoadDictionarySection();
     testDictionaryRequest();
     testDictionaryResume();
+    testEnsureDictionaryConfig();
 
     std::filesystem::remove_all(kDir);
     if (g_failures) {

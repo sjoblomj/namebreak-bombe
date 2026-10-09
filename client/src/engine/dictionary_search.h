@@ -123,6 +123,10 @@ struct DictionarySearchHooks {
     // DictionaryResult::nextNumber so far: every candidate numbered below it
     // has been searched.
     std::function<void(uint64_t nextNumber)> onProgress;
+    // Alongside onProgress: how many candidates have been hashed so far
+    // (DictionaryResult::candidatesSearched), of how many there are to hash
+    // in all - what the progress line's percentage is of.
+    std::function<void(uint64_t searched, uint64_t toSearch)> onCount;
 };
 
 // Runs a dictionary search on `backend`, which must supportsDictionary(). The

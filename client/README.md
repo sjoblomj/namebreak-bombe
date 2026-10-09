@@ -217,6 +217,12 @@ A list (`dictionaries`, `separators`) is items separated by commas, each
 either `"quoted"` - kept exactly, spaces and commas included - or not, and
 then trimmed. `""` is an empty item; an empty unquoted one is an error.
 
+The Windows GUI's setup has a Local Dictionary tab with these keys (a Browse
+button adds word lists, relative to the current directory when they're in
+it), and checks them as a search would before it writes them. While it
+searches, its progress bar is how many of the candidates it has hashed, and
+the basenames that match the key are listed with the Hash-A matches.
+
 **Tails.** Names often end with a number, or a number and a letter -
 `PROTOSS1`, `KEEP3B` - which `tails` adds after the last word, before the
 suffix. Each element of the list stands for some strings:
