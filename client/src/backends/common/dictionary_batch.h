@@ -127,19 +127,15 @@ struct DictionaryHit {
 class DictionaryHitVerifier {
 public:
     void begin(const DictionaryConstants& constants);
-    // Whether a backend hashes each candidate's basename - if the basename
-    // key is checked, and the suffix has no '\' - and then only that: the
-    // file's name has the key's basename, so a candidate whose basename
-    // doesn't match it can't be the file, and hashA would be hashed for
-    // nothing. The backend reports basename hits alone, and addHits checks
-    // their hashA and hashB. Otherwise the backend hashes hashA alone. If
-    // the suffix has a '\', the basename is its end alike for every
-    // candidate, and addHits checks it itself, once a call.
-    bool candidatesHaveBasenames() const { return checkBasename_ && !suffixHasBackslash_; }
-    // Adds the hashA hits and basename hits of `batches` to `outcome` - with
-    // candidatesHaveBasenames, a basename hit whose hashA matches as a hashA
-    // hit too - and if every candidate's basename is the suffix's, and it
-    // matches, the first candidate of the call as the one basename hit.
+    // The hashes a backend works out for each candidate, and reports the
+    // hits of (see dictionaryHashes).
+    DictionaryHashes hashes() const { return hashes_; }
+    // Adds the hashA hits and basename hits of `batches` to `outcome` - the
+    // basename hits only if they're recorded, and if the backend worked out
+    // the basename hash alone, a basename hit whose hashA matches as a
+    // hashA hit too - and if every candidate's basename is the suffix's,
+    // and it matches, the first candidate of the call as the one basename
+    // hit.
     void addHits(const std::vector<DictionaryBatch>& batches, const std::vector<DictionaryHit>& hashAHits,
                  const std::vector<DictionaryHit>& basenameHits, DictionaryOutcome& outcome) const;
 
@@ -151,7 +147,8 @@ private:
     uint32_t targetB_ = 0;
     bool checkBasename_ = false;
     uint32_t basenameKey_ = 0;
-    bool suffixHasBackslash_ = false;
+    bool recordBasenames_ = false;
+    DictionaryHashes hashes_ = DictionaryHashes::HashA;
     bool suffixBasenameMatches_ = false;
 };
 

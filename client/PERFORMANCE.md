@@ -697,6 +697,17 @@ afternoon).
   - Metal: tested emulated (its kernel compiled as C++, threadgroups as
     threads), with `dictionary_search_test` in its three builds and the
     key-only path's mutations; not measured.
+  - [x] **The key used whenever it's known**, whether or not the basenames
+    are recorded (`record_basenames`, a target's `send_basenames`) - and
+    `record_hasha_matches` (a `[dictionary]` setting) to hash both again,
+    for a search that wants every Hash-A match or doesn't trust its key.
+    The kernels take which hashes as a template parameter (a macro in
+    OpenCL and Metal). **Measured** at Nsight Compute's fixed clocks: both
+    13.88-13.89 ms a launch, as the kernel before (1.644 G warp
+    instructions, the same); the basename alone 12.57-12.61 and hashA alone
+    12.58-12.62, as before it. At the GPU's own clocks (72-75 C): 21.9 G
+    candidates/s with both, 28.2-28.5 with the basename alone, 28.7-29.2
+    with hashA alone.
 - [ ] **Hide the word table's loads.** Since **One hash a candidate**, both
   kernels wait on a word's entry and characters more than they compute
   (73% of issue slots busy at fixed clocks): loading the next word's while

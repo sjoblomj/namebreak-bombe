@@ -380,7 +380,7 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
     const std::string& suffix = dictionary_.suffix;
     const uint32_t* table = cryptTable_.data();
     const uint32_t targetA = dictionary_.targetHashA;
-    const bool checkBasename = dictionaryVerifier_.candidatesHaveBasenames();
+    const DictionaryHashes hashes = dictionaryVerifier_.hashes();
     const uint32_t basenameKey = dictionary_.basenameKey;
 
     // Work items: slices of one batch's words, about eight per thread, taken
@@ -410,9 +410,9 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
         for (size_t i = next++; i < items.size(); i = next++) {
             const DictionaryBatch& batch = batches[items[i].batch];
             const uint32_t first = batch.firstWord + items[i].from, end = batch.firstWord + items[i].to;
-            if (checkBasename) {
-                // The basename alone: the verifier checks hashA and hashB of
-                // those that match (see candidatesHaveBasenames).
+            if (hashes != DictionaryHashes::HashA) {
+                // The basename - alone, the verifier checks hashA and hashB
+                // of those that match (see dictionaryHashes).
                 for (uint32_t w = first; w < end; ++w) {
                     uint32_t k1 = batch.basenameSeed1, k2 = batch.basenameSeed2;
                     auto stepBasename = [&](unsigned char ch) {
@@ -430,7 +430,8 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
                     if (basenameKeyMatches(k1, basenameKey))
                         mine.basename.push_back({(uint32_t) items[i].batch, w});
                 }
-            } else {
+            }
+            if (hashes != DictionaryHashes::Basename) {
                 for (uint32_t w = first; w < end; ++w) {
                     uint32_t s1 = batch.seed1, s2 = batch.seed2;
                     for (unsigned char ch : words[w])

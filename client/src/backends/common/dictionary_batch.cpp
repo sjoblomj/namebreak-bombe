@@ -141,11 +141,11 @@ void DictionaryHitVerifier::begin(const DictionaryConstants& constants) {
     targetB_ = constants.targetHashB;
     checkBasename_ = constants.checkBasename;
     basenameKey_ = constants.basenameKey;
+    recordBasenames_ = constants.checkBasename && constants.recordBasenames;
+    hashes_ = dictionaryHashes(constants);
     const size_t slash = suffix_.rfind('\\');
-    suffixHasBackslash_ = slash != std::string::npos;
-    suffixBasenameMatches_ =
-        suffixHasBackslash_ && basenameKeyMatches(continueBasenameHash(kInitialHashState, suffix_.substr(slash), cryptTable_.data()).first,
-                                                  basenameKey_);
+    suffixBasenameMatches_ = recordBasenames_ && slash != std::string::npos &&
+                             basenameKeyMatches(continueBasenameHash(kInitialHashState, suffix_.substr(slash), cryptTable_.data()).first, basenameKey_);
 }
 
 void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches, const std::vector<DictionaryHit>& hashAHits,
@@ -180,10 +180,11 @@ void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches,
                    filename.c_str());
             continue;
         }
-        outcome.basenameHits.push_back(filename);
-        // The backend hashed the basename alone (candidatesHaveBasenames):
-        // hashA is checked here.
-        if (candidatesHaveBasenames() && hashAMatches(continueHash(kInitialHashState, filename, kHashAOffset, table).first, targetA_))
+        if (recordBasenames_)
+            outcome.basenameHits.push_back(filename);
+        // The backend worked out the basename hash alone: hashA is checked
+        // here.
+        if (hashes_ == DictionaryHashes::Basename && hashAMatches(continueHash(kInitialHashState, filename, kHashAOffset, table).first, targetA_))
             addHashAHit(filename);
     }
     if (suffixBasenameMatches_ && !batches.empty())

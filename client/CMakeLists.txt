@@ -602,7 +602,8 @@ endif()
 #                            default backend (build/tests/dictionary_bench
 #                            --backend <name> for another; --words <n> to
 #                            time the CPU backend on fewer; --no-key to
-#                            hash hashA, not the basename)
+#                            hash hashA, not the basename;
+#                            --record-hasha-matches to hash both)
 # NAMEBREAK_BENCH_WINDOW sets the GPU window for search_bench only, to
 # re-sweep that tuning value against real hardware without hand-editing the
 # source - e.g. -DNAMEBREAK_BENCH_WINDOW=6. Empty, the shipped default is used.

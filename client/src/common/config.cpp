@@ -434,6 +434,7 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
     if (!r.getRequired("hash_b", hashBHex, error)) return false;
     std::string keyHex = unquote(r.getOptional("encryption_key", ""));
     std::string recordStr = unquote(r.getOptional("record_basenames", ""));
+    std::string recordHashAStr = unquote(r.getOptional("record_hasha_matches", "false"));
     std::string matchesName = unquote(r.getOptional("matches_name", ""));
     std::string resumeStr = unquote(r.getOptional("resume_from_last_candidate", "false"));
 
@@ -472,12 +473,17 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
         return false;
     }
     out.checkBasename = hasKey;
-    if (!recordStr.empty() && !parseBool(recordStr, out.checkBasename)) {
+    out.recordBasenames = hasKey;
+    if (!recordStr.empty() && !parseBool(recordStr, out.recordBasenames)) {
         error = "invalid record_basenames: '" + recordStr + "' (expected true/false)";
         return false;
     }
-    if (out.checkBasename && !hasKey) {
+    if (out.recordBasenames && !hasKey) {
         error = "record_basenames needs an encryption_key to compare the basenames to";
+        return false;
+    }
+    if (!parseBool(recordHashAStr, out.recordHashAMatches)) {
+        error = "invalid record_hasha_matches: '" + recordHashAStr + "' (expected true/false)";
         return false;
     }
     bool resume = false;
@@ -546,8 +552,9 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
             printf("resume_from_last_candidate: no progress file %s yet - starting from the beginning\n", out.progressFilePath.c_str());
         } else if (progress.fingerprint != dictionaryFingerprint(out)) {
             error = "resume_from_last_candidate: " + out.progressFilePath +
-                    " is from a search with different settings (words, separators, word counts, prefix, suffix, bounds, hashes or "
-                    "encryption key) - remove it, or set resume_from_last_candidate = false, to start this one from the beginning";
+                    " is from a search with different settings (words, separators, word counts, prefix, suffix, bounds, hashes, "
+                    "encryption key, record_basenames or record_hasha_matches) - remove it, or set resume_from_last_candidate = false, "
+                    "to start this one from the beginning";
             return false;
         } else {
             out.startNumber = progress.next;

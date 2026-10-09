@@ -16,7 +16,7 @@
 // numbers), checked against a target's hashA and hashB - and, given the
 // file's encryption key, its basename against that key, and then only the
 // candidates whose basename matches against the hashes (see
-// DictionaryConstants::checkBasename).
+// dictionaryHashes, engine/backend.h).
 //
 // It walks the candidates in number order. The bounds are whole filenames:
 // a candidate outside them is skipped, and so is everything after a leading
@@ -56,12 +56,19 @@ struct DictionaryRequest {
     FilenameBounds bounds;
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
-    // Compare each candidate's basename to basenameKey (see
-    // continueBasenameHash), and write every basename that matches to
-    // basenamesFilePath. Unless the suffix has a '\', only those candidates
-    // are then compared to the targets: the file's name has that basename.
+    // The file's encryption key is known: compare each candidate's basename
+    // to basenameKey (see continueBasenameHash). Unless the suffix has a
+    // '\', only the candidates whose basename matches are then compared to
+    // the targets - the file's name has that basename - unless
+    // recordHashAMatches (see dictionaryHashes, engine/backend.h).
     bool checkBasename = false;
     uint32_t basenameKey = 0;
+    // With checkBasename, write every basename that matches to
+    // basenamesFilePath (or, without one, only to onBasenameMatch).
+    bool recordBasenames = true;
+    // With checkBasename, compare every candidate to the targets all the
+    // same, reporting every hashA hit, as if the key weren't known.
+    bool recordHashAMatches = false;
     // The number of the first candidate to search - every one before it is
     // taken as searched (see the progress file below) - and of the first not
     // to: a coordinator range is the candidates [startNumber, endNumber).
@@ -73,9 +80,10 @@ struct DictionaryRequest {
     // The most recent hashA match, or the match of both hashes - see
     // SearchRequest::outputFilePath.
     std::string outputFilePath = "matches.txt";
-    // Every basename that matched basenameKey, one per line, each once -
-    // appended to, never replaced. Empty for none: a coordinator range's go
-    // to onBasenameMatch only (see runDictionarySearch).
+    // With recordBasenames, every basename that matched basenameKey, one per
+    // line, each once - appended to, never replaced. Empty for none: a
+    // coordinator range's go to onBasenameMatch only (see
+    // runDictionarySearch).
     std::string basenamesFilePath = "basenames.txt";
     // The progress file - see writeDictionaryProgress. Written this often,
     // whenever the search pauses, and when it ends. Empty for none.

@@ -263,11 +263,19 @@ static void testDictionaryRequest() {
     {
         ConfigFile config = makeDictionaryConfig();
         config.dictionary["encryption_key"] = "0x4565C467";
-        check(buildDict(config, req, error) && req.checkBasename && req.basenameKey == 0x4565C467, "an encryption_key: basenames recorded");
+        check(buildDict(config, req, error) && req.checkBasename && req.basenameKey == 0x4565C467 && req.recordBasenames &&
+                  !req.recordHashAMatches,
+              "an encryption_key: used, basenames recorded, not every hashA hit");
         config.dictionary["record_basenames"] = "false";
-        check(buildDict(config, req, error) && !req.checkBasename, "... unless record_basenames = false");
+        check(buildDict(config, req, error) && req.checkBasename && !req.recordBasenames,
+              "... the basenames not recorded with record_basenames = false - the key used all the same");
         config.dictionary["record_basenames"] = "true";
-        check(buildDict(config, req, error) && req.checkBasename, "record_basenames = true: recorded");
+        check(buildDict(config, req, error) && req.checkBasename && req.recordBasenames, "record_basenames = true: recorded");
+        config.dictionary["record_hasha_matches"] = "true";
+        check(buildDict(config, req, error) && req.recordHashAMatches, "record_hasha_matches = true: every hashA hit");
+        config.dictionary["record_hasha_matches"] = "sometimes";
+        check(errorOf(config).find("invalid record_hasha_matches") != std::string::npos, "record_hasha_matches not a boolean: an error");
+        config.dictionary.erase("record_hasha_matches");
         config.dictionary["record_basenames"] = "maybe";
         check(errorOf(config).find("invalid record_basenames") != std::string::npos, "record_basenames not a boolean: an error");
         config.dictionary["record_basenames"] = "true";
@@ -277,6 +285,8 @@ static void testDictionaryRequest() {
         check(errorOf(config).find("needs an encryption_key") != std::string::npos, "record_basenames = true without a key: an error");
         config.dictionary["record_basenames"] = "false";
         check(buildDict(config, req, error) && !req.checkBasename, "record_basenames = false without a key: fine");
+        config.dictionary["record_hasha_matches"] = "true";
+        check(buildDict(config, req, error) && !req.checkBasename, "record_hasha_matches = true without a key: fine (every hashA hit anyway)");
     }
     {
         ConfigFile config = makeDictionaryConfig();

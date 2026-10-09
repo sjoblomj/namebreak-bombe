@@ -203,21 +203,21 @@ struct Expected {
     uint64_t total = 0;               // candidates in all
 };
 
-// Checking basenames, with a suffix that has no '\', a candidate is compared
-// to hashA and hashB only if its basename matches the key: the file's name
-// has that basename.
+// With the key, and a suffix that has no '\', a candidate is compared
+// to hashA and hashB only if its basename matches the key - the file's name
+// has that basename - unless every hashA hit is recorded.
 static Expected expectedOf(const DictionaryRequest& req) {
     Expected e;
     const std::vector<std::string> all = allCandidates(req.pattern);
     e.total = all.size();
-    const bool basenameFirst = req.checkBasename && req.suffix.find('\\') == std::string::npos;
+    const bool basenameFirst = req.checkBasename && !req.recordHashAMatches && req.suffix.find('\\') == std::string::npos;
     for (uint64_t n = req.startNumber; n < std::min<uint64_t>(all.size(), req.endNumber); ++n) {
         const std::string filename = req.prefix + all[n] + req.suffix;
         if (!req.bounds.contains(filename))
             continue;
         ++e.searched;
         const bool basenameMatches = req.checkBasename && basenameKeyMatches(hashOf(basename(filename), 0x300), req.basenameKey);
-        if (basenameMatches)
+        if (basenameMatches && req.recordBasenames)
             e.basenames.insert(basename(filename));
         if ((!basenameFirst || basenameMatches) && hashAMatches(hashOf(filename, 0x100), req.targetHashA)) {
             e.hits.push_back(filename);
@@ -291,6 +291,8 @@ static DictionaryRequest randomRequest(std::mt19937& rng, int round) {
     // is - or another's, which the planted one, checked against hashA and
     // hashB only if its basename matches, mustn't be found by.
     req.basenameKey = hashOf(basename(rng() % 3 ? planted : reached[rng() % reached.size()]), 0x300);
+    req.recordBasenames = rng() % 4 != 0;
+    req.recordHashAMatches = rng() % 3 == 0;
     return req;
 }
 
@@ -328,7 +330,7 @@ static void testAgainstBruteForce(SearchBackend& backend) {
             const std::set<std::string> fileSet(lines.begin(), lines.end());
             ok = ok && fileSet.size() == lines.size() && fileSet == e.basenames && r.basenameHits == e.basenames.size();
             withBasenames += e.basenames.empty() ? 0 : 1;
-            if (!req.checkBasename)
+            if (!req.checkBasename || !req.recordBasenames)
                 ok = ok && !std::filesystem::exists(req.basenamesFilePath);
             // The progress file: done, from this search.
             DictionaryProgress progress;
@@ -358,7 +360,7 @@ static void testAgainstBruteForce(SearchBackend& backend) {
     check(found >= 30, "... " + std::to_string(found) + " of them finding a planted match of both hashes");
     check(withBasenames >= 30, "... " + std::to_string(withBasenames) + " of them recording basenames");
     if (kHashAMatchMask != 0xFFFFFFFFu)
-        check(withHits >= 30, "... " + std::to_string(withHits) + " of them with hashA hits to compare");
+        check(withHits >= 40, "... " + std::to_string(withHits) + " of them with hashA hits to compare");
 }
 
 // Many words, of every length from 1 to 12 characters, some with a '\':
@@ -469,6 +471,29 @@ static void testRealHashes(SearchBackend& backend) {
         const DictionaryResult r = run(backend, req);
         check(r.ok && r.found && !std::filesystem::exists(req.basenamesFilePath), "not checking basenames: no basenames file");
     }
+    {
+        DictionaryRequest req = creditsRequest("credits-unrecorded");
+        req.recordBasenames = false;
+        const DictionaryResult r = run(backend, req);
+        check(r.ok && r.found && r.filename == "REZ\\CRDT_LST.TXT" && r.basenameHits == 0 && !std::filesystem::exists(req.basenamesFilePath),
+              "the key, its basenames not recorded: found all the same, no basenames file");
+    }
+    {
+        // A wrong key: only candidates whose basename matches it are
+        // compared to the hashes - so the name isn't found, unless every
+        // hashA hit is recorded.
+        DictionaryRequest req = creditsRequest("credits-wrong-key");
+        req.basenameKey = hashOf("NOT_THE_CREDITS.TXT", 0x300);
+        req.recordBasenames = false;
+        const DictionaryResult wrong = run(backend, req);
+        check(wrong.ok && !wrong.found, "a wrong key: the name not found");
+        req.recordHashAMatches = true;
+        const DictionaryResult r = run(backend, req);
+        check(r.ok && r.found && r.filename == "REZ\\CRDT_LST.TXT", "... but found with every hashA hit recorded");
+        req.recordBasenames = true;
+        const DictionaryResult both = run(backend, req);
+        check(both.ok && both.found && both.filename == "REZ\\CRDT_LST.TXT", "... and with its basenames recorded too");
+    }
 }
 
 static void testBasenamesFile(SearchBackend& backend) {
@@ -538,8 +563,10 @@ static void testEdges(SearchBackend& backend) {
         check(!run(backend, req).ok, "a basenames file that can't be opened: not ok");
         req.basenamesFilePath = req.outputFilePath + "/basenames.txt"; // under a file
         check(!run(backend, req).ok, "a basenames file whose directory can't be made: not ok");
+        req.recordBasenames = false;
+        check(run(backend, req).ok, "... unless basenames aren't recorded");
         req.checkBasename = false;
-        check(run(backend, req).ok, "... unless basenames aren't checked");
+        check(run(backend, req).ok, "... nor checked");
     }
     {
         DictionaryRequest req = creditsRequest("progress-unwritable");

@@ -203,8 +203,9 @@ resume_from_last_candidate = true
 | `prefix` / `suffix` | yes | The fixed parts of the filename around the candidate. |
 | `lower_bound` / `upper_bound` | no | Whole filenames (inclusive) bounding the search alphabetically - typically an unknown file's neighbours in the archive. Either may be left out. |
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex. |
-| `encryption_key` | no | The file's raw encryption key, hex: hash type 3 of its basename, before the adjustment for its position and size in the archive (mpqcli's `encryption-key-raw`, the coordinator's `encryption_key_hex`). Every candidate whose basename - what follows the filename's last `\` - hashes to it is recorded. While they are (`record_basenames`), and unless the suffix has a `\`, only those candidates are compared to `hash_a` and `hash_b` at all - the file's name has that basename, so no other can be it - which makes the search about a third faster (see [Dictionary searches on the GPU](#dictionary-searches-on-the-gpu)). |
-| `record_basenames` | no (default `true` with an `encryption_key`, else `false`) | Whether to record those basenames. `true` needs an `encryption_key`. |
+| `encryption_key` | no | The file's raw encryption key, hex: hash type 3 of its basename, before the adjustment for its position and size in the archive (mpqcli's `encryption-key-raw`, the coordinator's `encryption_key_hex`). Every candidate whose basename - what follows the filename's last `\` - hashes to it is recorded (see `record_basenames`), and, unless the suffix has a `\`, only those candidates are compared to `hash_a` and `hash_b` at all: the file's name has that basename, so no other can be it. That makes the search about a third faster (see [Dictionary searches on the GPU](#dictionary-searches-on-the-gpu)) - and a wrong key hides the file (see `record_hasha_matches`). |
+| `record_basenames` | no (default `true` with an `encryption_key`, else `false`) | Whether to record the basenames that match the key. `true` needs an `encryption_key`; `false` still uses the key. |
+| `record_hasha_matches` | no (default `false`) | With an `encryption_key`, compare every candidate to `hash_a` and `hash_b` all the same, as if the key weren't known: every Hash-A match is recorded in `matches.txt`, and a wrong key can't hide the file - but the search is about a third slower, as before the key was used for that. Without an `encryption_key`, every candidate is compared anyway. |
 | `matches_name` | no | Names the files the search writes, as in `[search]`. |
 | `resume_from_last_candidate` | no (default `false`) | Carry on from the progress file (see below). |
 
@@ -248,10 +249,13 @@ lower bound, `REZ\CRDT...` is both inside (`REZ\CRDT_MAP.TXT`) and outside
   `next` has been searched. Written every 30 seconds, when the search is
   paused, and when it ends. It also has a fingerprint of everything that
   decides which candidates are searched and what's looked for (the words,
-  separators, word counts, prefix, suffix, bounds, hashes and encryption
-  key): `resume_from_last_candidate = true` refuses to resume from a file
-  with another fingerprint, rather than skip candidates the changed search
-  never searched.
+  separators, word counts, prefix, suffix, bounds, hashes, encryption key,
+  and whether basenames and every Hash-A match are recorded):
+  `resume_from_last_candidate = true` refuses to resume from a file with
+  another fingerprint, rather than skip candidates the changed search never
+  searched. (A search with an encryption key whose basenames are recorded
+  keeps the fingerprint it had before the key was used to hash less, so it
+  can carry on from there.)
 
 **`english-1`** is every all-lowercase ASCII word of Debian's `wamerican`
 word list (from SCOWL) - see `data/english-1.LICENSE.txt` for where it comes
@@ -298,9 +302,11 @@ get one.
   has got as a candidate number - every candidate below it has been searched -
   so the server checkpoints a dictionary range at every heartbeat, and a quit
   hands back exactly the rest.
-- **Basenames.** When the target asks for them (its `send_basenames`), every
-  candidate whose basename matches its encryption key is sent with the next
-  heartbeat, quit or completion, at most 5,000 a report. Until a report gets
+- **Basenames.** A target's encryption key is used whenever it has one, as
+  `encryption_key` is in dictionary mode. When the target asks for them
+  (its `send_basenames`), every candidate whose basename matches the key is
+  sent with the next heartbeat, quit or completion, at most 5,000 a
+  report. Until a report gets
   through they wait in memory - never in a file - so if the server can't be
   reached, they go with the next report that is. A report never says the
   search got further than a basename it doesn't carry, and a completion
@@ -1268,7 +1274,9 @@ searches* for the measurements):
   it, and its hashA would be hashed for nothing. The host checks hashA and
   hashB of the few that match (`DictionaryHitVerifier`). A search without
   one hashes hashA alone. Hashing both, as the kernels first did, took
-  about a third longer.
+  about a third longer - and is what they still do with
+  `record_hasha_matches` (unless the basenames aren't recorded: then only
+  hashA).
 - **Words by length.** A warp goes round a word's loop as many times as its
   longest word needs. The word table the kernels read
   (`DictionaryWordTable`) has the words in the order of their lengths, so

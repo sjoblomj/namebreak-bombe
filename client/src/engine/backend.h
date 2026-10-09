@@ -113,14 +113,41 @@ struct DictionaryConstants {
     const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
-    // Also compare each candidate's basename - its filename after the last
-    // '\' - hashed as Storm makes a file's encryption key (hash type 3), to
-    // basenameKey. Unless the suffix has a '\', only a candidate whose
-    // basename matches is then compared to the targets: the file's name has
-    // that basename (see DictionaryHitVerifier::candidatesHaveBasenames).
+    // The file's encryption key is known: compare each candidate's basename -
+    // its filename after the last '\' - hashed as Storm makes the key (hash
+    // type 3), to basenameKey. The file's name has that basename, so only a
+    // candidate whose basename matches is compared to the targets - unless
+    // recordHashAMatches (see dictionaryHashes).
     bool checkBasename = false;
     uint32_t basenameKey = 0;
+    // With checkBasename: report every candidate whose basename matches
+    // (DictionaryOutcome::basenameHits).
+    bool recordBasenames = true;
+    // With checkBasename: compare every candidate to the targets all the
+    // same, as if the key weren't known - so that every hashA hit is
+    // reported, and a wrong key can't hide the file.
+    bool recordHashAMatches = false;
 };
+
+// Which hashes a dictionary search's backend works out for each candidate -
+// numbered as the OpenCL and Metal kernels' HASHES.
+enum class DictionaryHashes { HashA = 0, Basename = 1, Both = 2 };
+
+// HashA, unless the basename key is checked and the suffix has no '\' (if
+// it has one, every candidate's basename is the same, its end, and
+// DictionaryHitVerifier checks it once a call). With the key, Basename: the
+// file's name has the key's basename, so a candidate whose basename doesn't
+// match it can't be the file, and its hashA would be worked out for
+// nothing - the verifier checks hashA and hashB of those that match. With
+// recordHashAMatches, every candidate's hashA all the same: Both - or
+// HashA, if the basenames aren't recorded.
+inline DictionaryHashes dictionaryHashes(const DictionaryConstants& constants) {
+    if (!constants.checkBasename || constants.suffix.find('\\') != std::string::npos)
+        return DictionaryHashes::HashA;
+    if (!constants.recordHashAMatches)
+        return DictionaryHashes::Basename;
+    return constants.recordBasenames ? DictionaryHashes::Both : DictionaryHashes::HashA;
+}
 
 // One leading part of a dictionary search's candidates - its prefix, and its
 // words and separators but the last word - followed by each of the words
@@ -142,15 +169,16 @@ struct DictionaryBatch {
 // order.
 struct DictionaryOutcome {
     // The filename of every hashA hit - of the candidates compared to the
-    // targets at all (see DictionaryConstants::checkBasename).
+    // targets at all (see dictionaryHashes).
     std::vector<std::string> hits;
     // Set once one of them also matches hashB.
     bool found = false;
     std::string foundFilename;
-    // The filename of every candidate whose basename matched basenameKey -
-    // or, if the suffix has a '\', and so every candidate has the same
-    // basename, of at least one of the call's candidates if it matched (see
-    // DictionaryHitVerifier, backends/common/dictionary_batch.h).
+    // With recordBasenames, the filename of every candidate whose basename
+    // matched basenameKey - or, if the suffix has a '\', and so every
+    // candidate has the same basename, of at least one of the call's
+    // candidates if it matched (see DictionaryHitVerifier,
+    // backends/common/dictionary_batch.h).
     std::vector<std::string> basenameHits;
 };
 

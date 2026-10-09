@@ -124,9 +124,12 @@ struct ClaimResponse {
     // The target's bounds, as whole filenames - absent for none.
     std::optional<std::string> filenameLowerBound;
     std::optional<std::string> filenameUpperBound;
-    // Compare every candidate's basename to encryptionKeyHex and send the
-    // ones that match (HeartbeatRequest::basenames).
+    // Send every candidate's basename that matches encryptionKeyHex
+    // (HeartbeatRequest::basenames).
     bool sendBasenames = false;
+    // A dictionary target's encryption key, if it has one - empty if not:
+    // only the candidates whose basename matches it are compared to the
+    // hashes. Older servers send it only with sendBasenames.
     std::string encryptionKeyHex;
 };
 

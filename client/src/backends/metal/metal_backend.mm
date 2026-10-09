@@ -171,12 +171,12 @@ private:
     id<MTLBuffer> dictionaryCryptKeys_, dictionaryFilters_, dictionarySuffixKeys_;
     uint32_t dictionaryWordCount_ = 0;
     int dictionarySuffixLen_ = 0;
-    bool dictionaryBasenames_ = false;
+    DictionaryHashes dictionaryHashes_ = DictionaryHashes::HashA;
     uint32_t dictionaryTargetA_ = 0;
     uint32_t dictionaryBasenameKey_ = 0;
-    // Compiled once per (suffix length, basenames) and kept, as the row
+    // Compiled once per (suffix length, hashes) and kept, as the row
     // search's pipelines are.
-    std::map<std::pair<int, bool>, id<MTLComputePipelineState>> dictionaryPipelines_;
+    std::map<std::pair<int, DictionaryHashes>, id<MTLComputePipelineState>> dictionaryPipelines_;
     // Kept from one search to the next, grown as a launch needs: its batches
     // (DictionaryLaunchBatch), the hit counts - 0 at every launch - and the
     // hits, room for dictionaryHitCapacity_ of each kind.
@@ -433,7 +433,7 @@ void MetalBackend::beginDictionarySearch(const DictionaryConstants& constants) {
         announcedDevice_ = true;
     }
     dictionaryVerifier_.begin(constants);
-    dictionaryBasenames_ = dictionaryVerifier_.candidatesHaveBasenames();
+    dictionaryHashes_ = dictionaryVerifier_.hashes();
     dictionaryTargetA_ = constants.targetHashA;
     dictionaryBasenameKey_ = constants.basenameKey;
     dictionarySuffixLen_ = (int) constants.suffix.size();
@@ -486,7 +486,7 @@ void MetalBackend::endDictionarySearch() {
 }
 
 id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
-    const auto key = std::make_pair(dictionarySuffixLen_, dictionaryBasenames_);
+    const auto key = std::make_pair(dictionarySuffixLen_, dictionaryHashes_);
     auto found = dictionaryPipelines_.find(key);
     if (found != dictionaryPipelines_.end())
         return found->second;
@@ -495,7 +495,7 @@ id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
         MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
         options.preprocessorMacros = @{
             @"SUFFIX_LEN": @(dictionarySuffixLen_),
-            @"BASENAMES": @(dictionaryBasenames_ ? 1 : 0),
+            @"HASHES": @((int) dictionaryHashes_),
             @"WORDS_PER_THREAD": @(kDictionaryWordsPerThread),
             @"FILTER_BITS": @(kDictionaryFilterBits),
             @"FILTER_WORDS": @(kDictionaryFilterWords),

@@ -76,10 +76,11 @@ private:
 
 DictionaryOutcome ReferenceBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
     DictionaryOutcome outcome;
-    // Checking basenames with a suffix that has no '\', only a candidate
-    // whose basename matches the key is compared to the targets (see
-    // DictionaryConstants::checkBasename).
-    const bool basenameFirst = dictionary_.checkBasename && dictionary_.suffix.find('\\') == std::string::npos;
+    // With the key, and a suffix that has no '\', only a candidate whose
+    // basename matches it is compared to the targets - unless every
+    // candidate's hashA is to be recorded (see dictionaryHashes).
+    const bool basenameFirst =
+        dictionary_.checkBasename && !dictionary_.recordHashAMatches && dictionary_.suffix.find('\\') == std::string::npos;
     for (const DictionaryBatch& batch : batches) {
         for (uint32_t i = 0; i < batch.wordCount; ++i) {
             const std::string filename = batch.leading + dictionary_.words[batch.firstWord + i] + dictionary_.suffix;
@@ -88,7 +89,7 @@ DictionaryOutcome ReferenceBackend::runDictionaryBatches(const std::vector<Dicti
                 const size_t slash = filename.rfind('\\');
                 const std::string basename = slash == std::string::npos ? filename : filename.substr(slash + 1);
                 basenameMatches = basenameKeyMatches(hashFromScratch(basename, 0x300), dictionary_.basenameKey);
-                if (basenameMatches)
+                if (basenameMatches && dictionary_.recordBasenames)
                     outcome.basenameHits.push_back(filename);
             }
             if ((!basenameFirst || basenameMatches) && hashAMatches(hashFromScratch(filename, 0x100), dictionary_.targetHashA)) {

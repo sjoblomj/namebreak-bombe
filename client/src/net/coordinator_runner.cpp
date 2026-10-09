@@ -700,8 +700,12 @@ bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::stri
         error = "malformed target hash in claim response (hashA=" + claim.hashAHex + " hashB=" + claim.hashBHex + ")";
         return false;
     }
-    req.checkBasename = claim.sendBasenames;
-    if (claim.sendBasenames && !hexToU32(claim.encryptionKeyHex, req.basenameKey)) {
+    // The key, whenever the target has one: only the candidates whose
+    // basename matches it are compared to the hashes - and with
+    // send_basenames, those basenames are sent.
+    req.checkBasename = !claim.encryptionKeyHex.empty();
+    req.recordBasenames = claim.sendBasenames;
+    if (req.checkBasename && !hexToU32(claim.encryptionKeyHex, req.basenameKey)) {
         error = "malformed encryption key in claim response (" + claim.encryptionKeyHex + ")";
         return false;
     }

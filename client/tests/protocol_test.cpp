@@ -131,6 +131,9 @@ static void testClaims() {
     check(parseClaimResponse(dictionaryClaim(emptyAndNull), c) && c.separators.empty() && !c.filenameLowerBound &&
               c.filenameUpperBound == std::optional<std::string>("Z") && !c.sendBasenames && c.encryptionKeyHex.empty(),
           "an empty array, a null bound, and send_basenames left out");
+    c = ClaimResponse();
+    check(parseClaimResponse(dictionaryClaim(fieldsJson("send_basenames")), c) && !c.sendBasenames && c.encryptionKeyHex == "0x0000ABCD",
+          "a key without send_basenames: kept, for hashing the basenames, with none to send");
 
     // What a dictionary claim has to have.
     for (const char* key : {"word_lists", "word_list_checksums", "words_checksum", "separators", "min_words", "max_words",

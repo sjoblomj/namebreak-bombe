@@ -733,13 +733,24 @@ DictionaryBatch dictionaryBatchOf(const DictionarySelfTestBatch& b, const uint32
     return batch;
 }
 
+// What a dictionary case knows of the planted candidate's key (see
+// dictionaryHashes).
+enum class DictionaryCaseKey {
+    None,
+    Recorded,        // its key: the basenames hashed alone, and recorded
+    Unrecorded,      // its key, the basenames hashed alone, not recorded
+    EveryHashA,      // its key, every candidate's hashA hashed too
+    WrongEveryHashA, // another basename's key, every hashA hashed too
+};
+
 // One dictionary case: `batches`, searched in one call, with the candidate
 // made of batch `plantBatch`'s leading part, word `plantWord` and `suffix`
-// as the target - and, with checkBasename, its basename's hash as the key.
-// It must be found (as matching both hashes, and its basename as matching
-// the key) exactly when the word is one of the batch's.
+// as the target - and its basename's hash as the key, as `key` says. It
+// must be found (as matching both hashes, and its basename as matching the
+// key, if the basenames are recorded) exactly when the word is one of the
+// batch's.
 bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& words, const std::vector<DictionarySelfTestBatch>& batches,
-                       const std::string& suffix, int plantBatch, uint32_t plantWord, bool checkBasename, const uint32_t* cryptTable,
+                       const std::string& suffix, int plantBatch, uint32_t plantWord, DictionaryCaseKey key, const uint32_t* cryptTable,
                        std::string& error) {
     const DictionarySelfTestBatch& planted = batches[plantBatch];
     const std::string plantedName = planted.leading + words[plantWord] + suffix;
@@ -753,8 +764,11 @@ bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& w
     constants.cryptTable = cryptTable;
     constants.targetHashA = hashFromScratch(plantedName, cryptTable, kHashAOffset);
     constants.targetHashB = hashFromScratch(plantedName, cryptTable, kHashBOffset);
-    constants.checkBasename = checkBasename;
-    constants.basenameKey = hashFromScratch(plantedBasename, cryptTable, kFileKeyOffset);
+    constants.checkBasename = key != DictionaryCaseKey::None;
+    constants.basenameKey = hashFromScratch(key == DictionaryCaseKey::WrongEveryHashA ? "NO SUCH BASENAME" : plantedBasename, cryptTable,
+                                            kFileKeyOffset);
+    constants.recordBasenames = key != DictionaryCaseKey::Unrecorded;
+    constants.recordHashAMatches = key == DictionaryCaseKey::EveryHashA || key == DictionaryCaseKey::WrongEveryHashA;
     std::vector<DictionaryBatch> calls;
     for (const DictionarySelfTestBatch& b : batches)
         calls.push_back(dictionaryBatchOf(b, cryptTable));
@@ -762,9 +776,11 @@ bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& w
     const DictionaryOutcome outcome = backend.runDictionaryBatches(calls);
     backend.endDictionarySearch();
 
+    static const char* const keyNames[] = {"", ", its key", ", its key, basenames not recorded", ", its key, every hashA",
+                                           ", another key, every hashA"};
     char where[200];
     snprintf(where, sizeof where, " (dictionary search: %zu batch(es), planted in batch %d, word %u of %zu, suffix length %zu%s)", batches.size(),
-             plantBatch, plantWord, words.size(), suffix.size(), checkBasename ? ", checking basenames" : "");
+             plantBatch, plantWord, words.size(), suffix.size(), keyNames[(int) key]);
     // Every candidate of a batch, in a set, to check that a reported
     // filename is one.
     auto isCandidate = [&](const std::string& filename) {
@@ -798,9 +814,9 @@ bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& w
         error = "reported '" + plantedName + "', which isn't one of the batch's candidates" + where;
         return false;
     }
-    if (!checkBasename) {
+    if (!constants.checkBasename || !constants.recordBasenames) {
         if (!outcome.basenameHits.empty()) {
-            error = std::string("reported a basename match without being asked to check basenames") + where;
+            error = std::string("reported a basename match without being asked to record basenames") + where;
             return false;
         }
         return true;
@@ -813,6 +829,8 @@ bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& w
             return false;
         }
     }
+    if (key == DictionaryCaseKey::WrongEveryHashA)
+        return true;
     // Every candidate whose basename is the planted one's must be reported -
     // unless the suffix has a '\', and every candidate has that basename:
     // then one is enough.
@@ -860,9 +878,12 @@ bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
         for (uint32_t at : {0u, 8191u, 8192u, count - 1})
             planted.push_back(byLength[at]);
     }
+    // Each with the basenames hashed alone, and with hashA too.
     for (uint32_t w : planted) {
-        if (w < count && !runDictionaryCase(backend, words, all, wav, 0, w, true, cryptTable, error))
-            return false;
+        for (DictionaryCaseKey key : {DictionaryCaseKey::Recorded, DictionaryCaseKey::EveryHashA}) {
+            if (w < count && !runDictionaryCase(backend, words, all, wav, 0, w, key, cryptTable, error))
+                return false;
+        }
     }
 
     // Some of the words, in the list's order: a batch of more than 8,192
@@ -870,12 +891,12 @@ bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
     // it - and a batch of one.
     const std::vector<DictionarySelfTestBatch> part = {{"REZ\\CRDT_", 100, 8500}};
     for (uint32_t w : {99u, 100u, 101u, 100u + 8191, 100u + 8192, 100u + 8499, 100u + 8500}) {
-        if (!runDictionaryCase(backend, words, part, wav, 0, w, true, cryptTable, error))
+        if (!runDictionaryCase(backend, words, part, wav, 0, w, DictionaryCaseKey::Recorded, cryptTable, error))
             return false;
     }
     const std::vector<DictionarySelfTestBatch> one = {{"A", 4321, 1}};
     for (uint32_t w : {4320u, 4321u, 4322u}) {
-        if (!runDictionaryCase(backend, words, one, wav, 0, w, true, cryptTable, error))
+        if (!runDictionaryCase(backend, words, one, wav, 0, w, DictionaryCaseKey::Recorded, cryptTable, error))
             return false;
     }
 
@@ -888,7 +909,7 @@ bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
         {4, count - 10}, {4, count - 1}, {4, count - 11},
     };
     for (const auto& p : severalPlanted) {
-        if (!runDictionaryCase(backend, words, several, wav, p.batch, p.word, true, cryptTable, error))
+        if (!runDictionaryCase(backend, words, several, wav, p.batch, p.word, DictionaryCaseKey::Recorded, cryptTable, error))
             return false;
     }
 
@@ -898,28 +919,37 @@ bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
     for (uint32_t b = 0; b < 300; ++b)
         many.push_back({"M\\" + std::to_string(b) + "_", (b * 29) % (count - 3), 1 + b % 3});
     for (int b : {0, 1, 150, 298, 299}) {
-        if (!runDictionaryCase(backend, words, many, wav, b, many[b].firstWord + many[b].wordCount - 1, true, cryptTable, error))
+        const uint32_t last = many[b].firstWord + many[b].wordCount - 1;
+        if (!runDictionaryCase(backend, words, many, wav, b, last, DictionaryCaseKey::Recorded, cryptTable, error))
             return false;
     }
 
     // Other suffixes - none, of a character, longer than the CUDA kernel has
     // compiled in, longer than its constant memory holds, and with
-    // characters past ASCII - and not checking basenames.
+    // characters past ASCII - each hashing the basenames alone, and hashA
+    // too.
     const std::string veryLong(100, 'S');
     for (const std::string& suffix : {std::string(), std::string("X"), std::string(".A LONGER SUFFIX\xE9"), veryLong}) {
         for (uint32_t w : {0u, 8192u, count - 1}) {
-            if (!runDictionaryCase(backend, words, all, suffix, 0, w, true, cryptTable, error))
+            for (DictionaryCaseKey key : {DictionaryCaseKey::Recorded, DictionaryCaseKey::EveryHashA}) {
+                if (!runDictionaryCase(backend, words, all, suffix, 0, w, key, cryptTable, error))
+                    return false;
+            }
+        }
+    }
+    // Without the key; with it, its basenames not recorded; and with
+    // another basename's key, every hashA hashed all the same - which must
+    // find the planted candidate however wrong the key is.
+    for (DictionaryCaseKey key : {DictionaryCaseKey::None, DictionaryCaseKey::Unrecorded, DictionaryCaseKey::WrongEveryHashA}) {
+        for (uint32_t w : {0u, indexOf("AB\\CD"), indexOf("ZZ10\\FLOOD"), count - 1}) {
+            if (!runDictionaryCase(backend, words, several, wav, 0, w, key, cryptTable, error) ||
+                !runDictionaryCase(backend, words, several, wav, 2, 1050, key, cryptTable, error))
                 return false;
         }
     }
-    for (uint32_t w : {0u, indexOf("AB\\CD"), count - 1}) {
-        if (!runDictionaryCase(backend, words, several, wav, 0, w, false, cryptTable, error) ||
-            !runDictionaryCase(backend, words, several, wav, 2, 1050, false, cryptTable, error))
-            return false;
-    }
     // A suffix with a '\': every candidate's basename is its end.
     for (uint32_t w : {0u, count / 3}) {
-        if (!runDictionaryCase(backend, words, several, "\\Z.TXT", 0, w, true, cryptTable, error))
+        if (!runDictionaryCase(backend, words, several, "\\Z.TXT", 0, w, DictionaryCaseKey::Recorded, cryptTable, error))
             return false;
     }
 

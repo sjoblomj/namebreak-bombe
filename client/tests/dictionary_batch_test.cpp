@@ -223,7 +223,7 @@ static void testVerifier() {
     constants.basenameKey = hashOf("CRDT_LST.TXT", 0x300);
     DictionaryHitVerifier verifier;
     verifier.begin(constants);
-    check(verifier.candidatesHaveBasenames(), "checking basenames, a suffix without a '\\': a backend hashes each candidate's");
+    check(verifier.hashes() == DictionaryHashes::Basename, "with the key, a suffix without a '\\': a backend hashes the basenames alone");
 
     // The backend reports basename hits alone; their hashA and hashB are
     // checked here.
@@ -240,13 +240,39 @@ static void testVerifier() {
     outcome = DictionaryOutcome();
     verifier.addHits(batches, {}, {{1, 1}}, outcome);
     check(outcome.hits.size() == 1 && !outcome.found, "a hit that doesn't match hashB: reported, not found");
-
-    // Not checking basenames: the backend reports hashA hits, and basename
-    // hits are ignored.
-    constants.checkBasename = false;
     constants.targetHashB = hashOf("REZ\\CRDT_LST.TXT", 0x200);
+
+    // The basenames not recorded: the key used all the same.
+    constants.recordBasenames = false;
     verifier.begin(constants);
-    check(!verifier.candidatesHaveBasenames(), "not checking basenames: a backend hashes no candidate's");
+    check(verifier.hashes() == DictionaryHashes::Basename, "the basenames not recorded: hashed alone all the same");
+    outcome = DictionaryOutcome();
+    verifier.addHits(batches, {}, {{1, 1}, {2, 1}}, outcome);
+    check(outcome.basenameHits.empty() && outcome.hits == std::vector<std::string>{"REZ\\CRDT_LST.TXT"} && outcome.found,
+          "... their hits not reported, but checked against hashA and hashB");
+
+    // Every hashA recorded: with the basenames, the backend hashes both, and
+    // reports hits of each - a basename hit isn't a hashA hit as well.
+    constants.recordBasenames = true;
+    constants.recordHashAMatches = true;
+    verifier.begin(constants);
+    check(verifier.hashes() == DictionaryHashes::Both, "every hashA recorded, and the basenames: both hashed");
+    outcome = DictionaryOutcome();
+    verifier.addHits(batches, {{1, 1}, {0, 2}}, {{1, 1}, {2, 1}}, outcome);
+    check(outcome.hits == std::vector<std::string>{"REZ\\CRDT_LST.TXT"} && outcome.found,
+          "... the hashA hit that matches kept, once, one that doesn't dropped");
+    check(outcome.basenameHits == std::vector<std::string>{"REZ\\CRDT_LST.TXT", "SCRIPTS\\CRDT_LST.TXT"}, "... and the basename hits");
+    constants.recordBasenames = false;
+    verifier.begin(constants);
+    check(verifier.hashes() == DictionaryHashes::HashA, "every hashA recorded, the basenames not: hashA alone");
+    constants.recordBasenames = true;
+    constants.recordHashAMatches = false;
+
+    // Without the key: the backend reports hashA hits, and basename hits are
+    // ignored.
+    constants.checkBasename = false;
+    verifier.begin(constants);
+    check(verifier.hashes() == DictionaryHashes::HashA, "without the key: hashA alone");
     outcome = DictionaryOutcome();
     verifier.addHits(batches, {{1, 1}, {0, 2}}, {{1, 1}}, outcome);
     check(outcome.hits == std::vector<std::string>{"REZ\\CRDT_LST.TXT"}, "a hashA hit that matches kept, one that doesn't dropped");
@@ -258,7 +284,7 @@ static void testVerifier() {
     constants.checkBasename = true;
     constants.suffix = "\\CRDT_LST.TXT";
     verifier.begin(constants);
-    check(!verifier.candidatesHaveBasenames(), "a suffix with a '\\': a backend hashes no candidate's basename");
+    check(verifier.hashes() == DictionaryHashes::HashA, "a suffix with a '\\': a backend hashes hashA alone");
     outcome = DictionaryOutcome();
     verifier.addHits(batches, {}, {}, outcome);
     check(outcome.basenameHits == std::vector<std::string>{"REZ\\CRDT\\CRDT_LST.TXT"}, "... the call's first candidate reported, as its basename matches");
@@ -270,6 +296,12 @@ static void testVerifier() {
     outcome = DictionaryOutcome();
     verifier.addHits(batches, {}, {}, outcome);
     check(outcome.basenameHits.empty(), "... and nothing if it doesn't match");
+    constants.suffix = "\\CRDT_LST.TXT";
+    constants.recordBasenames = false;
+    verifier.begin(constants);
+    outcome = DictionaryOutcome();
+    verifier.addHits(batches, {}, {}, outcome);
+    check(outcome.basenameHits.empty(), "... nor if the basenames aren't recorded");
 }
 
 int main() {

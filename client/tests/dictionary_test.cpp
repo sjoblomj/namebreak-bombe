@@ -345,6 +345,10 @@ static void testFingerprint() {
     const std::string fp = dictionaryFingerprint(base);
     check(fp.size() == 16 && fp.find_first_not_of("0123456789abcdef") == std::string::npos, "16 lowercase hex digits");
     check(dictionaryFingerprint(base) == fp, "the same request: the same fingerprint");
+    // Worked out by hand (well, in Python) from the format the fingerprint
+    // has had since dictionary mode began: a search with a key, its
+    // basenames recorded, keeps resuming from the progress files it wrote.
+    check(fp == "e0f01a98635c367c", "a recorded key's fingerprint as it always was: " + fp);
 
     std::vector<std::pair<std::string, std::function<void(DictionaryRequest&)>>> changes = {
         {"a word", [](DictionaryRequest& r) { r.pattern.words = {"A", "C"}; }},
@@ -362,7 +366,9 @@ static void testFingerprint() {
         {"hashA", [](DictionaryRequest& r) { r.targetHashA = 9; }},
         {"hashB", [](DictionaryRequest& r) { r.targetHashB = 9; }},
         {"the encryption key", [](DictionaryRequest& r) { r.basenameKey = 9; }},
-        {"not checking basenames", [](DictionaryRequest& r) { r.checkBasename = false; }},
+        {"to no encryption key", [](DictionaryRequest& r) { r.checkBasename = false; }},
+        {"to the basenames not recorded", [](DictionaryRequest& r) { r.recordBasenames = false; }},
+        {"to every hashA hit recorded", [](DictionaryRequest& r) { r.recordHashAMatches = true; }},
     };
     for (auto& change : changes) {
         DictionaryRequest changed = base;

@@ -78,6 +78,7 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
 //   hash_a, hash_b      required
 //   encryption_key      optional, the raw key: hash type 3 of the basename
 //   record_basenames    default true with an encryption_key, else false
+//   record_hasha_matches   default false
 //   matches_name        names the files: matches-<name>.txt, ...
 //   resume_from_last_candidate   default false
 // A list is items separated by commas, each either "quoted" - kept as it

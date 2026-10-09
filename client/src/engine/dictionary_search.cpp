@@ -306,7 +306,20 @@ std::string dictionaryFingerprint(const DictionaryRequest& req) {
     text += req.bounds.hasLower ? field("lower", req.bounds.lower) : "lower=none\n";
     text += req.bounds.hasUpper ? field("upper", req.bounds.upper) : "upper=none\n";
     text += field("hashes", std::to_string(req.targetHashA) + " " + std::to_string(req.targetHashB));
-    text += req.checkBasename ? field("basename_key", std::to_string(req.basenameKey)) : "basename_key=none\n";
+    // The key, whenever it's known - it decides which candidates are compared
+    // to the hashes - and whether the basenames are recorded, and every
+    // hashA hit (a search whose basenames weren't recorded, or that only
+    // compared the candidates matching the key to the hashes, mustn't be
+    // resumed as one that did).
+    if (!req.checkBasename) {
+        text += "basename_key=none\n";
+    } else {
+        text += field("basename_key", std::to_string(req.basenameKey));
+        if (!req.recordBasenames)
+            text += "basenames=unrecorded\n";
+        if (req.recordHashAMatches)
+            text += "hasha_matches=every\n";
+    }
     return hex64(fnv1a64(text));
 }
 
@@ -395,8 +408,9 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     MatchWriter matches;
     if (!matches.open(req.outputFilePath, error))
         return fail(error);
+    const bool recordBasenames = req.checkBasename && req.recordBasenames;
     BasenameWriter basenames;
-    if (req.checkBasename && !basenames.open(req.basenamesFilePath, error))
+    if (recordBasenames && !basenames.open(req.basenamesFilePath, error))
         return fail(error);
 
     uint32_t cryptTable[0x500];
@@ -424,10 +438,28 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     printf("upper: %s\n", req.bounds.hasUpper ? ("'" + req.bounds.upper + "'").c_str() : "(none)");
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
+    DictionaryConstants constants;
+    constants.words = space.words();
+    constants.suffix = req.suffix;
+    constants.cryptTable = cryptTable;
+    constants.targetHashA = req.targetHashA;
+    constants.targetHashB = req.targetHashB;
+    constants.checkBasename = req.checkBasename;
+    constants.basenameKey = req.basenameKey;
+    constants.recordBasenames = req.recordBasenames;
+    constants.recordHashAMatches = req.recordHashAMatches;
     if (req.checkBasename) {
-        printf("basename key: '%X' - matching basenames go to %s\n", req.basenameKey,
-               req.basenamesFilePath.empty() ? "the coordinator" : req.basenamesFilePath.c_str());
-        printf("basename matches expected by chance: %.3g (one per 4,294,967,296 candidates)\n", (double) toSearch / 4294967296.0);
+        if (recordBasenames) {
+            printf("basename key: '%X' - matching basenames go to %s\n", req.basenameKey,
+                   req.basenamesFilePath.empty() ? "the coordinator" : req.basenamesFilePath.c_str());
+            printf("basename matches expected by chance: %.3g (one per 4,294,967,296 candidates)\n", (double) toSearch / 4294967296.0);
+        } else {
+            printf("basename key: '%X' - matching basenames aren't recorded\n", req.basenameKey);
+        }
+        if (dictionaryHashes(constants) == DictionaryHashes::Basename)
+            printf("only candidates whose basename matches the key are compared to hashA and hashB\n");
+        else if (req.recordHashAMatches)
+            printf("every candidate is compared to hashA and hashB (record_hasha_matches)\n");
     }
     printf("candidates: %llu in all, numbered 0 to %llu\n", (unsigned long long) space.size(),
            (unsigned long long) (space.size() - 1));
@@ -440,14 +472,6 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
         printf("progress file: %s\n", req.progressFilePath.c_str());
     fflush(stdout);
 
-    DictionaryConstants constants;
-    constants.words = space.words();
-    constants.suffix = req.suffix;
-    constants.cryptTable = cryptTable;
-    constants.targetHashA = req.targetHashA;
-    constants.targetHashB = req.targetHashB;
-    constants.checkBasename = req.checkBasename;
-    constants.basenameKey = req.basenameKey;
     backend.beginDictionarySearch(constants);
 
     result.nextNumber = start;

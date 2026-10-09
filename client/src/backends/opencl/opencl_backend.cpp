@@ -263,12 +263,12 @@ private:
     cl_mem dictionaryCryptKeys_ = nullptr, dictionaryFilters_ = nullptr, dictionarySuffixKeys_ = nullptr;
     cl_uint dictionaryWordCount_ = 0;
     int dictionarySuffixLen_ = 0;
-    bool dictionaryBasenames_ = false;
+    DictionaryHashes dictionaryHashes_ = DictionaryHashes::HashA;
     cl_uint dictionaryTargetA_ = 0;
     cl_uint dictionaryBasenameKey_ = 0;
-    // Compiled once per (suffix length, basenames) and kept, as the row
+    // Compiled once per (suffix length, hashes) and kept, as the row
     // search's kernels are.
-    std::map<std::pair<int, bool>, CompiledKernel> dictionaryKernels_;
+    std::map<std::pair<int, DictionaryHashes>, CompiledKernel> dictionaryKernels_;
     // Kept from one search to the next, grown as a launch needs: its batches
     // (DictionaryLaunchBatch), the hit counts, and the hits - room for
     // dictionaryHitCapacity_ of each kind.
@@ -585,7 +585,7 @@ void OpenClBackend::beginDictionarySearch(const DictionaryConstants& constants) 
     }
     releaseDictionaryBuffers();
     dictionaryVerifier_.begin(constants);
-    dictionaryBasenames_ = dictionaryVerifier_.candidatesHaveBasenames();
+    dictionaryHashes_ = dictionaryVerifier_.hashes();
     dictionaryTargetA_ = constants.targetHashA;
     dictionaryBasenameKey_ = constants.basenameKey;
     dictionarySuffixLen_ = (int) constants.suffix.size();
@@ -646,12 +646,12 @@ void OpenClBackend::releaseDictionaryBuffers() {
 }
 
 const OpenClBackend::CompiledKernel& OpenClBackend::dictionaryKernel() {
-    const auto key = std::make_pair(dictionarySuffixLen_, dictionaryBasenames_);
+    const auto key = std::make_pair(dictionarySuffixLen_, dictionaryHashes_);
     auto found = dictionaryKernels_.find(key);
     if (found != dictionaryKernels_.end())
         return found->second;
     const std::string options = "-cl-std=CL1.2 -DSUFFIX_LEN=" + std::to_string(dictionarySuffixLen_) +
-                                " -DBASENAMES=" + (dictionaryBasenames_ ? "1" : "0") +
+                                " -DHASHES=" + std::to_string((int) dictionaryHashes_) +
                                 " -DWORDS_PER_THREAD=" + std::to_string(kDictionaryWordsPerThread) +
                                 " -DFILTER_BITS=" + std::to_string(kDictionaryFilterBits) +
                                 " -DFILTER_WORDS=" + std::to_string(kDictionaryFilterWords) +
