@@ -721,8 +721,22 @@ afternoon).
   one) and a tail index in each hit. **Measured** on the CPU backend, which
   hashes a word once for all its tails (a key, the machine busy with other
   work): 0.82-0.94 G candidates/s with 300 words of `english-1` and those
-  2,970 tails, against 0.40-0.44 with 20,000 words and none. Not measured
-  on the GPU yet - it was busy with a search.
+  2,970 tails, against 0.40-0.44 with 20,000 words and none. On the GPU,
+  with `dictionary_bench` (up to two words, a key) - every word of
+  `english-1` and no tails, 16.3 billion candidates; 20,000 words and
+  `digits:1`'s 10 tails, 16.0 billion; 1,200 words and the 2,970, 17.1
+  billion:
+  - Nsight Compute, one launch of 2^28 at its fixed clocks: 12.55-12.58 ms
+    without tails (1.21 G warp instructions, as before there were tails),
+    5.42-5.45 ms with 10 (0.59 G) and 7.25-7.46 ms with 2,970 (0.71 G,
+    their tails mostly three characters long) - 2.3 and 1.7 times as many
+    candidates a second. Issue slots 73% busy without tails, 86% and 78%
+    with: the tail loop's arithmetic hides the word table's loads.
+  - At the GPU's own clocks (64-71 C), alternating: CUDA 30.4-31.2 G
+    candidates/s without tails, 89.8-94.3 with 10 and 78.8-81.6 with
+    2,970; OpenCL 29.4-30.8, 89.1-93.0 and 75.9-77.3. Two words of all of
+    `english-1` with those 2,970 tails, 4.8 * 10^13 candidates, would take
+    about ten minutes.
 - [ ] **Hide the word table's loads.** Since **One hash a candidate**, both
   kernels wait on a word's entry and characters more than they compute
   (73% of issue slots busy at fixed clocks): loading the next word's while
