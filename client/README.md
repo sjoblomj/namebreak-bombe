@@ -251,11 +251,16 @@ lower bound, `REZ\CRDT...` is both inside (`REZ\CRDT_MAP.TXT`) and outside
   decides which candidates are searched and what's looked for (the words,
   separators, word counts, prefix, suffix, bounds, hashes, encryption key,
   and whether basenames and every Hash-A match are recorded):
-  `resume_from_last_candidate = true` refuses to resume from a file with
-  another fingerprint, rather than skip candidates the changed search never
-  searched. (A search with an encryption key whose basenames are recorded
-  keeps the fingerprint it had before the key was used to hash less, so it
-  can carry on from there.)
+  `resume_from_last_candidate = true` refuses to resume from a file another
+  search wrote, rather than skip candidates the changed search never
+  searched - unless that search did at least as much as this one: compared
+  every candidate to the hashes where this one compares only those whose
+  basename matches the key (with `record_hasha_matches`, or without an
+  `encryption_key`), or recorded the basenames where this one doesn't. So
+  turning `record_hasha_matches` off part way through a search carries on,
+  and turning it on starts again. A search with an encryption key whose
+  basenames are recorded keeps the fingerprint it had before the key was
+  used to hash less.
 
 **`english-1`** is every all-lowercase ASCII word of Debian's `wamerican`
 word list (from SCOWL) - see `data/english-1.LICENSE.txt` for where it comes

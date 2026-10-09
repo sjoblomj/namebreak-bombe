@@ -323,6 +323,36 @@ static void testDictionaryResume() {
     config.dictionary["lower_bound"] = "REZ\\A";
     check(errorOf(config).find("different settings") != std::string::npos, "... a bound changed, too");
     config.dictionary.erase("lower_bound");
+
+    // From a search that did at least as much as this one: resumes. The
+    // progress file above is from one without a key, which compared every
+    // candidate to the hashes and recorded no basenames.
+    config.dictionary["encryption_key"] = "0x4565C467";
+    config.dictionary["record_basenames"] = "false";
+    check(buildDict(config, req, error) && req.startNumber == 7,
+          "with a key, its basenames not recorded: resumes from a search without a key, which compared every candidate");
+    config.dictionary.erase("record_basenames");
+    check(errorOf(config).find("did less") != std::string::npos, "... but not if it records them, which that one didn't");
+    // Every hashA hit recorded, then not: resumes. Not the other way round.
+    auto fingerprintOf = [&](ConfigFile c) {
+        c.dictionary["resume_from_last_candidate"] = "false";
+        DictionaryRequest r;
+        std::string e;
+        buildDict(c, r, e);
+        return dictionaryFingerprint(r);
+    };
+    config.dictionary["record_hasha_matches"] = "true";
+    writeDictionaryProgress(progressPath, {fingerprintOf(config), 9}, 12, "LST_ZERG", error);
+    config.dictionary.erase("record_hasha_matches");
+    check(buildDict(config, req, error) && req.startNumber == 9,
+          "from a search that compared every candidate to the hashes: one comparing only those matching the key resumes");
+    writeDictionaryProgress(progressPath, {fingerprintOf(config), 9}, 12, "LST_ZERG", error);
+    config.dictionary["record_hasha_matches"] = "true";
+    check(errorOf(config).find("did less") != std::string::npos,
+          "from one that compared only those: one comparing every candidate refuses, saying why");
+    config.dictionary.erase("record_hasha_matches");
+    config.dictionary.erase("encryption_key");
+
     writeFile(progressPath, "fingerprint = 0123456789abcdef\n");
     check(errorOf(config).find("isn't a dictionary search's progress file") != std::string::npos, "a broken progress file: an error");
     std::filesystem::remove(progressPath);

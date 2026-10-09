@@ -550,15 +550,18 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
             return false;
         if (!exists) {
             printf("resume_from_last_candidate: no progress file %s yet - starting from the beginning\n", out.progressFilePath.c_str());
-        } else if (progress.fingerprint != dictionaryFingerprint(out)) {
+        } else if (const std::vector<std::string> resumable = dictionaryResumableFingerprints(out);
+                   std::find(resumable.begin(), resumable.end(), progress.fingerprint) == resumable.end()) {
             error = "resume_from_last_candidate: " + out.progressFilePath +
-                    " is from a search with different settings (words, separators, word counts, prefix, suffix, bounds, hashes, "
-                    "encryption key, record_basenames or record_hasha_matches) - remove it, or set resume_from_last_candidate = false, "
-                    "to start this one from the beginning";
+                    " is from a search with different settings (words, separators, word counts, prefix, suffix, bounds, hashes or "
+                    "encryption key), or one that did less than this one (compared fewer candidates to the hashes - "
+                    "record_hasha_matches - or recorded no basenames) - remove it, or set resume_from_last_candidate = false, to start "
+                    "this one from the beginning";
             return false;
         } else {
             out.startNumber = progress.next;
-            printf("Resuming from number %llu, from %s\n", (unsigned long long) progress.next, out.progressFilePath.c_str());
+            printf("Resuming from number %llu, from %s%s\n", (unsigned long long) progress.next, out.progressFilePath.c_str(),
+                   progress.fingerprint == dictionaryFingerprint(out) ? "" : " (written by a search that did at least as much as this one)");
         }
     }
     return true;

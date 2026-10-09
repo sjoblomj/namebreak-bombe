@@ -148,9 +148,16 @@ std::string formatDuration(double seconds);
 
 // Identifies everything that decides which candidates a search checks and
 // what it looks for - every field of `req` but the start and end, the file
-// paths and the intervals. A search may only be resumed from a progress file written
-// by one with the same fingerprint. 16 hex digits.
+// paths and the intervals. 16 hex digits.
 std::string dictionaryFingerprint(const DictionaryRequest& req);
+
+// The fingerprints of the searches a search of `req` may be resumed from:
+// its own, and those of the searches that did at least as much with the
+// same words, bounds and hashes - that compared every candidate to the
+// hashes where it compares only those whose basename matches the key (see
+// dictionaryHashes), or recorded the basenames where it doesn't. Of those,
+// only the ones with its key, or with none.
+std::vector<std::string> dictionaryResumableFingerprints(const DictionaryRequest& req);
 
 // The progress file: which search wrote it, and the number every candidate
 // below which has been searched - plus, for a human, how many candidates

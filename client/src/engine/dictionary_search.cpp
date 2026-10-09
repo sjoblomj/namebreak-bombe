@@ -323,6 +323,50 @@ std::string dictionaryFingerprint(const DictionaryRequest& req) {
     return hex64(fnv1a64(text));
 }
 
+std::vector<std::string> dictionaryResumableFingerprints(const DictionaryRequest& req) {
+    // Whether a search compares every candidate to the hashes - rather than
+    // only those whose basename matches its key - and records the basenames.
+    auto comparesEvery = [](const DictionaryRequest& r) {
+        DictionaryConstants constants;
+        constants.suffix = r.suffix;
+        constants.checkBasename = r.checkBasename;
+        constants.recordBasenames = r.recordBasenames;
+        constants.recordHashAMatches = r.recordHashAMatches;
+        return dictionaryHashes(constants) != DictionaryHashes::Basename;
+    };
+    auto recordsBasenames = [](const DictionaryRequest& r) { return r.checkBasename && r.recordBasenames; };
+
+    // Every search that differs from this one in those only: without a key,
+    // and with this one's, its basenames recorded or not, every hashA hit
+    // recorded or not.
+    struct Variant {
+        bool checkBasename, recordBasenames, recordHashAMatches;
+    };
+    std::vector<Variant> variants = {{false, false, false}};
+    if (req.checkBasename) {
+        for (bool record : {false, true}) {
+            for (bool everyHashA : {false, true})
+                variants.push_back({true, record, everyHashA});
+        }
+    }
+    std::vector<std::string> fingerprints;
+    DictionaryRequest earlier = req;
+    for (const Variant& v : variants) {
+        earlier.checkBasename = v.checkBasename;
+        earlier.recordBasenames = v.recordBasenames;
+        earlier.recordHashAMatches = v.recordHashAMatches;
+        // It compared at least the candidates this one compares to the
+        // hashes - all of them, or with the same key, those whose basename
+        // matches it - and recorded the basenames if this one does.
+        const bool compared = comparesEvery(earlier) || (!comparesEvery(req) && earlier.checkBasename);
+        const bool recorded = !recordsBasenames(req) || recordsBasenames(earlier);
+        const std::string fingerprint = dictionaryFingerprint(earlier);
+        if (compared && recorded && std::find(fingerprints.begin(), fingerprints.end(), fingerprint) == fingerprints.end())
+            fingerprints.push_back(fingerprint);
+    }
+    return fingerprints;
+}
+
 bool writeDictionaryProgress(const std::string& path, const DictionaryProgress& progress, uint64_t total,
                              const std::string& candidate, std::string& error) {
     std::string text = "# namebreak dictionary search progress - every candidate numbered below `next` has been searched\n";

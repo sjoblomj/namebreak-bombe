@@ -14,6 +14,7 @@
 #include <fstream>
 #include <functional>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -386,6 +387,76 @@ static void testFingerprint() {
     check(dictionaryFingerprint(same) == fp, "the start, the files, the intervals and where the words came from don't");
 }
 
+static void testResumableFingerprints() {
+    printf("--- dictionaryResumableFingerprints ---\n");
+    DictionaryRequest base;
+    base.pattern = pattern({"A", "B"}, {"", "_"}, 1, 2);
+    base.prefix = "REZ\\";
+    base.suffix = ".TXT";
+    base.targetHashA = 1;
+    base.targetHashB = 2;
+    base.basenameKey = 3;
+    // A search with the key (or without one), its basenames recorded or
+    // not, every hashA hit recorded or not.
+    struct Settings {
+        const char* name;
+        bool key, record, every;
+    };
+    const Settings all[] = {
+        {"no key", false, false, false},
+        {"the key, the basenames hashed alone and recorded", true, true, false},
+        {"the key, the basenames hashed alone, not recorded", true, false, false},
+        {"the key, every hashA hit and the basenames recorded", true, true, true},
+        {"the key, every hashA hit recorded, not the basenames", true, false, true},
+    };
+    auto with = [&](const Settings& s, const std::string& suffix) {
+        DictionaryRequest r = base;
+        r.suffix = suffix;
+        r.checkBasename = s.key;
+        r.recordBasenames = s.record;
+        r.recordHashAMatches = s.every;
+        return r;
+    };
+    // Which earlier search (columns, in the order of `all`) each search
+    // (rows) may resume from: one that did at least as much - compared every
+    // candidate to the hashes, or the same as it does, and recorded the
+    // basenames if it does.
+    const bool resumes[5][5] = {
+        {true, false, false, false, false},  // no key: every candidate compared
+        {false, true, false, true, false},   // the basenames alone, recorded
+        {true, true, true, true, true},      // the basenames alone, not recorded
+        {false, false, false, true, false},  // every candidate compared, the basenames recorded
+        {true, false, false, true, true},    // every candidate compared, the basenames not
+    };
+    int wrong = 0;
+    for (int now = 0; now < 5; ++now) {
+        const std::vector<std::string> resumable = dictionaryResumableFingerprints(with(all[now], ".TXT"));
+        for (int earlier = 0; earlier < 5; ++earlier) {
+            const bool got = std::find(resumable.begin(), resumable.end(), dictionaryFingerprint(with(all[earlier], ".TXT"))) != resumable.end();
+            if (got != resumes[now][earlier] && ++wrong <= 5)
+                fprintf(stderr, "  %s, from %s: %s\n", all[now].name, all[earlier].name, got ? "resumes" : "refused");
+        }
+    }
+    check(wrong == 0, "each of the 5 settings resumes from exactly the searches that did at least as much (" + std::to_string(wrong) + " wrong)");
+
+    // With a suffix that has a '\', every candidate is compared to the
+    // hashes whatever the settings: only the basenames decide.
+    const std::vector<std::string> fromSuffix = dictionaryResumableFingerprints(with(all[1], "\\X.TXT"));
+    std::vector<std::string> expected = {dictionaryFingerprint(with(all[1], "\\X.TXT")), dictionaryFingerprint(with(all[3], "\\X.TXT"))};
+    check(std::set<std::string>(fromSuffix.begin(), fromSuffix.end()) == std::set<std::string>(expected.begin(), expected.end()),
+          "a suffix with a '\\', the basenames recorded: from either search that recorded them");
+
+    // Another key, or anything else changed: never.
+    DictionaryRequest otherKey = with(all[4], ".TXT");
+    otherKey.basenameKey = 9;
+    const std::vector<std::string> fromBase = dictionaryResumableFingerprints(with(all[2], ".TXT"));
+    check(std::find(fromBase.begin(), fromBase.end(), dictionaryFingerprint(otherKey)) == fromBase.end(),
+          "not from a search with another key, though it compared every candidate");
+    DictionaryRequest otherHash = with(all[0], ".TXT");
+    otherHash.targetHashA = 9;
+    check(std::find(fromBase.begin(), fromBase.end(), dictionaryFingerprint(otherHash)) == fromBase.end(), "nor from one for other hashes");
+}
+
 static void writeFile(const std::string& path, const std::string& text) {
     std::ofstream out(path, std::ios::binary);
     out << text;
@@ -454,6 +525,7 @@ int main() {
     testHashes();
     testCounting();
     testFingerprint();
+    testResumableFingerprints();
     testProgressFile();
 
     std::filesystem::remove_all(kDir);
