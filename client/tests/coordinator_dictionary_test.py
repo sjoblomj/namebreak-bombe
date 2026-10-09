@@ -11,7 +11,8 @@ matching the target's key, which the server keeps.
 
 Phase 2 - searching to the end: a dictionary target with a planted name
 (english-1 and a word list of the test's own, which the client downloads
-once and then keeps), another one searched through without a find, and an
+once and then keeps) whose basename other candidates, in other directories,
+have before it, another one searched through without a find, and an
 alphabet target, all in one run. The finds have to be reported, every
 basename matching a key sent - none ever written to a file - and the
 dashboard has to show it all.
@@ -291,15 +292,17 @@ def phase1(server, client_binary, workdir, backend, english):
 def phase2(server, client_binary, workdir, backend, english, own_words):
     print("--- phase 2: searching dictionary and alphabet targets to the end ---", flush=True)
     words = sorted(set(english) | set(own_words))
-    # A planted name: one of the last few first words, then a word only the
-    # test's own list has. The bounds take in the last 20 first words.
+    # A planted name: one of the last few first words as a directory, then a
+    # word only the test's own list has. The bounds take in the last 20
+    # first words - so the planted name's basename is first found, and sent,
+    # in the directories of the ten before it.
     first = words[-10]
-    planted = "MUSIC\\" + first + "_" + "QUARTZBLASTER" + ".WAV"
-    early = words[-20] + ".WAV"  # a one-word candidate, searched before the planted one
+    early = "QUARTZBLASTER" + ".WAV"
+    planted = "MUSIC\\" + first + "\\" + early
     found = server.admin("POST", "/api/v1/admin/targets", {
         "name": "found", "prefix": "music\\", "suffix": ".wav",
         "hash_a_hex": hex32(mpq_hash(planted, 0x100)), "hash_b_hex": hex32(mpq_hash(planted, 0x200)),
-        "dictionary": {"word_lists": ["english-1", "own"], "separators": ["", "_"], "max_words": 2},
+        "dictionary": {"word_lists": ["english-1", "own"], "separators": ["", "_", "\\"], "max_words": 2},
         "lower_bound": "MUSIC\\" + words[-20], "upper_bound": "MUSIC\\" + words[-1] + "~",
         "encryption_key_hex": hex32(mpq_hash(early, 0x300)), "send_basenames": True, "priority": 3,
     })["target_id"]
@@ -330,7 +333,7 @@ def phase2(server, client_binary, workdir, backend, english, own_words):
 
     t = server.target(found)
     check(t["status"] == "solved" and t["found_filename"] == planted, "the planted name found: " + str(t["found_filename"]))
-    check(early in basenames(server, found), "... and the basename before it sent")
+    check(early in basenames(server, found), "... and its basename, found before it, sent")
     t = server.target(through)
     check([r["candidate_len"] for r in t["ranges"]] == [1, 2, 3], "every word count searched, a range each")
     check(three in basenames(server, through), "the three-word candidate's basename sent")
@@ -343,7 +346,7 @@ def phase2(server, client_binary, workdir, backend, english, own_words):
     check(basename_files(client) == [], "no basename written to a file: %s" % basename_files(client))
 
     d = server.target(found)["dictionary"]
-    check(d["word_lists"] == ["english-1", "own"] and d["separators"] == ["", "_"] and d["min_words"] == 1 and d["max_words"] == 2,
+    check(d["word_lists"] == ["english-1", "own"] and d["separators"] == ["", "_", "\\"] and d["min_words"] == 1 and d["max_words"] == 2,
           "the dashboard shows what the candidates are made of")
     volunteers = server.get("/api/v1/dashboard")["volunteers"]
     check([(v["username"], v["found"]) for v in volunteers] == [("e2e", 2)], "the volunteer credited with both finds")

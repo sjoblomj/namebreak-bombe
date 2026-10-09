@@ -500,6 +500,7 @@ id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
             @"FILTER_BITS": @(kDictionaryFilterBits),
             @"FILTER_WORDS": @(kDictionaryFilterWords),
             @"HASHA_MATCH_MASK": @(kHashAMatchMask),
+            @"BASENAME_MATCH_MASK": @(kBasenameMatchMask),
         };
         NSError* error = nil;
         id<MTLLibrary> library = [device_ newLibraryWithSource:@(kDictionaryKernelSource) options:options error:&error];

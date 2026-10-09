@@ -11,6 +11,7 @@
 //   FILTER_WORDS      kDictionaryFilterWords: the uint32s of a filter
 //   HASHA_MATCH_MASK  the bits of hashA a hit must match - all of them, except
 //                     in the tests' builds (see engine/hash_match.h)
+//   BASENAME_MATCH_MASK  the same for the basename hash
 //
 // A dictionary search (engine/dictionary_search.h) hands the backend batches:
 // a leading part's hash states, followed by a run of the word list's words
@@ -20,16 +21,31 @@
 // backends/common/dictionary_batch.h). Its work-items take neighbouring
 // words - in the word table's order (by length, so that a wavefront's words
 // mostly have the same length) if the batch has every word, in the list's if
-// not - and hash each from the batch's states: hashA, and with BASENAMES the
-// basename hash too, which a word with a '\' starts over after the last one.
-// Then the suffix, where its filter lets it through. Every hashA hit, and
-// every basename hit, is recorded as (batch, word): the host rebuilds and
-// checks them.
+// not - and hash each from the batch's state, with one hash: hashA - or with
+// BASENAMES the basename hash alone, which a word with a '\' starts over
+// after the last one, compared to the key: the file's name has that
+// basename, so the host checks hashA and hashB of those that match
+// (DictionaryHitVerifier). Then the suffix, where its filter lets it
+// through. Every hit is recorded as (batch, word) - a hashA hit, or with
+// BASENAMES a basename hit: the host rebuilds and checks them.
 
 #ifndef HASHA_MATCH_MASK
 #define HASHA_MATCH_MASK 0xFFFFFFFFu
 #endif
-#define HASHA_MATCHES(a, target) (((a) & HASHA_MATCH_MASK) == ((target) & HASHA_MATCH_MASK))
+#ifndef BASENAME_MATCH_MASK
+#define BASENAME_MATCH_MASK 0xFFFFFFFFu
+#endif
+
+// Which hash a candidate is hashed with: its crypt table part, filter, suffix
+// keys and hits are the first of each (hashA's) or the second (the basename
+// hash's), and what a hit must match.
+#if BASENAMES
+#define HASH_PART 1
+#define HASH_MATCHES(h, target) (((h) & BASENAME_MATCH_MASK) == ((target) & BASENAME_MATCH_MASK))
+#else
+#define HASH_PART 0
+#define HASH_MATCHES(h, target) (((h) & HASHA_MATCH_MASK) == ((target) & HASHA_MATCH_MASK))
+#endif
 
 // lowBitsFilterIndex (backends/common/lowbits_filter.h) at FILTER_BITS,
 // which this must match exactly: the low bits of seed1, then those of seed2.
@@ -46,23 +62,12 @@
         seed2 = seed1 + 33u * seed2 + (ordPlus3);    \
     } while (0)
 
-// Hashes character b (0: the lowest byte) of `four` into hashA's state -
-// and with BASENAMES the basename hash's.
-#if BASENAMES
+// Hashes character b (0: the lowest byte) of `four` into the state.
 #define STEP_CHAR(four, b)                                  \
     do {                                                    \
         const uint ch_ = ((four) >> (8 * (b))) & 0xFFu;     \
-        const uint2 keys_ = lKeys[ch_];                     \
-        STEP_PLUS3(seed1, seed2, keys_.x, ch_ + 3);         \
-        STEP_PLUS3(key1, key2, keys_.y, ch_ + 3);           \
+        STEP_PLUS3(seed1, seed2, lKeys[ch_], ch_ + 3);      \
     } while (0)
-#else
-#define STEP_CHAR(four, b)                                  \
-    do {                                                    \
-        const uint ch_ = ((four) >> (8 * (b))) & 0xFFu;     \
-        STEP_PLUS3(seed1, seed2, lKeys[ch_].x, ch_ + 3);    \
-    } while (0)
-#endif
 
 // These two must match their namesakes in backends/common/dictionary_batch.h.
 typedef struct {
@@ -92,29 +97,22 @@ uint hashSuffix(uint seed1, uint seed2, __constant const uint* suffixKeys, int w
 // `entries` are DictionaryWordEntry's: (offset, length, basenameStart, index).
 // `cryptKeys` is the crypt table's hashA part (0x100) and then its basename
 // hash's part (0x300), 256 entries each, and `filters` the suffix filters,
-// hashA's and then the basename hash's - all copied into local memory.
-// `counts` is how many hits of each kind the launch had, every one of them,
-// and the hits arrays the first `capacity` of each.
+// hashA's and then the basename hash's - the hash's own of each copied into
+// local memory. `counts` is how many hits of each kind the launch had,
+// every one of them, and the hits arrays the first `capacity` of each.
 __kernel void searchDictionary(__global const DictionaryLaunchBatch* batches, uint batchCount, __global const uint* chars,
                                __global const uint4* entries, __global const uint* positions, uint wordCount,
                                __global const uint* cryptKeys, __global const uint* filters, __constant const uint* suffixKeys,
                                uint targetA, uint basenameKey, __global int* counts, __global DictionaryHit* hashAHits,
                                __global DictionaryHit* basenameHits, uint capacity) {
-    __local uint2 lKeys[256];
-    __local uint lFilterA[FILTER_WORDS];
-#if BASENAMES
-    __local uint lFilterBasename[FILTER_WORDS];
-#endif
+    __local uint lKeys[256];
+    __local uint lFilter[FILTER_WORDS];
     __local uint lBatch;
     const uint lid = get_local_id(0), lsize = get_local_size(0);
     for (uint i = lid; i < 256; i += lsize)
-        lKeys[i] = (uint2)(cryptKeys[i], cryptKeys[256 + i]);
-    for (uint i = lid; i < FILTER_WORDS; i += lsize) {
-        lFilterA[i] = filters[i];
-#if BASENAMES
-        lFilterBasename[i] = filters[FILTER_WORDS + i];
-#endif
-    }
+        lKeys[i] = cryptKeys[256 * HASH_PART + i];
+    for (uint i = lid; i < FILTER_WORDS; i += lsize)
+        lFilter[i] = filters[FILTER_WORDS * HASH_PART + i];
     // The work-group's batch: the last whose first segment is at most its own
     // (dictionaryBatchOfSegment on the host).
     const uint segment = get_group_id(0);
@@ -141,8 +139,8 @@ __kernel void searchDictionary(__global const DictionaryLaunchBatch* batches, ui
         const uint4 entry = entries[wholeList ? i : positions[batch.firstWord + i]];
         const uint length = entry.y, basenameStart = entry.z, index = entry.w;
         __global const uint* wordChars = chars + entry.x;
-        uint seed1 = batch.seed1, seed2 = batch.seed2;
-        uint key1 = batch.basenameSeed1, key2 = batch.basenameSeed2;
+        uint seed1 = BASENAMES ? batch.basenameSeed1 : batch.seed1;
+        uint seed2 = BASENAMES ? batch.basenameSeed2 : batch.seed2;
         if (!BASENAMES || basenameStart == 0) {
             // Four characters at a time, as they're stored, and then the
             // rest.
@@ -164,35 +162,25 @@ __kernel void searchDictionary(__global const DictionaryLaunchBatch* batches, ui
                     STEP_CHAR(four, 2);
             }
         } else {
-            // A word with a '\': its basename starts over after the last one.
-            key1 = 0x7FED7FEDu;
-            key2 = 0xEEEEEEEEu;
+            // A word with a '\': its basename starts over after the last
+            // one, and what comes before that isn't hashed at all.
+            seed1 = 0x7FED7FEDu;
+            seed2 = 0xEEEEEEEEu;
             uint four = 0;
-            for (uint c = 0; c < length; ++c) {
-                if ((c & 3) == 0)
+            for (uint c = basenameStart; c < length; ++c) {
+                if (c == basenameStart || (c & 3) == 0)
                     four = wordChars[c / 4];
-                const uint ch = (four >> (8 * (c & 3))) & 0xFFu;
-                const uint2 keys = lKeys[ch];
-                STEP_PLUS3(seed1, seed2, keys.x, ch + 3);
-                if (c >= basenameStart)
-                    STEP_PLUS3(key1, key2, keys.y, ch + 3);
+                STEP_CHAR(four, c & 3);
             }
         }
-        if (FILTER_PASSES(lFilterA, seed1, seed2) && HASHA_MATCHES(hashSuffix(seed1, seed2, suffixKeys, 0), targetA)) {
-            const int slot = atomic_inc(&counts[0]);
+        if (FILTER_PASSES(lFilter, seed1, seed2) &&
+            HASH_MATCHES(hashSuffix(seed1, seed2, suffixKeys, HASH_PART), BASENAMES ? basenameKey : targetA)) {
+            const int slot = atomic_inc(&counts[HASH_PART]);
             if ((uint) slot < capacity) {
-                hashAHits[slot].batch = batchIndex;
-                hashAHits[slot].word = index;
+                __global DictionaryHit* const hits = BASENAMES ? basenameHits : hashAHits;
+                hits[slot].batch = batchIndex;
+                hits[slot].word = index;
             }
         }
-#if BASENAMES
-        if (FILTER_PASSES(lFilterBasename, key1, key2) && hashSuffix(key1, key2, suffixKeys, 1) == basenameKey) {
-            const int slot = atomic_inc(&counts[1]);
-            if ((uint) slot < capacity) {
-                basenameHits[slot].batch = batchIndex;
-                basenameHits[slot].word = index;
-            }
-        }
-#endif
     }
 }

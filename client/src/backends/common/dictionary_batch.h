@@ -74,8 +74,8 @@ std::vector<uint32_t> dictionarySuffixKeys(const std::string& suffix, const uint
 constexpr int kDictionaryFilterBits = NAMEBREAK_DICTIONARY_FILTER_BITS;
 static_assert(kDictionaryFilterBits >= 1 && kDictionaryFilterBits <= 8, "NAMEBREAK_DICTIONARY_FILTER_BITS must be 1-8");
 constexpr uint32_t kDictionaryFilterWords = (1u << (2 * kDictionaryFilterBits)) < 32 ? 1 : (1u << (2 * kDictionaryFilterBits)) / 32;
-// The bits of seed1 a filter compares: hashA's - those a hit must match,
-// see hash_match.h - or the basename hash's, all of them.
+// The bits of seed1 a filter compares: those a hit must match (see
+// hash_match.h), of hashA or the basename hash.
 uint32_t dictionaryFilterMask(bool basename);
 // The filter for the suffix hashed with the crypt table at `keyOffset`
 // (kHashAOffset, kFileKeyOffset), to `target`'s bits of `mask`.
@@ -127,14 +127,19 @@ struct DictionaryHit {
 class DictionaryHitVerifier {
 public:
     void begin(const DictionaryConstants& constants);
-    // Whether a backend has to hash each candidate's basename - only if the
-    // basename key is checked, and the suffix has no '\'. If it has one, the
-    // basename is the suffix's end alike for every candidate, and addHits
-    // checks it itself, once a call.
+    // Whether a backend hashes each candidate's basename - if the basename
+    // key is checked, and the suffix has no '\' - and then only that: the
+    // file's name has the key's basename, so a candidate whose basename
+    // doesn't match it can't be the file, and hashA would be hashed for
+    // nothing. The backend reports basename hits alone, and addHits checks
+    // their hashA and hashB. Otherwise the backend hashes hashA alone. If
+    // the suffix has a '\', the basename is its end alike for every
+    // candidate, and addHits checks it itself, once a call.
     bool candidatesHaveBasenames() const { return checkBasename_ && !suffixHasBackslash_; }
-    // Adds the hashA hits and basename hits of `batches` to `outcome` - and
-    // if every candidate's basename is the suffix's, and it matches, the
-    // first candidate of the call as the one basename hit.
+    // Adds the hashA hits and basename hits of `batches` to `outcome` - with
+    // candidatesHaveBasenames, a basename hit whose hashA matches as a hashA
+    // hit too - and if every candidate's basename is the suffix's, and it
+    // matches, the first candidate of the call as the one basename hit.
     void addHits(const std::vector<DictionaryBatch>& batches, const std::vector<DictionaryHit>& hashAHits,
                  const std::vector<DictionaryHit>& basenameHits, DictionaryOutcome& outcome) const;
 

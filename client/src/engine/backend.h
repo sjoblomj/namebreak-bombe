@@ -115,7 +115,9 @@ struct DictionaryConstants {
     uint32_t targetHashB = 0;
     // Also compare each candidate's basename - its filename after the last
     // '\' - hashed as Storm makes a file's encryption key (hash type 3), to
-    // basenameKey.
+    // basenameKey. Unless the suffix has a '\', only a candidate whose
+    // basename matches is then compared to the targets: the file's name has
+    // that basename (see DictionaryHitVerifier::candidatesHaveBasenames).
     bool checkBasename = false;
     uint32_t basenameKey = 0;
 };
@@ -139,7 +141,8 @@ struct DictionaryBatch {
 // What one runDictionaryBatches() call found - every hit, in no particular
 // order.
 struct DictionaryOutcome {
-    // The filename of every hashA hit.
+    // The filename of every hashA hit - of the candidates compared to the
+    // targets at all (see DictionaryConstants::checkBasename).
     std::vector<std::string> hits;
     // Set once one of them also matches hashB.
     bool found = false;

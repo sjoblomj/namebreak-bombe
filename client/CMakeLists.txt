@@ -353,8 +353,9 @@ namebreak_test(dictionary_batch_test dictionary_batch_test)
 # runDictionarySearch (src/engine/dictionary_search.h) end to end on every
 # backend, against brute force - after the dictionary self-test (src/backends/
 # self_test.h), as createDictionaryBackend runs it. As built; with few of
-# hashA's bits compared (so that there are hits to compare); and with also
-# few candidates and batches per call to the backend (so that a search is
+# hashA's and the basename hash's bits compared (so that there are hits to
+# compare, and basenames that match by chance); and with also few
+# candidates and batches per call to the backend (so that a search is
 # split into many calls, and stopped and resumed part way), on several CPU
 # threads, and the GPU backends' launches made small: a few words to a
 # thread block, so that even a small word list spans several, room for one
@@ -367,9 +368,10 @@ foreach(backend IN LISTS DICTIONARY_BACKENDS)
     namebreak_test(dictionary-search-${backend} dictionary_search_test --backend ${backend})
 endforeach()
 if(NAMEBREAK_TEST_VARIANTS)
-    namebreak_search_library(namebreak_search_dictionary_dense NAMEBREAK_HASHA_MATCH_BITS=8)
+    namebreak_search_library(namebreak_search_dictionary_dense NAMEBREAK_HASHA_MATCH_BITS=8 NAMEBREAK_BASENAME_MATCH_BITS=8)
     namebreak_test_executable(dictionary_search_test_dense tests/dictionary_search_test.cpp namebreak_search_dictionary_dense)
-    namebreak_search_library(namebreak_search_dictionary_small NAMEBREAK_HASHA_MATCH_BITS=8 NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL=97
+    namebreak_search_library(namebreak_search_dictionary_small NAMEBREAK_HASHA_MATCH_BITS=8 NAMEBREAK_BASENAME_MATCH_BITS=8
+                             NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL=97
                              NAMEBREAK_DICTIONARY_BATCHES_PER_CALL=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=16
                              NAMEBREAK_DICTIONARY_THREADS_PER_BLOCK=8 NAMEBREAK_DICTIONARY_WORDS_PER_THREAD=3
                              NAMEBREAK_DICTIONARY_HIT_CAPACITY=1 NAMEBREAK_DICTIONARY_FILTER_BITS=1)
@@ -600,7 +602,7 @@ endif()
 #                            default backend (build/tests/dictionary_bench
 #                            --backend <name> for another; --words <n> to
 #                            time the CPU backend on fewer; --no-key to
-#                            hash hashA only)
+#                            hash hashA, not the basename)
 # NAMEBREAK_BENCH_WINDOW sets the GPU window for search_bench only, to
 # re-sweep that tuning value against real hardware without hand-editing the
 # source - e.g. -DNAMEBREAK_BENCH_WINDOW=6. Empty, the shipped default is used.

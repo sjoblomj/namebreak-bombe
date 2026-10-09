@@ -655,7 +655,8 @@ const OpenClBackend::CompiledKernel& OpenClBackend::dictionaryKernel() {
                                 " -DWORDS_PER_THREAD=" + std::to_string(kDictionaryWordsPerThread) +
                                 " -DFILTER_BITS=" + std::to_string(kDictionaryFilterBits) +
                                 " -DFILTER_WORDS=" + std::to_string(kDictionaryFilterWords) +
-                                " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u";
+                                " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
+                                " -DBASENAME_MATCH_MASK=" + std::to_string(kBasenameMatchMask) + "u";
     CompiledKernel compiled;
     compiled.program = buildProgram(kDictionaryKernelSource, options, "dictionary");
     cl_int err = CL_SUCCESS;

@@ -14,7 +14,9 @@
 // A dictionary search: every candidate made of words from a list, with
 // separators between them (see dictionary.h for which candidates, and their
 // numbers), checked against a target's hashA and hashB - and, given the
-// file's encryption key, its basename against that key.
+// file's encryption key, its basename against that key, and then only the
+// candidates whose basename matches against the hashes (see
+// DictionaryConstants::checkBasename).
 //
 // It walks the candidates in number order. The bounds are whole filenames:
 // a candidate outside them is skipped, and so is everything after a leading
@@ -56,7 +58,8 @@ struct DictionaryRequest {
     uint32_t targetHashB = 0;
     // Compare each candidate's basename to basenameKey (see
     // continueBasenameHash), and write every basename that matches to
-    // basenamesFilePath.
+    // basenamesFilePath. Unless the suffix has a '\', only those candidates
+    // are then compared to the targets: the file's name has that basename.
     bool checkBasename = false;
     uint32_t basenameKey = 0;
     // The number of the first candidate to search - every one before it is

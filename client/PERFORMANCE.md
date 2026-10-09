@@ -610,10 +610,11 @@ A dictionary search (README.md's [Dictionary mode](README.md#dictionary-mode))
 hands the backend batches - a leading part's hash states, a run of the word
 list's words and the suffix - rather than rows. The GPU kernels
 (`dictionaryKernel` in `cuda_backend.cu`, `dictionary.cl`,
-`dictionary.metal`) hash each word on from its batch's states, hashA and the
-basename hash together, and the suffix where a filter lets it through.
-There's no row trick to be had: every candidate is a word of its own, about
-8 characters, two hashes of them. Measured on the RTX 3080 Ti Laptop with
+`dictionary.metal`) hash each word on from its batch's state - hashA, or with
+a basename key the basename hash alone (see **One hash a candidate**) - and
+the suffix where a filter lets it through. There's no row trick to be had:
+every candidate is a word of its own, about 8 characters. Until **One hash a
+candidate**, a search with a key hashed both. Measured on the RTX 3080 Ti Laptop with
 `english-1` and the three StarCraft lists (66,276 words), two words a
 candidate, four separators, `MUSIC\BG` and `.WAV`, a basename key: 17.6
 billion candidates. Kernel times are Nsight Compute's for one launch of 2^28
@@ -662,6 +663,45 @@ afternoon).
   17.1 and 16.3 G candidates/s on CUDA and OpenCL with the GPU at 60-64 C,
   10.9 and 10.4 at 85 C - and 0.20 on the CPU backend, 83 s, for which
   the GPU takes under a second.
+- [x] **One hash a candidate.** With a basename key, every word was hashed
+  twice, hashA and the basename hash - though the file's name has the
+  key's basename, so a candidate whose basename doesn't match it can't be
+  the file, and its hashA was hashed for nothing. Now the kernels hash the
+  basename alone, compared to the key, and the host checks hashA and hashB
+  of the few that match (`DictionaryHitVerifier`); a word with a `\` hashes
+  only what follows its last one. Without a key, they hash hashA alone, as
+  before. The word loop went from 12.4 to 6.8 instructions a character
+  (SASS of `dictionaryKernel<4, ...>`: 99 for eight characters, against 109
+  for sixteen). **Measured** with `run_dictionary_bench` (`english-1`, up to
+  two words, a key), alternating with the code before:
+  - Nsight Compute, one launch of 2^28 at its fixed clocks: 12.54-12.61 ms
+    against 13.88 (-9%), with 1.21 G warp instructions against 1.64 (-26%).
+    Without a key, unchanged: 12.59-12.61 ms against 12.58-12.60. Fewer
+    instructions saved less time because the issue slots went from 89% busy
+    to 73%: the warps now wait on the word table's loads (long scoreboard,
+    L1TEX), which the second hash's arithmetic used to hide.
+  - At the GPU's own clocks: CUDA 25.6-27.5 G candidates/s against
+    19.7-21.0, +30 to +33% in six pairs of six (about +32%); OpenCL
+    25.5-25.8 against 18.6-19.3, +34 to +37% in four of four. Without a
+    key, both within 2% of before. This GPU runs at its 80 W power cap,
+    and a kernel that does less for each candidate draws less and is
+    clocked higher (about 760 MHz against 630 in the timed search, worked
+    out from the instructions and Nsight Systems' kernel times) - a GPU
+    with power to spare would get nearer the fixed clocks' 10%.
+  - The CPU backend (`--words 20000`, on a machine busy with other work):
+    0.59-0.63 G candidates/s against 0.34-0.37 with a key (+60 to +70%) -
+    it hashed the basename apart from hashA, every character a second
+    time - and 0.69-0.72 against 0.67-0.69 without one. Which hash, decided
+    for each word, cost 3% without a key; it's decided once for a run of
+    words.
+  - Metal: tested emulated (its kernel compiled as C++, threadgroups as
+    threads), with `dictionary_search_test` in its three builds and the
+    key-only path's mutations; not measured.
+- [ ] **Hide the word table's loads.** Since **One hash a candidate**, both
+  kernels wait on a word's entry and characters more than they compute
+  (73% of issue slots busy at fixed clocks): loading the next word's while
+  hashing this one's might win back some of the 10% the fixed clocks
+  didn't show.
 - [ ] **Overlap the host with the GPU.** The engine builds a call's batches
   (about 4,000 leading parts for a launch of 2^28) while the GPU waits,
   and the GPU then runs while the engine waits. **Measured** with a

@@ -2,17 +2,17 @@
 // dictionary_search.h) on one backend: two words of english-1 - one word
 // and two, four separators, about 16.3 billion candidates - after MUSIC\BG,
 // with .WAV after them, an unreachable target and an encryption key, so
-// that it runs to the end and hashes every candidate's basename too, as a
-// search for a file's name usually does. PERFORMANCE.md's "Dictionary
-// searches" has what it measured.
+// that it runs to the end and hashes every candidate's basename - rather
+// than its hashA - as a search for a file's name usually does.
+// PERFORMANCE.md's "Dictionary searches" has what it measured.
 //
 //   dictionary_bench [--backend <name>] [--words <n>] [--max-words <n>] [--no-key]
 //
 // --words takes the first <n> words of english-1 only (to time a slower
 // backend in a reasonable time - the CPU backend takes minutes for all of
 // them); --max-words searches up to <n> words a candidate (default 2);
-// --no-key searches without the encryption key, so that only hashA is
-// hashed - what a search that hashed only the basename would cost.
+// --no-key searches without the encryption key, hashing every candidate's
+// hashA instead.
 // Creating the backend (for CUDA, the GPU context, and the self-tests) and
 // a first, small search happen before the clock starts. Writes its files
 // under ./dictionary_bench/.

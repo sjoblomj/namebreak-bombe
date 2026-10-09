@@ -8,8 +8,9 @@
 // pausing, and the files it writes.
 //
 // Built against several search libraries (see CMakeLists.txt): one with only
-// a few of hashA's bits compared (NAMEBREAK_HASHA_MATCH_BITS), so that
-// about one candidate in 256 is a hit and the hit lists really get
+// a few of hashA's and the basename hash's bits compared
+// (NAMEBREAK_HASHA_MATCH_BITS, NAMEBREAK_BASENAME_MATCH_BITS), so that about
+// one candidate in 256 is a hit of each and the hit lists really get
 // compared, and one that hands the backend only a few candidates per call
 // (NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL) on several threads.
 //
@@ -110,6 +111,20 @@ static std::vector<std::string> readLines(const std::string& path) {
     return lines;
 }
 
+// Whether a basenames file's lines are `expected` and a search recorded
+// `hits` new ones: exactly, with the basename hash compared in full. With
+// few of its bits compared (see CMakeLists.txt) others match by chance too,
+// so then only that `expected` are there, in that order, every line once,
+// and that there were at least `hits`.
+static bool basenamesAre(const std::vector<std::string>& lines, const std::vector<std::string>& expected, uint64_t recorded, uint64_t hits) {
+    if (kBasenameMatchMask == 0xFFFFFFFFu)
+        return lines == expected && recorded == hits;
+    size_t at = 0;
+    for (const std::string& line : lines)
+        at += at < expected.size() && line == expected[at];
+    return at == expected.size() && std::set<std::string>(lines.begin(), lines.end()).size() == lines.size() && recorded >= hits;
+}
+
 // Forwards everything to another backend, counting its runDictionaryBatches
 // calls - and setting `abortAfter`'s flag once it has made that many.
 class CountingBackend : public SearchBackend {
@@ -188,22 +203,27 @@ struct Expected {
     uint64_t total = 0;               // candidates in all
 };
 
+// Checking basenames, with a suffix that has no '\', a candidate is compared
+// to hashA and hashB only if its basename matches the key: the file's name
+// has that basename.
 static Expected expectedOf(const DictionaryRequest& req) {
     Expected e;
     const std::vector<std::string> all = allCandidates(req.pattern);
     e.total = all.size();
+    const bool basenameFirst = req.checkBasename && req.suffix.find('\\') == std::string::npos;
     for (uint64_t n = req.startNumber; n < std::min<uint64_t>(all.size(), req.endNumber); ++n) {
         const std::string filename = req.prefix + all[n] + req.suffix;
         if (!req.bounds.contains(filename))
             continue;
         ++e.searched;
-        if (hashAMatches(hashOf(filename, 0x100), req.targetHashA)) {
+        const bool basenameMatches = req.checkBasename && basenameKeyMatches(hashOf(basename(filename), 0x300), req.basenameKey);
+        if (basenameMatches)
+            e.basenames.insert(basename(filename));
+        if ((!basenameFirst || basenameMatches) && hashAMatches(hashOf(filename, 0x100), req.targetHashA)) {
             e.hits.push_back(filename);
             if (e.firstFound.empty() && hashOf(filename, 0x200) == req.targetHashB)
                 e.firstFound = filename;
         }
-        if (req.checkBasename && hashOf(basename(filename), 0x300) == req.basenameKey)
-            e.basenames.insert(basename(filename));
     }
     return e;
 }
@@ -267,7 +287,10 @@ static DictionaryRequest randomRequest(std::mt19937& rng, int round) {
     req.targetHashA = round % 3 == 0 || rng() % 2 ? hashOf(planted, 0x100) : (uint32_t) rng();
     req.targetHashB = round % 3 == 0 ? hashOf(planted, 0x200) : (uint32_t) rng();
     req.checkBasename = rng() % 4 != 0;
-    req.basenameKey = hashOf(basename(reached[rng() % reached.size()]), 0x300);
+    // The key: mostly the planted candidate's basename's, as a real search's
+    // is - or another's, which the planted one, checked against hashA and
+    // hashB only if its basename matches, mustn't be found by.
+    req.basenameKey = hashOf(basename(rng() % 3 ? planted : reached[rng() % reached.size()]), 0x300);
     return req;
 }
 
@@ -335,7 +358,7 @@ static void testAgainstBruteForce(SearchBackend& backend) {
     check(found >= 30, "... " + std::to_string(found) + " of them finding a planted match of both hashes");
     check(withBasenames >= 30, "... " + std::to_string(withBasenames) + " of them recording basenames");
     if (kHashAMatchMask != 0xFFFFFFFFu)
-        check(withHits >= 40, "... " + std::to_string(withHits) + " of them with hashA hits to compare");
+        check(withHits >= 30, "... " + std::to_string(withHits) + " of them with hashA hits to compare");
 }
 
 // Many words, of every length from 1 to 12 characters, some with a '\':
@@ -415,7 +438,7 @@ static void testRealHashes(SearchBackend& backend) {
         const DictionaryRequest req = creditsRequest("credits");
         const DictionaryResult r = run(backend, req);
         check(r.ok && r.found && r.filename == "REZ\\CRDT_LST.TXT", "finds REZ\\CRDT_LST.TXT by its hashA and hashB");
-        check(readLines(req.basenamesFilePath) == std::vector<std::string>{"CRDT_LST.TXT"} && r.basenameHits == 1,
+        check(basenamesAre(readLines(req.basenamesFilePath), {"CRDT_LST.TXT"}, r.basenameHits, 1),
               "and records its basename CRDT_LST.TXT, by its encryption key");
         check(readLines(req.outputFilePath) == std::vector<std::string>{"REZ\\CRDT_LST.TXT"}, "the matches file holds the match");
         check(readLines(kDir + "/credits/found.txt") == std::vector<std::string>{"REZ\\CRDT_LST.TXT"}, "and found.txt too");
@@ -425,7 +448,7 @@ static void testRealHashes(SearchBackend& backend) {
         DictionaryRequest req = creditsRequest("credits-elsewhere");
         req.prefix = "SOMEWHERE\\ELSE\\";
         const DictionaryResult r = run(backend, req);
-        check(r.ok && !r.found && readLines(req.basenamesFilePath) == std::vector<std::string>{"CRDT_LST.TXT"},
+        check(r.ok && !r.found && basenamesAre(readLines(req.basenamesFilePath), {"CRDT_LST.TXT"}, r.basenameHits, 1),
               "with the wrong directory: no match, but the basename is recorded");
     }
     {
@@ -437,7 +460,7 @@ static void testRealHashes(SearchBackend& backend) {
         req.prefix = "";
         req.targetHashA = 0;
         const DictionaryResult r = run(backend, req);
-        check(r.ok && readLines(req.basenamesFilePath) == std::vector<std::string>{"CRDT_LST.TXT"} && r.basenameHits == 1,
+        check(r.ok && basenamesAre(readLines(req.basenamesFilePath), {"CRDT_LST.TXT"}, r.basenameHits, 1),
               "a basename made in many directories (a '\\' separator): recorded once");
     }
     {
@@ -457,12 +480,12 @@ static void testBasenamesFile(SearchBackend& backend) {
         out << "EARLIER.TXT\r\nCRDT_LST.TXT\n";
     }
     DictionaryResult r = run(backend, req);
-    check(r.ok && readLines(req.basenamesFilePath) == std::vector<std::string>{"EARLIER.TXT", "CRDT_LST.TXT"} && r.basenameHits == 0,
+    check(r.ok && basenamesAre(readLines(req.basenamesFilePath), {"EARLIER.TXT", "CRDT_LST.TXT"}, r.basenameHits, 0),
           "a basename already in the file isn't written again, and what was there is kept");
     std::filesystem::remove(req.basenamesFilePath);
     run(backend, req);
     r = run(backend, req);
-    check(r.ok && readLines(req.basenamesFilePath) == std::vector<std::string>{"CRDT_LST.TXT"} && r.basenameHits == 0,
+    check(r.ok && basenamesAre(readLines(req.basenamesFilePath), {"CRDT_LST.TXT"}, r.basenameHits, 0) && r.basenameHits == 0,
           "searched twice: written once");
 }
 
@@ -601,7 +624,8 @@ static void testStopAndResume(SearchBackend& backend) {
     std::vector<std::string> want = e.hits;
     std::sort(want.begin(), want.end());
     check(both == want, "and their hashA hits together are every one (" + std::to_string(want.size()) + ")");
-    check(readLines(req.basenamesFilePath) == std::vector<std::string>{"W10-W20_W07.TXT"}, "the basename found in one of them, recorded once");
+    check(basenamesAre(readLines(req.basenamesFilePath), {"W10-W20_W07.TXT"}, r1.basenameHits + r2.basenameHits, 1),
+          "the basename found in one of them, recorded once");
 
     {
         std::atomic<bool> abortNow{true};
@@ -772,7 +796,8 @@ int main(int argc, char* argv[]) {
         return selfTestFailed ? 1 : 77;
     }
     prepareCryptTable(g_table);
-    printf("backend %s, hashA bits compared %d\n", backendName.c_str(), NAMEBREAK_HASHA_MATCH_BITS);
+    printf("backend %s, hashA bits compared %d, basename hash bits %d\n", backendName.c_str(), NAMEBREAK_HASHA_MATCH_BITS,
+           NAMEBREAK_BASENAME_MATCH_BITS);
 
     testAgainstBruteForce(*backend);
     testManyWords(*backend);

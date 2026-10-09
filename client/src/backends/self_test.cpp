@@ -807,7 +807,8 @@ bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& w
     }
     for (const std::string& hit : outcome.basenameHits) {
         const size_t s = hit.rfind('\\');
-        if (!isCandidate(hit) || hashFromScratch(s == std::string::npos ? hit : hit.substr(s + 1), cryptTable, kFileKeyOffset) != constants.basenameKey) {
+        const std::string basename = s == std::string::npos ? hit : hit.substr(s + 1);
+        if (!isCandidate(hit) || !basenameKeyMatches(hashFromScratch(basename, cryptTable, kFileKeyOffset), constants.basenameKey)) {
             error = "reported '" + hit + "' as a basename match, which isn't a candidate whose basename matches the key" + where;
             return false;
         }

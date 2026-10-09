@@ -225,27 +225,33 @@ static void testVerifier() {
     verifier.begin(constants);
     check(verifier.candidatesHaveBasenames(), "checking basenames, a suffix without a '\\': a backend hashes each candidate's");
 
+    // The backend reports basename hits alone; their hashA and hashB are
+    // checked here.
     DictionaryOutcome outcome;
-    verifier.addHits(batches, {{1, 1}, {0, 2}}, {{1, 1}, {2, 1}, {0, 3}}, outcome);
-    check(outcome.hits == std::vector<std::string>{"REZ\\CRDT_LST.TXT"}, "a hashA hit that matches kept, one that doesn't dropped");
-    check(outcome.found && outcome.foundFilename == "REZ\\CRDT_LST.TXT", "... and found, matching hashB too");
+    verifier.addHits(batches, {}, {{1, 1}, {2, 1}, {0, 3}}, outcome);
     check(outcome.basenameHits == std::vector<std::string>{"REZ\\CRDT_LST.TXT", "SCRIPTS\\CRDT_LST.TXT"},
           "the basename hits that match kept, in any directory - one that doesn't dropped");
+    check(outcome.hits == std::vector<std::string>{"REZ\\CRDT_LST.TXT"}, "... the one matching hashA a hashA hit too, the others not");
+    check(outcome.found && outcome.foundFilename == "REZ\\CRDT_LST.TXT", "... and found, matching hashB too");
 
-    // A hit matching hashA but not hashB: kept, not found.
+    // A basename hit matching hashA but not hashB: a hashA hit, not found.
     constants.targetHashB = 0;
     verifier.begin(constants);
     outcome = DictionaryOutcome();
-    verifier.addHits(batches, {{1, 1}}, {}, outcome);
+    verifier.addHits(batches, {}, {{1, 1}}, outcome);
     check(outcome.hits.size() == 1 && !outcome.found, "a hit that doesn't match hashB: reported, not found");
 
-    // Not checking basenames: basename hits ignored.
+    // Not checking basenames: the backend reports hashA hits, and basename
+    // hits are ignored.
     constants.checkBasename = false;
+    constants.targetHashB = hashOf("REZ\\CRDT_LST.TXT", 0x200);
     verifier.begin(constants);
     check(!verifier.candidatesHaveBasenames(), "not checking basenames: a backend hashes no candidate's");
     outcome = DictionaryOutcome();
-    verifier.addHits(batches, {}, {{1, 1}}, outcome);
-    check(outcome.basenameHits.empty(), "... and any it reports are ignored");
+    verifier.addHits(batches, {{1, 1}, {0, 2}}, {{1, 1}}, outcome);
+    check(outcome.hits == std::vector<std::string>{"REZ\\CRDT_LST.TXT"}, "a hashA hit that matches kept, one that doesn't dropped");
+    check(outcome.found && outcome.foundFilename == "REZ\\CRDT_LST.TXT", "... and found, matching hashB too");
+    check(outcome.basenameHits.empty(), "... and any basename hits it reports are ignored");
 
     // A suffix with a '\': every candidate's basename is its end - checked
     // here, once a call.

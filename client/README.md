@@ -203,7 +203,7 @@ resume_from_last_candidate = true
 | `prefix` / `suffix` | yes | The fixed parts of the filename around the candidate. |
 | `lower_bound` / `upper_bound` | no | Whole filenames (inclusive) bounding the search alphabetically - typically an unknown file's neighbours in the archive. Either may be left out. |
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex. |
-| `encryption_key` | no | The file's raw encryption key, hex: hash type 3 of its basename, before the adjustment for its position and size in the archive (mpqcli's `encryption-key-raw`, the coordinator's `encryption_key_hex`). Every candidate whose basename - what follows the filename's last `\` - hashes to it is recorded. |
+| `encryption_key` | no | The file's raw encryption key, hex: hash type 3 of its basename, before the adjustment for its position and size in the archive (mpqcli's `encryption-key-raw`, the coordinator's `encryption_key_hex`). Every candidate whose basename - what follows the filename's last `\` - hashes to it is recorded. While they are (`record_basenames`), and unless the suffix has a `\`, only those candidates are compared to `hash_a` and `hash_b` at all - the file's name has that basename, so no other can be it - which makes the search about a third faster (see [Dictionary searches on the GPU](#dictionary-searches-on-the-gpu)). |
 | `record_basenames` | no (default `true` with an `encryption_key`, else `false`) | Whether to record those basenames. `true` needs an `encryption_key`. |
 | `matches_name` | no | Names the files the search writes, as in `[search]`. |
 | `resume_from_last_candidate` | no (default `false`) | Carry on from the progress file (see below). |
@@ -234,7 +234,8 @@ lower bound, `REZ\CRDT...` is both inside (`REZ\CRDT_MAP.TXT`) and outside
 
 **What it writes**, in `matches_dir`, named with `matches_name` if given:
 
-- `matches.txt` - the most recent Hash-A match, as in the other modes, and
+- `matches.txt` - the most recent Hash-A match, as in the other modes (of
+  the candidates compared to the hashes at all, see `encryption_key`), and
   `found.txt` for a match of both hashes, where the search stops.
 - `basenames.txt` - with `record_basenames`, every basename that matched the
   encryption key, one per line, each once (those already in the file
@@ -265,9 +266,10 @@ directory to find.
 **Backends.** Every backend searches dictionaries; unless `backend` says
 otherwise, the first that can run on the machine is used, as in the other
 modes. On the RTX 3080 Ti Laptop, up to two words of `english-1` with four
-separators - 16.3 billion candidates, `run_dictionary_bench` - take about a
-second on the GPU, 17 G candidates/s with CUDA and 16 with OpenCL (up to 20
-with a cool GPU), and 83 s on the CPU backend, 0.2 G candidates/s. A
+separators and an encryption key - 16.3 billion candidates,
+`run_dictionary_bench` - take about 0.6 s on the GPU, 26-27 G candidates/s
+with CUDA and about 25.5 with OpenCL (with the GPU at 77-82 C), and about
+28 s on the CPU backend, 0.6 G candidates/s. A
 dictionary search runs a
 self-test of its own first (`selfTestDictionaryBackend`,
 `src/backends/self_test.h`): known answers planted among 9,000 words, which
@@ -380,7 +382,8 @@ bounds and counting against brute force), `wordlist_test` (which pins
 `english-1`), `dictionary_batch_test` (the word table, suffix filters,
 launch plan and hit checking the GPU backends share), `dictionary-search-*`
 (the dictionary self-test, then whole searches on each backend against brute
-force - also with one candidate in 256 a hit, and with few candidates and
+force - also with one candidate in 256 a hit, and one in 256 a basename
+matching the key by chance, and with few candidates and
 batches per call, stopped and resumed part way, the GPU kernels' thread
 blocks a few words each, room for a single hit and a one-bit suffix filter,
 and cut into ranges of numbers as a coordinator hands them out) and
@@ -1259,6 +1262,13 @@ neighbouring words.
 What makes it fast (see [PERFORMANCE.md](PERFORMANCE.md)'s *Dictionary
 searches* for the measurements):
 
+- **One hash a candidate.** A search with an encryption key hashes each
+  candidate's basename alone, and compares it to the key: the file's name
+  has that basename, so a candidate whose basename doesn't match can't be
+  it, and its hashA would be hashed for nothing. The host checks hashA and
+  hashB of the few that match (`DictionaryHitVerifier`). A search without
+  one hashes hashA alone. Hashing both, as the kernels first did, took
+  about a third longer.
 - **Words by length.** A warp goes round a word's loop as many times as its
   longest word needs. The word table the kernels read
   (`DictionaryWordTable`) has the words in the order of their lengths, so
@@ -1267,10 +1277,9 @@ searches* for the measurements):
   list (at a bound, or where a call ends) is searched in the list's order.
   A hit is reported by the word's index in the list either way, so the
   order is the kernel's business only.
-- **Four characters to a load, both hashes together.** The table has four
-  characters to a uint32, each word from a uint32 of its own; a character's
-  two crypt-table keys sit side by side in shared memory, one 64-bit lookup
-  for both hashes.
+- **Four characters to a load.** The table has four characters to a
+  uint32, each word from a uint32 of its own, and the crypt table's part
+  for the hash is in shared memory.
 - **The suffix filter.** As the row search's [lookup
   filter](#the-lookup-filter-most-candidates-are-never-hashed): the low 7
   bits of seed1 after the suffix depend only on the low 7 bits of seed1 and
@@ -1279,11 +1288,12 @@ searches* for the measurements):
   hashed in full for 1 candidate in 128.
 
 A word with a `\` starts the basename hash over after its last one (the
-table has where), and a suffix with a `\` makes every candidate's basename
-the same, its end - checked once a call on the host, not per candidate
-(`DictionaryHitVerifier`). The kernel records hits as (batch, word); the
-host rebuilds each filename, hashes it from scratch and checks hashB, as
-for the row search. A launch has room for 4,096 hits of each kind - a
+table has where), so what comes before it isn't hashed at all, and a suffix
+with a `\` makes every candidate's basename the same, its end - checked once
+a call on the host, not per candidate (`DictionaryHitVerifier`), while the
+kernel hashes hashA. The kernel records hits as (batch, word); the host
+rebuilds each filename, hashes it from scratch and checks hashB - and, for a
+basename hit, hashA first - as for the row search. A launch has room for 4,096 hits of each kind - a
 search with a 32-bit target has about one hit per 2^32 candidates - and one
 that has more is searched again with room for all of them, so none is ever
 lost. The OpenCL and Metal kernels are the CUDA one ported, compiled at

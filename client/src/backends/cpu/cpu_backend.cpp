@@ -409,16 +409,11 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
     auto work = [&](Hits& mine) {
         for (size_t i = next++; i < items.size(); i = next++) {
             const DictionaryBatch& batch = batches[items[i].batch];
-            for (uint32_t w = batch.firstWord + items[i].from; w < batch.firstWord + items[i].to; ++w) {
-                const std::string& word = words[w];
-                uint32_t s1 = batch.seed1, s2 = batch.seed2;
-                for (unsigned char ch : word)
-                    mpqStep(s1, s2, table[0x100 + ch], ch);
-                for (unsigned char ch : suffix)
-                    mpqStep(s1, s2, table[0x100 + ch], ch);
-                if (hashAMatches(s1, targetA))
-                    mine.hashA.push_back({(uint32_t) items[i].batch, w});
-                if (checkBasename) {
+            const uint32_t first = batch.firstWord + items[i].from, end = batch.firstWord + items[i].to;
+            if (checkBasename) {
+                // The basename alone: the verifier checks hashA and hashB of
+                // those that match (see candidatesHaveBasenames).
+                for (uint32_t w = first; w < end; ++w) {
                     uint32_t k1 = batch.basenameSeed1, k2 = batch.basenameSeed2;
                     auto stepBasename = [&](unsigned char ch) {
                         if (ch == '\\') {
@@ -428,12 +423,22 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
                             mpqStep(k1, k2, table[kFileKeyOffset + ch], ch);
                         }
                     };
-                    for (unsigned char ch : word)
+                    for (unsigned char ch : words[w])
                         stepBasename(ch);
                     for (unsigned char ch : suffix)
                         stepBasename(ch);
-                    if (k1 == basenameKey)
+                    if (basenameKeyMatches(k1, basenameKey))
                         mine.basename.push_back({(uint32_t) items[i].batch, w});
+                }
+            } else {
+                for (uint32_t w = first; w < end; ++w) {
+                    uint32_t s1 = batch.seed1, s2 = batch.seed2;
+                    for (unsigned char ch : words[w])
+                        mpqStep(s1, s2, table[0x100 + ch], ch);
+                    for (unsigned char ch : suffix)
+                        mpqStep(s1, s2, table[0x100 + ch], ch);
+                    if (hashAMatches(s1, targetA))
+                        mine.hashA.push_back({(uint32_t) items[i].batch, w});
                 }
             }
         }

@@ -597,8 +597,8 @@ void launchSearchFor(AlphabetSizeList<Sizes...>, bool listed, bool inserted, dim
 // A dictionary search (engine/dictionary_search.h) hands the backend batches:
 // a leading part's hash states, followed by a run of the word list's words
 // and then the suffix - one candidate per word. dictionaryKernel hashes each
-// of them on from its batch's states: hashA, and if the search checks
-// basenames, the basename hash too (see backends/common/dictionary_batch.h,
+// of them on from its batch's state: hashA, or if the search checks
+// basenames, the basename hash instead (see backends/common/dictionary_batch.h,
 // which also has the host's side of it).
 
 // The word list, as DictionaryWordTable has it, on the GPU - a kernel
@@ -675,40 +675,41 @@ __device__ __forceinline__ bool dictionarySuffixMatches(uint32_t seed1, uint32_t
         for (int i = 0; i < SuffixLen; ++i)
             mpqStepPlus3(seed1, seed2, d_dictionarySuffixKeys[3 * i + (Basename ? 1 : 0)], d_dictionarySuffixKeys[3 * i + 2]);
     }
-    return Basename ? seed1 == target : hashAMatches(seed1, target);
+    return Basename ? basenameKeyMatches(seed1, target) : hashAMatches(seed1, target);
 }
 
 // One block per segment of the launch (see planDictionaryLaunch): up to
 // kDictionaryWordsPerThread * blockDim.x consecutive words of one batch, the
 // block's threads taking neighbouring words - in the word table's order
 // (by length, see DictionaryWordTable) if the batch has every word, in the
-// list's if not - each hashed from the batch's states, then the suffix,
-// where its filter lets it through. Records every hashA hit, and with
-// Basenames every basename hit, as (batch, word): the host rebuilds and
-// checks them.
+// list's if not - each hashed from the batch's state, then the suffix,
+// where its filter lets it through. One hash a candidate: hashA - or with
+// Basenames the basename hash alone, compared to the key, since the file's
+// name has that basename; the host checks hashA and hashB of those that
+// match (DictionaryHitVerifier). Records every hit, as (batch, word) - a
+// hashA hit, or with Basenames a basename hit: the host rebuilds and checks
+// them.
 //
 // `cryptKeys` is the crypt table's hashA part (0x100) and then its basename
-// hash's part (0x300), 256 entries each, which the block copies into shared
-// memory, a character's two keys side by side: a word's characters are a
-// lookup each, different for every lane. `filters` is the suffix filters
+// hash's part (0x300), 256 entries each, of which the block copies the one
+// it hashes with into shared memory: a word's characters are a lookup each,
+// different for every lane. `filters` is the suffix filters
 // (buildDictionarySuffixFilter), hashA's and then the basename hash's,
-// kDictionaryFilterWords each - into shared memory too.
+// kDictionaryFilterWords each - the one it uses into shared memory too.
 template<int SuffixLen, bool Basenames>
 __global__ void dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batches, uint32_t batchCount, DictionaryWords words,
                                  const uint32_t* __restrict__ cryptKeys, const uint32_t* __restrict__ filters,
                                  const uint32_t* __restrict__ suffixKeys, int suffixLen, uint32_t targetA, uint32_t basenameKey,
                                  DictionaryResults results) {
-    __shared__ uint2 sKeys[256];
-    __shared__ uint32_t sFilterA[kDictionaryFilterWords];
-    __shared__ uint32_t sFilterBasename[Basenames ? kDictionaryFilterWords : 1];
+    __shared__ uint32_t sKeys[256];
+    __shared__ uint32_t sFilter[kDictionaryFilterWords];
     __shared__ uint32_t sBatch;
+    const uint32_t* const hashKeys = cryptKeys + (Basenames ? 256 : 0);
+    const uint32_t* const hashFilter = filters + (Basenames ? kDictionaryFilterWords : 0);
     for (int i = threadIdx.x; i < 256; i += blockDim.x)
-        sKeys[i] = make_uint2(__ldg(&cryptKeys[i]), __ldg(&cryptKeys[256 + i]));
-    for (int i = threadIdx.x; i < (int) kDictionaryFilterWords; i += blockDim.x) {
-        sFilterA[i] = __ldg(&filters[i]);
-        if constexpr (Basenames)
-            sFilterBasename[i] = __ldg(&filters[kDictionaryFilterWords + i]);
-    }
+        sKeys[i] = __ldg(&hashKeys[i]);
+    for (int i = threadIdx.x; i < (int) kDictionaryFilterWords; i += blockDim.x)
+        sFilter[i] = __ldg(&hashFilter[i]);
     if (threadIdx.x == 0)
         sBatch = dictionaryBatchOf(batches, batchCount, blockIdx.x);
     __syncthreads();
@@ -722,19 +723,16 @@ __global__ void dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batch
     for (uint32_t i = first + threadIdx.x; i < end; i += blockDim.x) {
         const uint4 entry = __ldg(reinterpret_cast<const uint4*>(&words.entries[wholeList ? i : __ldg(&words.positions[batch.firstWord + i])]));
         const uint32_t offset = entry.x, length = entry.y, basenameStart = entry.z, index = entry.w;
-        uint32_t seed1 = batch.seed1, seed2 = batch.seed2;
-        uint32_t key1 = batch.basenameSeed1, key2 = batch.basenameSeed2;
+        uint32_t seed1 = Basenames ? batch.basenameSeed1 : batch.seed1;
+        uint32_t seed2 = Basenames ? batch.basenameSeed2 : batch.seed2;
+        auto step = [&](uint32_t four, int b) {
+            const uint32_t ch = extractByte(four, b);
+            mpqStepPlus3(seed1, seed2, sKeys[ch], ch + 3);
+        };
         if (!Basenames || basenameStart == 0) {
             // Four characters at a time, as they're stored, and then the
             // rest. The lanes of a warp mostly have words of the same length
             // (see DictionaryWordTable), so they go round together.
-            auto step = [&](uint32_t four, int b) {
-                const uint32_t ch = extractByte(four, b);
-                const uint2 keys = sKeys[ch];
-                mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
-                if constexpr (Basenames)
-                    mpqStepPlus3(key1, key2, keys.y, ch + 3);
-            };
             const uint32_t* chars = words.chars + offset;
             const uint32_t* const fullEnd = chars + length / 4;
             for (; chars != fullEnd; ++chars) {
@@ -754,31 +752,21 @@ __global__ void dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batch
                     step(four, 2);
             }
         } else {
-            // A word with a '\': its basename starts over after the last one.
-            key1 = 0x7FED7FED;
-            key2 = 0xEEEEEEEE;
+            // A word with a '\': its basename starts over after the last
+            // one, and what comes before that isn't hashed at all.
+            seed1 = 0x7FED7FED;
+            seed2 = 0xEEEEEEEE;
             uint32_t four = 0;
-            for (uint32_t c = 0; c < length; ++c) {
-                if ((c & 3) == 0)
+            for (uint32_t c = basenameStart; c < length; ++c) {
+                if (c == basenameStart || (c & 3) == 0)
                     four = __ldg(&words.chars[offset + c / 4]);
-                const uint32_t ch = extractByte(four, c & 3);
-                const uint2 keys = sKeys[ch];
-                mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
-                if (c >= basenameStart)
-                    mpqStepPlus3(key1, key2, keys.y, ch + 3);
+                step(four, c & 3);
             }
         }
-        if (dictionarySuffixMatches<SuffixLen, false>(seed1, seed2, sFilterA, suffixKeys, suffixLen, targetA)) {
-            const int slot = atomicAdd(&results.counts[0], 1);
+        if (dictionarySuffixMatches<SuffixLen, Basenames>(seed1, seed2, sFilter, suffixKeys, suffixLen, Basenames ? basenameKey : targetA)) {
+            const int slot = atomicAdd(&results.counts[Basenames ? 1 : 0], 1);
             if ((uint32_t) slot < results.capacity)
-                results.hashAHits[slot] = DictionaryHit{batchIndex, index};
-        }
-        if constexpr (Basenames) {
-            if (dictionarySuffixMatches<SuffixLen, true>(key1, key2, sFilterBasename, suffixKeys, suffixLen, basenameKey)) {
-                const int slot = atomicAdd(&results.counts[1], 1);
-                if ((uint32_t) slot < results.capacity)
-                    results.basenameHits[slot] = DictionaryHit{batchIndex, index};
-            }
+                (Basenames ? results.basenameHits : results.hashAHits)[slot] = DictionaryHit{batchIndex, index};
         }
     }
 }

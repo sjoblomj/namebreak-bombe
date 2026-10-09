@@ -49,7 +49,7 @@ std::vector<uint32_t> dictionarySuffixKeys(const std::string& suffix, const uint
 }
 
 uint32_t dictionaryFilterMask(bool basename) {
-    return basename ? lowBitsFilterStateMask(kDictionaryFilterBits) : lowBitsFilterStateMask(kDictionaryFilterBits) & kHashAMatchMask;
+    return lowBitsFilterStateMask(kDictionaryFilterBits) & (basename ? kBasenameMatchMask : kHashAMatchMask);
 }
 
 std::vector<uint32_t> buildDictionarySuffixFilter(const std::string& suffix, const uint32_t* cryptTable, int keyOffset, uint32_t target,
@@ -143,14 +143,24 @@ void DictionaryHitVerifier::begin(const DictionaryConstants& constants) {
     basenameKey_ = constants.basenameKey;
     const size_t slash = suffix_.rfind('\\');
     suffixHasBackslash_ = slash != std::string::npos;
-    suffixBasenameMatches_ = suffixHasBackslash_ &&
-                             continueBasenameHash(kInitialHashState, suffix_.substr(slash), cryptTable_.data()).first == basenameKey_;
+    suffixBasenameMatches_ =
+        suffixHasBackslash_ && basenameKeyMatches(continueBasenameHash(kInitialHashState, suffix_.substr(slash), cryptTable_.data()).first,
+                                                  basenameKey_);
 }
 
 void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches, const std::vector<DictionaryHit>& hashAHits,
                                     const std::vector<DictionaryHit>& basenameHits, DictionaryOutcome& outcome) const {
     const uint32_t* table = cryptTable_.data();
     auto filenameOf = [&](const DictionaryHit& hit) { return batches[hit.batch].leading + words_[hit.word] + suffix_; };
+    // A candidate whose hashA matches: a hashA hit, and the match if its
+    // hashB does too.
+    auto addHashAHit = [&](const std::string& filename) {
+        outcome.hits.push_back(filename);
+        if (!outcome.found && continueHash(kInitialHashState, filename, kHashBOffset, table).first == targetB_) {
+            outcome.found = true;
+            outcome.foundFilename = filename;
+        }
+    };
     for (const DictionaryHit& hit : hashAHits) {
         const std::string filename = filenameOf(hit);
         const uint32_t hashA = continueHash(kInitialHashState, filename, kHashAOffset, table).first;
@@ -159,22 +169,22 @@ void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches,
                    hashA);
             continue;
         }
-        outcome.hits.push_back(filename);
-        if (!outcome.found && continueHash(kInitialHashState, filename, kHashBOffset, table).first == targetB_) {
-            outcome.found = true;
-            outcome.foundFilename = filename;
-        }
+        addHashAHit(filename);
     }
     if (!checkBasename_)
         return;
     for (const DictionaryHit& hit : basenameHits) {
         const std::string filename = filenameOf(hit);
-        if (continueBasenameHash(kInitialHashState, filename, table).first != basenameKey_) {
+        if (!basenameKeyMatches(continueBasenameHash(kInitialHashState, filename, table).first, basenameKey_)) {
             printf("WARNING: basename hash mismatch for '%s' - the backend reported a hit, the full filename doesn't match\n",
                    filename.c_str());
             continue;
         }
         outcome.basenameHits.push_back(filename);
+        // The backend hashed the basename alone (candidatesHaveBasenames):
+        // hashA is checked here.
+        if (candidatesHaveBasenames() && hashAMatches(continueHash(kInitialHashState, filename, kHashAOffset, table).first, targetA_))
+            addHashAHit(filename);
     }
     if (suffixBasenameMatches_ && !batches.empty())
         outcome.basenameHits.push_back(batches[0].leading + words_[batches[0].firstWord] + suffix_);

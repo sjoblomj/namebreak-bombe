@@ -31,4 +31,20 @@ NAMEBREAK_HOST_DEVICE inline bool hashAMatches(uint32_t hashA, uint32_t target) 
     return (hashA & kHashAMatchMask) == (target & kHashAMatchMask);
 }
 
+// The same for a dictionary search's basename hash (hash type 3, what an
+// encryption key is made with): all 32 bits in the program, fewer in the
+// dictionary search test's builds (-DNAMEBREAK_BASENAME_MATCH_BITS=8), so
+// that a candidate's basename matches the key by chance often enough to
+// test every path a basename hit takes. The low bits again: the suffix
+// filters rely on that.
+#ifndef NAMEBREAK_BASENAME_MATCH_BITS
+#define NAMEBREAK_BASENAME_MATCH_BITS 32
+#endif
+static_assert(NAMEBREAK_BASENAME_MATCH_BITS >= 1 && NAMEBREAK_BASENAME_MATCH_BITS <= 32, "NAMEBREAK_BASENAME_MATCH_BITS must be 1-32");
+constexpr uint32_t kBasenameMatchMask = 0xFFFFFFFFu >> (32 - NAMEBREAK_BASENAME_MATCH_BITS);
+
+NAMEBREAK_HOST_DEVICE inline bool basenameKeyMatches(uint32_t hash, uint32_t key) {
+    return (hash & kBasenameMatchMask) == (key & kBasenameMatchMask);
+}
+
 #endif // NAMEBREAK_ENGINE_HASH_MATCH_H

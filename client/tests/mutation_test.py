@@ -12,12 +12,12 @@ three checks that guard the search, on its own:
   stress             tests/search_stress_test.cpp
 
 And two more for a dictionary search: tests/dictionary_search_test.cpp,
-built with few of hashA's bits compared ("dictionary") and to make its GPU
-launches small ("dictionary-small" - see dictionary_search_test_small in
-CMakeLists.txt). The self-test there is both of createDictionaryBackend's:
-the row search's and, for a backend that can search dictionaries, the
-dictionary search's. A dictionary mutation is caught by those three - or
-some of them - and none of the others.
+built with few of hashA's and the basename hash's bits compared
+("dictionary") and to make its GPU launches small ("dictionary-small" -
+see dictionary_search_test_small in CMakeLists.txt). The self-test there is
+both of createDictionaryBackend's: the row search's and, for a backend that
+can search dictionaries, the dictionary search's. A dictionary mutation is
+caught by those three - or some of them - and none of the others.
 
 Two more run on every copy too. tests/search_overflow_test.cpp
 ("overflow") covers what happens when a launch has more hits than it can
@@ -183,6 +183,16 @@ DICT_COMMON_MUTATIONS = [
     Mutation("dictsuffixbasename", "the basename every candidate has, when the suffix has a '\\', never reported",
              [(DICT_COMMON, "if (suffixBasenameMatches_ && !batches.empty())", "if (false)")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
+    # A search checking basenames hashes them alone: the verifier checks
+    # hashA and hashB of the candidates whose basename matches.
+    Mutation("dictkeynoa", "a basename hit's hashA and hashB never checked",
+             [(DICT_COMMON, "        if (candidatesHaveBasenames() && hashAMatches(continueHash(kInitialHashState, filename, kHashAOffset, table).first, targetA_))\n"
+                            "            addHashAHit(filename);\n", "")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictkeyanya", "every basename hit taken as a hashA hit",
+             [(DICT_COMMON, "if (candidatesHaveBasenames() && hashAMatches(continueHash(kInitialHashState, filename, kHashAOffset, table).first, targetA_))",
+               "if (candidatesHaveBasenames())")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
     # Searching the words in another order, or launching a segment more than
     # there are, must not change what's found.
     Mutation("dictlongestfirst", "the word table in the order of their lengths, longest first", expect="harmless",
@@ -213,10 +223,25 @@ CUDA_DICT_MUTATIONS = [
              [(KERNEL, "                step(four, 2);\n                step(four, 3);", "                step(four, 2);\n                step(four, 2);")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictreset", "a word with a '\\' hashing its basename on from the batch's",
-             [(KERNEL, "            key1 = 0x7FED7FED;\n            key2 = 0xEEEEEEEE;", "            key1 = batch.basenameSeed1;\n            key2 = batch.basenameSeed2;")],
+             [(KERNEL, "            seed1 = 0x7FED7FED;\n            seed2 = 0xEEEEEEEE;\n            uint32_t four = 0;",
+               "            seed1 = batch.basenameSeed1;\n            seed2 = batch.basenameSeed2;\n            uint32_t four = 0;")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictfromslash", "a word's basename hashed from one character after where it starts",
-             [(KERNEL, "if (c >= basenameStart)", "if (c > basenameStart)")],
+             [(KERNEL, "for (uint32_t c = basenameStart; c < length; ++c) {", "for (uint32_t c = basenameStart + 1; c < length; ++c) {")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictfirstfour", "a word's basename starting part way into four characters hashed before they're read",
+             [(KERNEL, "if (c == basenameStart || (c & 3) == 0)", "if ((c & 3) == 0)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictkeypart", "the basename hashed with hashA's part of the crypt table",
+             [(KERNEL, "const uint32_t* const hashKeys = cryptKeys + (Basenames ? 256 : 0);", "const uint32_t* const hashKeys = cryptKeys;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictkeyfilter", "the basename hash's suffix let through by hashA's filter",
+             [(KERNEL, "const uint32_t* const hashFilter = filters + (Basenames ? kDictionaryFilterWords : 0);",
+               "const uint32_t* const hashFilter = filters;")],
+             caught_by=("self-test", "dictionary")),
+    Mutation("dictkeyseed", "the basename hashed on from hashA's state after the leading part",
+             [(KERNEL, "        uint32_t seed1 = Basenames ? batch.basenameSeed1 : batch.seed1;\n        uint32_t seed2 = Basenames ? batch.basenameSeed2 : batch.seed2;",
+               "        uint32_t seed1 = batch.seed1;\n        uint32_t seed2 = batch.seed2;")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictfilter", "the suffix filter's bits read 31 to a word",
              [(KERNEL, "if (!(filter[index / 32] >> (index % 32) & 1))", "if (!(filter[index / 32] >> (index % 31) & 1))")],
@@ -398,8 +423,18 @@ OPENCL_DICT_MUTATIONS = [
              [(CL_DICT_KERNEL, "                if (rest > 2)\n                    STEP_CHAR(four, 2);", "                if (rest > 3)\n                    STEP_CHAR(four, 2);")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictreset", "a word with a '\\' hashing its basename on from the batch's",
-             [(CL_DICT_KERNEL, "            key1 = 0x7FED7FEDu;\n            key2 = 0xEEEEEEEEu;\n            uint four = 0;",
+             [(CL_DICT_KERNEL, "            seed1 = 0x7FED7FEDu;\n            seed2 = 0xEEEEEEEEu;\n            uint four = 0;",
                "            uint four = 0;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictfirstfour", "a word's basename starting part way into four characters hashed before they're read",
+             [(CL_DICT_KERNEL, "if (c == basenameStart || (c & 3) == 0)", "if ((c & 3) == 0)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictkeypart", "the basename hashed with hashA's part of the crypt table",
+             [(CL_DICT_KERNEL, "lKeys[i] = cryptKeys[256 * HASH_PART + i];", "lKeys[i] = cryptKeys[i];")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictkeyseed", "the basename hashed on from hashA's state after the leading part",
+             [(CL_DICT_KERNEL, "        uint seed1 = BASENAMES ? batch.basenameSeed1 : batch.seed1;\n        uint seed2 = BASENAMES ? batch.basenameSeed2 : batch.seed2;",
+               "        uint seed1 = batch.seed1;\n        uint seed2 = batch.seed2;")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictfilter", "the suffix filter's index shifting seed2's bits one too far",
              [(CL_DICT_KERNEL, "#define FILTER_INDEX(seed1, seed2) (((seed1) & FILTER_STATE_MASK) | (((seed2) & FILTER_STATE_MASK) << FILTER_BITS))",
@@ -684,6 +719,9 @@ CPU_MUTATIONS = [
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictcpusuffix", "the basename hash's suffix never hashed",
              [(CPU, "                    for (unsigned char ch : suffix)\n                        stepBasename(ch);\n", "")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictcpureset", "a word's '\\' hashed into its basename, rather than starting it over",
+             [(CPU, "                        if (ch == '\\\\') {", "                        if (false) {")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
 ] + ENGINE_PRUNING_MUTATIONS
 
