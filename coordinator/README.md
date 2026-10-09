@@ -384,9 +384,9 @@ have a `\` or `/`.
 A dictionary target's candidates are made of words: one to `max_words` of
 them, with a separator between each two - every word from its word lists,
 merged (normalized as Storm hashes names - letters uppercase, `/` as `\` -
-sorted, and without duplicates), every separator from its `separators`. A
-filename is prefix + candidate + suffix, so `MUSIC\` + `BATTLE` + `_` +
-`THEME` + `.WAV`. It's the client's dictionary mode (see the client README's
+sorted, and without duplicates), every separator from its `separators` -
+and then, if it has `tails`, a tail. A filename is prefix + candidate +
+suffix, so `MUSIC\` + `BATTLE` + `_` + `THEME` + `2` + `.WAV`. It's the client's dictionary mode (see the client README's
 "Dictionary mode"), shared out.
 
 `english-1`, the dictionary compiled into the client, is built into the
@@ -426,7 +426,8 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "dictionary": {
       "word_lists": ["english-1", "sc-units"],
       "separators": ["", "_", "-", " "],
-      "min_words": 1, "max_words": 2
+      "min_words": 1, "max_words": 2,
+      "tails": ["digits:0-1"]
     },
     "lower_bound": "MUSIC\\BG", "upper_bound": "MUSIC\\BH",
     "encryption_key_hex": "0x1D5AD26C", "send_basenames": true
@@ -437,6 +438,14 @@ curl -X POST localhost:8080/api/v1/admin/targets \
   printable ASCII - `""` writes words together. `min_words` (default 1) to
   `max_words`: at most 8, and no more candidates than 2^63 - two words of
   `english-1` with four separators are 16.3 billion, three 4.2 * 10^15.
+- `tails` (default none): what follows the last word - every string made of
+  one of each element's, in turn, each once. An element is `digits:A-B`
+  (every string of A to B digits, `digits:N` exactly N), `letters:A-B` (the
+  same of A-Z) or `X|Y|...` (one of these literal strings, `""` among them
+  if it ends with `|`): `["digits:1-2", "letters:0-1"]` makes 2,970 tails,
+  `0` to `9Z`, for names like `PROTOSS1` and `KEEP3B`. At most 8 characters
+  a tail, no `\`, and 1,048,576 tails; the candidates are as many times as
+  many (see **Tails.** in the client README's "Dictionary mode").
 - `lower_bound`/`upper_bound`: whole filenames this time (prefix, candidate
   and suffix), inclusive, either or both left out for none. Candidates are
   numbered with their first word slowest, so bounds mostly pick out first
@@ -465,7 +474,7 @@ curl -X POST localhost:8080/api/v1/admin/targets \
 
 `PATCH` takes `name`, `status`, `priority`, `description`,
 `encryption_key_hex`, `base_file_name` and `send_basenames` - the words,
-separators, word counts, prefix, suffix and bounds can't be changed.
+separators, word counts, tails, prefix, suffix and bounds can't be changed.
 
 A dictionary target's ranges are ranges of candidate numbers, sized by each
 client's rate at dictionary searches, measured apart from its rate at
@@ -473,12 +482,14 @@ alphabet ones (`users.ema_dictionary_rate_per_sec`; a GPU searches some 20
 billion a second, a CPU some 0.2 billion) - `DEFAULT_DICTIONARY_RATE_PER_SEC`
 until it's measured. A range never spans two numbers of words, which is its
 `candidate_len` (the dashboard's Words column). A claim of one carries the
-word lists' names and checksums, the separators, the word counts, the range's
-first and end numbers, the bounds, the key if the target has one, and
-whether to send basenames (see
+word lists' names and checksums, the separators, the word counts, the
+tails' elements and the checksum of the tails they make if the target has
+tails, the range's first and end numbers, the bounds, the key if the target
+has one, and whether to send basenames (see
 `ClaimResponse::dictionary` in `protocol/src/lib.rs`); the client checks its
-copy of each word list against its checksum, and the merged words against
-theirs, before it searches. Heartbeats and a quit report progress as a
+copy of each word list against its checksum, and the merged words and the
+tails it makes against theirs, before it searches - handing the range back
+if any differs. Heartbeats and a quit report progress as a
 candidate number (`next_candidate_number` - every candidate numbered below it
 has been searched) rather than a Hash A match, so a dictionary range is
 checkpointed at every heartbeat, and a quit splits it exactly there. Clients

@@ -1738,9 +1738,9 @@
     return frag;
   }
 
-  // What a dictionary target's candidates are made of: its word lists and
-  // separators, how many words a candidate has, and how many candidates
-  // that makes - all of them, and those its bounds leave.
+  // What a dictionary target's candidates are made of: its word lists,
+  // separators and tails, how many words a candidate has, and how many
+  // candidates that makes - all of them, and those its bounds leave.
   function dictionarySettings(d) {
     const frag = document.createDocumentFragment();
     frag.appendChild(settingsLine('Words', [
@@ -1750,6 +1750,11 @@
     const separators = d.separators.map((s) => (s === '' ? hint('none', 'Words written together') : candidateChip(s)));
     const wordCounts = d.min_words === d.max_words ? words(d.min_words) : `${d.min_words} to ${d.max_words} words`;
     frag.appendChild(settingsLine('Separators', [separators.flatMap((x, i) => (i ? [', ', x] : [x])), `${wordCounts} a candidate`]));
+    // The tails after the last word, as given - e.g. digits:1-2, letters:0-1.
+    if (d.tails && d.tails.length) {
+      const tails = d.tails.map((t) => candidateChip(t)).flatMap((chip, i) => (i ? [', ', chip] : [chip]));
+      frag.appendChild(settingsLine('Tails', [tails, `${fmtNum(d.tail_count)} after every last word`]));
+    }
     const candidates = d.candidate_count === d.total_count
       ? `${fmtNum(d.candidate_count)}`
       : `${fmtNum(d.candidate_count)} of ${fmtNum(d.total_count)} within the bounds`;

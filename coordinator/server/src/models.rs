@@ -95,6 +95,10 @@ pub struct Target {
     pub separators: Option<String>,
     pub min_words: Option<i64>,
     pub max_words: Option<i64>,
+    /// A dictionary target's tail elements (see `dictionary::expand_tails`),
+    /// as a JSON array of strings - None for an alphabet target, or one made
+    /// before there were tails, which has none.
+    pub tails: Option<String>,
     /// 1 to have clients send the basenames that match the encryption key -
     /// see `AdminCreateTargetRequest::send_basenames`.
     pub send_basenames: i64,

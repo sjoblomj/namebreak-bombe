@@ -470,14 +470,16 @@ async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetReque
     }
 
     let mut tx = state.pool.begin().await?;
-    let loaded = dictionary::load(&mut tx, &settings.word_lists, &separators, settings.min_words, settings.max_words, &prefix, &suffix, bounds.clone()).await?;
+    let loaded =
+        dictionary::load(&mut tx, &settings.word_lists, &separators, settings.min_words, settings.max_words, &settings.tails, &prefix, &suffix, bounds.clone())
+            .await?;
     let first = loaded.windows[0];
     let now = now_unix();
     let as_json = |list: &[String]| serde_json::to_string(list).expect("a list of strings serializes");
     let target_id: i64 = sqlx::query_scalar(
         "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, alphabet_name, alphabet, status, priority, description, \
-         start_len, encryption_key, base_file_name, kind, word_lists, separators, min_words, max_words, send_basenames, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'active', ?, ?, 1, ?, ?, 'dictionary', ?, ?, ?, ?, ?, ?) RETURNING id",
+         start_len, encryption_key, base_file_name, kind, word_lists, separators, min_words, max_words, tails, send_basenames, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'active', ?, ?, 1, ?, ?, 'dictionary', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&prefix)
@@ -495,6 +497,7 @@ async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetReque
     .bind(as_json(&separators))
     .bind(settings.min_words)
     .bind(settings.max_words)
+    .bind((!settings.tails.is_empty()).then(|| as_json(&settings.tails)))
     .bind(req.send_basenames as i64)
     .bind(now)
     .fetch_one(&mut *tx)

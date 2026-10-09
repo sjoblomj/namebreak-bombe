@@ -233,6 +233,14 @@ pub struct ClaimResponse {
     pub min_words: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_words: Option<i64>,
+    /// A dictionary target's tail elements, as given (see
+    /// `DictionarySettings::tails`), and the checksum (as `words_checksum`)
+    /// of the tails they make - which the client checks its own expansion
+    /// against. Left out without tails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tails: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tails_checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_candidate_number: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -500,10 +508,10 @@ pub struct AdminCreateTargetRequest {
 }
 
 /// What a dictionary target's candidates are made of. A candidate is
-/// `min_words` to `max_words` words, with a separator between each two:
-/// every word from the word lists (merged: normalized, sorted and without
-/// duplicates), every separator from `separators`. Its filename is prefix +
-/// candidate + suffix. They're numbered as the client's dictionary mode
+/// `min_words` to `max_words` words, with a separator between each two, and
+/// then a tail: every word from the word lists (merged: normalized, sorted
+/// and without duplicates), every separator from `separators`, every tail
+/// from what `tails` makes. Its filename is prefix + candidate + suffix. They're numbered as the client's dictionary mode
 /// numbers them (client/src/engine/dictionary.h), and none of this can be
 /// changed once the target is made.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +525,17 @@ pub struct DictionarySettings {
     pub min_words: i64,
     /// At most 8, and no more candidates than 2^63.
     pub max_words: i64,
+    /// What follows the last word, as a list of elements, each of which
+    /// stands for some strings: `digits:A-B` (every string of A to B digits,
+    /// leading zeros and all - `digits:N` for exactly N), `letters:A-B` (the
+    /// same of the letters A-Z), or `X|Y|...` (one of these strings, "" among
+    /// them if it ends with '|'). The tails are every string made of one of
+    /// each element's, in turn: `["digits:1-2", "letters:0-1"]` makes 0-9 and
+    /// 00-99, each with nothing or a letter after it - `PROTOSS1`,
+    /// `KEEP3B`. At most 8 characters and 2^20 tails, no '\'. Defaults to
+    /// none.
+    #[serde(default)]
+    pub tails: Vec<String>,
 }
 
 fn default_start_len() -> i64 {

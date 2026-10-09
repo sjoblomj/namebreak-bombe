@@ -295,6 +295,44 @@ async fn a_dictionary_target_has_to_make_sense() {
 }
 
 #[tokio::test]
+async fn a_target_with_tails_numbers_them_and_claims_say_so() {
+    let state = state(3.0).await;
+    put_list(&state, "nato", WORDS).await.unwrap();
+    let tails = serde_json::json!(["digits:1", "_|"]);
+    let id = create(&state, serde_json::json!({"dictionary": {"word_lists": ["nato"], "separators": ["", "_"], "max_words": 1, "tails": tails}}))
+        .await
+        .unwrap();
+    assert_eq!(target(&state, id).await.tails.as_deref(), Some(r#"["digits:1","_|"]"#), "the elements kept as given");
+    let client = user(&state, "u", "1.5.0").await;
+    let c = claim(&state, &client).await.unwrap();
+    assert_eq!(c.tails, Some(vec!["digits:1".to_string(), "_|".to_string()]));
+    let made = dictionary::expand_tails(&["digits:1".to_string(), "_|".to_string()]).unwrap();
+    assert_eq!(made.len(), 20, "0-9, then nothing or _");
+    assert_eq!(c.tails_checksum, Some(dictionary::hex64(dictionary::checksum(&made))));
+    // 5 words of 20 tails each, numbered 0 to 99, the tail fastest: the
+    // claim's first and last candidate, ALPHA and its first tails.
+    let end = c.end_candidate_number.unwrap();
+    assert!(c.first_candidate_number == Some(0) && end > 1 && end <= 20, "{c:?}");
+    assert_eq!(c.lower_bound_filename, "MUSIC\\ALPHA0.WAV");
+    assert_eq!(c.upper_bound_filename, format!("MUSIC\\ALPHA{}.WAV", made[end as usize - 1]));
+    assert_eq!(&made[..3], &["0", "0_", "1"]);
+
+    // Without tails, a claim has none - as a client too old to know them reads it.
+    let plain = create(&state, serde_json::json!({"name": "plain", "priority": 5})).await.unwrap();
+    let c = claim(&state, &client).await.unwrap();
+    assert_eq!((c.target_id, c.tails, c.tails_checksum), (plain, None, None));
+    assert_eq!(target(&state, plain).await.tails, None);
+
+    // Tails that don't make tails are refused.
+    for (bad, in_error) in [("digits:2-1", "A <= B"), ("digits:9", "longer than"), ("a/b", "'\\'"), ("digits:7", "more than")] {
+        let err = create(&state, serde_json::json!({"name": bad, "dictionary": {"word_lists": ["nato"], "separators": [""], "max_words": 1, "tails": [bad]}}))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, AppError::BadRequest(msg) if msg.contains("invalid tails") && msg.contains(in_error)), "{bad}: {err:?}");
+    }
+}
+
+#[tokio::test]
 async fn too_many_candidates_are_refused() {
     let state = state(1.0).await;
     let words: String = (0..1000).map(|i| format!("w{i}\n")).collect();

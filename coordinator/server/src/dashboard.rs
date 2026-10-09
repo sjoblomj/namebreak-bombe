@@ -246,6 +246,10 @@ pub struct DashboardDictionary {
     pub separators: Vec<String>,
     pub min_words: i64,
     pub max_words: i64,
+    /// The tail elements, as given (empty for none), and how many tails
+    /// they make.
+    pub tails: Vec<String>,
+    pub tail_count: usize,
     /// Every candidate of those word counts, and how many of them the
     /// target's bounds leave to search (see `dictionary::windows`).
     #[serde(serialize_with = "as_decimal")]
@@ -942,6 +946,8 @@ fn dictionary_target(
             separators: space.separators().to_vec(),
             min_words: space.min_words(),
             max_words: space.max_words(),
+            tails: dictionary.tail_elements.clone(),
+            tail_count: space.tails().len(),
             total_count: space.size() as Pos,
             candidate_count: dictionary.window_candidates() as Pos,
             send_basenames: target.send_basenames != 0,
