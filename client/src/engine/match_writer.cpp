@@ -22,10 +22,11 @@ bool writeLine(const std::string& path, const char* mode, const std::string& lin
     return ok;
 }
 
-// Writes `contents` to `path`, replacing what it held - in text mode, as
-// writeLine does, so a line break is "\r\n" on Windows.
-bool writeContents(const std::string& path, const std::string& contents, std::string& error) {
-    FILE* f = fopen(path.c_str(), "w");
+// Writes `contents` to `path`, replacing what it held - in `mode`: "w" is
+// text mode, as writeLine writes, so a line break is "\r\n" on Windows;
+// "wb" writes the bytes as they are.
+bool writeContents(const std::string& path, const std::string& contents, const char* mode, std::string& error) {
+    FILE* f = fopen(path.c_str(), mode);
     if (!f) {
         error = "fopen " + path + ": " + strerror(errno);
         return false;
@@ -37,11 +38,11 @@ bool writeContents(const std::string& path, const std::string& contents, std::st
     return ok;
 }
 
-} // namespace
-
-bool replaceFileContents(const std::string& path, const std::string& contents, std::string& error) {
+// replaceFileContents and replaceFileBytes, writing in `mode` - see
+// writeContents.
+bool replaceFile(const std::string& path, const std::string& contents, const char* mode, std::string& error) {
     const std::string tmp = path + ".tmp";
-    if (!writeContents(tmp, contents, error))
+    if (!writeContents(tmp, contents, mode, error))
         return false;
     std::error_code ec;
     // Windows won't rename over a file another process has open - as the GUI
@@ -56,7 +57,17 @@ bool replaceFileContents(const std::string& path, const std::string& contents, s
             return true;
     }
     std::filesystem::remove(tmp, ec);
-    return writeContents(path, contents, error);
+    return writeContents(path, contents, mode, error);
+}
+
+} // namespace
+
+bool replaceFileContents(const std::string& path, const std::string& contents, std::string& error) {
+    return replaceFile(path, contents, "w", error);
+}
+
+bool replaceFileBytes(const std::string& path, const std::string& contents, std::string& error) {
+    return replaceFile(path, contents, "wb", error);
 }
 
 namespace {

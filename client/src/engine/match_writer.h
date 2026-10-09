@@ -62,6 +62,10 @@ private:
 // `error` set, if it can't be written.
 bool replaceFileContents(const std::string& path, const std::string& contents, std::string& error);
 
+// replaceFileContents, but `contents` written byte for byte - not in text
+// mode, where a line break becomes "\r\n" on Windows.
+bool replaceFileBytes(const std::string& path, const std::string& contents, std::string& error);
+
 // The file a search whose matches file is `matchesPath` appends its
 // both-hashes matches to: found.txt, in the same directory.
 std::string foundFilePath(const std::string& matchesPath);

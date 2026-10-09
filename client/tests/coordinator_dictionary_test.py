@@ -5,9 +5,9 @@ localhost.
 
 Phase 1 - a quit part way: a big dictionary target (english-1, two words),
 whose second range the client is still searching when it's told to quit
-(SIGTERM). Its quit report has to carry how far it got, as a candidate
-number - the server splits the range there - and the basename it found
-matching the target's key, which the server keeps.
+(SIGTERM, or Ctrl+Break on Windows). Its quit report has to carry how far
+it got, as a candidate number - the server splits the range there - and the
+basename it found matching the target's key, which the server keeps.
 
 Phase 2 - searching to the end: a dictionary target with a planted name
 (english-1 and a word list of the test's own, which the client downloads
@@ -206,13 +206,18 @@ class Client:
             f.write("poll_interval_secs = 1\n")
         self.output_path = os.path.join(workdir, name + ".log")
         self.output = open(self.output_path, "w")
+        # On Windows, a process group of its own, for quit()'s Ctrl+Break to
+        # go to it alone.
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         self.process = subprocess.Popen([binary, "--config", config], stdin=subprocess.DEVNULL, stdout=self.output, stderr=subprocess.STDOUT,
-                                        cwd=workdir)
+                                        cwd=workdir, creationflags=flags)
         Client.started.append(self)
 
     def quit(self):
-        """SIGTERM: the client tells the server how far it got, and exits."""
-        self.process.send_signal(signal.SIGTERM)
+        """SIGTERM: the client tells the server how far it got, and exits.
+        Windows has no SIGTERM to send - Popen would terminate the process
+        outright - so it's Ctrl+Break there, a quit to the client too."""
+        self.process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
         code = self.process.wait(timeout=60)
         self.output.close()
         return code

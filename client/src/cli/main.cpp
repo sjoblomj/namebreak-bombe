@@ -103,7 +103,8 @@ void pauseKeyListener() {
 // restoring the terminal first like the handler enableRawKeypressMode()
 // installed would have. For SIGTERM always, for SIGINT when stdin isn't a
 // terminal (no pausing then), and for the Ctrl+C that would otherwise quit
-// - see handleSigintPauseOrQuit. Signal-handler context: see there.
+// - see handleSigintPauseOrQuit - and for Ctrl+Break on Windows.
+// Signal-handler context: see there.
 void requestQuitOrQuitNow(int sig) {
     if (!g_quitRequested.exchange(true, std::memory_order_relaxed)) {
         static constexpr char kMsg[] =
@@ -313,6 +314,11 @@ int main(int argc, char* argv[]) {
         // handleQuitSignal. A SIGTERM (systemd stopping a service, say) is a
         // quit too, and so is Ctrl+C without a terminal to pause from.
         std::signal(SIGTERM, handleQuitSignal);
+#ifdef SIGBREAK
+        // Windows has no SIGTERM to send: a console program is stopped with
+        // Ctrl+Break (GenerateConsoleCtrlEvent), which arrives as SIGBREAK.
+        std::signal(SIGBREAK, handleQuitSignal);
+#endif
         if (!interactive)
             std::signal(SIGINT, handleQuitSignal);
         int exitCode = runCoordinator(cargs, &g_paused, &g_quitRequested, nullptr, &g_finishRangeThenPause);

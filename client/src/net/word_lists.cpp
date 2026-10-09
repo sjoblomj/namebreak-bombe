@@ -79,7 +79,7 @@ bool resolveClaimWords(const ClaimResponse& claim, const std::string& cacheDir, 
                 std::error_code ec;
                 std::filesystem::create_directories(cacheDir, ec);
                 std::string writeError;
-                if (ec || !replaceFileContents(path, text, writeError))
+                if (ec || !replaceFileBytes(path, text, writeError))
                     fprintf(stderr, "[coordinator] warning: can't keep word list %s in %s (%s) - it'll be downloaded again next time\n", name.c_str(),
                             path.c_str(), ec ? ec.message().c_str() : writeError.c_str());
                 downloaded.push_back(name);
