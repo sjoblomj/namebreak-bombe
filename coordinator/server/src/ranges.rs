@@ -119,6 +119,7 @@ pub(crate) fn to_claim_response(
 pub(crate) fn to_dictionary_claim_response(target: &Target, dictionary: &DictionaryTarget, range_id: i64, start: i64, end: i64, lease_seconds: i64) -> ClaimResponse {
     let filename = |number: i64| format!("{}{}{}", target.prefix, dictionary.space.text(number), target.suffix);
     let send_basenames = target.send_basenames != 0 && target.encryption_key.is_some();
+    let encryption_key_hex = target.encryption_key.map(|key| format!("0x{:08X}", i64_to_u32(key)));
     ClaimResponse {
         range_id,
         target_id: target.id,
@@ -154,7 +155,7 @@ pub(crate) fn to_dictionary_claim_response(target: &Target, dictionary: &Diction
         filename_lower_bound: dictionary.bounds.lower.clone(),
         filename_upper_bound: dictionary.bounds.upper.clone(),
         send_basenames,
-        encryption_key_hex: send_basenames.then(|| format!("0x{:08X}", i64_to_u32(target.encryption_key.expect("checked above")))),
+        encryption_key_hex,
     }
 }
 

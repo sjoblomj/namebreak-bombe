@@ -347,8 +347,18 @@ async fn a_claim_says_everything_the_client_needs() {
     assert_eq!(c.encryption_key_hex.as_deref(), Some("0x0000ABCD"));
     assert_eq!((c.prefix.as_str(), c.suffix.as_str(), c.alphabet.as_str()), ("MUSIC\\", ".WAV", ""));
 
-    // Without send_basenames, the key isn't sent - nor compared.
+    // Without send_basenames, the key is sent all the same: clients compare
+    // only the candidates whose basename matches it to the hashes - and send
+    // none of the basenames.
     handlers::admin_patch_target(State(state.clone()), AdminAuth, Path(id), Json(serde_json::from_value(serde_json::json!({"send_basenames": false})).unwrap()))
+        .await
+        .unwrap();
+    let c = claim(&state, &client).await.unwrap();
+    assert!(!c.send_basenames);
+    assert_eq!(c.encryption_key_hex.as_deref(), Some("0x0000ABCD"));
+
+    // Without a key, neither.
+    handlers::admin_patch_target(State(state.clone()), AdminAuth, Path(id), Json(serde_json::from_value(serde_json::json!({"encryption_key_hex": null})).unwrap()))
         .await
         .unwrap();
     let c = claim(&state, &client).await.unwrap();

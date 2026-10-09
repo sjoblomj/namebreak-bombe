@@ -243,11 +243,14 @@ pub struct ClaimResponse {
     pub filename_lower_bound: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename_upper_bound: Option<String>,
-    /// Compare every candidate's basename to `encryption_key_hex` (hash type
-    /// 3 of what follows its last '\') and send the ones that match - see
+    /// Send every candidate's basename that matches `encryption_key_hex`
+    /// (hash type 3 of what follows its last '\') - see
     /// `HeartbeatRequest::basenames`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub send_basenames: bool,
+    /// A dictionary target's encryption key, if it has one: a client compares
+    /// only the candidates whose basename matches it to the hashes - the
+    /// file's name has that basename. Clients before 1.5 don't read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_hex: Option<String>,
 }
@@ -467,8 +470,10 @@ pub struct AdminCreateTargetRequest {
     /// keys get for their position and size in the archive - mpqcli's
     /// `encryption-key-raw`, StormLib's `SFileInfoEncryptionKeyRaw`. That
     /// key is made from the file's name without its directory, so it's the
-    /// same for every file of that name, wherever it lies. Only stored and
-    /// shown on the dashboard; the search doesn't use it. Defaults to none.
+    /// same for every file of that name, wherever it lies. Shown on the
+    /// dashboard. An alphabet search doesn't use it; a dictionary target's
+    /// clients compare only the candidates whose basename matches it to the
+    /// hashes (see `ClaimResponse::encryption_key_hex`). Defaults to none.
     #[serde(default)]
     pub encryption_key_hex: Option<String>,
     /// The target file's name without its directory, when that's known but
@@ -488,7 +493,8 @@ pub struct AdminCreateTargetRequest {
     /// the key, and send every one that matches, which the server keeps -
     /// a file's name without its directory, found even when the directory
     /// searched is the wrong one. About one candidate in 2^32 matches by
-    /// chance. Defaults to false: clients then don't compare basenames at all.
+    /// chance. Defaults to false: clients then send none (but use the key all
+    /// the same - see `ClaimResponse::encryption_key_hex`).
     #[serde(default)]
     pub send_basenames: bool,
 }

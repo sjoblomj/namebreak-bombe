@@ -369,7 +369,8 @@ since it's never sanitized.
 
 `encryption_key_hex` and `base_file_name` (both optional) record what's known
 about an encrypted target file beyond its two hashes. They're shown on the
-target's dashboard card; the search doesn't use them. `encryption_key_hex` is
+target's dashboard card; an alphabet search doesn't use them (a dictionary
+search does use the key - see `send_basenames` below). `encryption_key_hex` is
 the file's encryption key, in hex like the hashes, without the adjustment
 some files' keys get for their position and size in the archive - mpqcli's
 `encryption-key-raw`. That key is made from the file's name without its
@@ -446,17 +447,17 @@ curl -X POST localhost:8080/api/v1/admin/targets \
   refused.
 - `prefix`, `suffix`, separators and bounds are stored normalized, as the
   client normalizes them.
+- `encryption_key_hex`: with a key, clients compare every candidate's
+  basename - what follows its last `\` - to it, and, unless the suffix has
+  a `\`, only the candidates whose basename matches to the hashes: the
+  file's name has the key's basename. That makes the search about a third
+  faster (see the client README's "Dictionary searches on the GPU") - and
+  means a wrong key hides the file.
 - `send_basenames` (default false, needs `encryption_key_hex`): clients
-  compare every candidate's basename - what follows its last `\` - to the
-  key and send every one that matches, so a file's name is found even when
-  the directory searched is the wrong one. About one candidate in 2^32
-  matches by chance: some four in two words of `english-1` with four
-  separators, about a million in three (see **Basenames** below). Unless
-  the suffix has a `\`, a client then compares only those candidates to
-  the hashes - the file's name has the key's basename - which makes the
-  search about a third faster (see the client README's "Dictionary
-  searches on the GPU"). Without it, clients don't compare basenames at
-  all.
+  also send every basename that matches the key, so a file's name is found
+  even when the directory searched is the wrong one. About one candidate in
+  2^32 matches by chance: some four in two words of `english-1` with four
+  separators, about a million in three (see **Basenames** below).
 - `name`, `priority`, `description`, `encryption_key_hex` and
   `base_file_name` are as for any target; the alphabet, the pruning rules,
   the insertions, `start_len` and `auto_priority` aren't for a dictionary
@@ -473,7 +474,8 @@ billion a second, a CPU some 0.2 billion) - `DEFAULT_DICTIONARY_RATE_PER_SEC`
 until it's measured. A range never spans two numbers of words, which is its
 `candidate_len` (the dashboard's Words column). A claim of one carries the
 word lists' names and checksums, the separators, the word counts, the range's
-first and end numbers, the bounds and, with `send_basenames`, the key (see
+first and end numbers, the bounds, the key if the target has one, and
+whether to send basenames (see
 `ClaimResponse::dictionary` in `protocol/src/lib.rs`); the client checks its
 copy of each word list against its checksum, and the merged words against
 theirs, before it searches. Heartbeats and a quit report progress as a
