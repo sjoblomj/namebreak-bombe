@@ -2144,15 +2144,17 @@ pub async fn create_skip_range(
     Ok(id)
 }
 
-/// Removes a skip range, so nothing it matches stays skipped. Its `skipped`
-/// rows that carving will still reach are removed, so carving searches
-/// them. The ones carving has already passed (see `still_to_be_reached`),
-/// which it never goes back to, become `pending` rows instead, which
-/// `claim_range` hands out ahead of fresh carving - in chunks, see
-/// `split_off_chunk`. The skip range itself is deleted - also one removed
-/// before this worked this way, whose passed rows then get searched too.
-/// Returns how many candidates were requeued as pending, or `None` if
-/// there's no such skip range.
+/// Removes a skip range, so nothing only it matches stays skipped. The
+/// parts of its `skipped` rows another of the target's skip ranges matches
+/// stay skipped, as that one's - so a skip range can be narrowed by adding
+/// the narrower one(s) first, then removing it. Of the rest, what carving
+/// will still reach is removed, so carving searches it. What carving has
+/// already passed (see `still_to_be_reached`), which it never goes back to,
+/// becomes `pending` rows instead, which `claim_range` hands out ahead of
+/// fresh carving - in chunks, see `split_off_chunk`. The skip range itself
+/// is deleted - also one removed before this worked this way, whose passed
+/// rows then get searched too. Returns how many candidates were requeued as
+/// pending, or `None` if there's no such skip range.
 pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<Option<Pos>, AppError> {
     let mut tx = pool.begin().await?;
     let Some(skip_range) = sqlx::query_as::<_, SkipRange>("SELECT * FROM skip_ranges WHERE id = ?").bind(skip_range_id).fetch_optional(&mut *tx).await?
@@ -2169,10 +2171,37 @@ pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<
     let now = now_unix();
     let mut requeued: Pos = 0;
     for row in rows {
-        let span = [(row.start(), row.end())];
-        let reached = still_to_be_reached(&mut tx, &target, row.candidate_len, &row.alphabet_name, &row.alphabet, &span).await?;
         sqlx::query("DELETE FROM ranges WHERE id = ?").bind(row.id).execute(&mut *tx).await?;
-        for (start, end) in subtract_spans(&span, &reached) {
+        // What the other skip ranges match stays skipped, as theirs (this
+        // one's segments are gone already).
+        let others = skip_spans_at(&mut tx, target.id, row.candidate_len, &row.alphabet_name, &row.alphabet).await?;
+        let mut freed = Vec::new();
+        let mut at = row.start();
+        while at < row.end() {
+            let Some((start, end, other_id)) = first_overlap(&others, at, row.end()) else {
+                freed.push((at, row.end()));
+                break;
+            };
+            if at < start {
+                freed.push((at, start));
+            }
+            insert_skipped_range(
+                &mut tx,
+                target.id,
+                row.candidate_len,
+                start,
+                end,
+                &row.alphabet_name,
+                &row.alphabet,
+                row.priority_range_id,
+                Some(other_id),
+                row.created_at,
+            )
+            .await?;
+            at = end;
+        }
+        let reached = still_to_be_reached(&mut tx, &target, row.candidate_len, &row.alphabet_name, &row.alphabet, &freed).await?;
+        for (start, end) in subtract_spans(&freed, &reached) {
             insert_pending_range(&mut tx, target.id, row.candidate_len, start, end, &row.alphabet_name, &row.alphabet, row.priority_range_id, now).await?;
             requeued += end - start;
         }
@@ -4174,6 +4203,64 @@ mod tests {
         assert_eq!((claim.lower_bound_filename.as_str(), claim.upper_bound_filename.as_str()), ("PREC.SUF", "PREE.SUF"));
         let claim = claim_range(&pool, &test_config(30), &user).await.unwrap().expect("F onwards");
         assert_eq!((claim.lower_bound_filename.as_str(), claim.upper_bound_filename.as_str()), ("PREF.SUF", "PREZ.SUF"));
+    }
+
+    /// The `skipped` rows of `target_id` at length `len`, with whose they are.
+    async fn skipped_rows_by_owner(pool: &SqlitePool, target_id: i64, len: i64) -> Vec<(i64, i64, Option<i64>)> {
+        sqlx::query_as("SELECT start_index, end_index, skip_range_id FROM ranges WHERE target_id = ? AND candidate_len = ? AND status = 'skipped' ORDER BY start_index")
+            .bind(target_id)
+            .bind(len)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Narrowing a skip range the sweep hasn't reached - adding the narrower
+    /// ones, then removing it: what they match stays skipped, as theirs, and
+    /// only what's left out of them is searched.
+    #[tokio::test]
+    async fn removing_a_skip_range_keeps_what_another_matches_skipped() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+        let wide = add_skip_range(&pool, target_id, "[C-J]", 1).await;
+        let left = add_skip_range(&pool, target_id, "[C-E]", 1).await;
+        let right = add_skip_range(&pool, target_id, "[G-J]", 1).await;
+        assert_eq!(skipped_rows_by_owner(&pool, target_id, 1).await, vec![(2, 10, Some(wide))], "the narrower ones add no rows of their own");
+
+        assert_eq!(remove_skip_range(&pool, wide).await.unwrap(), Some(0));
+        assert_eq!(skipped_rows_by_owner(&pool, target_id, 1).await, vec![(2, 5, Some(left)), (6, 10, Some(right))]);
+        let claims: Vec<(String, String)> =
+            claim_through_len(&pool, &test_config(1), &user, 1).await.into_iter().map(|c| (c.lower_bound_filename, c.upper_bound_filename)).collect();
+        let expected = [("PREA.SUF", "PREA.SUF"), ("PREB.SUF", "PREB.SUF"), ("PREF.SUF", "PREF.SUF")];
+        assert_eq!(claims[..3], expected.map(|(lo, hi)| (lo.to_string(), hi.to_string())), "A, B, F - then K onwards");
+        assert_eq!(claims[3].0, "PREK.SUF");
+    }
+
+    /// The same where carving has passed it - here a priority range done
+    /// handing out, which never goes back: only what no other skip range
+    /// matches is requeued, and the rest stays skipped.
+    #[tokio::test]
+    async fn removing_a_passed_skip_range_requeues_only_what_no_other_matches() {
+        let pool = test_pool().await;
+        let user = insert_user(&pool, "tester").await;
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let target_id = insert_target_with_alphabet(&pool, "letters", letters, "A", "Z").await;
+        let wide = add_skip_range(&pool, target_id, "[C-J]", 1).await;
+        insert_priority_range(&pool, target_id, letters, "letters", 10, "[A-J]", 1).await;
+        let claims = claim_through_len(&pool, &test_config(30), &user, 1).await;
+        assert_eq!(claims[0].upper_bound_filename, "PREB.SUF", "the priority range hands out A-B and jumps C-J");
+        let left = add_skip_range(&pool, target_id, "[C-E]", 1).await;
+        let right = add_skip_range(&pool, target_id, "[G-J]", 1).await;
+
+        assert_eq!(remove_skip_range(&pool, wide).await.unwrap(), Some(1), "only F");
+        assert_eq!(skipped_rows_by_owner(&pool, target_id, 1).await, vec![(2, 5, Some(left)), (6, 10, Some(right))]);
+        let claim = claim_range(&pool, &test_config(30), &user).await.unwrap().expect("the requeued F");
+        assert_eq!((claim.lower_bound_filename.as_str(), claim.upper_bound_filename.as_str()), ("PREF.SUF", "PREF.SUF"));
+        let next = claim_range(&pool, &test_config(30), &user).await.unwrap().expect("length 2");
+        let len: i64 = sqlx::query_scalar("SELECT candidate_len FROM ranges WHERE id = ?").bind(next.range_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(len, 2, "and nothing else at length 1");
     }
 
     /// Removing a skip range deletes it whether or not it skipped anything,

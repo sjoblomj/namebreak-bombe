@@ -141,8 +141,11 @@ See the top-level plan/design notes for the full rationale; the short version:
   (the main sweep or a priority range) jumps straight over them. Ranges
   already carved, even pending ones, are left alone. Where a skip range
   overlaps a priority range, skipping wins.
-  `DELETE /api/v1/admin/skip-ranges/{id}` deletes it, and nothing it
-  matched stays skipped. Its rows that carving hasn't reached yet are
+  `DELETE /api/v1/admin/skip-ranges/{id}` deletes it, and nothing only it
+  matched stays skipped: what another of the target's skip ranges matches
+  stays skipped, as that one's. So to narrow a skip range - `[B-M][ -9]` to
+  all but `I` - add the narrower ones (`[B-H][ -9]` and `[J-M][ -9]`) first,
+  then delete it. Of the rest, its rows that carving hasn't reached yet are
   removed, so carving searches those candidates as it gets there. The ones
   the main sweep (or, inside a priority range, the priority range) has
   already passed - carving never goes back - are requeued as pending
