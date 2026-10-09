@@ -38,6 +38,7 @@
 #include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/mpq_hash.h"
+#include "engine/wordlist.h"
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -72,14 +73,15 @@ static std::string basename(const std::string& filename) {
 }
 
 // Every candidate's text in number order, by nested loops (see
-// dictionary.h's numbering).
+// dictionary.h's numbering) - the tail fastest.
 static std::vector<std::string> allCandidates(const DictionaryPattern& p) {
     std::vector<std::string> out;
     for (int k = p.minWords; k <= p.maxWords; ++k) {
         std::function<void(int, const std::string&)> gen = [&](int level, const std::string& text) {
             for (const std::string& word : p.words) {
                 if (level == k - 1) {
-                    out.push_back(text + word);
+                    for (const std::string& tail : p.tails)
+                        out.push_back(text + word + tail);
                     continue;
                 }
                 for (const std::string& separator : p.separators)
@@ -256,6 +258,15 @@ static DictionaryRequest randomRequest(std::mt19937& rng, int round) {
     req.pattern.separators = separatorSets[rng() % separatorSets.size()];
     req.pattern.minWords = 1 + (int) (rng() % 2);
     req.pattern.maxWords = req.pattern.minWords + (int) (rng() % (words.size() > 4 ? 2 : 3));
+    // Tails in two rounds of three: a few, "" among them or not - now and
+    // then of up to 8 characters.
+    if (rng() % 3 != 0) {
+        std::vector<std::string> tails;
+        const int longest = rng() % 4 ? 2 : 8;
+        for (int i = 1 + (int) (rng() % 4); i > 0; --i)
+            tails.push_back(randomString(rng, "1A_", 0, longest));
+        req.pattern.tails = sortedUniqueWords(tails);
+    }
     req.prefix = std::vector<std::string>{"", "REZ\\", "A", "X\\Y_"}[rng() % 4];
     req.suffix = std::vector<std::string>{"", ".TXT", "\\Z", "B"}[rng() % 4];
 
@@ -415,6 +426,72 @@ static void testManyWords(SearchBackend& backend) {
                     !e.firstFound.empty(), hits.size(), e.hits.size(), (unsigned long long) r.candidatesSearched, (unsigned long long) e.searched);
     }
     check(mismatches == 0, std::to_string(rounds) + " searches of 50 to 300 words: as brute force (" + std::to_string(mismatches) + " differ)");
+    check(found >= 5, "... " + std::to_string(found) + " of them finding a planted match of both hashes");
+}
+
+// Many tails - more than a cell of a GPU backend has, so that every word's
+// are split between several threads - with names planted at the edges of
+// those cells, and in parts of the tails a bound or a call's end cuts off.
+static void testManyTails(SearchBackend& backend) {
+    printf("--- many tails ---\n");
+    std::mt19937 rng(9102026);
+    std::vector<std::string> tails, longTails;
+    std::string error;
+    expandDictionaryTails({"digits:1-2", "letters:0-1"}, tails, error);
+    expandDictionaryTails({"PATCH|V|", "digits:0-3"}, longTails, error); // up to 8 characters
+    int mismatches = 0, found = 0;
+    const int rounds = 12;
+    for (int round = 0; round < rounds; ++round) {
+        DictionaryRequest req = freshRequest("tails");
+        std::set<std::string> words;
+        while (words.size() < 20 + rng() % 30)
+            words.insert(randomString(rng, rng() % 6 ? "ABCDEFGH" : "AB\\_", 1, 9));
+        req.pattern.words.assign(words.begin(), words.end());
+        req.pattern.separators = {"", "_"};
+        req.pattern.minWords = 1;
+        req.pattern.maxWords = round % 4 == 3 ? 2 : 1;
+        req.pattern.tails = round % 4 == 3 ? std::vector<std::string>(tails.begin(), tails.begin() + 70) : round % 4 == 1 ? longTails : tails;
+        req.prefix = std::vector<std::string>{"", "UNIT\\", "OR"}[rng() % 3];
+        req.suffix = std::vector<std::string>{".LBM", "", "\\X.WAV"}[rng() % 3];
+        const std::vector<std::string> all = allCandidates(req.pattern);
+        // The planted name: at a cell's edge (32 tails, or 3 in the small
+        // builds), or anywhere.
+        const uint64_t t = std::vector<uint64_t>{0, 31, 32, 63, 64, 2, 3, 5, req.pattern.tails.size() - 1, rng() % req.pattern.tails.size()}[rng() % 10];
+        const uint64_t number = (rng() % (all.size() / req.pattern.tails.size())) * req.pattern.tails.size() + t % req.pattern.tails.size();
+        const std::string planted = req.prefix + all[number] + req.suffix;
+        if (rng() % 2) {
+            req.bounds.hasLower = true;
+            req.bounds.lower = req.prefix + all[rng() % all.size()].substr(0, 1 + rng() % 4);
+        }
+        req.startNumber = rng() % 3 ? 0 : rng() % (number + 1);
+        req.targetHashA = hashOf(planted, 0x100);
+        req.targetHashB = round % 3 ? hashOf(planted, 0x200) : (uint32_t) rng();
+        req.checkBasename = round % 2 == 0;
+        req.basenameKey = hashOf(basename(planted), 0x300);
+        req.recordHashAMatches = round % 6 == 4;
+
+        const Expected e = expectedOf(req);
+        std::vector<std::string> hits;
+        const DictionaryResult r = run(backend, req, &hits);
+        bool ok = r.ok && r.found == !e.firstFound.empty();
+        if (ok && r.found) {
+            ok = r.filename == e.firstFound;
+            ++found;
+        } else if (ok) {
+            std::vector<std::string> got = hits, want = e.hits;
+            std::sort(got.begin(), got.end());
+            std::sort(want.begin(), want.end());
+            const std::vector<std::string> lines = readLines(req.basenamesFilePath);
+            ok = got == want && r.candidatesSearched == e.searched && std::set<std::string>(lines.begin(), lines.end()) == e.basenames;
+        }
+        if (!ok && ++mismatches <= 5)
+            fprintf(stderr, "  round %d: %zu words, %zu tails, planted '%s' (tail %llu): found %d/%d, hits %zu/%zu, searched %llu/%llu\n", round,
+                    req.pattern.words.size(), req.pattern.tails.size(), planted.c_str(), (unsigned long long) t, r.found,
+                    !e.firstFound.empty(), hits.size(), e.hits.size(), (unsigned long long) r.candidatesSearched,
+                    (unsigned long long) e.searched);
+    }
+    check(mismatches == 0, std::to_string(rounds) + " searches with up to 3,333 tails, of up to 8 characters: as brute force (" +
+                               std::to_string(mismatches) + " differ)");
     check(found >= 5, "... " + std::to_string(found) + " of them finding a planted match of both hashes");
 }
 
@@ -828,6 +905,7 @@ int main(int argc, char* argv[]) {
 
     testAgainstBruteForce(*backend);
     testManyWords(*backend);
+    testManyTails(*backend);
     testRealHashes(*backend);
     testBasenamesFile(*backend);
     testEdges(*backend);

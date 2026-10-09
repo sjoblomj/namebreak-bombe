@@ -5,7 +5,10 @@
 //   SUFFIX_LEN        the suffix's length
 //   HASHES            the hashes each candidate gets (dictionaryHashes in
 //                     engine/backend.h): 0 hashA, 1 the basename hash, 2 both
-//   WORDS_PER_THREAD  how many words of a batch one thread hashes
+//   WORDS_PER_THREAD  how many cells of a batch one thread hashes
+//   TAILS             1 if the candidates have tails, 0 if their only tail
+//                     is ""
+//   TAILS_PER_CELL    how many tails a cell has at most
 //   FILTER_BITS       kDictionaryFilterBits: how many low bits of each seed
 //                     index the suffix filters (backends/common/dictionary_batch.h)
 //   FILTER_WORDS      kDictionaryFilterWords: the uint32s of a filter
@@ -14,16 +17,19 @@
 //   BASENAME_MATCH_MASK  the same for the basename hash
 //
 // A launch is cut into segments, up to WORDS_PER_THREAD * the threadgroup's
-// size consecutive words of one batch, one per threadgroup (see
-// planDictionaryLaunch in backends/common/dictionary_batch.h). Its threads
-// take neighbouring words - in the word table's order (by length) if the
-// batch has every word, in the list's if not - and hash each from the
-// batch's states: hashA, the basename hash (which a word with a '\' starts
-// over after the last one), or both, as HASHES says. Then the suffix, where
-// its filter lets it through. Every hashA hit, and every basename hit, is
-// recorded as (batch, word): the host rebuilds and checks them - and, of a
-// basename hit with the basename hash alone, its hashA and hashB
-// (DictionaryHitVerifier).
+// size consecutive cells of one batch - a cell a word and a chunk of up to
+// TAILS_PER_CELL of the batch's tails - one per threadgroup (see
+// DictionaryLaunchBatch and planDictionaryLaunch in
+// backends/common/dictionary_batch.h). Its threads take neighbouring cells:
+// neighbouring words with the same chunk of tails, the words in the word
+// table's order (by length) if the batch has every word, in the list's if
+// not. A thread hashes its word from the batch's states - hashA, the
+// basename hash (which a word with a '\' starts over after the last one),
+// or both, as HASHES says - then each tail of its chunk from there, and then
+// the suffix, where its filter lets it through. Every hashA hit, and every
+// basename hit, is recorded as (batch, word, tail): the host rebuilds and
+// checks them - and, of a basename hit with the basename hash alone, its
+// hashA and hashB (DictionaryHitVerifier).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -78,11 +84,14 @@ struct DictionaryLaunchBatch {
     uint firstWord;
     uint wordCount;
     uint firstSegment;
-    uint unused;
+    uint firstTail;
+    uint tailCount;
+    uint tailChunks;
 };
 struct DictionaryHit {
     uint batch;
     uint word;
+    uint tail;
 };
 
 // Must match DictionaryArgs in metal_backend.mm.
@@ -107,7 +116,8 @@ static uint hashSuffix(uint seed1, uint seed2, constant uint* suffixKeys, int wh
 // `cryptKeys` is the crypt table's hashA part (0x100) and then its basename
 // hash's part (0x300), 256 entries each, and `filters` the suffix filters,
 // hashA's and then the basename hash's - the ones it uses copied into
-// threadgroup memory. `counts` is how many hits of each kind the launch
+// threadgroup memory. `tails` is the tails (dictionaryTailTable), which a
+// SIMD-group's threads read together. `counts` is how many hits of each kind the launch
 // had, every one of them, and the hits arrays the first args.capacity of
 // each.
 kernel void searchDictionary(constant DictionaryArgs& args [[buffer(0)]],
@@ -121,16 +131,13 @@ kernel void searchDictionary(constant DictionaryArgs& args [[buffer(0)]],
                              device atomic_int* counts [[buffer(8)]],
                              device DictionaryHit* hashAHits [[buffer(9)]],
                              device DictionaryHit* basenameHits [[buffer(10)]],
+                             device const uint4* tails [[buffer(11)]],
                              uint segment [[threadgroup_position_in_grid]],
                              uint lid [[thread_position_in_threadgroup]],
                              uint lsize [[threads_per_threadgroup]]) {
     threadgroup uint2 lKeys[256];
-#if HASH_A
-    threadgroup uint lFilterA[FILTER_WORDS];
-#endif
-#if HASH_BASENAME
-    threadgroup uint lFilterBasename[FILTER_WORDS];
-#endif
+    threadgroup uint lFilterA[HASH_A ? FILTER_WORDS : 1];
+    threadgroup uint lFilterBasename[HASH_BASENAME ? FILTER_WORDS : 1];
     threadgroup uint lBatch;
     for (uint i = lid; i < 256; i += lsize)
         lKeys[i] = uint2(cryptKeys[i], cryptKeys[256 + i]);
@@ -160,10 +167,18 @@ kernel void searchDictionary(constant DictionaryArgs& args [[buffer(0)]],
     const uint batchIndex = lBatch;
     const DictionaryLaunchBatch batch = batches[batchIndex];
     const bool wholeList = batch.wordCount == args.wordCount;
-    const uint wordsPerSegment = WORDS_PER_THREAD * lsize;
-    const uint first = (segment - batch.firstSegment) * wordsPerSegment;
-    const uint end = min(first + wordsPerSegment, batch.wordCount);
-    for (uint i = first + lid; i < end; i += lsize) {
+    const uint cellsPerSegment = WORDS_PER_THREAD * lsize;
+    const uint first = (segment - batch.firstSegment) * cellsPerSegment;
+    const uint end = min(first + cellsPerSegment, batch.wordCount * batch.tailChunks);
+    for (uint cell = first + lid; cell < end; cell += lsize) {
+        // The cell's word, and its chunk of the tails.
+        uint i = cell, tailFirst = batch.firstTail, tailEnd = batch.firstTail + batch.tailCount;
+        if (TAILS && batch.tailChunks > 1) {
+            const uint chunk = cell / batch.wordCount;
+            i = cell - chunk * batch.wordCount;
+            tailFirst += chunk * TAILS_PER_CELL;
+            tailEnd = min(tailFirst + TAILS_PER_CELL, tailEnd);
+        }
         const uint4 entry = entries[wholeList ? i : positions[batch.firstWord + i]];
         const uint length = entry.y, basenameStart = entry.z, index = entry.w;
         device const uint* wordChars = chars + entry.x;
@@ -208,23 +223,47 @@ kernel void searchDictionary(constant DictionaryArgs& args [[buffer(0)]],
                     STEP_PLUS3(key1, key2, keys.y, ch + 3);
             }
         }
-#if HASH_A
-        if (FILTER_PASSES(lFilterA, seed1, seed2) && HASHA_MATCHES(hashSuffix(seed1, seed2, suffixKeys, 0), args.targetA)) {
-            const int slot = atomic_fetch_add_explicit(&counts[0], 1, memory_order_relaxed);
-            if ((uint) slot < args.capacity) {
-                hashAHits[slot].batch = batchIndex;
-                hashAHits[slot].word = index;
+        // The suffix after tail `tailIndex`, which has left the states at
+        // (s1, s2) and (k1, k2): a hit recorded where it matches.
+#define CHECK_SUFFIX(s1, s2, k1, k2, tailIndex)                                                                            \
+    do {                                                                                                                   \
+        if (HASH_A && FILTER_PASSES(lFilterA, s1, s2) && HASHA_MATCHES(hashSuffix(s1, s2, suffixKeys, 0), args.targetA)) { \
+            const int slot = atomic_fetch_add_explicit(&counts[0], 1, memory_order_relaxed);                               \
+            if ((uint) slot < args.capacity) {                                                                             \
+                hashAHits[slot].batch = batchIndex;                                                                        \
+                hashAHits[slot].word = index;                                                                              \
+                hashAHits[slot].tail = (tailIndex);                                                                        \
+            }                                                                                                              \
+        }                                                                                                                  \
+        if (HASH_BASENAME && FILTER_PASSES(lFilterBasename, k1, k2) &&                                                     \
+            BASENAME_MATCHES(hashSuffix(k1, k2, suffixKeys, 1), args.basenameKey)) {                                       \
+            const int slot = atomic_fetch_add_explicit(&counts[1], 1, memory_order_relaxed);                               \
+            if ((uint) slot < args.capacity) {                                                                             \
+                basenameHits[slot].batch = batchIndex;                                                                     \
+                basenameHits[slot].word = index;                                                                           \
+                basenameHits[slot].tail = (tailIndex);                                                                     \
+            }                                                                                                              \
+        }                                                                                                                  \
+    } while (0)
+#if TAILS
+        // Each tail on from the word's states: its characters, eight at
+        // most, two uints of them.
+        for (uint t = tailFirst; t < tailEnd; ++t) {
+            const uint4 tail = tails[t];
+            uint s1 = seed1, s2 = seed2, k1 = key1, k2 = key2;
+            for (uint c = 0; c < tail.z; ++c) {
+                const uint ch = ((c < 4 ? tail.x : tail.y) >> (8 * (c & 3))) & 0xFFu;
+                const uint2 keys = lKeys[ch];
+                if (HASH_A)
+                    STEP_PLUS3(s1, s2, keys.x, ch + 3);
+                if (HASH_BASENAME)
+                    STEP_PLUS3(k1, k2, keys.y, ch + 3);
             }
+            CHECK_SUFFIX(s1, s2, k1, k2, t);
         }
+#else
+        CHECK_SUFFIX(seed1, seed2, key1, key2, tailFirst);
 #endif
-#if HASH_BASENAME
-        if (FILTER_PASSES(lFilterBasename, key1, key2) && BASENAME_MATCHES(hashSuffix(key1, key2, suffixKeys, 1), args.basenameKey)) {
-            const int slot = atomic_fetch_add_explicit(&counts[1], 1, memory_order_relaxed);
-            if ((uint) slot < args.capacity) {
-                basenameHits[slot].batch = batchIndex;
-                basenameHits[slot].word = index;
-            }
-        }
-#endif
+#undef CHECK_SUFFIX
     }
 }

@@ -5,6 +5,7 @@
 #include <random>
 
 #include "backends/common/lowbits_filter.h"
+#include "engine/dictionary.h"
 #include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 
@@ -101,7 +102,8 @@ bool checkDictionarySuffixFilter(const std::vector<uint32_t>& filter, const std:
     return true;
 }
 
-uint64_t planDictionaryLaunch(const std::vector<DictionaryBatch>& batches, uint32_t wordsPerSegment, std::vector<DictionaryLaunchBatch>& out) {
+uint64_t planDictionaryLaunch(const std::vector<DictionaryBatch>& batches, uint32_t cellsPerSegment, uint32_t tailsPerCell,
+                              std::vector<DictionaryLaunchBatch>& out) {
     out.clear();
     out.reserve(batches.size());
     uint64_t segments = 0;
@@ -114,11 +116,25 @@ uint64_t planDictionaryLaunch(const std::vector<DictionaryBatch>& batches, uint3
         b.firstWord = batch.firstWord;
         b.wordCount = batch.wordCount;
         b.firstSegment = (uint32_t) segments;
-        b.unused = 0;
+        b.firstTail = batch.firstTail;
+        b.tailCount = batch.tailCount;
+        b.tailChunks = (batch.tailCount + tailsPerCell - 1) / tailsPerCell;
         out.push_back(b);
-        segments += (batch.wordCount + (uint64_t) wordsPerSegment - 1) / wordsPerSegment;
+        segments += ((uint64_t) batch.wordCount * b.tailChunks + cellsPerSegment - 1) / cellsPerSegment;
     }
     return segments;
+}
+
+static_assert(kMaxDictionaryTailLength <= 8, "a tail's characters fit in two uint32s of the tail table");
+
+std::vector<uint32_t> dictionaryTailTable(const std::vector<std::string>& tails) {
+    std::vector<uint32_t> table(4 * tails.size(), 0);
+    for (size_t t = 0; t < tails.size(); ++t) {
+        for (size_t c = 0; c < tails[t].size(); ++c)
+            table[4 * t + c / 4] |= (uint32_t) (unsigned char) tails[t][c] << (8 * (c % 4));
+        table[4 * t + 2] = (uint32_t) tails[t].size();
+    }
+    return table;
 }
 
 uint32_t dictionaryBatchOfSegment(const std::vector<DictionaryLaunchBatch>& batches, uint64_t segment) {
@@ -135,6 +151,7 @@ uint32_t dictionaryBatchOfSegment(const std::vector<DictionaryLaunchBatch>& batc
 
 void DictionaryHitVerifier::begin(const DictionaryConstants& constants) {
     words_ = constants.words;
+    tails_ = constants.tails;
     suffix_ = constants.suffix;
     cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
     targetA_ = constants.targetHashA;
@@ -151,7 +168,7 @@ void DictionaryHitVerifier::begin(const DictionaryConstants& constants) {
 void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches, const std::vector<DictionaryHit>& hashAHits,
                                     const std::vector<DictionaryHit>& basenameHits, DictionaryOutcome& outcome) const {
     const uint32_t* table = cryptTable_.data();
-    auto filenameOf = [&](const DictionaryHit& hit) { return batches[hit.batch].leading + words_[hit.word] + suffix_; };
+    auto filenameOf = [&](const DictionaryHit& hit) { return batches[hit.batch].leading + words_[hit.word] + tails_[hit.tail] + suffix_; };
     // A candidate whose hashA matches: a hashA hit, and the match if its
     // hashB does too.
     auto addHashAHit = [&](const std::string& filename) {
@@ -188,5 +205,5 @@ void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches,
             addHashAHit(filename);
     }
     if (suffixBasenameMatches_ && !batches.empty())
-        outcome.basenameHits.push_back(batches[0].leading + words_[batches[0].firstWord] + suffix_);
+        outcome.basenameHits.push_back(batches[0].leading + words_[batches[0].firstWord] + tails_[batches[0].firstTail] + suffix_);
 }

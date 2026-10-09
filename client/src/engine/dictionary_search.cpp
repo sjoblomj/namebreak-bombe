@@ -68,15 +68,16 @@ std::string basenameOf(const std::string& filename) {
 
 namespace {
 
-// A run of candidates the walk below hands on: `leading` followed by each of
-// the words [firstWord, firstWord + wordCount), numbered from firstNumber.
+// A run of candidates the walk below hands on: `leading` followed by the
+// last word and the tail - items [firstItem, firstItem + itemCount) of
+// those, item word * T + tail with T tails - numbered from firstNumber.
 struct Leaf {
     const std::string* leading;
     HashState hashA;
     HashState basename;
     uint64_t firstNumber;
-    uint32_t firstWord;
-    uint32_t wordCount;
+    uint64_t firstItem;
+    uint64_t itemCount;
 };
 
 // Walks a dictionary search's candidates from a start number up to (not
@@ -156,37 +157,56 @@ private:
         return true;
     }
 
-    // The candidates `leading` + each word + the suffix, numbered from
-    // nodeStart.
+    // The candidates `leading` + each word + each tail + the suffix,
+    // numbered from nodeStart.
     bool leaf(uint64_t nodeStart, const std::string& leading, HashState hashA, HashState basename, bool inside) {
         const std::vector<std::string>& words = space_.words();
-        const uint32_t wordCount = (uint32_t) words.size();
-        const uint32_t first = start_ > nodeStart ? (uint32_t) (start_ - nodeStart) : 0;
-        const uint32_t last = end_ - nodeStart < wordCount ? (uint32_t) (end_ - nodeStart) : wordCount; // exclusive
+        const std::vector<std::string>& tails = space_.tails();
+        const uint64_t tailCount = tails.size(), items = (uint64_t) words.size() * tailCount;
+        const uint64_t first = start_ > nodeStart ? start_ - nodeStart : 0;
+        const uint64_t last = std::min(end_ - nodeStart, items); // exclusive
         if (inside)
             return emit(nodeStart, leading, hashA, basename, first, last - first);
-        // Cut through by a bound: each candidate is compared, and every run
-        // of them within the bounds handed on.
-        uint32_t runStart = first;
-        for (uint32_t i = first; i <= last; ++i) {
-            const bool within = i < last && bounds_.contains(leading + words[i] + suffix_);
-            if (within)
+        // Cut through by a bound: a word the bounds put wholly inside or
+        // outside isn't compared further, each candidate of one they cut
+        // through is - and every run of them within the bounds handed on.
+        uint64_t runStart = first;
+        auto endRun = [&](uint64_t item) {
+            const bool ok = item <= runStart || emit(nodeStart, leading, hashA, basename, runStart, item - runStart);
+            runStart = item + 1;
+            return ok;
+        };
+        for (uint64_t item = first; item < last;) {
+            const uint64_t word = item / tailCount, wordEnd = std::min((word + 1) * tailCount, last);
+            const std::string start = leading + words[word];
+            const FilenameBounds::Verdict verdict = bounds_.classifyStart(start);
+            if (verdict == FilenameBounds::Verdict::Inside) {
+                item = wordEnd;
                 continue;
-            if (i > runStart && !emit(nodeStart, leading, hashA, basename, runStart, i - runStart))
-                return false;
-            runStart = i + 1;
+            }
+            if (verdict == FilenameBounds::Verdict::Outside) {
+                if (!endRun(item))
+                    return false;
+                runStart = wordEnd;
+                item = wordEnd;
+                continue;
+            }
+            for (; item < wordEnd; ++item) {
+                if (!bounds_.contains(start + tails[item % tailCount] + suffix_) && !endRun(item))
+                    return false;
+            }
         }
-        return true;
+        return endRun(last);
     }
 
     // Hands on a run of (at least one) candidates.
-    bool emit(uint64_t nodeStart, const std::string& leading, HashState hashA, HashState basename, uint32_t firstWord,
-              uint32_t wordCount) {
+    bool emit(uint64_t nodeStart, const std::string& leading, HashState hashA, HashState basename, uint64_t firstItem,
+              uint64_t itemCount) {
         if (!onLeaf_) {
-            counted_ += wordCount;
+            counted_ += itemCount;
             return true;
         }
-        return onLeaf_(Leaf{&leading, hashA, basename, nodeStart + firstWord, firstWord, wordCount});
+        return onLeaf_(Leaf{&leading, hashA, basename, nodeStart + firstItem, firstItem, itemCount});
     }
 
     const DictionarySpace& space_;
@@ -305,6 +325,10 @@ std::string dictionaryFingerprint(const DictionaryRequest& req) {
     text += field("suffix", req.suffix);
     text += req.bounds.hasLower ? field("lower", req.bounds.lower) : "lower=none\n";
     text += req.bounds.hasUpper ? field("upper", req.bounds.upper) : "upper=none\n";
+    // The tails, only if there are any: the fingerprints of searches without
+    // are as they were before there were tails.
+    if (req.pattern.tails != std::vector<std::string>{""})
+        text += field("tails", hex64(wordListChecksum(req.pattern.tails)) + " " + std::to_string(req.pattern.tails.size()));
     text += field("hashes", std::to_string(req.targetHashA) + " " + std::to_string(req.targetHashB));
     // The key, whenever it's known - it decides which candidates are compared
     // to the hashes - and whether the basenames are recorded, and every
@@ -476,6 +500,8 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
            hex64(wordListChecksum(space.words())).c_str());
     printf("separators: %s\n", separators.c_str());
     printf("words per candidate: %d to %d\n", space.minWords(), space.maxWords());
+    if (space.tails().size() > 1)
+        printf("tails: %zu, '%s' to '%s'\n", space.tails().size(), space.tails().front().c_str(), space.tails().back().c_str());
     printf("prefix: '%s'\n", req.prefix.c_str());
     printf("suffix: '%s'\n", req.suffix.c_str());
     printf("lower: %s\n", req.bounds.hasLower ? ("'" + req.bounds.lower + "'").c_str() : "(none)");
@@ -484,6 +510,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     printf("hashB: '%X'\n", req.targetHashB);
     DictionaryConstants constants;
     constants.words = space.words();
+    constants.tails = space.tails();
     constants.suffix = req.suffix;
     constants.cryptTable = cryptTable;
     constants.targetHashA = req.targetHashA;
@@ -619,22 +646,37 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
         return true;
     };
 
+    // A leaf's run of candidates, as batches of whole words, each with every
+    // tail - but a word the run, or a call, has only some of the tails of,
+    // which is a batch of its own: so a batch's candidates are numbered one
+    // after another, and so are a call's.
+    const uint64_t tailCount = space.tails().size();
     Walker walker(space, req.prefix, req.suffix, req.bounds, start, end, cryptTable, [&](const Leaf& leaf) {
-        uint32_t done = 0;
-        while (done < leaf.wordCount) {
-            const uint32_t take = (uint32_t) std::min<uint64_t>(leaf.wordCount - done, perCall - pendingCount);
+        uint64_t item = leaf.firstItem;
+        const uint64_t itemsEnd = leaf.firstItem + leaf.itemCount;
+        while (item < itemsEnd) {
+            const uint64_t room = perCall - pendingCount, word = item / tailCount, tail = item % tailCount;
             DictionaryBatch batch;
             batch.leading = *leaf.leading;
             batch.seed1 = leaf.hashA.first;
             batch.seed2 = leaf.hashA.second;
             batch.basenameSeed1 = leaf.basename.first;
             batch.basenameSeed2 = leaf.basename.second;
-            batch.firstWord = leaf.firstWord + done;
-            batch.wordCount = take;
+            batch.firstWord = (uint32_t) word;
+            if (tail != 0 || itemsEnd - item < tailCount || room < tailCount) {
+                batch.wordCount = 1;
+                batch.firstTail = (uint32_t) tail;
+                batch.tailCount = (uint32_t) std::min({tailCount - tail, itemsEnd - item, room});
+            } else {
+                batch.wordCount = (uint32_t) std::min((itemsEnd - item) / tailCount, room / tailCount);
+                batch.firstTail = 0;
+                batch.tailCount = (uint32_t) tailCount;
+            }
+            const uint64_t count = (uint64_t) batch.wordCount * batch.tailCount;
             pending.push_back(std::move(batch));
-            pendingCount += take;
-            done += take;
-            pendingEnd = leaf.firstNumber + done;
+            pendingCount += count;
+            item += count;
+            pendingEnd = leaf.firstNumber + (item - leaf.firstItem);
             if ((pendingCount >= perCall || pending.size() >= batchesPerCall) && !searchPending())
                 return false;
         }

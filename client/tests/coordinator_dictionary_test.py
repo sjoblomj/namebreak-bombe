@@ -13,7 +13,8 @@ Phase 2 - searching to the end: a dictionary target with a planted name
 (english-1 and a word list of the test's own, which the client downloads
 once and then keeps) whose basename other candidates, in other directories,
 have before it, another one searched through without a find, one with a
-key but no basenames to send, and an alphabet target, all in one run. The finds have to be reported, every
+key but no basenames to send, one with tails after its words, and an
+alphabet target, all in one run. The finds have to be reported, every
 basename matching a key sent - none ever written to a file - and the
 dashboard has to show it all.
 
@@ -323,6 +324,16 @@ def phase2(server, client_binary, workdir, backend, english, own_words):
         "dictionary": {"word_lists": ["own"], "separators": ["", "_"], "max_words": 2},
         "encryption_key_hex": hex32(mpq_hash(quiet_basename, 0x300)), "priority": 2,
     })["target_id"]
+    # Tails: a name of a word, digits and a letter - found among the 2,970
+    # tails after every word, by the key alone.
+    tailed_basename = own_words[1] + "3B.LBM"
+    tailed_name = "UNIT\\" + tailed_basename
+    tailed = server.admin("POST", "/api/v1/admin/targets", {
+        "name": "tailed", "prefix": "unit/", "suffix": ".lbm",
+        "hash_a_hex": hex32(mpq_hash(tailed_name, 0x100)), "hash_b_hex": hex32(mpq_hash(tailed_name, 0x200)),
+        "dictionary": {"word_lists": ["own"], "separators": ["", "_"], "max_words": 2, "tails": ["digits:1-2", "letters:0-1"]},
+        "encryption_key_hex": hex32(mpq_hash(tailed_basename, 0x300)), "priority": 2,
+    })["target_id"]
     alphabet_name = "TEST\\BCA.TXT"
     alphabet = server.admin("POST", "/api/v1/admin/targets", {
         "name": "alphabet", "prefix": "TEST\\", "suffix": ".TXT", "alphabet": "ABC", "lower_bound": "A", "upper_bound": "CCC",
@@ -335,7 +346,7 @@ def phase2(server, client_binary, workdir, backend, english, own_words):
         targets = {t["id"]: t for t in server.get("/api/v1/dashboard")["targets"]}
         t = targets[through]
         return (targets[found]["status"] == "solved" and targets[alphabet]["status"] == "solved" and targets[quiet]["status"] == "solved"
-                and t["cursor_candidate"] == "" and all(r["status"] == "completed" for r in t["ranges"]))
+                and targets[tailed]["status"] == "solved" and t["cursor_candidate"] == "" and all(r["status"] == "completed" for r in t["ranges"]))
 
     wait_for("every target done", done, client)
     check(client.quit() == 0, "the client quits when told to")
@@ -350,6 +361,10 @@ def phase2(server, client_binary, workdir, backend, english, own_words):
     t = server.target(quiet)
     check(t["status"] == "solved" and t["found_filename"] == quiet_name, "a target with a key, no basenames to send, found: " + str(t["found_filename"]))
     check(basenames(server, quiet) == [] and "matching basenames aren't recorded" in output, "... the key used, none of its basenames sent")
+    t = server.target(tailed)
+    check(t["status"] == "solved" and t["found_filename"] == tailed_name, "a target with tails found: " + str(t["found_filename"]))
+    d = t["dictionary"]
+    check(d["tails"] == ["digits:1-2", "letters:0-1"] and d["tail_count"] == 2970, "... the dashboard showing its tails: %s, %s" % (d["tails"], d["tail_count"]))
     check(server.target(alphabet)["found_filename"] == alphabet_name, "the alphabet target's name found in the same run")
 
     check(output.count("downloading word list own") == 1 and "downloading word list english-1" not in output,
@@ -362,7 +377,7 @@ def phase2(server, client_binary, workdir, backend, english, own_words):
     check(d["word_lists"] == ["english-1", "own"] and d["separators"] == ["", "_", "\\"] and d["min_words"] == 1 and d["max_words"] == 2,
           "the dashboard shows what the candidates are made of")
     volunteers = server.get("/api/v1/dashboard")["volunteers"]
-    check([(v["username"], v["found"]) for v in volunteers] == [("e2e", 3)], "the volunteer credited with all three finds")
+    check([(v["username"], v["found"]) for v in volunteers] == [("e2e", 4)], "the volunteer credited with all four finds")
 
 
 def phase3(server, client_binary, workdir, backend, english):

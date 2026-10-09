@@ -708,6 +708,21 @@ afternoon).
     12.58-12.62, as before it. At the GPU's own clocks (72-75 C): 21.9 G
     candidates/s with both, 28.2-28.5 with the basename alone, 28.7-29.2
     with hashA alone.
+- [x] **Tails** (`tails`, README.md's "Tails"): a word followed by each of
+  a list of tails - `digits:1-2, letters:0-1` makes 2,970, `0` to `9Z`.
+  A word is hashed once for a run of its tails rather than once for each:
+  the GPU kernels take *cells*, a word and a chunk of up to 32 of its tails
+  (`kDictionaryTailsPerCell`), a thread hashing its cell's word and then
+  each tail, one to eight characters, on from there; a warp's lanes take
+  neighbouring words with the same chunk, so they load the same tail and
+  go round its loop together. The kernels take tails or not as a template
+  parameter (a macro in OpenCL and Metal): without, there's no tail loop,
+  and the kernel is as it was but for a cell count (the word count times
+  one) and a tail index in each hit. **Measured** on the CPU backend, which
+  hashes a word once for all its tails (a key, the machine busy with other
+  work): 0.82-0.94 G candidates/s with 300 words of `english-1` and those
+  2,970 tails, against 0.40-0.44 with 20,000 words and none. Not measured
+  on the GPU yet - it was busy with a search.
 - [ ] **Hide the word table's loads.** Since **One hash a candidate**, both
   kernels wait on a word's entry and characters more than they compute
   (73% of issue slots busy at fixed clocks): loading the next word's while

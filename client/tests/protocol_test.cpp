@@ -85,6 +85,8 @@ static const Fields kDictionaryFields = {
     {"separators", R"([ "", "_" , "\\", "\"" ])"},
     {"min_words", "1"},
     {"max_words", "2"},
+    {"tails", R"(["digits:1-2", "_|"])"},
+    {"tails_checksum", R"("0011223344556677")"},
     {"first_candidate_number", "1"},
     {"end_candidate_number", "4"},
     {"filename_lower_bound", R"("MUSIC\\B")"},
@@ -124,6 +126,7 @@ static void testClaims() {
           "... its word counts and numbers");
     check(c.filenameLowerBound == std::optional<std::string>("MUSIC\\B") && !c.filenameUpperBound, "... its bounds, one of them left out");
     check(c.sendBasenames && c.encryptionKeyHex == "0x0000ABCD", "... and the basenames to send");
+    check(c.tails == std::vector<std::string>{"digits:1-2", "_|"} && c.tailsChecksum == "0011223344556677", "... and its tails and their checksum");
 
     c = ClaimResponse();
     const std::string emptyAndNull = fieldsJson("send_basenames", {{"separators", "[]"}, {"filename_lower_bound", "null"}, {"encryption_key_hex", "null"}}) +
@@ -150,6 +153,14 @@ static void testClaims() {
     };
     refused({{"word_list_checksums", R"(["63b352823c6059b0"])"}}, "a checksum short: refused");
     refused({{"encryption_key_hex", "null"}}, "basenames to send, but no key: refused");
+    refused({{"tails_checksum", "null"}}, "tails without their checksum: refused");
+    refused({{"tails", "null"}}, "a tails checksum without tails: refused");
+    {
+        ClaimResponse noTails;
+        check(parseClaimResponse(dictionaryClaim(fieldsJson("", {{"tails", "null"}, {"tails_checksum", "null"}})), noTails) && noTails.tails.empty() &&
+                  noTails.tailsChecksum.empty(),
+              "no tails (null, as left out): none");
+    }
     refused({{"end_candidate_number", "0"}}, "a range ending before it starts: refused");
     refused({{"first_candidate_number", "-1"}}, "a negative number: refused");
     refused({{"word_lists", R"(["english-1",2])"}}, "an array of anything but strings: refused");

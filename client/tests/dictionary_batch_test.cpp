@@ -187,16 +187,17 @@ static void testLaunchPlan() {
     printf("--- a launch's segments ---\n");
     const std::vector<DictionaryBatch> batches = {batchOf("A", 0, 10), batchOf("B\\", 3, 1), batchOf("", 0, 24), batchOf("C", 7, 25)};
     std::vector<DictionaryLaunchBatch> launch;
-    const uint64_t segments = planDictionaryLaunch(batches, 8, launch);
+    const uint64_t segments = planDictionaryLaunch(batches, 8, 1, launch);
     // 10 words: 2 segments; 1: 1; 24: 3; 25: 4.
     check(segments == 10, "segments of 8 words: 2 + 1 + 3 + 4 = " + std::to_string(segments));
     bool copied = launch.size() == batches.size();
     for (size_t b = 0; copied && b < batches.size(); ++b) {
         copied = launch[b].seed1 == batches[b].seed1 && launch[b].seed2 == batches[b].seed2 &&
                  launch[b].basenameSeed1 == batches[b].basenameSeed1 && launch[b].basenameSeed2 == batches[b].basenameSeed2 &&
-                 launch[b].firstWord == batches[b].firstWord && launch[b].wordCount == batches[b].wordCount;
+                 launch[b].firstWord == batches[b].firstWord && launch[b].wordCount == batches[b].wordCount &&
+                 launch[b].firstTail == 0 && launch[b].tailCount == 1 && launch[b].tailChunks == 1;
     }
-    check(copied, "each batch's states and words as they are");
+    check(copied, "each batch's states and words as they are, one tail and chunk each");
     check(launch[0].firstSegment == 0 && launch[1].firstSegment == 2 && launch[2].firstSegment == 3 && launch[3].firstSegment == 6,
           "each batch's first segment: 0, 2, 3, 6");
     const uint32_t expected[] = {0, 0, 1, 2, 2, 2, 3, 3, 3, 3};
@@ -204,9 +205,25 @@ static void testLaunchPlan() {
     for (uint64_t s = 0; s < segments; ++s)
         found = found && dictionaryBatchOfSegment(launch, s) == expected[s];
     check(found, "every segment's batch found by its first segment");
-    check(planDictionaryLaunch(batches, 1000, launch) == 4, "segments larger than any batch: one each");
-    check(planDictionaryLaunch({}, 8, launch) == 0 && launch.empty(), "no batches: nothing");
+    check(planDictionaryLaunch(batches, 1000, 1, launch) == 4, "segments larger than any batch: one each");
+    check(planDictionaryLaunch({}, 8, 1, launch) == 0 && launch.empty(), "no batches: nothing");
     check(dictionaryBatchOfSegment({launch.empty() ? DictionaryLaunchBatch{} : launch[0]}, 0) == 0, "one batch: it");
+
+    // With tails: a cell is a word and up to 4 tails here.
+    std::vector<DictionaryBatch> withTails = {batchOf("A", 0, 10), batchOf("B", 3, 1), batchOf("C", 0, 3)};
+    withTails[0].firstTail = 0, withTails[0].tailCount = 9;  // 3 chunks: 30 cells
+    withTails[1].firstTail = 5, withTails[1].tailCount = 4;  // 1 chunk: 1 cell
+    withTails[2].firstTail = 2, withTails[2].tailCount = 5;  // 2 chunks: 6 cells
+    const uint64_t cellSegments = planDictionaryLaunch(withTails, 8, 4, launch);
+    check(cellSegments == 4 + 1 + 1, "segments of 8 cells, cells of 4 tails: 4 + 1 + 1 = " + std::to_string(cellSegments));
+    check(launch[0].tailChunks == 3 && launch[1].tailChunks == 1 && launch[2].tailChunks == 2 && launch[2].firstTail == 2 &&
+              launch[2].tailCount == 5 && launch[0].firstSegment == 0 && launch[1].firstSegment == 4 && launch[2].firstSegment == 5,
+          "each batch's tails, their chunks and its first segment");
+
+    // The tail table: two uint32s of characters, the length.
+    const std::vector<uint32_t> table = dictionaryTailTable({"", "7", "_07B", "ABCDEFGH"});
+    check(table == std::vector<uint32_t>{0, 0, 0, 0, 0x37, 0, 1, 0, 0x4237305F, 0, 4, 0, 0x44434241, 0x48474645, 8, 0},
+          "the tail table: characters four to a uint32, the first in the lowest byte, and the length");
 }
 
 static void testVerifier() {

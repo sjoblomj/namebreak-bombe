@@ -84,6 +84,7 @@ CPU = "src/backends/cpu/cpu_backend.cpp"
 PRUNING = "src/backends/common/row_pruning.cpp"
 DICT_COMMON = "src/backends/common/dictionary_batch.cpp"
 BACKEND_H = "src/engine/backend.h"
+DICT_ENGINE = "src/engine/dictionary_search.cpp"
 CL_DICT_KERNEL = "src/backends/opencl/dictionary.cl"
 MTL_DICT_KERNEL = "src/backends/metal/dictionary.metal"
 
@@ -178,9 +179,21 @@ DICT_COMMON_MUTATIONS = [
              [(DICT_COMMON, "slash == std::string::npos ? 0 : (uint32_t) slash + 1, w});", "slash == std::string::npos ? 0 : (uint32_t) slash, w});")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictplanfloor", "a batch's last, partial segment left out of the launch",
-             [(DICT_COMMON, "segments += (batch.wordCount + (uint64_t) wordsPerSegment - 1) / wordsPerSegment;",
-               "segments += batch.wordCount / wordsPerSegment;")],
+             [(DICT_COMMON, "segments += ((uint64_t) batch.wordCount * b.tailChunks + cellsPerSegment - 1) / cellsPerSegment;",
+               "segments += (uint64_t) batch.wordCount * b.tailChunks / cellsPerSegment;")],
              caught_by=DICT_CAUGHT),
+    Mutation("dicttailchunks", "a batch's last, partial chunk of tails left out of its cells",
+             [(DICT_COMMON, "b.tailChunks = (batch.tailCount + tailsPerCell - 1) / tailsPerCell;",
+               "b.tailChunks = std::max<uint32_t>(1, batch.tailCount / tailsPerCell);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttailtable", "a tail's 5th to 8th characters stored over its first four",
+             [(DICT_COMMON, "table[4 * t + c / 4] |=", "table[4 * t + c / 8] |=")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    # The search's batches (engine/dictionary_search.cpp), which the
+    # self-test - a backend on its own - doesn't see.
+    Mutation("dictbatchtail", "a batch of part of a word's tails searched from its first",
+             [(DICT_ENGINE, "batch.firstTail = (uint32_t) tail;", "batch.firstTail = 0;")],
+             caught_by=("dictionary-small", "dictionary")),
     Mutation("dictsuffixbasename", "the basename every candidate has, when the suffix has a '\\', never reported",
              [(DICT_COMMON, "if (suffixBasenameMatches_ && !batches.empty())", "if (false)")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
@@ -207,15 +220,30 @@ DICT_COMMON_MUTATIONS = [
     # there are, must not change what's found.
     Mutation("dictlongestfirst", "the word table in the order of their lengths, longest first", expect="harmless",
              edits=[(DICT_COMMON, "return words[a].size() < words[b].size(); });", "return words[a].size() > words[b].size(); });")]),
-    Mutation("dictextrasegment", "an empty segment more after every batch whose words fill its segments", expect="harmless",
-             edits=[(DICT_COMMON, "segments += (batch.wordCount + (uint64_t) wordsPerSegment - 1) / wordsPerSegment;",
-                     "segments += batch.wordCount / wordsPerSegment + 1;")]),
+    Mutation("dictextrasegment", "an empty segment more after every batch whose cells fill its segments", expect="harmless",
+             edits=[(DICT_COMMON, "segments += ((uint64_t) batch.wordCount * b.tailChunks + cellsPerSegment - 1) / cellsPerSegment;",
+                     "segments += (uint64_t) batch.wordCount * b.tailChunks / cellsPerSegment + 1;")]),
 ]
 
 CUDA_DICT_MUTATIONS = [
-    Mutation("dictlastword", "every segment's last word skipped",
-             [(KERNEL, "const uint32_t end = min(first + wordsPerSegment, batch.wordCount);",
-               "const uint32_t end = min(first + wordsPerSegment, batch.wordCount) - 1;")],
+    Mutation("dictlastword", "every segment's last cell skipped",
+             [(KERNEL, "const uint32_t end = min(first + cellsPerSegment, batch.wordCount * batch.tailChunks);",
+               "const uint32_t end = min(first + cellsPerSegment, batch.wordCount * batch.tailChunks) - 1;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttailchunk", "a cell's chunk of tails one tail short of the chunk before's end",
+             [(KERNEL, "tailFirst += chunk * kDictionaryTailsPerCell;", "tailFirst += chunk * (kDictionaryTailsPerCell + 1);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttailcell", "a cell's word and chunk worked out word first",
+             [(KERNEL, "const uint32_t chunk = cell / batch.wordCount;", "const uint32_t chunk = cell % batch.tailChunks;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttailhigh", "a tail's 5th to 8th characters read from its first four",
+             [(KERNEL, "extractByte(c < 4 ? tail.x : tail.y, c & 3)", "extractByte(tail.x, c & 3)")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttaillast", "a tail's last character never hashed",
+             [(KERNEL, "for (uint32_t c = 0; c < tail.z; ++c) {", "for (uint32_t c = 0; c + 1 < tail.z; ++c) {")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictnotails", "the kernel without tails launched for a search with them",
+             [(KERNEL, "dictionaryHasTails_ = constants.tails != std::vector<std::string>{\"\"};", "dictionaryHasTails_ = false;")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictbatchsearch", "a block's batch found one too early where segments start",
              [(KERNEL, "if (__ldg(&batches[mid].firstSegment) <= segment)", "if (__ldg(&batches[mid].firstSegment) < segment)")],
@@ -424,9 +452,18 @@ CUDA_MUTATIONS = [
 ] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS + CUDA_DICT_MUTATIONS
 
 OPENCL_DICT_MUTATIONS = [
-    Mutation("dictlastword", "every segment's last word skipped",
-             [(CL_DICT_KERNEL, "const uint end = min(first + wordsPerSegment, batch.wordCount);",
-               "const uint end = min(first + wordsPerSegment, batch.wordCount) - 1;")],
+    Mutation("dictlastword", "every segment's last cell skipped",
+             [(CL_DICT_KERNEL, "const uint end = min(first + cellsPerSegment, batch.wordCount * batch.tailChunks);",
+               "const uint end = min(first + cellsPerSegment, batch.wordCount * batch.tailChunks) - 1;")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttailchunk", "a cell's chunk of tails one tail short of the chunk before's end",
+             [(CL_DICT_KERNEL, "tailFirst += chunk * TAILS_PER_CELL;", "tailFirst += chunk * (TAILS_PER_CELL + 1);")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttailhigh", "a tail's 5th to 8th characters read from its first four",
+             [(CL_DICT_KERNEL, "((c < 4 ? tail.x : tail.y) >> (8 * (c & 3)))", "(tail.x >> (8 * (c & 3)))")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dicttaillast", "a tail's last character never hashed",
+             [(CL_DICT_KERNEL, "for (uint c = 0; c < tail.z; ++c) {", "for (uint c = 0; c + 1 < tail.z; ++c) {")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictbatchsearch", "a work-group's batch found one too early where segments start",
              [(CL_DICT_KERNEL, "if (batches[mid].firstSegment <= segment)", "if (batches[mid].firstSegment < segment)")],
@@ -738,10 +775,14 @@ CPU_MUTATIONS = [
                "items.push_back({b, (uint32_t) from, (uint32_t) std::min<uint64_t>(batches[b].wordCount, from + wordsPerItem) - 1});")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictcpusuffix", "the basename hash's suffix never hashed",
-             [(CPU, "                    for (unsigned char ch : suffix)\n                        stepBasename(ch);\n", "")],
+             [(CPU, "                        for (unsigned char ch : suffix)\n                            stepBasename(k1, k2, ch);\n", "")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictcpureset", "a word's '\\' hashed into its basename, rather than starting it over",
-             [(CPU, "                        if (ch == '\\\\') {", "                        if (false) {")],
+             [(CPU, "        if (ch == '\\\\') {", "        if (false) {")],
+             caught_by=DICT_CAUGHT + ("dictionary",)),
+    Mutation("dictcputails", "a batch's first tail skipped by the basename hash",
+             [(CPU, "                    for (uint32_t t = batch.firstTail; t < tailEnd; ++t) {\n                        uint32_t k1 = w1, k2 = w2;",
+               "                    for (uint32_t t = batch.firstTail + 1; t < tailEnd; ++t) {\n                        uint32_t k1 = w1, k2 = w2;")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
     Mutation("dictcpubothnoa", "with record_hasha_matches, hashA never hashed",
              [(CPU, "            if (hashes != DictionaryHashes::Basename) {", "            if (hashes == DictionaryHashes::HashA) {")],

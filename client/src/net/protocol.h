@@ -121,6 +121,11 @@ struct ClaimResponse {
     int64_t maxWords = 0;
     int64_t firstCandidateNumber = 0;
     int64_t endCandidateNumber = 0;
+    // The tail elements (see expandDictionaryTails, engine/dictionary.h) and
+    // the checksum (as wordsChecksum's) of the tails they make - both empty
+    // without tails.
+    std::vector<std::string> tails;
+    std::string tailsChecksum;
     // The target's bounds, as whole filenames - absent for none.
     std::optional<std::string> filenameLowerBound;
     std::optional<std::string> filenameUpperBound;

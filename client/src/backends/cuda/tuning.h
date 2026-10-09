@@ -95,6 +95,12 @@ constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
 constexpr int kDictionaryThreadsPerBlock = dictionaryThreadsPerBlockOr(256);
 static_assert(kDictionaryWordsPerThread >= 1 && kDictionaryThreadsPerBlock >= 1 && kDictionaryThreadsPerBlock <= 1024,
               "a dictionary launch needs at least one word per thread, and 1 to 1024 threads per block");
+// With tails, a thread's "word" is a cell: a word and up to this many of
+// its tails, hashed on from the word's state, which it hashes once (see
+// DictionaryLaunchBatch). Overridable the same way
+// (-DNAMEBREAK_DICTIONARY_TAILS_PER_CELL=N).
+constexpr int kDictionaryTailsPerCell = dictionaryTailsPerCellOr(32);
+static_assert(kDictionaryTailsPerCell >= 1, "a cell needs at least one tail");
 
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index
 // (alphabetSize^(trailingLen-1)) must fit in 32 bits: 63^5 < 2^32 <= 63^6.

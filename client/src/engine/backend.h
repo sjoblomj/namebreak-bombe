@@ -107,8 +107,10 @@ struct BatchOutcome {
 // (dictionary_search.h).
 struct DictionaryConstants {
     // The words a candidate's last word is one of - DictionaryBatch::firstWord
-    // indexes them.
+    // indexes them - and the tails that follow it (DictionaryBatch::firstTail;
+    // {""} for none).
     std::vector<std::string> words;
+    std::vector<std::string> tails = {""};
     std::string suffix;
     const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
     uint32_t targetHashA = 0;
@@ -151,7 +153,11 @@ inline DictionaryHashes dictionaryHashes(const DictionaryConstants& constants) {
 
 // One leading part of a dictionary search's candidates - its prefix, and its
 // words and separators but the last word - followed by each of the words
-// [firstWord, firstWord + wordCount) and then the suffix.
+// [firstWord, firstWord + wordCount), each followed by each of the tails
+// [firstTail, firstTail + tailCount), and then the suffix: wordCount *
+// tailCount candidates. A search only gives a batch of one word part of the
+// tails, so that a batch's candidates are numbered one after another - but a
+// backend searches any.
 struct DictionaryBatch {
     std::string leading;
     // hashA's state after `leading` (see mpqHashWithPrefixCache_CPU).
@@ -163,6 +169,8 @@ struct DictionaryBatch {
     uint32_t basenameSeed2 = 0;
     uint32_t firstWord = 0;
     uint32_t wordCount = 0;
+    uint32_t firstTail = 0;
+    uint32_t tailCount = 1;
 };
 
 // What one runDictionaryBatches() call found - every hit, in no particular

@@ -200,6 +200,7 @@ resume_from_last_candidate = true
 | `dictionaries` | no | More word lists, as a list of files (relative to the current directory, unless absolute): one word per line. Spaces and tabs around a word are dropped; blank lines and lines starting with `#` are skipped; a line with anything but printable ASCII is skipped, with a warning. The words of every list and the built-in dictionary are searched together, each once. |
 | `min_words` / `max_words` | `max_words` yes (`min_words` default `1`) | How many words a candidate has: every count from `min_words` to `max_words` (at most 8), fewest first. |
 | `separators` | no (default `""`) | What goes between two words, as a list: `""` writes them together. `"\"` makes the words before it directories. |
+| `tails` | no (default none) | What follows the last word, as a list of elements: every string made of one of each element's, in turn, after every last word - see [Tails](#tails). |
 | `prefix` / `suffix` | yes | The fixed parts of the filename around the candidate. |
 | `lower_bound` / `upper_bound` | no | Whole filenames (inclusive) bounding the search alphabetically - typically an unknown file's neighbours in the archive. Either may be left out. |
 | `hash_a` / `hash_b` | yes | The two target MPQ hashes, hex. |
@@ -216,15 +217,35 @@ A list (`dictionaries`, `separators`) is items separated by commas, each
 either `"quoted"` - kept exactly, spaces and commas included - or not, and
 then trimmed. `""` is an empty item; an empty unquoted one is an error.
 
+**Tails.** Names often end with a number, or a number and a letter -
+`PROTOSS1`, `KEEP3B` - which `tails` adds after the last word, before the
+suffix. Each element of the list stands for some strings:
+
+- `digits:A-B` - every string of A to B digits, leading zeros and all:
+  `digits:1-2` is 0-9 and 00-99. `digits:N` is exactly N.
+- `letters:A-B` - the same of the letters A-Z.
+- `X|Y|...` - one of these literal strings, `""` among them if the element
+  ends with `|`: `_|` is an underscore or nothing.
+
+The tails are every string made of one of each element's, in turn, each
+once: `tails = digits:1-2, letters:0-1` makes 2,970 of them, `0` to `9Z`,
+and `tails = "_|", digits:2` makes `00` to `99` and `_00` to `_99`. A tail
+is at most 8 characters, without a `\` (it's part of a basename), and there
+are at most 1,048,576 of them. Every candidate is followed by each, so a
+search has as many times as many candidates - but a GPU hashes a word once for a
+run of its tails, so a candidate with a tail costs less than one without
+(see [Dictionary searches on the GPU](#dictionary-searches-on-the-gpu)).
+
 **The numbers.** Every candidate has a number, counting from 0 the way an
-odometer counts, with a wheel per word and per separator: all one-word
-candidates first, then all two-word ones, and so on; within those, the
-first word turns slowest, then the separator after it, and the last word
-fastest. The words are sorted, so the candidates of each word count come in
-alphabetical order of their first word. The numbers depend only on the
-words, the separators and the word counts - not on the bounds, prefix or
-suffix. The search prints how many candidates there are in all, and how
-many it will search within the bounds.
+odometer counts, with a wheel per word, per separator and for the tail:
+all one-word candidates first, then all two-word ones, and so on; within
+those, the first word turns slowest, then the separator after it, then the
+last word, and the tail fastest. The words are sorted, so the candidates of
+each word count come in alphabetical order of their first word. The numbers
+depend only on the words, the separators, the word counts and the tails -
+not on the bounds, prefix or suffix - and without tails, they're what they
+were before there were tails. The search prints how many candidates there
+are in all, and how many it will search within the bounds.
 
 **The bounds** compare whole filenames. A word that already puts every
 filename starting with it outside the bounds is skipped, with everything
@@ -249,7 +270,7 @@ lower bound, `REZ\CRDT...` is both inside (`REZ\CRDT_MAP.TXT`) and outside
   `next` has been searched. Written every 30 seconds, when the search is
   paused, and when it ends. It also has a fingerprint of everything that
   decides which candidates are searched and what's looked for (the words,
-  separators, word counts, prefix, suffix, bounds, hashes, encryption key,
+  separators, word counts, tails, prefix, suffix, bounds, hashes, encryption key,
   and whether basenames and every Hash-A match are recorded):
   `resume_from_last_candidate = true` refuses to resume from a file another
   search wrote, rather than skip candidates the changed search never
@@ -394,10 +415,11 @@ bounds and counting against brute force), `wordlist_test` (which pins
 launch plan and hit checking the GPU backends share), `dictionary-search-*`
 (the dictionary self-test, then whole searches on each backend against brute
 force - also with one candidate in 256 a hit, and one in 256 a basename
-matching the key by chance, and with few candidates and
+matching the key by chance, with tails, and with few candidates and
 batches per call, stopped and resumed part way, the GPU kernels' thread
-blocks a few words each, room for a single hit and a one-bit suffix filter,
-and cut into ranges of numbers as a coordinator hands them out) and
+blocks a few words each and three tails to a cell, room for a single hit
+and a one-bit suffix filter, and cut into ranges of numbers as a
+coordinator hands them out) and
 `dictionary-cli-*` (the program itself). The coordinator client's own parts
 have `protocol_test` (the JSON, an
 alphabet claim as older clients read it and a dictionary claim with its
@@ -1262,13 +1284,15 @@ own, after a leading part - the prefix and the words and separators before
 the last word. The engine (`runDictionarySearch`) walks the leading parts on
 the CPU, hashing each once, and hands the backend *batches*: a leading part's
 two hash states (hashA's, and the basename hash's - hash type 3 of what
-follows the last `\`), followed by a run of the word list's words and then
-the suffix. A GPU launch is a call's batches, up to 2^28 candidates, cut
-into *segments* of up to 8,192 words of one batch (32 words to each of 256
-threads), one per thread block (`planDictionaryLaunch`,
-`src/backends/common/dictionary_batch.h`). A block finds its batch by a
-binary search over the batches' first segments, and its threads take
-neighbouring words.
+follows the last `\`), followed by a run of the word list's words, each with
+a run of the tails, and then the suffix. A GPU launch is a call's batches,
+up to 2^28 candidates, cut into *segments* of up to 8,192 *cells* of one
+batch (32 cells to each of 256 threads), one per thread block
+(`planDictionaryLaunch`, `src/backends/common/dictionary_batch.h`). A cell
+is a word and a chunk of up to 32 of its tails - without tails, a word. A
+block finds its batch by a binary search over the batches' first segments,
+and its threads take neighbouring cells: neighbouring words, with the same
+chunk of tails.
 
 What makes it fast (see [PERFORMANCE.md](PERFORMANCE.md)'s *Dictionary
 searches* for the measurements):
@@ -1282,6 +1306,12 @@ searches* for the measurements):
   about a third longer - and is what they still do with
   `record_hasha_matches` (unless the basenames aren't recorded: then only
   hashA).
+- **A word hashed once for a run of its tails.** With tails, a thread hashes
+  its cell's word once, and then each of its chunk's tails - one to eight
+  characters each - from there. The lanes of a warp take the same chunk of
+  neighbouring words, so they read the same tail, as one load, and go round
+  its loop together. A search without tails gets a kernel without the loop
+  (each is compiled both ways).
 - **Words by length.** A warp goes round a word's loop as many times as its
   longest word needs. The word table the kernels read
   (`DictionaryWordTable`) has the words in the order of their lengths, so

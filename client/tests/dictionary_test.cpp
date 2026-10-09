@@ -21,6 +21,7 @@
 #include "engine/dictionary.h"
 #include "engine/dictionary_search.h"
 #include "engine/mpq_hash.h"
+#include "engine/wordlist.h"
 
 static int g_failures = 0;
 
@@ -45,15 +46,16 @@ static DictionaryPattern pattern(std::vector<std::string> words, std::vector<std
 }
 
 // Every candidate's text in number order, made by plain nested loops - the
-// first word turning slowest, then the separator after it, and so on - not
-// by DictionarySpace.
+// first word turning slowest, then the separator after it, and so on, and
+// the tail fastest - not by DictionarySpace.
 static std::vector<std::string> allCandidates(const DictionaryPattern& p) {
     std::vector<std::string> out;
     for (int k = p.minWords; k <= p.maxWords; ++k) {
         std::function<void(int, const std::string&)> gen = [&](int level, const std::string& text) {
             for (const std::string& word : p.words) {
                 if (level == k - 1) {
-                    out.push_back(text + word);
+                    for (const std::string& tail : p.tails)
+                        out.push_back(text + word + tail);
                     continue;
                 }
                 for (const std::string& separator : p.separators)
@@ -80,6 +82,17 @@ static std::vector<std::string> randomWords(std::mt19937& rng, const std::string
     std::sort(words.begin(), words.end());
     words.erase(std::unique(words.begin(), words.end()), words.end());
     return words;
+}
+
+// A few random tails, sorted and without duplicates - "" among them or not.
+static std::vector<std::string> randomTails(std::mt19937& rng, const std::string& alphabet) {
+    std::vector<std::string> tails;
+    const int count = 1 + (int) (rng() % 5);
+    for (int i = 0; i < count; ++i)
+        tails.push_back(randomString(rng, alphabet, 0, 2));
+    std::sort(tails.begin(), tails.end());
+    tails.erase(std::unique(tails.begin(), tails.end()), tails.end());
+    return tails;
 }
 
 static const char* verdictName(FilenameBounds::Verdict v) {
@@ -128,6 +141,17 @@ static void testSpace() {
     fails(pattern({"A"}, {""}, 0, 1), "1 <= min_words", "min_words 0: an error");
     fails(pattern({"A"}, {""}, 2, 1), "1 <= min_words", "max_words < min_words: an error");
     fails(pattern({"A"}, {""}, 1, kMaxDictionaryWords + 1), "1 <= min_words", "max_words over the limit: an error");
+    DictionaryPattern withTails = pattern({"A"}, {""}, 1, 1);
+    withTails.tails = {};
+    fails(withTails, "tails", "no tails at all: an error (\"\" is none)");
+    withTails.tails = {"1", ""};
+    fails(withTails, "sorted", "unsorted tails: an error");
+    withTails.tails = {"", "123456789"};
+    fails(withTails, "at most", "a tail too long: an error");
+    withTails.tails = {"", "A\\B"};
+    fails(withTails, "'\\'", "a tail with a '\\': an error");
+    withTails.tails = {"", "1", "2"};
+    check(DictionarySpace::create(withTails, space, error) && space.size() == 3, "tails: one word of one, three tails - three candidates");
     check(DictionarySpace::create(pattern({"A"}, {""}, 1, kMaxDictionaryWords), space, error) && space.size() == kMaxDictionaryWords,
           "max_words at the limit: fine");
     {
@@ -149,9 +173,11 @@ static void testSpace() {
     std::mt19937 rng(1234);
     bool allMatch = true, roundTrips = true;
     for (int round = 0; round < 40; ++round) {
-        const DictionaryPattern p = pattern(randomWords(rng, "AB\\_.", 1 + round % 6, 3),
-                                            round % 3 == 0 ? std::vector<std::string>{""} : std::vector<std::string>{"", "_", "\\"},
-                                            1 + round % 2, 1 + round % 2 + round % 3);
+        DictionaryPattern p = pattern(randomWords(rng, "AB\\_.", 1 + round % 6, 3),
+                                      round % 3 == 0 ? std::vector<std::string>{""} : std::vector<std::string>{"", "_", "\\"},
+                                      1 + round % 2, 1 + round % 2 + round % 3);
+        if (round % 4 != 0)
+            p.tails = randomTails(rng, "1A_");
         DictionarySpace s;
         if (!DictionarySpace::create(p, s, error)) {
             check(false, "random pattern: " + error);
@@ -162,11 +188,11 @@ static void testSpace() {
         for (uint64_t n = 0; n < s.size() && allMatch; ++n) {
             const DictionaryChoice choice = s.decode(n);
             allMatch = allMatch && s.text(choice) == expected[n] && s.textOf(n) == expected[n] &&
-                       choice.separators.size() + 1 == choice.words.size();
+                       choice.separators.size() + 1 == choice.words.size() && choice.tail < p.tails.size();
             roundTrips = roundTrips && s.encode(choice) == n;
         }
     }
-    check(allMatch, "every number decodes to the candidate nested loops give, in the same order (40 random patterns)");
+    check(allMatch, "every number decodes to the candidate nested loops give, in the same order (40 random patterns, most with tails)");
     check(roundTrips, "encode(decode(n)) == n for every one");
     {
         DictionarySpace s;
@@ -179,6 +205,65 @@ static void testSpace() {
         choice.separators = {1};
         check(s.encode(choice) == 3 + (1 * 2 + 1) * 3 + 2 && s.text(choice) == "B_C", "encode: ((w1 * S + s1) * W + w2) after the one-word block");
     }
+    {
+        DictionaryPattern p = pattern({"A", "B"}, {"", "_"}, 1, 2);
+        p.tails = {"", "1", "2B"};
+        DictionarySpace s;
+        DictionarySpace::create(p, s, error);
+        check(s.size() == (2 + 2 * 2 * 2) * 3 && s.textOf(0) == "A" && s.textOf(1) == "A1" && s.textOf(2) == "A2B" && s.textOf(3) == "B" &&
+                  s.textOf(6) == "AA" && s.textOf(7) == "AA1" && s.textOf(9) == "AB" && s.textOf(29) == "B_B2B",
+              "worked example with tails: A A1 A2B B ...; AA AA1 AA2B AB ... B_B2B - the tail fastest of all");
+        DictionaryChoice choice;
+        choice.words = {1, 0};
+        choice.separators = {1};
+        choice.tail = 2;
+        check(s.encode(choice) == 6 + ((1 * 2 + 1) * 2 + 0) * 3 + 2 && s.text(choice) == "B_A2B",
+              "encode: (((w1 * S + s1) * W + w2) * T + t) after the one-word block");
+    }
+}
+
+static void testTails() {
+    printf("--- expandDictionaryTails ---\n");
+    auto expand = [](const std::vector<std::string>& elements, std::vector<std::string>& tails) {
+        std::string error;
+        return expandDictionaryTails(elements, tails, error);
+    };
+    std::vector<std::string> tails;
+    check(expand({}, tails) && tails == std::vector<std::string>{""}, "no elements: only \"\"");
+    check(expand({"digits:1"}, tails) && tails.size() == 10 && tails.front() == "0" && tails.back() == "9", "digits:1: 0 to 9");
+    check(expand({"digits:1-2"}, tails) && tails.size() == 110 && tails[0] == "0" && tails[1] == "00" && tails[2] == "01" && tails[11] == "1",
+          "digits:1-2: 0-9 and 00-99, sorted (0 00 01 ... 09 1 10 ...)");
+    check(expand({"letters:0-1"}, tails) && tails.size() == 27 && tails[0].empty() && tails[1] == "A" && tails[26] == "Z",
+          "letters:0-1: nothing, or A to Z");
+    check(expand({"digits:1", "letters:1"}, tails) && tails.size() == 260 && tails[0] == "0A" && tails[259] == "9Z", "digits:1, letters:1: 0A to 9Z");
+    check(expand({"_|", "digits:2"}, tails) && tails.size() == 200 && tails[0] == "00" && tails[100] == "_00", "_|, digits:2: 00 to 99, _00 to _99");
+    // X, Y or nothing, then nothing or a letter: 81 made, but X and Y twice.
+    check(expand({"x|y||", "letters:0-1"}, tails) && tails.size() == 79 && tails[0].empty() && tails[1] == "A",
+          "literals in any case, \"\" among them: normalized, each once");
+    check(expand({"digits:0-1", "digits:0-1"}, tails) && tails.size() == 111, "a tail made twice (1 + \"\", \"\" + 1): once - 111 of 121");
+    check(expand({"digits:6"}, tails) && tails.size() == 1000000, "digits:6: a million, within the limit");
+    // Checksums the server's tests pin too, worked out a third way (in
+    // Python): the client and the server expand tails alike.
+    check(expand({"digits:1-2", "letters:0-1"}, tails) && hex64(wordListChecksum(tails)) == "3c4d231dd57c0078",
+          "digits:1-2, letters:0-1: 2,970 tails, with the checksum the server and Python agree on");
+    check(expand({"digits:0-2", "_|"}, tails) && hex64(wordListChecksum(tails)) == "a0735b5058f2e9be",
+          "digits:0-2, _|: 222 tails, the same");
+    auto fails = [&](const std::vector<std::string>& elements, const std::string& expectedInError) {
+        std::vector<std::string> out;
+        std::string error;
+        const bool failed = !expandDictionaryTails(elements, out, error);
+        check(failed && error.find(expectedInError) != std::string::npos, "'" + elements[0] + "': an error ('" + error + "')");
+    };
+    fails({"digits:2-1"}, "A <= B");
+    fails({"digit:1-2"}, "unknown tail element");
+    fails({"digits:"}, "digits:");
+    fails({"letters:a"}, "letters:");
+    fails({"digits:9"}, "longer than");
+    fails({"digits:7"}, "more than");
+    fails({"digits:3", "letters:3"}, "more than");
+    fails({"ABCDE", "FGHIJ"}, "longer than");
+    fails({"A/B"}, "'\\'");
+    fails({"\xE9"}, "printable ASCII");
 }
 
 static void testBounds() {
@@ -292,9 +377,11 @@ static void testCounting() {
     bool allMatch = true;
     int withBounds = 0;
     for (int round = 0; round < 400 && allMatch; ++round) {
-        const DictionaryPattern p = pattern(randomWords(rng, "AB_\\", 1 + round % 7, 3),
-                                            round % 2 ? std::vector<std::string>{"", "_"} : std::vector<std::string>{"\\"},
-                                            1 + round % 2, 1 + round % 2 + round % 3);
+        DictionaryPattern p = pattern(randomWords(rng, "AB_\\", 1 + round % 7, 3),
+                                      round % 2 ? std::vector<std::string>{"", "_"} : std::vector<std::string>{"\\"},
+                                      1 + round % 2, 1 + round % 2 + round % 3);
+        if (round % 3 != 0)
+            p.tails = randomTails(rng, "1B_");
         DictionarySpace space;
         std::string error;
         if (!DictionarySpace::create(p, space, error)) {
@@ -328,7 +415,7 @@ static void testCounting() {
             fprintf(stderr, "  round %d: counted %llu, brute force %llu\n", round, (unsigned long long) counted, (unsigned long long) expected);
         }
     }
-    check(allMatch, "the count within the bounds from a start number: as brute force (400 random patterns, bounds and starts)");
+    check(allMatch, "the count within the bounds from a start number: as brute force (400 random patterns, most with tails, bounds and starts)");
     check(withBounds > 300, "... most of them with a bound");
 }
 
@@ -524,6 +611,7 @@ int main() {
     testBounds();
     testHashes();
     testCounting();
+    testTails();
     testFingerprint();
     testResumableFingerprints();
     testProgressFile();

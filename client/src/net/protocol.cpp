@@ -250,6 +250,13 @@ bool getStringArray(const std::map<std::string, JsonValue>& obj, const std::stri
     return true;
 }
 
+// Like getStringArray, but a missing key (or null) is no items.
+bool getOptionalStringArray(const std::map<std::string, JsonValue>& obj, const std::string& key, std::vector<std::string>& out) {
+    out.clear();
+    auto it = obj.find(key);
+    return it == obj.end() || it->second.isNull() || getStringArray(obj, key, out);
+}
+
 // A dictionary claim's fields (see ClaimResponse::dictionary) - every one
 // of them needed once `dictionary` is true, none of them before.
 bool getDictionaryClaim(const std::map<std::string, JsonValue>& obj, ClaimResponse& out) {
@@ -262,6 +269,8 @@ bool getDictionaryClaim(const std::map<std::string, JsonValue>& obj, ClaimRespon
            getStringArray(obj, "separators", out.separators) &&
            getInt64(obj, "min_words", out.minWords) &&
            getInt64(obj, "max_words", out.maxWords) &&
+           getOptionalStringArray(obj, "tails", out.tails) &&
+           getOptionalString(obj, "tails_checksum", out.tailsChecksum) && out.tails.empty() == out.tailsChecksum.empty() &&
            getInt64(obj, "first_candidate_number", out.firstCandidateNumber) &&
            getInt64(obj, "end_candidate_number", out.endCandidateNumber) &&
            out.firstCandidateNumber >= 0 && out.endCandidateNumber >= out.firstCandidateNumber &&

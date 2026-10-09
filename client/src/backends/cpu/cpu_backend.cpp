@@ -377,25 +377,28 @@ BatchOutcome CpuBackend::runBatches(int trailingLen, const std::vector<BatchRequ
 
 DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
     const std::vector<std::string>& words = dictionary_.words;
+    const std::vector<std::string>& tails = dictionary_.tails;
     const std::string& suffix = dictionary_.suffix;
     const uint32_t* table = cryptTable_.data();
     const uint32_t targetA = dictionary_.targetHashA;
     const DictionaryHashes hashes = dictionaryVerifier_.hashes();
     const uint32_t basenameKey = dictionary_.basenameKey;
 
-    // Work items: slices of one batch's words, about eight per thread, taken
-    // in turn as the threads finish (as in runBatches).
+    // Work items: slices of one batch's words - each with the batch's tails -
+    // about eight per thread, taken in turn as the threads finish (as in
+    // runBatches).
     uint64_t totalCount = 0;
     for (const DictionaryBatch& batch : batches)
-        totalCount += batch.wordCount;
+        totalCount += (uint64_t) batch.wordCount * batch.tailCount;
     const uint64_t threads = std::min<uint64_t>(threadCount_, std::max<uint64_t>(1, totalCount / kMinCandidatesPerThread));
-    const uint64_t wordsPerItem = std::max<uint64_t>(1, (totalCount + threads * 8 - 1) / (threads * 8));
+    const uint64_t candidatesPerItem = std::max<uint64_t>(1, (totalCount + threads * 8 - 1) / (threads * 8));
     struct Item {
         size_t batch;
         uint32_t from, to; // words [from, to) of the batch's, counted from its first
     };
     std::vector<Item> items;
     for (size_t b = 0; b < batches.size(); ++b) {
+        const uint64_t wordsPerItem = std::max<uint64_t>(1, candidatesPerItem / std::max<uint32_t>(1, batches[b].tailCount));
         for (uint64_t from = 0; from < batches[b].wordCount; from += wordsPerItem)
             items.push_back({b, (uint32_t) from, (uint32_t) std::min<uint64_t>(batches[b].wordCount, from + wordsPerItem)});
     }
@@ -406,40 +409,52 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
     };
     std::vector<Hits> found(threads);
     std::atomic<size_t> next{0};
+    // A step of the basename hash: a '\' starts it over.
+    auto stepBasename = [&](uint32_t& k1, uint32_t& k2, unsigned char ch) {
+        if (ch == '\\') {
+            k1 = kInitialHashState.first;
+            k2 = kInitialHashState.second;
+        } else {
+            mpqStep(k1, k2, table[kFileKeyOffset + ch], ch);
+        }
+    };
     auto work = [&](Hits& mine) {
         for (size_t i = next++; i < items.size(); i = next++) {
             const DictionaryBatch& batch = batches[items[i].batch];
             const uint32_t first = batch.firstWord + items[i].from, end = batch.firstWord + items[i].to;
+            const uint32_t tailEnd = batch.firstTail + batch.tailCount;
             if (hashes != DictionaryHashes::HashA) {
                 // The basename - alone, the verifier checks hashA and hashB
                 // of those that match (see dictionaryHashes).
                 for (uint32_t w = first; w < end; ++w) {
-                    uint32_t k1 = batch.basenameSeed1, k2 = batch.basenameSeed2;
-                    auto stepBasename = [&](unsigned char ch) {
-                        if (ch == '\\') {
-                            k1 = kInitialHashState.first;
-                            k2 = kInitialHashState.second;
-                        } else {
-                            mpqStep(k1, k2, table[kFileKeyOffset + ch], ch);
-                        }
-                    };
+                    uint32_t w1 = batch.basenameSeed1, w2 = batch.basenameSeed2;
                     for (unsigned char ch : words[w])
-                        stepBasename(ch);
-                    for (unsigned char ch : suffix)
-                        stepBasename(ch);
-                    if (basenameKeyMatches(k1, basenameKey))
-                        mine.basename.push_back({(uint32_t) items[i].batch, w});
+                        stepBasename(w1, w2, ch);
+                    for (uint32_t t = batch.firstTail; t < tailEnd; ++t) {
+                        uint32_t k1 = w1, k2 = w2;
+                        for (unsigned char ch : tails[t])
+                            stepBasename(k1, k2, ch);
+                        for (unsigned char ch : suffix)
+                            stepBasename(k1, k2, ch);
+                        if (basenameKeyMatches(k1, basenameKey))
+                            mine.basename.push_back({(uint32_t) items[i].batch, w, t});
+                    }
                 }
             }
             if (hashes != DictionaryHashes::Basename) {
                 for (uint32_t w = first; w < end; ++w) {
-                    uint32_t s1 = batch.seed1, s2 = batch.seed2;
+                    uint32_t w1 = batch.seed1, w2 = batch.seed2;
                     for (unsigned char ch : words[w])
-                        mpqStep(s1, s2, table[0x100 + ch], ch);
-                    for (unsigned char ch : suffix)
-                        mpqStep(s1, s2, table[0x100 + ch], ch);
-                    if (hashAMatches(s1, targetA))
-                        mine.hashA.push_back({(uint32_t) items[i].batch, w});
+                        mpqStep(w1, w2, table[0x100 + ch], ch);
+                    for (uint32_t t = batch.firstTail; t < tailEnd; ++t) {
+                        uint32_t s1 = w1, s2 = w2;
+                        for (unsigned char ch : tails[t])
+                            mpqStep(s1, s2, table[0x100 + ch], ch);
+                        for (unsigned char ch : suffix)
+                            mpqStep(s1, s2, table[0x100 + ch], ch);
+                        if (hashAMatches(s1, targetA))
+                            mine.hashA.push_back({(uint32_t) items[i].batch, w, t});
+                    }
                 }
             }
         }

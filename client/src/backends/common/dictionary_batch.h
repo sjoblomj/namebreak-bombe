@@ -89,9 +89,14 @@ bool checkDictionarySuffixFilter(const std::vector<uint32_t>& filter, const std:
                                  uint32_t target, uint32_t mask, uint64_t seed, std::string& error);
 
 // One batch of a launch, as a kernel reads it: the batch's states, its
-// words, and the launch's first segment of them - segments firstSegment ..
-// firstSegment + ceil(wordCount / wordsPerSegment) - 1 are its. Must match
-// its namesakes in the kernels (cuda_backend.cu, dictionary.cl,
+// words and tails, and the launch's first segment of them. A kernel's thread
+// takes a *cell*: a word, and a chunk of up to tailsPerCell of the batch's
+// tails - tailChunks of them - so that one word with many tails is hashed by
+// many threads. The batch's cells are its first chunk of each word, in
+// turn, then its second, and so on: cell c is word c % wordCount (of the
+// batch's) with chunk c / wordCount. Segments firstSegment .. firstSegment +
+// ceil(wordCount * tailChunks / cellsPerSegment) - 1 are its. Must match its
+// namesakes in the kernels (cuda_backend.cu, dictionary.cl,
 // dictionary.metal).
 struct DictionaryLaunchBatch {
     uint32_t seed1;
@@ -101,22 +106,32 @@ struct DictionaryLaunchBatch {
     uint32_t firstWord;
     uint32_t wordCount;
     uint32_t firstSegment;
-    uint32_t unused;
+    uint32_t firstTail;
+    uint32_t tailCount;
+    uint32_t tailChunks;
 };
-static_assert(sizeof(DictionaryLaunchBatch) == 32, "DictionaryLaunchBatch is laid out as in the kernels");
+static_assert(sizeof(DictionaryLaunchBatch) == 40, "DictionaryLaunchBatch is laid out as in the kernels");
 
 // `batches` as a launch's, in `out`. Returns how many segments they have.
-uint64_t planDictionaryLaunch(const std::vector<DictionaryBatch>& batches, uint32_t wordsPerSegment, std::vector<DictionaryLaunchBatch>& out);
+uint64_t planDictionaryLaunch(const std::vector<DictionaryBatch>& batches, uint32_t cellsPerSegment, uint32_t tailsPerCell,
+                              std::vector<DictionaryLaunchBatch>& out);
+
+// The tails as a kernel reads them: four uint32s each, the first two its
+// characters (four to a uint32, the first in the lowest byte - at most
+// kMaxDictionaryTailLength of them), the third its length.
+std::vector<uint32_t> dictionaryTailTable(const std::vector<std::string>& tails);
 
 // The batch a launch's segment is in: the last whose firstSegment is at most
 // `segment` - what a kernel works out for its block, by binary search.
 uint32_t dictionaryBatchOfSegment(const std::vector<DictionaryLaunchBatch>& batches, uint64_t segment);
 
-// A candidate a kernel reports: word `word` (its index in the list) of the
-// launch's batch `batch`. Must match its namesakes in the kernels.
+// A candidate a kernel reports: word `word` (its index in the list) and tail
+// `tail` (in the tails) of the launch's batch `batch`. Must match its
+// namesakes in the kernels.
 struct DictionaryHit {
     uint32_t batch;
     uint32_t word;
+    uint32_t tail;
 };
 
 // Turns the hits a backend reports into what runDictionaryBatches returns:
@@ -141,6 +156,7 @@ public:
 
 private:
     std::vector<std::string> words_;
+    std::vector<std::string> tails_;
     std::string suffix_;
     std::vector<uint32_t> cryptTable_;
     uint32_t targetA_ = 0;
@@ -176,6 +192,15 @@ constexpr int dictionaryThreadsPerBlockOr([[maybe_unused]] int backendDefault) {
 constexpr int dictionaryWordsPerThreadOr([[maybe_unused]] int backendDefault) {
 #ifdef NAMEBREAK_DICTIONARY_WORDS_PER_THREAD
     return NAMEBREAK_DICTIONARY_WORDS_PER_THREAD;
+#else
+    return backendDefault;
+#endif
+}
+// The same for how many tails a cell has (see DictionaryLaunchBatch):
+// -DNAMEBREAK_DICTIONARY_TAILS_PER_CELL=N.
+constexpr int dictionaryTailsPerCellOr([[maybe_unused]] int backendDefault) {
+#ifdef NAMEBREAK_DICTIONARY_TAILS_PER_CELL
+    return NAMEBREAK_DICTIONARY_TAILS_PER_CELL;
 #else
     return backendDefault;
 #endif

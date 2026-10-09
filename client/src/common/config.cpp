@@ -425,6 +425,7 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
     std::string minWordsStr = unquote(r.getOptional("min_words", "1"));
     if (!r.getRequired("max_words", maxWordsStr, error)) return false;
     std::string separatorsStr = r.getOptional("separators", "\"\"");
+    std::string tailsStr = r.getOptional("tails", "");
     if (!r.getRequired("prefix", prefix, error)) return false;
     if (!r.getRequired("suffix", suffix, error)) return false;
     const bool hasLower = config.dictionary.count("lower_bound") > 0, hasUpper = config.dictionary.count("upper_bound") > 0;
@@ -503,6 +504,11 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
     }
     for (std::string& separator : separators)
         out.pattern.separators.push_back(normalizeMpqName(separator));
+    std::vector<std::string> tailElements;
+    if (!parseConfigList(tailsStr, tailElements, error) || !expandDictionaryTails(tailElements, out.pattern.tails, error)) {
+        error = "invalid tails: " + error;
+        return false;
+    }
 
     // The words: the built-in dictionary's and every list's, together.
     std::vector<std::string> words;

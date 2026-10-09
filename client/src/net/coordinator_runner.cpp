@@ -674,6 +674,17 @@ bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::stri
         req.pattern.separators.push_back(normalizeMpqName(separator));
     req.pattern.minWords = (int) claim.minWords;
     req.pattern.maxWords = (int) claim.maxWords;
+    // The tails, made here as the server made them - and checked against
+    // its checksum, rather than search other candidates than it numbered.
+    if (!expandDictionaryTails(claim.tails, req.pattern.tails, error)) {
+        error = "the claim's tails: " + error;
+        return false;
+    }
+    if (!claim.tails.empty() && hex64(wordListChecksum(req.pattern.tails)) != claim.tailsChecksum) {
+        error = "the claim's tails make other tails than the server's (checksum " + hex64(wordListChecksum(req.pattern.tails)) + ", not " +
+                claim.tailsChecksum + ")";
+        return false;
+    }
     DictionarySpace space;
     if (claim.minWords < 1 || claim.maxWords > kMaxDictionaryWords || !DictionarySpace::create(req.pattern, space, error)) {
         if (error.empty())

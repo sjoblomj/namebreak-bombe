@@ -73,6 +73,8 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
 //   min_words           default 1
 //   max_words           required
 //   separators          a list, default "" (words written together)
+//   tails               a list of tail elements (see expandDictionaryTails,
+//                       dictionary.h), default none
 //   prefix, suffix      required
 //   lower_bound, upper_bound   whole filenames, optional
 //   hash_a, hash_b      required

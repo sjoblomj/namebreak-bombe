@@ -358,10 +358,11 @@ namebreak_test(dictionary_batch_test dictionary_batch_test)
 # candidates and batches per call to the backend (so that a search is
 # split into many calls, and stopped and resumed part way), on several CPU
 # threads, and the GPU backends' launches made small: a few words to a
-# thread block, so that even a small word list spans several, room for one
-# hit of each kind (so that every launch with a hit is searched again, with
-# room for them all), and a suffix filter of one bit, which lets about half
-# of the candidates through.
+# thread block, so that even a small word list spans several, three tails
+# to a thread, so that a word's tails do too, room for one hit of each kind
+# (so that every launch with a hit is searched again, with room for them
+# all), and a suffix filter of one bit, which lets about half of the
+# candidates through.
 set(DICTIONARY_BACKENDS ${ROW_BACKENDS} reference)
 namebreak_test_executable(dictionary_search_test tests/dictionary_search_test.cpp namebreak_search)
 foreach(backend IN LISTS DICTIONARY_BACKENDS)
@@ -373,7 +374,7 @@ if(NAMEBREAK_TEST_VARIANTS)
     namebreak_search_library(namebreak_search_dictionary_small NAMEBREAK_HASHA_MATCH_BITS=8 NAMEBREAK_BASENAME_MATCH_BITS=8
                              NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL=97
                              NAMEBREAK_DICTIONARY_BATCHES_PER_CALL=5 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=16
-                             NAMEBREAK_DICTIONARY_THREADS_PER_BLOCK=8 NAMEBREAK_DICTIONARY_WORDS_PER_THREAD=3
+                             NAMEBREAK_DICTIONARY_THREADS_PER_BLOCK=8 NAMEBREAK_DICTIONARY_WORDS_PER_THREAD=3 NAMEBREAK_DICTIONARY_TAILS_PER_CELL=3
                              NAMEBREAK_DICTIONARY_HIT_CAPACITY=1 NAMEBREAK_DICTIONARY_FILTER_BITS=1)
     namebreak_test_executable(dictionary_search_test_small tests/dictionary_search_test.cpp namebreak_search_dictionary_small)
     foreach(backend IN LISTS DICTIONARY_BACKENDS)

@@ -42,13 +42,15 @@ constexpr int kRowsPerThread = rowsPerThreadOr(25);
 
 // A dictionary search's launches (dictionary.metal): how many candidates one
 // covers at most (SearchBackend::dictionaryCandidatesPerCall) - a quarter
-// of CUDA's, as the row search's batches are - how many words of a batch
-// one thread hashes, and the threadgroup's size, unless the pipeline allows
-// fewer. A segment of a launch is the last two's product. Not tuned yet:
-// the CUDA backend's values (see its tuning.h).
+// of CUDA's, as the row search's batches are - how many cells (words, with
+// tails) of a batch one thread hashes, and the threadgroup's size, unless
+// the pipeline allows fewer. A segment of a launch is the last two's
+// product. And with tails, how many a cell has (see DictionaryLaunchBatch).
+// Not tuned yet: the CUDA backend's values (see its tuning.h).
 constexpr uint64_t kDictionaryCandidatesPerLaunch = 1ull << 26;
 constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
 constexpr NSUInteger kDictionaryThreadgroupSize = dictionaryThreadsPerBlockOr(256);
+constexpr int kDictionaryTailsPerCell = dictionaryTailsPerCellOr(32);
 
 // Must match DictionaryArgs in dictionary.metal.
 struct DictionaryArgs {
@@ -168,15 +170,17 @@ private:
     // endDictionarySearch - and what the kernel is compiled with.
     DictionaryHitVerifier dictionaryVerifier_;
     id<MTLBuffer> dictionaryChars_, dictionaryEntries_, dictionaryPositions_;
+    id<MTLBuffer> dictionaryTails_; // dictionaryTailTable
+    bool dictionaryHasTails_ = false;
     id<MTLBuffer> dictionaryCryptKeys_, dictionaryFilters_, dictionarySuffixKeys_;
     uint32_t dictionaryWordCount_ = 0;
     int dictionarySuffixLen_ = 0;
     DictionaryHashes dictionaryHashes_ = DictionaryHashes::HashA;
     uint32_t dictionaryTargetA_ = 0;
     uint32_t dictionaryBasenameKey_ = 0;
-    // Compiled once per (suffix length, hashes) and kept, as the row
-    // search's pipelines are.
-    std::map<std::pair<int, DictionaryHashes>, id<MTLComputePipelineState>> dictionaryPipelines_;
+    // Compiled once per (suffix length, hashes, tails or not) and kept, as
+    // the row search's pipelines are.
+    std::map<std::tuple<int, DictionaryHashes, bool>, id<MTLComputePipelineState>> dictionaryPipelines_;
     // Kept from one search to the next, grown as a launch needs: its batches
     // (DictionaryLaunchBatch), the hit counts - 0 at every launch - and the
     // hits, room for dictionaryHitCapacity_ of each kind.
@@ -448,6 +452,11 @@ void MetalBackend::beginDictionarySearch(const DictionaryConstants& constants) {
     dictionaryChars_ = sharedBuffer(table.chars.size() * sizeof(uint32_t), table.chars.data());
     dictionaryEntries_ = sharedBuffer(table.entries.size() * sizeof(DictionaryWordEntry), table.entries.data());
     dictionaryPositions_ = sharedBuffer(table.positions.size() * sizeof(uint32_t), table.positions.data());
+    // The tails - only "" without any, which the kernel built without TAILS
+    // doesn't read.
+    dictionaryHasTails_ = constants.tails != std::vector<std::string>{""};
+    const std::vector<uint32_t> tailTable = dictionaryTailTable(constants.tails);
+    dictionaryTails_ = sharedBuffer(tailTable.size() * sizeof(uint32_t), tailTable.data());
 
     std::vector<uint32_t> cryptKeys(constants.cryptTable + kHashAOffset, constants.cryptTable + kHashAOffset + 256);
     cryptKeys.insert(cryptKeys.end(), constants.cryptTable + kFileKeyOffset, constants.cryptTable + kFileKeyOffset + 256);
@@ -480,13 +489,14 @@ void MetalBackend::endDictionarySearch() {
     dictionaryChars_ = nil;
     dictionaryEntries_ = nil;
     dictionaryPositions_ = nil;
+    dictionaryTails_ = nil;
     dictionaryCryptKeys_ = nil;
     dictionaryFilters_ = nil;
     dictionarySuffixKeys_ = nil;
 }
 
 id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
-    const auto key = std::make_pair(dictionarySuffixLen_, dictionaryHashes_);
+    const auto key = std::make_tuple(dictionarySuffixLen_, dictionaryHashes_, dictionaryHasTails_);
     auto found = dictionaryPipelines_.find(key);
     if (found != dictionaryPipelines_.end())
         return found->second;
@@ -497,6 +507,8 @@ id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
             @"SUFFIX_LEN": @(dictionarySuffixLen_),
             @"HASHES": @((int) dictionaryHashes_),
             @"WORDS_PER_THREAD": @(kDictionaryWordsPerThread),
+            @"TAILS": @(dictionaryHasTails_ ? 1 : 0),
+            @"TAILS_PER_CELL": @(kDictionaryTailsPerCell),
             @"FILTER_BITS": @(kDictionaryFilterBits),
             @"FILTER_WORDS": @(kDictionaryFilterWords),
             @"HASHA_MATCH_MASK": @(kHashAMatchMask),
@@ -526,11 +538,11 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
         return outcome;
     id<MTLComputePipelineState> pipeline = dictionaryPipeline();
     const NSUInteger threadgroupSize = std::min(kDictionaryThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
-    const uint32_t wordsPerSegment = (uint32_t) (kDictionaryWordsPerThread * threadgroupSize);
-    const uint64_t segments = planDictionaryLaunch(batches, wordsPerSegment, dictionaryLaunch_);
+    const uint32_t cellsPerSegment = (uint32_t) (kDictionaryWordsPerThread * threadgroupSize);
+    const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? kDictionaryTailsPerCell : 1, dictionaryLaunch_);
     uint64_t candidates = 0;
     for (const DictionaryBatch& batch : batches)
-        candidates += batch.wordCount;
+        candidates += (uint64_t) batch.wordCount * batch.tailCount;
     if (segments > UINT32_MAX || batches.size() > UINT32_MAX) {
         // runDictionarySearch's calls are far smaller (dictionaryCandidatesPerCall).
         fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments - exiting\n", (unsigned long long) segments);
@@ -572,6 +584,7 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
             [encoder setBuffer:dictionaryCounts_ offset:0 atIndex:8];
             [encoder setBuffer:dictionaryHashAHits_ offset:0 atIndex:9];
             [encoder setBuffer:dictionaryBasenameHits_ offset:0 atIndex:10];
+            [encoder setBuffer:dictionaryTails_ offset:0 atIndex:11];
             // A threadgroup per segment.
             [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger) segments, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupSize, 1, 1)];
             [encoder endEncoding];
@@ -603,9 +616,10 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
     for (const std::vector<DictionaryHit>* hits : {&hashA, &basename}) {
         for (const DictionaryHit& hit : *hits) {
             const DictionaryBatch* batch = hit.batch < batches.size() ? &batches[hit.batch] : nullptr;
-            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount) {
-                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u of batch %u, which it doesn't have - exiting\n", hit.word,
-                        hit.batch);
+            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount || hit.tail < batch->firstTail ||
+                hit.tail - batch->firstTail >= batch->tailCount) {
+                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u, tail %u of batch %u, which it doesn't have - exiting\n",
+                        hit.word, hit.tail, hit.batch);
                 exit(1);
             }
         }
