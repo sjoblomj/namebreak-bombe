@@ -451,8 +451,12 @@ curl -X POST localhost:8080/api/v1/admin/targets \
   key and send every one that matches, so a file's name is found even when
   the directory searched is the wrong one. About one candidate in 2^32
   matches by chance: some four in two words of `english-1` with four
-  separators, about a million in three (see **Basenames** below). Without
-  it, clients don't compare basenames at all.
+  separators, about a million in three (see **Basenames** below). Unless
+  the suffix has a `\`, a client then compares only those candidates to
+  the hashes - the file's name has the key's basename - which makes the
+  search about a third faster (see the client README's "Dictionary
+  searches on the GPU"). Without it, clients don't compare basenames at
+  all.
 - `name`, `priority`, `description`, `encryption_key_hex` and
   `base_file_name` are as for any target; the alphabet, the pruning rules,
   the insertions, `start_len` and `auto_priority` aren't for a dictionary
