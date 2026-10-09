@@ -39,7 +39,7 @@ fn config(chunk: f64) -> RangeConfig {
 
 async fn state_with(config: RangeConfig) -> AppState {
     let pool = crate::db::connect("sqlite::memory:").await.unwrap();
-    AppState(std::sync::Arc::new(Inner { pool, admin_token: "t".into(), config }))
+    AppState(std::sync::Arc::new(Inner { pool, admin_token: "t".into(), config, disk: Default::default() }))
 }
 
 async fn state(chunk: f64) -> AppState {
@@ -608,6 +608,23 @@ async fn basenames_are_kept_even_when_the_report_is_refused() {
 
     // But not for a range there's no such thing as.
     assert!(matches!(heartbeat(&state, &first, 9999, report(None, &["X.WAV"])).await, Err(AppError::NotFound)));
+}
+
+#[tokio::test]
+async fn basenames_are_discarded_while_the_disk_is_low() {
+    let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+    let disk = crate::disk::DiskSpace { dir: Some(".".into()), min_free_bytes: u64::MAX, warn_free_bytes: 0 };
+    let state = AppState(std::sync::Arc::new(Inner { pool, admin_token: "t".into(), config: config(20.0), disk }));
+    put_list(&state, "nato", WORDS).await.unwrap();
+    let id = create(&state, serde_json::json!({"encryption_key_hex": "0x1234", "send_basenames": true})).await.unwrap();
+    let client = user(&state, "u", "1.5.0").await;
+    let c = claim(&state, &client).await.unwrap();
+
+    assert!(heartbeat(&state, &client, c.range_id, report(Some(1), &["A.WAV"])).await.is_ok(), "answered as if kept");
+    complete(&state, &client, c.range_id, None, 1.0, 5, &["B.WAV"]).await.unwrap();
+    assert!(basenames(&state, id).await.is_empty());
+    assert_eq!(target(&state, id).await.basename_count, 0);
+    assert!(crate::dashboard::dashboard_data(State(state.clone())).await.unwrap().0.low_disk.unwrap().discarding, "and the dashboard says so");
 }
 
 #[tokio::test]

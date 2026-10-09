@@ -895,6 +895,7 @@ dependencies = [
  "axum",
  "flate2",
  "futures-util",
+ "libc",
  "namebreak-protocol",
  "rand",
  "regex",

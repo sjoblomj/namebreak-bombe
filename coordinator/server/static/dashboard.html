@@ -32,6 +32,9 @@
     --solved-text: #7a5b00;
     --row-in-progress-bg: #fff4e5;
     --detail-bg: #f7f8fa;
+    --warning-bg: #fef3c7;
+    --warning-border: #f59e0b;
+    --warning-text: #78350f;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
@@ -59,6 +62,9 @@
       --solved-text: #ffd75e;
       --row-in-progress-bg: rgba(224, 161, 58, 0.14);
       --detail-bg: rgba(255, 255, 255, 0.04);
+      --warning-bg: #3a2c06;
+      --warning-border: #d4a017;
+      --warning-text: #fde68a;
     }
   }
   * { box-sizing: border-box; }
@@ -640,9 +646,20 @@
     font-size: 14px;
   }
   .error { color: #b91c1c; }
+  /* Shown above everything while the server is low on disk space. */
+  .disk-warning {
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--warning-border);
+    border-radius: 8px;
+    background: var(--warning-bg);
+    color: var(--warning-text);
+    font-size: 14px;
+  }
 </style>
 </head>
 <body>
+  <div class="disk-warning" id="disk-warning" role="alert" hidden></div>
   <h1>namebreak coordinator</h1>
   <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span><div class="active-now" id="active-now" title="Ranges being searched right now" hidden></div></div>
   <nav class="page-tabs tab-bar" id="page-tabs" role="tablist">
@@ -862,6 +879,7 @@
 
   const targetsEl = document.getElementById('targets');
   const statusEl  = document.getElementById('status-text');
+  const diskWarningEl = document.getElementById('disk-warning');
   const subheadEl = document.querySelector('.subhead');
   const activeNowEl = document.getElementById('active-now');
 
@@ -910,6 +928,13 @@
   // as_decimal): past 2^53 a JavaScript number can't hold them exactly.
   function fmtNum(n) {
     return typeof n === 'string' ? BigInt(n).toLocaleString() : Number(n).toLocaleString();
+  }
+
+  function fmtBytes(n) {
+    const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n : n.toFixed(1)) + ' ' + units[i];
   }
 
   // A single candidate/bound string, boxed like inline code - the standard
@@ -2065,6 +2090,16 @@
       statusEl.title = now.iso;
       activeNowEl.textContent = 'Active now: ' + fmtNum(data.active_ranges || 0);
       activeNowEl.hidden = false;
+
+      const lowDisk = data.low_disk;
+      diskWarningEl.hidden = !lowDisk;
+      if (lowDisk) {
+        diskWarningEl.textContent = lowDisk.discarding
+          ? `The server is low on disk space (${fmtBytes(lowDisk.free_bytes)} free). ` +
+            'Basenames reported for dictionary targets are not being saved until there is more room.'
+          : `The server is running low on disk space (${fmtBytes(lowDisk.free_bytes)} free). ` +
+            `Below ${fmtBytes(lowDisk.min_free_bytes)} free, basenames reported for dictionary targets will not be saved.`;
+      }
     } catch (err) {
       subheadEl.classList.add('stale');
       statusEl.textContent = 'update failed (' + err.message + ') - reload to retry';

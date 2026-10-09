@@ -119,7 +119,7 @@ pub async fn heartbeat(
     Path(range_id): Path<i64>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
-    ranges::record_basenames(&state.pool, &user, range_id, &req.basenames).await?;
+    ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
     let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename, req.next_candidate_number).await?;
     Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, range_released: outcome.range_released }))
 }
@@ -130,7 +130,7 @@ pub async fn quit(
     Path(range_id): Path<i64>,
     Json(req): Json<QuitRequest>,
 ) -> Result<StatusCode, AppError> {
-    ranges::record_basenames(&state.pool, &user, range_id, &req.basenames).await?;
+    ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
     ranges::quit_range(&state.pool, &user, range_id, req.last_hash_a_match_filename.as_deref(), req.next_candidate_number).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -156,7 +156,7 @@ pub async fn complete(
     Path(range_id): Path<i64>,
     Json(req): Json<CompleteRequest>,
 ) -> Result<StatusCode, AppError> {
-    ranges::record_basenames(&state.pool, &user, range_id, &req.basenames).await?;
+    ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
     let outcome = ranges::complete_range(
         &state.pool,
         &state.config,
@@ -1195,7 +1195,7 @@ mod tests {
             likely_prefixes: Default::default(),
             dictionaries: Default::default(),
         };
-        AppState(std::sync::Arc::new(crate::state::Inner { pool, admin_token: "t".into(), config }))
+        AppState(std::sync::Arc::new(crate::state::Inner { pool, admin_token: "t".into(), config, disk: Default::default() }))
     }
 
     async fn create_target(state: &AppState, extra: serde_json::Value) -> Result<i64, AppError> {

@@ -35,6 +35,9 @@ pub struct DashboardResponse {
     /// How many ranges are being searched right now (in progress), across
     /// every target.
     pub active_ranges: i64,
+    /// The database's disk, while it's getting too full to keep basenames
+    /// (see `disk.rs`); none otherwise.
+    pub low_disk: Option<crate::disk::LowDisk>,
 }
 
 /// One username's contribution, across every hostname it has registered
@@ -817,7 +820,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     )
     .fetch_one(&state.pool)
     .await?;
-    Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await?, active_ranges }))
+    Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await?, active_ranges, low_disk: state.disk.warning() }))
 }
 
 /// A dictionary target's `DashboardTarget` (see `DashboardTarget::kind`):

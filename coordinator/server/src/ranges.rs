@@ -13,6 +13,7 @@ use crate::alphabet::{
 };
 use crate::error::AppError;
 use crate::dictionary::DictionaryTarget;
+use crate::disk::DiskSpace;
 use crate::models::{i64_to_u32, PriorityRange, Range, Segment, SkipRange, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME};
 use crate::state::{now_unix, RangeConfig};
 
@@ -1591,8 +1592,9 @@ pub async fn complete_range(
 /// whoever reports them, as a find is (see `complete_range`): they're facts
 /// about the target. A basename that can't be one - empty, with a '\', or
 /// with anything but printable ASCII - is left out; only a dictionary
-/// target keeps any.
-pub async fn record_basenames(pool: &SqlitePool, user: &User, range_id: i64, basenames: &[String]) -> Result<(), AppError> {
+/// target keeps any. While the database's disk is low (see `disk.rs`) they're
+/// all discarded - accepted, but not kept - so they can't fill it.
+pub async fn record_basenames(pool: &SqlitePool, disk: &DiskSpace, user: &User, range_id: i64, basenames: &[String]) -> Result<(), AppError> {
     if basenames.is_empty() {
         return Ok(());
     }
@@ -1617,6 +1619,10 @@ pub async fn record_basenames(pool: &SqlitePool, user: &User, range_id: i64, bas
             continue;
         }
         valid.push(basename);
+    }
+    if let Some(free_bytes) = disk.low() {
+        tracing::warn!(range_id, user_id = user.id, reported = basenames.len(), free_bytes, "low on disk space, discarding basenames");
+        return Ok(());
     }
     let kept = crate::basenames::store(&mut tx, target_id, user.id, range_id, now_unix(), &valid).await?;
     tx.commit().await?;

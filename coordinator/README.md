@@ -537,7 +537,14 @@ read and sent 20 reports at a time (`BASENAME_REPORTS_PAGE`), so it's never
 all in memory, and the database - one connection, which every claim and
 heartbeat needs too - is only held for a page's query, however slowly the
 list is downloaded. Two words make only a handful; `send_basenames` is off
-by default, so a target only collects them when it's asked to.
+by default, so a target only collects them when it's asked to. And should
+the disk still run low - under `MIN_FREE_DISK_BYTES` free where the
+database is (`server/src/disk.rs`) - the server discards every basename
+reported until there's room again, rather than let the database run out of
+it: the reports are answered as if they'd been kept, so those basenames are
+lost. The dashboard warns in a yellow box at the top before that, from
+under `WARN_FREE_DISK_BYTES` free, so there's time to make room, and says
+so once they're being discarded.
 
 Every answer is gzipped for a client that says it takes gzip
 (`Accept-Encoding` - a browser, `curl --compressed`, the client's word list
@@ -659,6 +666,8 @@ found/total". A canary still being searched isn't counted yet; one given up on
 | `EMA_ALPHA` | `0.3` | smoothing factor for each user's observed-rate average |
 | `CANARY_PROBABILITY` | `0.33` | chance that a claim gets a canary instead of real work; `0` turns them off |
 | `CANARY_SECONDS` | `5` | how long a canary should take, at the client's measured rate |
+| `MIN_FREE_DISK_BYTES` | `268435456` (256 MiB) | below this much free on the database's disk, reported basenames are discarded |
+| `WARN_FREE_DISK_BYTES` | `536870912` (512 MiB) | below this much free, the dashboard warns that basenames soon won't be kept |
 
 ## Deploying to fly.io
 

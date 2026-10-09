@@ -1,6 +1,7 @@
 use sqlx::SqlitePool;
 
 use crate::dictionary::DictionaryCache;
+use crate::disk::DiskSpace;
 use crate::likely_prefixes::LikelyPrefixes;
 use std::sync::Arc;
 
@@ -11,6 +12,8 @@ pub struct Inner {
     pub pool: SqlitePool,
     pub admin_token: String,
     pub config: RangeConfig,
+    /// Whether there's room left for basenames - see `disk.rs`.
+    pub disk: DiskSpace,
 }
 
 impl std::ops::Deref for AppState {

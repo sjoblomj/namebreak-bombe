@@ -6,6 +6,7 @@ mod client_release;
 mod dashboard;
 mod db;
 mod dictionary;
+mod disk;
 #[cfg(test)]
 mod dictionary_tests;
 mod error;
@@ -36,8 +37,9 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::connect(&database_url).await?;
     let config = RangeConfig::from_env();
+    let disk = disk::DiskSpace::from_env(&database_url)?;
     config.likely_prefixes.refresh_matches(&pool).await?;
-    let state = AppState(Arc::new(Inner { pool, admin_token, config }));
+    let state = AppState(Arc::new(Inner { pool, admin_token, config, disk }));
 
     spawn_reclaim_task(state.clone());
     let app = router(state);
