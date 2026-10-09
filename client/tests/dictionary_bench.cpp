@@ -6,11 +6,13 @@
 // search for a file's name usually does. PERFORMANCE.md's "Dictionary
 // searches" has what it measured.
 //
-//   dictionary_bench [--backend <name>] [--words <n>] [--max-words <n>]
+//   dictionary_bench [--backend <name>] [--words <n>] [--max-words <n>] [--no-key]
 //
 // --words takes the first <n> words of english-1 only (to time a slower
 // backend in a reasonable time - the CPU backend takes minutes for all of
-// them); --max-words searches up to <n> words a candidate (default 2).
+// them); --max-words searches up to <n> words a candidate (default 2);
+// --no-key searches without the encryption key, so that only hashA is
+// hashed - what a search that hashed only the basename would cost.
 // Creating the backend (for CUDA, the GPU context, and the self-tests) and
 // a first, small search happen before the clock starts. Writes its files
 // under ./dictionary_bench/.
@@ -30,6 +32,7 @@ int main(int argc, char** argv) {
     std::string backendName;
     size_t wordLimit = 0;
     int maxWords = 2;
+    bool key = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--backend" && i + 1 < argc) {
@@ -38,8 +41,10 @@ int main(int argc, char** argv) {
             wordLimit = std::stoul(argv[++i]);
         } else if (arg == "--max-words" && i + 1 < argc) {
             maxWords = std::stoi(argv[++i]);
+        } else if (arg == "--no-key") {
+            key = false;
         } else {
-            fprintf(stderr, "usage: %s [--backend <name>] [--words <n>] [--max-words <n>]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--backend <name>] [--words <n>] [--max-words <n>] [--no-key]\n", argv[0]);
             return 1;
         }
     }
@@ -64,8 +69,8 @@ int main(int argc, char** argv) {
     req.suffix = ".WAV";
     req.targetHashA = 0x216A81D3;
     req.targetHashB = 0;
-    req.checkBasename = true;
-    req.basenameKey = 0x1D5AD26C;
+    req.checkBasename = key;
+    req.basenameKey = key ? 0x1D5AD26C : 0;
     req.wordSource = "english-1";
     req.outputFilePath = dir + "/matches.txt";
     req.basenamesFilePath = dir + "/basenames.txt";
@@ -91,7 +96,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::filesystem::remove_all(dir);
-    printf("\n%s: %llu candidates in %.2f s - %.2f G candidates/s (%zu words, up to %d a candidate)\n", backend->name(),
-           (unsigned long long) result.candidatesSearched, seconds, (double) result.candidatesSearched / seconds / 1e9, words.size(), maxWords);
+    printf("\n%s: %llu candidates in %.2f s - %.2f G candidates/s (%zu words, up to %d a candidate, %s)\n", backend->name(),
+           (unsigned long long) result.candidatesSearched, seconds, (double) result.candidatesSearched / seconds / 1e9, words.size(), maxWords,
+           key ? "with the key" : "without a key");
     return 0;
 }
