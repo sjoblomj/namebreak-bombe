@@ -13,7 +13,11 @@
 // trailing split and benchmarks can re-sweep it. See runSearch (search.cpp)
 // and README.md's "Design decisions" for what it trades off.
 #ifndef NAMEBREAK_GPU_WINDOW_CHARS
+#if defined(__APPLE__)
+#define NAMEBREAK_GPU_WINDOW_CHARS 6
+#else
 #define NAMEBREAK_GPU_WINDOW_CHARS 5
+#endif
 #endif
 
 // How many *rows* one kernel launch covers at most (a row = every value of a
@@ -91,7 +95,11 @@ constexpr int kMaxBatchesPerLaunch = 32;
 #ifndef NAMEBREAK_DICTIONARY_CANDIDATES_PER_LAUNCH
 #define NAMEBREAK_DICTIONARY_CANDIDATES_PER_LAUNCH (1ull << 28)
 #endif
+#if defined(__APPLE__)
+constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(64);
+#else
 constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
+#endif
 constexpr int kDictionaryThreadsPerBlock = dictionaryThreadsPerBlockOr(256);
 static_assert(kDictionaryWordsPerThread >= 1 && kDictionaryThreadsPerBlock >= 1 && kDictionaryThreadsPerBlock <= 1024,
               "a dictionary launch needs at least one word per thread, and 1 to 1024 threads per block");
