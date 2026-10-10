@@ -365,9 +365,16 @@ pick those up directly.
 
 ```sh
 cmake --preset default            # configure into build/
-cmake --build --preset default    # builds build/namebreak, and the tests in build/tests/
+cmake --build --preset default -j "$(nproc)"   # builds build/namebreak, and the tests in build/tests/
 ctest --preset default            # runs the tests
 ```
+
+`-j` sets how many files are compiled at once - on a Mac, `-j "$(sysctl -n
+hw.ncpu)"`. The presets leave it out on purpose: with make, a bare `-j` has
+no limit, and the dozen builds of the search library the tests use then
+start hundreds of compilers at once, enough to run out of memory. Without
+`-j`, make compiles one file at a time; Ninja and Visual Studio pick a number
+themselves.
 
 On a machine with a GPU, add `-DNAMEBREAK_REQUIRE_GPU=ON` to the first
 command, so that tests fail rather than skip if the driver loses the GPU

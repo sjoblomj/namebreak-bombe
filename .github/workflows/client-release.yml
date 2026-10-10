@@ -142,7 +142,9 @@ jobs:
         run: cmake --preset portable "-DNAMEBREAK_VERSION=$VERSION"
         working-directory: client
       - name: Build
-        run: cmake --build --preset portable
+        # The preset's "jobs": 0 is a bare make -j - no limit, hundreds of
+        # compilers at once on a 3-core runner, which then swaps for hours.
+        run: cmake --build --preset portable -j "$(sysctl -n hw.ncpu)"
         working-directory: client
       - name: Test
         run: ctest --preset portable

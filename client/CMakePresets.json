@@ -40,18 +40,15 @@
   "buildPresets": [
     {
       "name": "default",
-      "configurePreset": "default",
-      "jobs": 0
+      "configurePreset": "default"
     },
     {
       "name": "hip",
-      "configurePreset": "hip",
-      "jobs": 0
+      "configurePreset": "hip"
     },
     {
       "name": "portable",
-      "configurePreset": "portable",
-      "jobs": 0
+      "configurePreset": "portable"
     }
   ],
   "testPresets": [
