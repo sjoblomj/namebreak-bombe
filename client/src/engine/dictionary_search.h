@@ -127,6 +127,11 @@ struct DictionarySearchHooks {
     // (DictionaryResult::candidatesSearched), of how many there are to hash
     // in all - what the progress line's percentage is of.
     std::function<void(uint64_t searched, uint64_t toSearch)> onCount;
+    // With every line of progress (see DictionaryRequest::statusInterval),
+    // the last of them at the end: the filename (prefix and suffix included)
+    // of the candidate numbered nextNumber, the next to be searched - "" once
+    // there's none left to search.
+    std::function<void(const std::string& filename)> onStatus;
 };
 
 // Runs a dictionary search on `backend`, which must supportsDictionary(). The

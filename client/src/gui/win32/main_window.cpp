@@ -74,6 +74,10 @@ constexpr int kIdTrayFinish = 205;
 constexpr const char* kFinishRangeText = "Finish current range, then pause";
 
 constexpr size_t kMaxMatchLines = 100;
+// The matches box's line for the candidate a dictionary search has got to -
+// only ever its last line, each replacing the one before (see
+// updateUiFromSharedState), so the box is never all of them.
+constexpr const char* kSearchingPrefix = "Searching: ";
 
 HWND g_hwndMain = nullptr;
 HWND g_hwndTargetLabel = nullptr;
@@ -103,6 +107,9 @@ bool g_quitting = false;
 // target), as the box shows only the current one's.
 std::deque<std::string> g_recentMatches;
 std::string g_recentMatchesPath;
+// The matches file's line last added to the box - not always its last line,
+// which may be a basename's or a search position's.
+std::string g_lastMatch;
 
 // Set once in main() after prepareConfig() succeeds, never touched again -
 // "coordinator", "bounded", "continuous" or "dictionary" (window title,
@@ -239,6 +246,7 @@ void updateUiFromSharedState() {
     double progressFraction;
     bool hasActiveRange, rangeJustFinished, searchEnded;
     std::vector<std::string> newBasenames;
+    std::string newSearchPosition;
     {
         std::lock_guard<std::mutex> lock(g_status.mutex);
         targetName = g_status.targetName;
@@ -257,6 +265,7 @@ void updateUiFromSharedState() {
         rangeJustFinished = g_status.rangeJustFinished;
         g_status.rangeJustFinished = false; // one-shot edge, consumed here
         newBasenames.swap(g_status.newBasenames);
+        newSearchPosition.swap(g_status.newSearchPosition);
     }
 
     bool paused = g_pauseRequested.load(std::memory_order_relaxed);
@@ -281,7 +290,7 @@ void updateUiFromSharedState() {
     // against - a coordinator range, or local bounded mode (see
     // onRangeClaimed/runLocalSearch, which leave lowerBound empty exactly
     // when there isn't one: continuous mode, or nothing running yet) - and
-    // for a local dictionary search, which says how far it has got itself
+    // for a dictionary search or range, which says how far it has got itself
     // (progressFraction).
     bool determinate = hasActiveRange && (progressFraction >= 0 || !lowerBound.empty());
     if (determinate) {
@@ -326,6 +335,7 @@ void updateUiFromSharedState() {
     if (outputFilePath != g_recentMatchesPath) {
         g_recentMatches.clear();
         g_recentMatchesPath = outputFilePath;
+        g_lastMatch.clear();
         matchesChanged = true;
     }
     auto addMatchLine = [&](const std::string& line) {
@@ -334,10 +344,21 @@ void updateUiFromSharedState() {
             g_recentMatches.pop_front();
         matchesChanged = true;
     };
-    if (!latestMatch.empty() && (g_recentMatches.empty() || g_recentMatches.back() != latestMatch))
-        addMatchLine(latestMatch);
+    // Coordinator mode may search dictionary ranges, whose basenames and
+    // search positions go in the box too, so its Hash A matches are said to
+    // be.
+    const bool dictionaryLines = g_activeMode == "coordinator" || g_activeMode == "dictionary";
+    if (!latestMatch.empty() && latestMatch != g_lastMatch) {
+        g_lastMatch = latestMatch;
+        addMatchLine(dictionaryLines ? "Hash A match: " + latestMatch : latestMatch);
+    }
     for (const std::string& basename : newBasenames)
         addMatchLine("Basename: " + basename);
+    if (!newSearchPosition.empty()) {
+        if (!g_recentMatches.empty() && g_recentMatches.back().rfind(kSearchingPrefix, 0) == 0)
+            g_recentMatches.pop_back();
+        addMatchLine(kSearchingPrefix + newSearchPosition);
+    }
     if (matchesChanged) {
         std::string joined;
         for (const std::string& match : g_recentMatches) {
@@ -365,9 +386,10 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
     SendMessage(g_hwndProgress, PBM_SETMARQUEE, TRUE, 100);
 
     // A dictionary search with an encryption key finds basenames that match
-    // it too, which go in the same box.
+    // it too, which go in the same box, as does how far it has got.
     CreateWindowExA(0, "STATIC",
-                     g_activeMode == "dictionary" ? "Hash A matches and basenames (most recent last):" : "Hash A matches (most recent last):",
+                     g_activeMode == "dictionary" || g_activeMode == "coordinator" ? "Search log (most recent last):"
+                                                                                  : "Hash A matches (most recent last):",
                      WS_CHILD | WS_VISIBLE, 10, 95, 470, 18, hwnd, nullptr, hInstance, nullptr);
     g_hwndMatches = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 115, 470, 280,

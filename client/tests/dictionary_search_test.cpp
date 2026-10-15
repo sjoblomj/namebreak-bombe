@@ -834,6 +834,8 @@ static void testRangesAndHooks(SearchBackend& backend) {
                 counts.push_back(searchedSoFar);
                 ok = ok && toSearch == inRange.searched && searchedSoFar <= toSearch;
             };
+            std::vector<std::string> statuses;
+            hooks.onStatus = [&](const std::string& filename) { statuses.push_back(filename); };
             const DictionaryResult r = runDictionarySearch(backend, range, nullptr, hooks);
             ++rangesRun;
             ok = ok && r.ok && !r.aborted && r.found == !inRange.firstFound.empty();
@@ -853,6 +855,12 @@ static void testRangesAndHooks(SearchBackend& backend) {
             // A count with every call to the backend, the last of them all
             // the search hashed.
             ok = ok && std::is_sorted(counts.begin(), counts.end()) && (counts.empty() ? r.candidatesSearched == 0 : counts.back() == r.candidatesSearched);
+            // A line of progress at the end at least, each of a filename
+            // with the request's prefix and suffix.
+            ok = ok && !statuses.empty() && std::all_of(statuses.begin(), statuses.end(), [&](const std::string& f) {
+                     return f.empty() || (f.size() >= range.prefix.size() + range.suffix.size() && f.compare(0, range.prefix.size(), range.prefix) == 0 &&
+                                          f.compare(f.size() - range.suffix.size(), range.suffix.size(), range.suffix) == 0);
+                 });
             ok = ok && std::is_sorted(progress.begin(), progress.end()) &&
                  std::all_of(progress.begin(), progress.end(), [&](uint64_t n) { return n >= range.startNumber && n <= range.endNumber; });
             hits.insert(hits.end(), rangeHits.begin(), rangeHits.end());

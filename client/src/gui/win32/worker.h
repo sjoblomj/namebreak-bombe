@@ -48,11 +48,10 @@ struct SharedStatus {
     Insertion insertFromEnd;
     std::string lowerBound; // candidate-only (no prefix/suffix)
     std::string upperBound; // candidate-only
-    // How far a local dictionary search has got, from 0 to 1 - it counts its
-    // own candidates (DictionarySearchHooks::onCount), so this is used as it
-    // is, rather than worked out from the matches file. -1 for any other
-    // search, and a coordinator's dictionary range, which has neither (see
-    // runDictionaryRange) and so shows the marquee style.
+    // How far a dictionary search - local, or a coordinator's dictionary
+    // range - has got, from 0 to 1: it counts its own candidates
+    // (DictionarySearchHooks::onCount), so this is used as it is, rather than
+    // worked out from the matches file. -1 for any other search.
     double progressFraction = -1;
     bool hasActiveRange = false;
     // Set true by onRangeFinished, consumed (cleared back to false) the next
@@ -62,6 +61,9 @@ struct SharedStatus {
     // Basenames a local dictionary search has found since the UI timer last
     // took them (and cleared this) - for the matches box.
     std::vector<std::string> newBasenames;
+    // The candidate a dictionary search has got to since the UI timer last
+    // took it (and cleared this) - also for the matches box. Empty for none.
+    std::string newSearchPosition;
     // A local search ran to its end - found the file, or searched every
     // candidate - rather than stopping on an error.
     bool searchEnded = false;

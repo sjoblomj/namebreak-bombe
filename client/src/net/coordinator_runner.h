@@ -72,6 +72,13 @@ struct CoordinatorCallbacks {
     // Fired when the current range's search ends, however it ended (found,
     // exhausted, or aborted) - lets a progress bar be reset/completed.
     std::function<void(bool found)> onRangeFinished;
+    // A dictionary range's search as it goes, on the thread running it - as
+    // DictionarySearchHooks' onCount, onStatus and onBasenameMatch: how many
+    // of the range's candidates it has hashed, the candidate it has got to,
+    // and every basename it finds.
+    std::function<void(uint64_t searched, uint64_t toSearch)> onDictionaryCount;
+    std::function<void(const std::string& filename)> onDictionaryStatus;
+    std::function<void(const std::string& basename)> onDictionaryBasename;
     // Outer-loop lifecycle text only (registered, registration failed,
     // claim retry/backoff, no work available) - mirrors the printf/fprintf
     // already at those call sites in runCoordinator(). Does NOT cover

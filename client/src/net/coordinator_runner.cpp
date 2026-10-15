@@ -766,9 +766,9 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
         printf("[coordinator] word list %s kept in %s\n", name.c_str(), cacheDir.c_str());
 
     if (callbacks && callbacks->onRangeClaimed) {
-        // What a caller can show of it: no lower bound, so no fraction of the
-        // way through (see CoordinatorCallbacks) - the numbers aren't a
-        // candidate's place in an alphabet.
+        // What a caller can show of it: no lower bound - the numbers aren't a
+        // candidate's place in an alphabet, so how far it has got comes from
+        // onDictionaryCount instead.
         SearchRequest shown;
         shown.prefix = req.prefix;
         shown.suffix = req.suffix;
@@ -784,8 +784,16 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
     search.outputFilePath = req.outputFilePath;
     search.run = [&](std::atomic<bool>& abort) {
         DictionarySearchHooks hooks;
-        hooks.onBasenameMatch = [&](const std::string& basename, const std::string&) { outbox.add(basename); };
+        hooks.onBasenameMatch = [&](const std::string& basename, const std::string&) {
+            outbox.add(basename);
+            if (callbacks && callbacks->onDictionaryBasename)
+                callbacks->onDictionaryBasename(basename);
+        };
         hooks.onProgress = [&](uint64_t next) { outbox.setProgress(next); };
+        if (callbacks) {
+            hooks.onCount = callbacks->onDictionaryCount;
+            hooks.onStatus = callbacks->onDictionaryStatus;
+        }
         DictionaryResult found = runDictionarySearch(*backend, req, &abort, hooks, pauseRequested);
         return RangeResult{found.ok, found.error, found.found, found.filename, found.aborted};
     };

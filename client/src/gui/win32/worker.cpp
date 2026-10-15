@@ -21,9 +21,85 @@ namespace {
 
 using namespace gui;
 
+// `n` with thousands separators: 4,080,040,000.
+std::string withCommas(uint64_t n) {
+    std::string digits = std::to_string(n), out;
+    for (size_t i = 0; i < digits.size(); ++i) {
+        if (i > 0 && (digits.size() - i) % 3 == 0)
+            out += ',';
+        out += digits[i];
+    }
+    return out;
+}
+
+// `n` short enough for the status line: 99,999, then 3 significant digits
+// and a unit - 4.08 G, 261 T.
+std::string compactCount(uint64_t n) {
+    if (n < 100000)
+        return withCommas(n);
+    const char* units[] = {"K", "M", "G", "T", "P", "E"};
+    double value = (double) n / 1000;
+    int unit = 0;
+    while (value >= 999.5 && unit < 5) {
+        value /= 1000;
+        ++unit;
+    }
+    char buf[32];
+    snprintf(buf, sizeof buf, "%.3g %s", value, units[unit]);
+    return buf;
+}
+
+// A dictionary search's progress, as the status line and the matches box
+// show it - a local one's, or each of a coordinator's dictionary ranges'. The
+// status line is the CLI's progress line, shortened. Worker thread only, but
+// for what it writes to g_status.
+class DictionaryProgressText {
+public:
+    // Before every search, for only its own candidates to count towards the
+    // rate - not those a resumed search had searched before.
+    void start() {
+        startTime_ = std::chrono::steady_clock::now();
+        basenameHits_ = 0;
+    }
+
+    void basename(const std::string& basename) {
+        ++basenameHits_;
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        g_status.newBasenames.push_back(basename);
+    }
+
+    void count(uint64_t searched, uint64_t toSearch) {
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime_).count();
+        const double rate = elapsed > 0 ? (double) searched / elapsed : 0;
+        const double fraction = toSearch ? (double) searched / (double) toSearch : 1.0;
+        char percent[16];
+        snprintf(percent, sizeof percent, "%.2f%%", 100.0 * fraction);
+        std::string text = std::string(percent) + " of " + compactCount(toSearch) + " candidates, about " +
+                           (rate > 0 ? formatDuration((double) (toSearch - searched) / rate) : "?") + " left";
+        if (basenameHits_)
+            text += " - " + withCommas(basenameHits_) + (basenameHits_ == 1 ? " basename" : " basenames");
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        g_status.progressFraction = fraction;
+        g_status.statusText = text;
+    }
+
+    void position(const std::string& filename) {
+        if (filename.empty())
+            return;
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        g_status.newSearchPosition = filename;
+    }
+
+private:
+    std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
+    uint64_t basenameHits_ = 0;
+};
+
+DictionaryProgressText g_dictionaryProgress;
+
 void onRangeClaimed(const ClaimResponse& claim, const SearchRequest& req) {
     std::lock_guard<std::mutex> lock(g_status.mutex);
-    g_status.targetName = claim.targetName;
+    g_status.targetName = claim.targetName + " (range " + std::to_string(claim.rangeId) + ")";
     g_status.outputFilePath = req.outputFilePath;
     // A coordinator range is always bounded (a fixed candidate length - see
     // toSearchRequest, coordinator_runner.cpp), so it always has a real
@@ -35,10 +111,14 @@ void onRangeClaimed(const ClaimResponse& claim, const SearchRequest& req) {
     g_status.insertFromEnd = req.insertFromEnd;
     g_status.lowerBound = req.lowerBound;
     g_status.upperBound = req.upperBound;
-    g_status.progressFraction = -1;
+    // A dictionary range counts its own candidates - from 0, until its first
+    // count (see DictionaryProgressText::count) replaces the status line too.
+    g_status.progressFraction = claim.dictionary ? 0 : -1;
     g_status.hasActiveRange = true;
     g_status.rangeJustFinished = false;
-    g_status.statusText = "Searching target: " + claim.targetName;
+    g_status.statusText = "Searching '" + claim.lowerBoundFilename + "' to '" + claim.upperBoundFilename + "'";
+    if (claim.dictionary)
+        g_dictionaryProgress.start();
 }
 
 void onRangeFinished(bool found) {
@@ -110,38 +190,10 @@ void runLocalSearch(const SearchRequest& req, bool continuous, const std::string
     g_status.searchEnded = result.ok && !result.aborted;
 }
 
-// `n` with thousands separators: 4,080,040,000.
-std::string withCommas(uint64_t n) {
-    std::string digits = std::to_string(n), out;
-    for (size_t i = 0; i < digits.size(); ++i) {
-        if (i > 0 && (digits.size() - i) % 3 == 0)
-            out += ',';
-        out += digits[i];
-    }
-    return out;
-}
-
-// `n` short enough for the status line: 99,999, then 3 significant digits
-// and a unit - 4.08 G, 261 T.
-std::string compactCount(uint64_t n) {
-    if (n < 100000)
-        return withCommas(n);
-    const char* units[] = {"K", "M", "G", "T", "P", "E"};
-    double value = (double) n / 1000;
-    int unit = 0;
-    while (value >= 999.5 && unit < 5) {
-        value /= 1000;
-        ++unit;
-    }
-    char buf[32];
-    snprintf(buf, sizeof buf, "%.3g %s", value, units[unit]);
-    return buf;
-}
-
 // Runs a dictionary search directly (see src/cli/main.cpp's main() for the
 // CLI's equivalent). It counts its own candidates, so the progress bar is
-// that fraction (see SharedStatus::progressFraction), and the status line
-// the CLI's progress line, shortened.
+// that fraction (see SharedStatus::progressFraction) - see
+// DictionaryProgressText.
 void runLocalDictionarySearch(const DictionaryRequest& req, const std::string& backendName) {
     {
         std::lock_guard<std::mutex> lock(g_status.mutex);
@@ -164,30 +216,11 @@ void runLocalDictionarySearch(const DictionaryRequest& req, const std::string& b
         return;
     }
 
-    // Only this run's candidates count towards the rate - not those a
-    // resumed search had searched before.
-    const auto startTime = std::chrono::steady_clock::now();
-    uint64_t basenameHits = 0;
+    g_dictionaryProgress.start();
     DictionarySearchHooks hooks;
-    hooks.onBasenameMatch = [&](const std::string& basename, const std::string&) {
-        ++basenameHits;
-        std::lock_guard<std::mutex> lock(g_status.mutex);
-        g_status.newBasenames.push_back(basename);
-    };
-    hooks.onCount = [&](uint64_t searched, uint64_t toSearch) {
-        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-        const double rate = elapsed > 0 ? (double) searched / elapsed : 0;
-        const double fraction = toSearch ? (double) searched / (double) toSearch : 1.0;
-        char percent[16];
-        snprintf(percent, sizeof percent, "%.2f%%", 100.0 * fraction);
-        std::string text = std::string(percent) + " of " + compactCount(toSearch) + " candidates, about " +
-                           (rate > 0 ? formatDuration((double) (toSearch - searched) / rate) : "?") + " left";
-        if (basenameHits)
-            text += " - " + withCommas(basenameHits) + (basenameHits == 1 ? " basename" : " basenames");
-        std::lock_guard<std::mutex> lock(g_status.mutex);
-        g_status.progressFraction = fraction;
-        g_status.statusText = text;
-    };
+    hooks.onBasenameMatch = [](const std::string& basename, const std::string&) { g_dictionaryProgress.basename(basename); };
+    hooks.onCount = [](uint64_t searched, uint64_t toSearch) { g_dictionaryProgress.count(searched, toSearch); };
+    hooks.onStatus = [](const std::string& filename) { g_dictionaryProgress.position(filename); };
     {
         std::lock_guard<std::mutex> lock(g_status.mutex);
         g_status.statusText = "Running dictionary search on " + std::string(backend->name()) + "...";
@@ -218,6 +251,9 @@ void workerThreadMain(AppConfig config, HWND notifyWindow) {
         callbacks.onRangeClaimed = onRangeClaimed;
         callbacks.onRangeFinished = onRangeFinished;
         callbacks.onStatus = onStatus;
+        callbacks.onDictionaryCount = [](uint64_t searched, uint64_t toSearch) { g_dictionaryProgress.count(searched, toSearch); };
+        callbacks.onDictionaryStatus = [](const std::string& filename) { g_dictionaryProgress.position(filename); };
+        callbacks.onDictionaryBasename = [](const std::string& basename) { g_dictionaryProgress.basename(basename); };
         runCoordinator(config.coordinatorArgs, &g_pauseRequested, &g_quitRequested, &callbacks, &g_finishRangeThenPause);
     } else if (config.mode == "dictionary") {
         runLocalDictionarySearch(config.dictionaryRequest, config.backend);

@@ -586,6 +586,8 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
                rate > 0 ? formatDuration((double) (toSearch - result.candidatesSearched) / rate).c_str() : "?",
                (unsigned long long) result.nextNumber, describeNumber(result.nextNumber).c_str());
         fflush(stdout);
+        if (hooks.onStatus)
+            hooks.onStatus(result.nextNumber < end ? req.prefix + space.textOf(result.nextNumber) + req.suffix : "");
         lastStatus = std::chrono::steady_clock::now();
     };
 
