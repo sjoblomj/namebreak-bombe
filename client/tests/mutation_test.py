@@ -1062,12 +1062,27 @@ def build(work, base, mutation, args):
     build_dir = src / "build"
     configure = ["cmake", "-S", str(src), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release", "-DNAMEBREAK_METAL=OFF",
                  "-DNAMEBREAK_NETWORK=OFF", "-DNAMEBREAK_TEST_VARIANTS=ON"] + BACKENDS[args.backend][0]
+    # Build for the one GPU that runs the checks, not a fat binary for several
+    # architectures - most of a CUDA build's time is nvcc on the templated
+    # kernel.
+    if args.cuda_arch:
+        configure.append(f"-DCMAKE_CUDA_ARCHITECTURES={args.cuda_arch}")
+    # A mutation changes a single file, so caching compilations turns the rest
+    # into hits: a run's second mutation on is mostly link time. The fresh
+    # per-mutation directory would defeat ccache, so normalise the paths it
+    # hashes (CCACHE_BASEDIR rewrites them relative to the copy's root, and no
+    # directory goes into the hash).
+    env = os.environ
+    if args.ccache and (ccache := shutil.which("ccache")):
+        for lang in ("CXX", "CUDA", "C"):
+            configure.append(f"-DCMAKE_{lang}_COMPILER_LAUNCHER={ccache}")
+        env = {**os.environ, "CCACHE_BASEDIR": str(src), "CCACHE_NOHASHDIR": "1"}
     configure += args.cmake_arg
     compile_ = ["cmake", "--build", str(build_dir), "-j", str(args.jobs), "--target"] + TARGETS
     log = src / "build.log"
     with open(log, "w") as out:
         for command in (configure, compile_):
-            if subprocess.run(command, stdout=out, stderr=subprocess.STDOUT).returncode != 0:
+            if subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, env=env).returncode != 0:
                 return None
     return build_dir
 
@@ -1163,6 +1178,10 @@ def main():
     parser.add_argument("--work-dir", help="where to put the copies (default: a new temporary directory)")
     parser.add_argument("--keep", action="store_true", help="keep the work directory even if everything went as expected")
     parser.add_argument("--cmake-arg", action="append", default=[], help="extra CMake argument, e.g. -DCMAKE_CUDA_ARCHITECTURES=86")
+    parser.add_argument("--cuda-arch", default="native",
+                        help="CMAKE_CUDA_ARCHITECTURES to build for (default 'native', the local GPU; '' leaves it to CMake)")
+    parser.add_argument("--no-ccache", dest="ccache", action="store_false",
+                        help="don't run the compilers through ccache (it is used when found, to cache unchanged files across mutations)")
     args = parser.parse_args()
 
     mutations = BACKENDS[args.backend][1]
