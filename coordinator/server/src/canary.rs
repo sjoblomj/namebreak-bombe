@@ -14,20 +14,24 @@
 //! only letters and digits, which no pruning rule skips - but for
 //! `min_backslash_count`, which a canary leaves at 0. (Text the target
 //! inserts, which the canary inserts too, could break a rule whatever is
-//! around it - but then every candidate of the target does as well.) Its target takes
-//! part in nothing but this one claim - not other claims, the dashboard's
-//! targets, `/status`, nor a volunteer's candidates, ranges or names found -
+//! around it - but then every candidate of the target does as well.) A
+//! dictionary target's canary copies its words, separators and tails
+//! instead, and its encryption key - made the planted name's (see
+//! `dictionary_canary`). Its target takes part in nothing but this one claim - not other claims, the dashboard's
+//! targets, `/status`, nor a volunteer's candidates, ranges, names or
+//! basenames found -
 //! and its result is kept in `canaries` (see `complete`).
 
 use std::sync::OnceLock;
 
-use namebreak_protocol::{ClaimResponse, Version};
+use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE};
 use rand::RngExt;
 
 use crate::alphabet::{alphabet_size, candidate_to_index, client_alphabet_for, index_to_candidate, max_supported_len, space_size, split_end, Pos};
 use crate::error::AppError;
-use crate::models::{u32_to_i64, Range, Target, User};
-use crate::ranges::{insert_claimed_range, to_claim_response};
+use crate::dictionary::DictionarySpace;
+use crate::models::{u32_to_i64, Range, Target, User, DICTIONARY_ALPHABET_NAME};
+use crate::ranges::{insert_claimed_range, to_claim_response, to_dictionary_claim_response};
 use crate::state::RangeConfig;
 
 /// Every canary's target's name. One name for all of them, as a client keeps
@@ -70,37 +74,46 @@ pub fn mpq_hash(name: &str, offset: usize) -> u32 {
 }
 
 /// A canary for `user`, now and then: with probability
-/// `config.canary_probability`, if some real target is active and the
-/// client's rate has been measured (a guessed one could make a canary take
-/// far longer than `config.canary_seconds`). Its range is
-/// claimed for `user` like any other; `None` means the claim goes on to
-/// real work.
+/// `config.canary_probability`, copying the real target the client would
+/// most likely get work from - the first, by priority, it can search - if
+/// the client's rate for that kind of target has been measured (a guessed
+/// one could make a canary take far longer than `config.canary_seconds`).
+/// Its range is claimed for `user` like any other; `None` means the claim
+/// goes on to real work.
 pub async fn maybe_claim(
     tx: &mut sqlx::SqliteConnection,
     config: &RangeConfig,
     user: &User,
     client_version: Version,
-    rate: f64,
     now: i64,
 ) -> Result<Option<ClaimResponse>, AppError> {
-    if user.ema_rate_per_sec.is_none() || config.canary_probability <= 0.0 || rand::rng().random::<f64>() >= config.canary_probability {
+    if config.canary_probability <= 0.0 || rand::rng().random::<f64>() >= config.canary_probability {
         return Ok(None);
     }
-    // A real target the client searches as it is, whose prefix, suffix,
-    // alphabet and pruning the canary copies - the one it would most likely
-    // get work from. Never a dictionary target, which has no alphabet.
-    let templates = sqlx::query_as::<_, Target>(
-        "SELECT * FROM targets WHERE status = 'active' AND is_virtual = 0 AND kind = 'alphabet' ORDER BY priority DESC, created_at ASC",
-    )
+    let templates = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' AND is_virtual = 0 ORDER BY priority DESC, created_at ASC")
         .fetch_all(&mut *tx)
         .await?;
-    let Some(template) =
-        templates.into_iter().find(|t| {
+    let Some(template) = templates.into_iter().find(|t| {
+        if t.is_dictionary() {
+            client_version >= DICTIONARY_SINCE
+        } else {
             client_alphabet_for(&t.alphabet_name, &t.alphabet, client_version) == Some(t.alphabet.as_str()) && t.insertions().searchable_by(client_version)
-        })
-    else {
+        }
+    }) else {
         return Ok(None);
     };
+    if template.is_dictionary() {
+        let Some(rate) = user.ema_dictionary_rate_per_sec else { return Ok(None) };
+        dictionary_canary(tx, config, user, &template, rate, now).await
+    } else {
+        let Some(rate) = user.ema_rate_per_sec else { return Ok(None) };
+        alphabet_canary(tx, config, user, &template, rate, now).await
+    }
+}
+
+/// A canary copying alphabet target `template`: its prefix, suffix,
+/// alphabet, pruning and insertions.
+async fn alphabet_canary(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, user: &User, template: &Target, rate: f64, now: i64) -> Result<Option<ClaimResponse>, AppError> {
     let Some(canary) = plan(&template.alphabet, (rate * config.canary_seconds).max(1.0) as Pos) else {
         return Ok(None);
     };
@@ -165,18 +178,112 @@ pub async fn maybe_claim(
         now,
     )
     .await?;
+    let target = record(tx, target_id, range_id, user, &filename, canary.end - canary.start, now).await?;
+    Ok(Some(to_claim_response(&target, range_id, canary.len, canary.start, canary.end, lease_seconds, &template.alphabet, &template.alphabet)))
+}
+
+/// A canary copying dictionary target `template`: its word lists,
+/// separators, word counts, tails, prefix and suffix - at the word count its
+/// sweep is at - and its encryption key and `send_basenames`, so the client
+/// compares basenames to a key as it does for the real target: the key the
+/// planted name's basename has. But not its bounds, which could leave the
+/// planted candidate out: a canary has none. Its claim is made with the
+/// template's `DictionaryTarget`, the same words, so the canary's target is
+/// never loaded into `config.dictionaries` - a canary each time would fill
+/// it.
+async fn dictionary_canary(
+    tx: &mut sqlx::SqliteConnection,
+    config: &RangeConfig,
+    user: &User,
+    template: &Target,
+    rate: f64,
+    now: i64,
+) -> Result<Option<ClaimResponse>, AppError> {
+    let dictionary = config.dictionaries.get(&mut *tx, template).await?;
+    let space = &dictionary.space;
+    let cursor_words: i64 = sqlx::query_scalar("SELECT candidate_len FROM target_progress WHERE target_id = ?").bind(template.id).fetch_one(&mut *tx).await?;
+    let words = cursor_words.clamp(space.min_words(), space.max_words());
+    let canary = plan_dictionary(space, words, (rate * config.canary_seconds).max(1.0) as i64);
+    let filename = format!("{}{}{}", template.prefix, space.text(canary.planted), template.suffix);
+    let basename = filename.rsplit('\\').next().expect("rsplit yields at least one piece");
+    let encryption_key = template.encryption_key.map(|_| u32_to_i64(mpq_hash(basename, 0x300)));
+
+    let target_id: i64 = sqlx::query_scalar(
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, alphabet_name, alphabet, status, priority, \
+         start_len, encryption_key, kind, word_lists, separators, min_words, max_words, tails, send_basenames, created_at, is_virtual) \
+         VALUES (?, ?, ?, ?, ?, '', '', ?, '', 'active', 0, 1, ?, 'dictionary', ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
+    )
+    .bind(CANARY_TARGET_NAME)
+    .bind(&template.prefix)
+    .bind(&template.suffix)
+    .bind(u32_to_i64(mpq_hash(&filename, 0x100)))
+    .bind(u32_to_i64(mpq_hash(&filename, 0x200)))
+    .bind(DICTIONARY_ALPHABET_NAME)
+    .bind(encryption_key)
+    .bind(&template.word_lists)
+    .bind(&template.separators)
+    .bind(template.min_words)
+    .bind(template.max_words)
+    .bind(&template.tails)
+    .bind(template.send_basenames)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    // A cursor past its one range, as an alphabet canary's.
+    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, 0, ?, ?, '')")
+        .bind(target_id)
+        .bind(words)
+        .bind(canary.end)
+        .bind(DICTIONARY_ALPHABET_NAME)
+        .execute(&mut *tx)
+        .await?;
+
+    let lease_seconds = config.lease_seconds;
+    let range_id =
+        insert_claimed_range(&mut *tx, target_id, words, canary.start as Pos, canary.end as Pos, DICTIONARY_ALPHABET_NAME, "", None, user, lease_seconds, now).await?;
+    let target = record(tx, target_id, range_id, user, &filename, (canary.end - canary.start) as Pos, now).await?;
+    let mut claim = to_dictionary_claim_response(&target, &dictionary, range_id, canary.start, canary.end, lease_seconds);
+    claim.filename_lower_bound = None;
+    claim.filename_upper_bound = None;
+    Ok(Some(claim))
+}
+
+/// Keeps a canary's planted `filename` in `canaries`, and reads its target
+/// back.
+async fn record(tx: &mut sqlx::SqliteConnection, target_id: i64, range_id: i64, user: &User, filename: &str, candidates: Pos, now: i64) -> Result<Target, AppError> {
     sqlx::query("INSERT INTO canaries (target_id, range_id, user_id, filename, created_at) VALUES (?, ?, ?, ?, ?)")
         .bind(target_id)
         .bind(range_id)
         .bind(user.id)
-        .bind(&filename)
+        .bind(filename)
         .bind(now)
         .execute(&mut *tx)
         .await?;
+    tracing::info!(range_id, user_id = user.id, %candidates, "handed out a canary");
+    Ok(sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_one(&mut *tx).await?)
+}
 
-    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(target_id).fetch_one(&mut *tx).await?;
-    tracing::info!(range_id, user_id = user.id, candidates = %(canary.end - canary.start), "handed out a canary");
-    Ok(Some(to_claim_response(&target, range_id, canary.len, canary.start, canary.end, lease_seconds, &template.alphabet, &template.alphabet)))
+/// Where a dictionary canary goes: its range [start, end) of candidate
+/// numbers, and the number of the candidate planted in it.
+#[derive(Debug)]
+struct DictionaryCanaryPlan {
+    start: i64,
+    end: i64,
+    planted: i64,
+}
+
+/// A dictionary canary of `count` candidates of `words` words (all of
+/// them, if there are fewer), with a random one of them planted at a random
+/// place in it. Every candidate is one a search compares - a dictionary
+/// search prunes nothing.
+fn plan_dictionary(space: &DictionarySpace, words: i64, count: i64) -> DictionaryCanaryPlan {
+    let (block_start, block_size) = (space.block_start(words), space.block_size(words));
+    let count = count.clamp(1, block_size);
+    let mut rng = rand::rng();
+    let planted = block_start + rng.random_range(0..block_size);
+    let offset = rng.random_range(0..count);
+    let start = (planted - offset).clamp(block_start, block_start + block_size - count);
+    DictionaryCanaryPlan { start, end: start + count, planted }
 }
 
 /// Where a canary goes: its range [start, end) of `len`-character

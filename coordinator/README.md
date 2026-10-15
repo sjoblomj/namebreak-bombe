@@ -493,8 +493,8 @@ if any differs. Heartbeats and a quit report progress as a
 candidate number (`next_candidate_number` - every candidate numbered below it
 has been searched) rather than a Hash A match, so a dictionary range is
 checkpointed at every heartbeat, and a quit splits it exactly there. Clients
-older than protocol 1.5 never get a dictionary target's work; nor is a
-canary made from one.
+older than protocol 1.5 never get a dictionary target's work, nor a canary
+made from one (see "Canaries").
 
 **Basenames.** A client sends the basenames it finds with its next
 heartbeat, quit or completion, at most 5,000 a report
@@ -642,7 +642,14 @@ hardware, driver and build: bit flips (consumer GPUs have no ECC memory), a
 driver bug, a broken release, a modified client. The canary copies a real
 target's prefix, suffix, alphabet and pruning, so it's searched the way real
 work is; the planted candidate has only letters and digits, so no pruning rule
-skips it. Its result goes in the `canaries` table (`found` or `missed`; a missed
+skips it. When the client's first target by priority is a dictionary target,
+the canary copies that instead (once the client's dictionary rate has been
+measured): its word lists, separators, word counts, tails, prefix and suffix,
+at the word count its sweep is at, and - if it has an encryption key - a key
+made from the planted name's basename, so the client takes the same key-only
+path real work does (as well as `send_basenames`; the basenames sent for a
+canary aren't kept). It leaves out the target's bounds, which could leave
+out the planted name. Its result goes in the `canaries` table (`found` or `missed`; a missed
 one is also logged as a warning). Virtual targets (`targets.is_virtual`) are
 left out of everything else - other claims, the dashboard's targets and
 ranges, `/status`, the rate estimate, and a volunteer's candidates, ranges and

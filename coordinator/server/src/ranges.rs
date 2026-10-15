@@ -892,7 +892,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
     let client_version: Version = user.protocol_version.parse().unwrap_or(Version::new(1, 0, 0));
 
     // Now and then a canary instead (see canary.rs).
-    if let Some(claim) = crate::canary::maybe_claim(&mut tx, config, user, client_version, rate, now).await? {
+    if let Some(claim) = crate::canary::maybe_claim(&mut tx, config, user, client_version, now).await? {
         tx.commit().await?;
         return Ok(Some(claim));
     }
@@ -1591,7 +1591,7 @@ pub async fn complete_range(
 /// 409 included, which the client then counts as delivered too. From
 /// whoever reports them, as a find is (see `complete_range`): they're facts
 /// about the target. A basename that can't be one - empty, with a '\', or
-/// with anything but printable ASCII - is left out; only a dictionary
+/// with anything but printable ASCII - is left out; only a (real) dictionary
 /// target keeps any. While the database's disk is low (see `disk.rs`) they're
 /// all discarded - accepted, but not kept - so they can't fill it.
 pub async fn record_basenames(pool: &SqlitePool, disk: &DiskSpace, user: &User, range_id: i64, basenames: &[String]) -> Result<(), AppError> {
@@ -1602,14 +1602,18 @@ pub async fn record_basenames(pool: &SqlitePool, disk: &DiskSpace, user: &User, 
         return Err(AppError::BadRequest(format!("at most {MAX_BASENAMES_PER_REPORT} basenames a report - send the rest with the next")));
     }
     let mut tx = pool.begin().await?;
-    let (target_id, kind): (i64, String) =
-        sqlx::query_as("SELECT targets.id, targets.kind FROM ranges JOIN targets ON targets.id = ranges.target_id WHERE ranges.id = ?")
+    let (target_id, kind, is_virtual): (i64, String, bool) =
+        sqlx::query_as("SELECT targets.id, targets.kind, targets.is_virtual FROM ranges JOIN targets ON targets.id = ranges.target_id WHERE ranges.id = ?")
             .bind(range_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound)?;
     if kind != "dictionary" {
         tracing::warn!(range_id, user_id = user.id, "basenames reported for an alphabet target, ignoring");
+        return Ok(());
+    }
+    // A canary's (see canary.rs): nothing to keep.
+    if is_virtual {
         return Ok(());
     }
     let mut valid: Vec<&str> = Vec::with_capacity(basenames.len());

@@ -839,27 +839,134 @@ async fn an_alphabet_target_cant_send_basenames() {
     assert!(handlers::admin_patch_target(State(state.clone()), AdminAuth, Path(id), Json(serde_json::from_value(body).unwrap())).await.is_ok());
 }
 
-#[tokio::test]
-async fn no_canary_is_made_from_a_dictionary_target() {
+/// A client `name`, handed canaries always, its alphabet rate measured as 1000
+/// a second (and its dictionary rate as `dictionary_rate`, if given).
+async fn canary_client(state: &AppState, name: &str, dictionary_rate: Option<f64>) -> User {
+    let client = user(state, name, "1.5.0").await;
+    sqlx::query("UPDATE users SET ema_rate_per_sec = 1000, ema_dictionary_rate_per_sec = ? WHERE id = ?")
+        .bind(dictionary_rate)
+        .bind(client.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    reload_user(state, client.id).await
+}
+
+fn canary_config() -> RangeConfig {
     let mut config = config(20.0);
     config.canary_probability = 1.0;
-    let state = state_with(config).await;
+    config
+}
+
+async fn planted(state: &AppState, range_id: i64) -> String {
+    sqlx::query_scalar("SELECT filename FROM canaries WHERE range_id = ?").bind(range_id).fetch_one(&state.pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_canary_copies_the_first_target_the_client_searches() {
+    let state = state_with(canary_config()).await;
     put_list(&state, "nato", WORDS).await.unwrap();
     create(&state, serde_json::json!({"priority": 10})).await.unwrap();
-    let client = user(&state, "u", "1.5.0").await;
-    sqlx::query("UPDATE users SET ema_rate_per_sec = 1000 WHERE id = ?").bind(client.id).execute(&state.pool).await.unwrap();
-    let client = reload_user(&state, client.id).await;
-    let c = claim(&state, &client).await.unwrap();
-    assert!(c.dictionary, "with no alphabet target to copy, no canary: the dictionary target's work");
-
-    // With one, a canary copies it - however much higher the dictionary
-    // target's priority.
     let alphabet_target = serde_json::json!({
         "name": "a", "prefix": "REZ\\", "suffix": ".WAV", "hash_a_hex": "1", "hash_b_hex": "2", "lower_bound": "A", "upper_bound": "B", "alphabet_name": "size42",
     });
     let _ = handlers::admin_create_target(State(state.clone()), AdminAuth, Json(serde_json::from_value(alphabet_target).unwrap())).await.unwrap();
+
+    // Not before its dictionary rate is measured: the dictionary target's work.
+    let client = canary_client(&state, "unmeasured", None).await;
     let c = claim(&state, &client).await.unwrap();
+    assert_eq!((c.target_name.as_str(), c.dictionary), ("dict", true));
+
+    let client = canary_client(&state, "u", Some(2.0)).await;
+    let c = claim(&state, &client).await.unwrap();
+    assert_eq!((c.target_name.as_str(), c.dictionary, c.prefix.as_str()), (crate::canary::CANARY_TARGET_NAME, true, "MUSIC\\"));
+
+    // A client too old for dictionary targets gets a canary of the alphabet
+    // target instead.
+    let old = user(&state, "old", "1.4.0").await;
+    sqlx::query("UPDATE users SET ema_rate_per_sec = 1000 WHERE id = ?").bind(old.id).execute(&state.pool).await.unwrap();
+    let old = reload_user(&state, old.id).await;
+    let c = claim(&state, &old).await.unwrap();
     assert_eq!((c.target_name.as_str(), c.dictionary, c.prefix.as_str()), (crate::canary::CANARY_TARGET_NAME, false, "REZ\\"));
+}
+
+#[tokio::test]
+async fn a_dictionary_canary_plants_a_name_the_client_must_find() {
+    let state = state_with(canary_config()).await;
+    put_list(&state, "nato", WORDS).await.unwrap();
+    let real = create(
+        &state,
+        serde_json::json!({"encryption_key_hex": "0x1234", "send_basenames": true, "lower_bound": "MUSIC\\B", "upper_bound": "MUSIC\\C",
+            "dictionary": {"word_lists": ["nato"], "separators": ["", "_"], "max_words": 2, "tails": ["digits:0-1"]}}),
+    )
+    .await
+    .unwrap();
+    // The real target's sweep reaches its two-word candidates.
+    sqlx::query("UPDATE target_progress SET candidate_len = 2 WHERE target_id = ?").bind(real).execute(&state.pool).await.unwrap();
+    let client = canary_client(&state, "u", Some(2.0)).await;
+
+    let mut results = Vec::new();
+    for report_it in [true, false] {
+        let c = claim(&state, &client).await.unwrap();
+        assert_ne!(c.target_id, real);
+        assert_eq!((c.target_name.as_str(), c.dictionary), (crate::canary::CANARY_TARGET_NAME, true));
+        assert_eq!((c.prefix.as_str(), c.suffix.as_str()), ("MUSIC\\", ".WAV"));
+        assert_eq!(c.word_lists, Some(vec!["nato".to_string()]));
+        assert_eq!(c.separators, Some(vec!["".to_string(), "_".to_string()]));
+        assert_eq!((c.min_words, c.max_words), (Some(1), Some(2)));
+        assert_eq!(c.tails, Some(vec!["digits:0-1".to_string()]));
+        assert!(c.send_basenames);
+        assert_eq!((c.filename_lower_bound.as_deref(), c.filename_upper_bound.as_deref()), (None, None), "no bounds to leave the planted name out");
+        assert_eq!(c.candidate_count, 10, "2/s, for canary_seconds");
+        let (start, end) = (c.first_candidate_number.unwrap(), c.end_candidate_number.unwrap());
+        assert_eq!(end - start, 10);
+        // Two-word candidates: numbered from 5 * 11, all 5 * 2 * 5 * 11 of them.
+        assert!(start >= 55 && end <= 55 + 550, "{start}..{end}");
+
+        let planted = planted(&state, c.range_id).await;
+        let space = dictionary::DictionarySpace::new(
+            dictionary::sorted_unique(dictionary::parse_word_list(WORDS).0),
+            vec!["".into(), "_".into()],
+            1,
+            2,
+            dictionary::expand_tails(&["digits:0-1".to_string()]).unwrap(),
+        )
+        .unwrap();
+        assert!((start..end).any(|n| format!("MUSIC\\{}.WAV", space.text(n)) == planted), "{planted} in {start}..{end}");
+        assert_eq!(c.hash_a_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x100)));
+        assert_eq!(c.hash_b_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x200)));
+        let basename = planted.strip_prefix("MUSIC\\").unwrap();
+        assert_eq!(c.encryption_key_hex, Some(format!("0x{:08X}", crate::canary::mpq_hash(basename, 0x300))), "the planted name's key");
+
+        // The basenames sent for it aren't kept, and it measures nothing.
+        heartbeat(&state, &client, c.range_id, report(Some(start + 1), &[basename])).await.unwrap();
+        complete(&state, &client, c.range_id, report_it.then_some(planted.as_str()), 1.0, 10, &[]).await.unwrap();
+        let canary_target: i64 = sqlx::query_scalar("SELECT target_id FROM ranges WHERE id = ?").bind(c.range_id).fetch_one(&state.pool).await.unwrap();
+        assert_eq!(target(&state, canary_target).await.basename_count, 0);
+        let (result, status): (String, String) = sqlx::query_as("SELECT c.result, t.status FROM canaries c JOIN targets t ON t.id = c.target_id WHERE c.range_id = ?")
+            .bind(c.range_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        results.push((result, status));
+    }
+    assert_eq!(results, vec![("found".into(), "solved".into()), ("missed".into(), "paused".into())]);
+    assert_eq!(reload_user(&state, client.id).await.ema_dictionary_rate_per_sec, Some(2.0), "a canary doesn't measure the client's rate");
+    let t = target(&state, real).await;
+    assert_eq!((t.status.as_str(), t.basename_count), ("active", 0));
+}
+
+#[tokio::test]
+async fn a_dictionary_canary_without_a_key_has_none() {
+    let state = state_with(canary_config()).await;
+    put_list(&state, "nato", WORDS).await.unwrap();
+    create(&state, serde_json::json!({})).await.unwrap();
+    let client = canary_client(&state, "u", Some(1000.0)).await;
+    let c = claim(&state, &client).await.unwrap();
+    assert_eq!(c.target_name, crate::canary::CANARY_TARGET_NAME);
+    assert_eq!((c.encryption_key_hex, c.send_basenames, c.tails), (None, false, None));
+    // More than there are one-word candidates (the sweep's start): all 5.
+    assert_eq!((c.first_candidate_number, c.end_candidate_number, c.candidate_count), (Some(0), Some(5), 5));
 }
 
 #[tokio::test]
