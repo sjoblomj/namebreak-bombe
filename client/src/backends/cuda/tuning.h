@@ -109,6 +109,16 @@ static_assert(kDictionaryWordsPerThread >= 1 && kDictionaryThreadsPerBlock >= 1 
 // (-DNAMEBREAK_DICTIONARY_TAILS_PER_CELL=N).
 constexpr int kDictionaryTailsPerCell = dictionaryTailsPerCellOr(32);
 static_assert(kDictionaryTailsPerCell >= 1, "a cell needs at least one tail");
+// How many threads of a block take a run of its cells together (see
+// dictionaryLanesPerRun).
+constexpr uint32_t kDictionaryLanesPerRun = dictionaryLanesPerRun(kDictionaryThreadsPerBlock);
+// How many of its blocks the dictionary kernel is compiled to fit on an SM
+// at once (__launch_bounds__): 6, as many as its 256 threads fit on an
+// RTX 30 series' (1,536), which caps it at 40 registers - what it used
+// before it had pairs (see DictionaryBatch), which took it to 40 to 50,
+// and 5 blocks, without. Not on AMD's GPUs (HIP), which read the number as
+// waves per SIMD, and which it hasn't been measured on.
+constexpr int kDictionaryMinBlocksPerSm = 6;
 
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index
 // (alphabetSize^(trailingLen-1)) must fit in 32 bits: 63^5 < 2^32 <= 63^6.

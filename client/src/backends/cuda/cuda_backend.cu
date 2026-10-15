@@ -601,13 +601,14 @@ void launchSearchFor(AlphabetSizeList<Sizes...>, bool listed, bool inserted, dim
 // or both (see dictionaryHashes, and backends/common/dictionary_batch.h for
 // the host's side of it).
 
-// The word list, as DictionaryWordTable has it, on the GPU - a kernel
-// argument.
+// The word list and the separators, as DictionaryWordTable has them, on the
+// GPU - a kernel argument.
 struct DictionaryWords {
     const uint32_t* chars;
     const DictionaryWordEntry* entries;
     const uint32_t* positions;
     uint32_t count;
+    uint32_t separatorCount;
 };
 
 // What a dictionary launch reports: how many hits of each kind it had -
@@ -678,19 +679,55 @@ __device__ __forceinline__ bool dictionarySuffixMatches(uint32_t seed1, uint32_t
     return Basename ? basenameKeyMatches(seed1, target) : hashAMatches(seed1, target);
 }
 
+// The states after `batch`'s leading part and pair `pair` - its word, then
+// its separator (see DictionaryBatch) - as (seed1, seed2, basenameSeed1,
+// basenameSeed2): hashA's, the basename hash's (which a '\' starts over),
+// or both, as HashA and Basename say. Once a pair, not once a candidate, so
+// a character at a time.
+template<bool HashA, bool Basename>
+__device__ uint4 dictionaryPairStates(const DictionaryLaunchBatch& batch, const DictionaryWords& words, const uint2* sKeys, uint32_t pair) {
+    uint32_t seed1 = batch.seed1, seed2 = batch.seed2, key1 = batch.basenameSeed1, key2 = batch.basenameSeed2;
+    const uint32_t word = pair / words.separatorCount;
+    const uint32_t at[2] = {__ldg(&words.positions[word]), words.count + (pair - word * words.separatorCount)};
+    for (int text = 0; text < 2; ++text) {
+        const uint4 entry = __ldg(reinterpret_cast<const uint4*>(&words.entries[at[text]]));
+        uint32_t four = 0;
+        for (uint32_t c = 0; c < entry.y; ++c) {
+            if ((c & 3) == 0)
+                four = __ldg(&words.chars[entry.x + c / 4]);
+            const uint32_t ch = extractByte(four, c & 3);
+            const uint2 keys = sKeys[ch];
+            if constexpr (HashA)
+                mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
+            if constexpr (Basename) {
+                if (ch == '\\') {
+                    key1 = 0x7FED7FED;
+                    key2 = 0xEEEEEEEE;
+                } else {
+                    mpqStepPlus3(key1, key2, keys.y, ch + 3);
+                }
+            }
+        }
+    }
+    return make_uint4(seed1, seed2, key1, key2);
+}
+
 // One block per segment of the launch (see planDictionaryLaunch): up to
-// kDictionaryWordsPerThread * blockDim.x consecutive cells of one batch - a
-// cell a word and a chunk of up to kDictionaryTailsPerCell of the batch's
-// tails (see DictionaryLaunchBatch) - the block's threads taking
-// neighbouring cells: neighbouring words with the same chunk of tails, the
-// words in the word table's order (by length, see DictionaryWordTable) if
-// the batch has every word, in the list's if not. A thread hashes its word
-// from the batch's states, then each tail of its chunk from there - with
-// Tails; without, there's only "" - and then the suffix, where its filter
-// lets it through: hashA, the basename hash, or both, as Hashes says.
-// Records every hashA hit and every basename hit, as (batch, word, tail):
-// the host rebuilds and checks them - and, of a basename hit with the
-// basename hash alone, its hashA and hashB (DictionaryHitVerifier).
+// kDictionaryWordsPerThread * blockDim.x cells of one batch - a cell a word
+// and a chunk of up to kDictionaryTailsPerCell of the batch's tails - of one
+// pair or of several whole ones (see DictionaryLaunchBatch). The block's
+// threads take neighbouring cells, a run each group of them
+// (dictionaryLanesPerRun): neighbouring words with the same chunk of tails,
+// the words in the word table's order (by length, see DictionaryWordTable)
+// if the batch has every word, in the list's if not. A thread hashes its
+// word from the states after the batch's leading part and the cell's pair -
+// which the block works out first - or without pairs, the batch's, then
+// each tail of its chunk from there - with Tails; without, there's only ""
+// - and then the suffix, where its filter lets it through: hashA, the
+// basename hash, or both, as Hashes says. Records every hashA hit and every
+// basename hit, as (batch, word, tail, pair): the host rebuilds and checks
+// them - and, of a basename hit with the basename hash alone, its hashA and
+// hashB (DictionaryHitVerifier).
 //
 // `cryptKeys` is the crypt table's hashA part (0x100) and then its basename
 // hash's part (0x300), 256 entries each, which the block copies into shared
@@ -701,16 +738,25 @@ __device__ __forceinline__ bool dictionarySuffixMatches(uint32_t seed1, uint32_t
 // `tails` is the tails (dictionaryTailTable), which a warp's lanes read
 // together.
 template<int SuffixLen, DictionaryHashes Hashes, bool Tails>
-__global__ void dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batches, uint32_t batchCount, DictionaryWords words,
-                                 const uint4* __restrict__ tails, const uint32_t* __restrict__ cryptKeys, const uint32_t* __restrict__ filters,
-                                 const uint32_t* __restrict__ suffixKeys, int suffixLen, uint32_t targetA, uint32_t basenameKey,
-                                 DictionaryResults results) {
+#if defined(__HIP_PLATFORM_AMD__)
+__global__ void __launch_bounds__(kDictionaryThreadsPerBlock)
+#else
+__global__ void __launch_bounds__(kDictionaryThreadsPerBlock, kDictionaryMinBlocksPerSm)
+#endif
+dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batches, uint32_t batchCount, DictionaryWords words, const uint4* __restrict__ tails,
+                 const uint32_t* __restrict__ cryptKeys, const uint32_t* __restrict__ filters, const uint32_t* __restrict__ suffixKeys,
+                 int suffixLen, uint32_t targetA, uint32_t basenameKey, DictionaryResults results) {
     constexpr bool HashA = Hashes != DictionaryHashes::Basename;
     constexpr bool Basename = Hashes != DictionaryHashes::HashA;
+    constexpr uint32_t kLanes = kDictionaryLanesPerRun;
     __shared__ uint2 sKeys[256];
     __shared__ uint32_t sFilterA[HashA ? kDictionaryFilterWords : 1];
     __shared__ uint32_t sFilterBasename[Basename ? kDictionaryFilterWords : 1];
-    __shared__ uint32_t sBatch;
+    __shared__ uint4 sPairs[kDictionaryPairSlots];
+    // The block's batch, its segment's first pair (of the batch's, counted
+    // from its first) and how many of its pairs it has, and its cells, from
+    // its first pair's first: [sCellFirst, sCellEnd).
+    __shared__ uint32_t sBatch, sPairFirst, sPairCount, sCellFirst, sCellEnd;
     for (int i = threadIdx.x; i < 256; i += blockDim.x)
         sKeys[i] = make_uint2(__ldg(&cryptKeys[i]), __ldg(&cryptKeys[256 + i]));
     for (int i = threadIdx.x; i < (int) kDictionaryFilterWords; i += blockDim.x) {
@@ -719,114 +765,184 @@ __global__ void dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batch
         if constexpr (Basename)
             sFilterBasename[i] = __ldg(&filters[kDictionaryFilterWords + i]);
     }
-    if (threadIdx.x == 0)
-        sBatch = dictionaryBatchOf(batches, batchCount, blockIdx.x);
+    if (threadIdx.x == 0) {
+        const uint32_t b = dictionaryBatchOf(batches, batchCount, blockIdx.x);
+        const DictionaryLaunchBatch& batch = batches[b];
+        const uint32_t segment = blockIdx.x - batch.firstSegment, pairCells = batch.wordCount * batch.tailChunks;
+        const uint32_t pairs = max(batch.pairCount, 1u), cellsPerSegment = kDictionaryWordsPerThread * kDictionaryThreadsPerBlock;
+        uint32_t pairFirst, pairCount, cellFirst = 0, cellEnd;
+        if (batch.segmentsPerPair > 1) {
+            // A segment of a pair (see DictionaryLaunchBatch).
+            pairFirst = segment / batch.segmentsPerPair;
+            pairCount = 1;
+            cellFirst = (segment - pairFirst * batch.segmentsPerPair) * cellsPerSegment;
+            cellEnd = min(cellFirst + cellsPerSegment, pairCells);
+        } else {
+            // Pairs of a segment.
+            pairFirst = segment * batch.pairsPerSegment;
+            pairCount = pairFirst < pairs ? min(batch.pairsPerSegment, pairs - pairFirst) : 0;
+            cellEnd = pairCount * pairCells;
+        }
+        // A segment past the batch's last pair has none of its cells.
+        if (pairFirst >= pairs) {
+            pairCount = 0;
+            cellEnd = cellFirst;
+        }
+        sBatch = b;
+        sPairFirst = pairFirst;
+        sPairCount = pairCount;
+        sCellFirst = cellFirst;
+        sCellEnd = cellEnd;
+        // Without pairs, the batch's states are those every cell's word is
+        // hashed on from - as its one pair's.
+        sPairs[0] = make_uint4(batch.seed1, batch.seed2, batch.basenameSeed1, batch.basenameSeed2);
+    }
     __syncthreads();
 
     const uint32_t batchIndex = sBatch;
     const DictionaryLaunchBatch batch = batches[batchIndex];
     const bool wholeList = batch.wordCount == words.count;
-    const uint32_t cellsPerSegment = kDictionaryWordsPerThread * blockDim.x;
-    const uint32_t first = (blockIdx.x - batch.firstSegment) * cellsPerSegment;
-    const uint32_t end = min(first + cellsPerSegment, batch.wordCount * batch.tailChunks);
-    for (uint32_t cell = first + threadIdx.x; cell < end; cell += blockDim.x) {
-        // The cell's word, and its chunk of the tails.
-        uint32_t i = cell, tailFirst = batch.firstTail, tailEnd = batch.firstTail + batch.tailCount;
-        if (Tails && batch.tailChunks > 1) {
-            const uint32_t chunk = cell / batch.wordCount;
-            i = cell - chunk * batch.wordCount;
-            tailFirst += chunk * kDictionaryTailsPerCell;
-            tailEnd = min(tailFirst + kDictionaryTailsPerCell, tailEnd);
-        }
-        const uint4 entry = __ldg(reinterpret_cast<const uint4*>(&words.entries[wholeList ? i : __ldg(&words.positions[batch.firstWord + i])]));
-        const uint32_t offset = entry.x, length = entry.y, basenameStart = entry.z, index = entry.w;
-        uint32_t seed1 = batch.seed1, seed2 = batch.seed2;
-        uint32_t key1 = batch.basenameSeed1, key2 = batch.basenameSeed2;
-        auto step = [&](uint32_t four, int b) {
-            const uint32_t ch = extractByte(four, b);
-            const uint2 keys = sKeys[ch];
-            if constexpr (HashA)
-                mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
-            if constexpr (Basename)
-                mpqStepPlus3(key1, key2, keys.y, ch + 3);
-        };
-        if (!Basename || basenameStart == 0) {
-            // Four characters at a time, as they're stored, and then the
-            // rest. The lanes of a warp mostly have words of the same length
-            // (see DictionaryWordTable), so they go round together.
-            const uint32_t* chars = words.chars + offset;
-            const uint32_t* const fullEnd = chars + length / 4;
-            for (; chars != fullEnd; ++chars) {
-                const uint32_t four = __ldg(chars);
-                step(four, 0);
-                step(four, 1);
-                step(four, 2);
-                step(four, 3);
+    const uint32_t pairCells = batch.wordCount * batch.tailChunks; // a pair's (all, without pairs)
+    const uint32_t cellFirst = sCellFirst, cellEnd = sCellEnd;
+    if (batch.pairCount) {
+        // The states after the leading part and each of the segment's pairs.
+        const uint32_t pairFirst = batch.firstPair + sPairFirst, pairs = sPairCount;
+        for (uint32_t p = threadIdx.x; p < pairs; p += blockDim.x)
+            sPairs[p] = dictionaryPairStates<HashA, Basename>(batch, words, sKeys, pairFirst + p);
+        __syncthreads();
+    }
+    // The segment's cells, in runs of perThread * kLanes, each of kLanes
+    // threads: the thread's are `left` cells, kLanes apart, from
+    // threadFirst on.
+    const uint32_t perThread = (cellEnd - cellFirst + kDictionaryThreadsPerBlock - 1) / kDictionaryThreadsPerBlock;
+    const uint32_t threadFirst = cellFirst + threadIdx.x / kLanes * kLanes * perThread + threadIdx.x % kLanes;
+    uint32_t left = threadFirst < cellEnd ? min(perThread, (cellEnd - threadFirst + kLanes - 1) / kLanes) : 0;
+    // Its cells pair by pair: the pair's slot of sPairs, and the cell of that
+    // pair's.
+    uint32_t slot = 0, within = threadFirst;
+    if (within >= pairCells) {
+        slot = within / pairCells;
+        within -= slot * pairCells;
+    }
+    const uint32_t hitPairFirst = batch.firstPair + sPairFirst;
+    while (left) {
+        const uint4 states = sPairs[slot];
+        const uint32_t pairSeed1 = states.x, pairSeed2 = states.y, pairKey1 = states.z, pairKey2 = states.w;
+        const uint32_t hitPair = hitPairFirst + slot;
+        // The thread's cells of the pair: `n` of them, from `within`.
+        const uint32_t n = min(left, (pairCells - within + kLanes - 1) / kLanes);
+        left -= n;
+        for (const uint32_t stop = within + n * kLanes; within < stop; within += kLanes) {
+            // The cell's word, and its chunk of the tails.
+            uint32_t i = within, tailFirst = batch.firstTail, tailEnd = batch.firstTail + batch.tailCount;
+            if (Tails && batch.tailChunks > 1) {
+                const uint32_t chunk = within / batch.wordCount;
+                i = within - chunk * batch.wordCount;
+                tailFirst += chunk * kDictionaryTailsPerCell;
+                tailEnd = min(tailFirst + kDictionaryTailsPerCell, tailEnd);
             }
-            const uint32_t rest = length % 4;
-            if (rest != 0) {
-                const uint32_t four = __ldg(chars);
-                step(four, 0);
-                if (rest > 1)
-                    step(four, 1);
-                if (rest > 2)
-                    step(four, 2);
-            }
-        } else {
-            // A word with a '\': its basename starts over after the last
-            // one - and without hashA, what comes before that isn't hashed
-            // at all.
-            key1 = 0x7FED7FED;
-            key2 = 0xEEEEEEEE;
-            const uint32_t from = HashA ? 0 : basenameStart;
-            uint32_t four = 0;
-            for (uint32_t c = from; c < length; ++c) {
-                if (c == from || (c & 3) == 0)
-                    four = __ldg(&words.chars[offset + c / 4]);
-                const uint32_t ch = extractByte(four, c & 3);
+            const uint4 entry = __ldg(reinterpret_cast<const uint4*>(&words.entries[wholeList ? i : __ldg(&words.positions[batch.firstWord + i])]));
+            const uint32_t offset = entry.x, length = entry.y, basenameStart = entry.z, index = entry.w;
+            uint32_t seed1 = pairSeed1, seed2 = pairSeed2;
+            uint32_t key1 = pairKey1, key2 = pairKey2;
+            auto step = [&](uint32_t four, int b) {
+                const uint32_t ch = extractByte(four, b);
                 const uint2 keys = sKeys[ch];
                 if constexpr (HashA)
                     mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
-                if (c >= basenameStart)
+                if constexpr (Basename)
                     mpqStepPlus3(key1, key2, keys.y, ch + 3);
-            }
-        }
-        // The suffix after tail `tail`, which has left the states at
-        // (s1, s2) and (k1, k2).
-        auto check = [&](uint32_t s1, uint32_t s2, uint32_t k1, uint32_t k2, uint32_t tail) {
-            if constexpr (HashA) {
-                if (dictionarySuffixMatches<SuffixLen, false>(s1, s2, sFilterA, suffixKeys, suffixLen, targetA)) {
-                    const int slot = atomicAdd(&results.counts[0], 1);
-                    if ((uint32_t) slot < results.capacity)
-                        results.hashAHits[slot] = DictionaryHit{batchIndex, index, tail};
+            };
+            if (!Basename || basenameStart == 0) {
+                // Four characters at a time, as they're stored, and then the
+                // rest. The lanes of a warp mostly have words of the same
+                // length (see DictionaryWordTable), so they go round
+                // together.
+                const uint32_t* chars = words.chars + offset;
+                const uint32_t* const fullEnd = chars + length / 4;
+                for (; chars != fullEnd; ++chars) {
+                    const uint32_t four = __ldg(chars);
+                    step(four, 0);
+                    step(four, 1);
+                    step(four, 2);
+                    step(four, 3);
                 }
-            }
-            if constexpr (Basename) {
-                if (dictionarySuffixMatches<SuffixLen, true>(k1, k2, sFilterBasename, suffixKeys, suffixLen, basenameKey)) {
-                    const int slot = atomicAdd(&results.counts[1], 1);
-                    if ((uint32_t) slot < results.capacity)
-                        results.basenameHits[slot] = DictionaryHit{batchIndex, index, tail};
+                const uint32_t rest = length % 4;
+                if (rest != 0) {
+                    const uint32_t four = __ldg(chars);
+                    step(four, 0);
+                    if (rest > 1)
+                        step(four, 1);
+                    if (rest > 2)
+                        step(four, 2);
                 }
-            }
-        };
-        if constexpr (!Tails) {
-            check(seed1, seed2, key1, key2, tailFirst);
-        } else {
-            // Each tail on from the word's states: its characters, eight at
-            // most, two uint32s of them.
-            for (uint32_t t = tailFirst; t < tailEnd; ++t) {
-                const uint4 tail = __ldg(&tails[t]);
-                uint32_t s1 = seed1, s2 = seed2, k1 = key1, k2 = key2;
-                for (uint32_t c = 0; c < tail.z; ++c) {
-                    const uint32_t ch = extractByte(c < 4 ? tail.x : tail.y, c & 3);
+            } else {
+                // A word with a '\': its basename starts over after the
+                // last one - and without hashA, what comes before that isn't
+                // hashed at all.
+                key1 = 0x7FED7FED;
+                key2 = 0xEEEEEEEE;
+                const uint32_t from = HashA ? 0 : basenameStart;
+                uint32_t four = 0;
+                for (uint32_t c = from; c < length; ++c) {
+                    if (c == from || (c & 3) == 0)
+                        four = __ldg(&words.chars[offset + c / 4]);
+                    const uint32_t ch = extractByte(four, c & 3);
                     const uint2 keys = sKeys[ch];
                     if constexpr (HashA)
-                        mpqStepPlus3(s1, s2, keys.x, ch + 3);
-                    if constexpr (Basename)
-                        mpqStepPlus3(k1, k2, keys.y, ch + 3);
+                        mpqStepPlus3(seed1, seed2, keys.x, ch + 3);
+                    if (c >= basenameStart)
+                        mpqStepPlus3(key1, key2, keys.y, ch + 3);
                 }
-                check(s1, s2, k1, k2, t);
             }
+            // The suffix after tail `tail`, which has left the states at
+            // (s1, s2) and (k1, k2).
+            auto check = [&](uint32_t s1, uint32_t s2, uint32_t k1, uint32_t k2, uint32_t tail) {
+                if constexpr (HashA) {
+                    if (dictionarySuffixMatches<SuffixLen, false>(s1, s2, sFilterA, suffixKeys, suffixLen, targetA)) {
+                        const int slot = atomicAdd(&results.counts[0], 1);
+                        if ((uint32_t) slot < results.capacity)
+                            results.hashAHits[slot] = DictionaryHit{batchIndex, index, tail, hitPair};
+                    }
+                }
+                if constexpr (Basename) {
+                    if (dictionarySuffixMatches<SuffixLen, true>(k1, k2, sFilterBasename, suffixKeys, suffixLen, basenameKey)) {
+                        const int slot = atomicAdd(&results.counts[1], 1);
+                        if ((uint32_t) slot < results.capacity)
+                            results.basenameHits[slot] = DictionaryHit{batchIndex, index, tail, hitPair};
+                    }
+                }
+            };
+            if constexpr (!Tails) {
+                check(seed1, seed2, key1, key2, tailFirst);
+            } else {
+                // Each tail on from the word's states: its characters,
+                // eight at most, two uint32s of them.
+                for (uint32_t t = tailFirst; t < tailEnd; ++t) {
+                    const uint4 tail = __ldg(&tails[t]);
+                    uint32_t s1 = seed1, s2 = seed2, k1 = key1, k2 = key2;
+                    for (uint32_t c = 0; c < tail.z; ++c) {
+                        const uint32_t ch = extractByte(c < 4 ? tail.x : tail.y, c & 3);
+                        const uint2 keys = sKeys[ch];
+                        if constexpr (HashA)
+                            mpqStepPlus3(s1, s2, keys.x, ch + 3);
+                        if constexpr (Basename)
+                            mpqStepPlus3(k1, k2, keys.y, ch + 3);
+                    }
+                    check(s1, s2, k1, k2, t);
+                }
+            }
+        }
+        // On to the thread's next pair - or one after that, if a pair has
+        // fewer cells than kLanes.
+        if (!left)
+            break;
+        within -= pairCells;
+        ++slot;
+        if (within >= pairCells) {
+            const uint32_t pairs = within / pairCells;
+            slot += pairs;
+            within -= pairs * pairCells;
         }
     }
 }
@@ -1258,7 +1374,7 @@ void CudaBackend::beginDictionarySearch(const DictionaryConstants& constants) {
     dictionarySuffixLen_ = (int) constants.suffix.size();
 
     DictionaryWordTable table;
-    if (!makeDictionaryWordTable(constants.words, table)) {
+    if (!makeDictionaryWordTable(constants.words, constants.separators, table)) {
         // runDictionarySearch's word lists are far smaller.
         fprintf(stderr, "INTERNAL ERROR: the word list is too long for the GPU's 32-bit offsets - exiting\n");
         exit(1);
@@ -1276,6 +1392,7 @@ void CudaBackend::beginDictionarySearch(const DictionaryConstants& constants) {
     upload(table.entries, dictionaryWords_.entries);
     upload(table.positions, dictionaryWords_.positions);
     dictionaryWords_.count = (uint32_t) constants.words.size();
+    dictionaryWords_.separatorCount = (uint32_t) constants.separators.size();
     // The tails - only "" without any, which the kernel built without
     // Tails doesn't read.
     dictionaryHasTails_ = constants.tails != std::vector<std::string>{""};
@@ -1370,10 +1487,12 @@ DictionaryOutcome CudaBackend::runDictionaryBatches(const std::vector<Dictionary
     const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? kDictionaryTailsPerCell : 1, dictionaryLaunch_);
     uint64_t candidates = 0;
     for (const DictionaryBatch& batch : batches)
-        candidates += (uint64_t) batch.wordCount * batch.tailCount;
-    if (segments > INT32_MAX || batches.size() > UINT32_MAX) {
+        candidates += dictionaryBatchCandidates(batch);
+    // The kernel counts a batch's cells in 32 bits.
+    if (segments > INT32_MAX || batches.size() > UINT32_MAX || candidates > UINT32_MAX) {
         // runDictionarySearch's calls are far smaller (dictionaryCandidatesPerCall).
-        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments - exiting\n", (unsigned long long) segments);
+        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments, %llu candidates - exiting\n", (unsigned long long) segments,
+                (unsigned long long) candidates);
         exit(1);
     }
     if (dictionaryLaunch_.size() > dictionaryBatchesCapacity_) {
@@ -1429,11 +1548,10 @@ DictionaryOutcome CudaBackend::runDictionaryBatches(const std::vector<Dictionary
     CUDA_CHECK(cudaMemsetAsync(dictionaryCounts_, 0, 2 * sizeof(int), 0));
     for (const std::vector<DictionaryHit>* hits : {&hashAHits, &basenameHits}) {
         for (const DictionaryHit& hit : *hits) {
-            const DictionaryBatch* batch = hit.batch < batches.size() ? &batches[hit.batch] : nullptr;
-            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount || hit.tail < batch->firstTail ||
-                hit.tail - batch->firstTail >= batch->tailCount) {
-                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u, tail %u of batch %u, which it doesn't have - exiting\n",
-                        hit.word, hit.tail, hit.batch);
+            if (!dictionaryHitInBatches(batches, hit)) {
+                fprintf(stderr,
+                        "INTERNAL ERROR: the dictionary kernel reported word %u, tail %u, pair %u of batch %u, which it doesn't have - exiting\n",
+                        hit.word, hit.tail, hit.pair, hit.batch);
                 exit(1);
             }
         }

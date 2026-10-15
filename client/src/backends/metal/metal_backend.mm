@@ -59,6 +59,7 @@ struct DictionaryArgs {
     uint32_t targetA;
     uint32_t basenameKey;
     uint32_t capacity;
+    uint32_t separatorCount;
 };
 
 // Must match RowArgs in search.metal.
@@ -174,6 +175,7 @@ private:
     bool dictionaryHasTails_ = false;
     id<MTLBuffer> dictionaryCryptKeys_, dictionaryFilters_, dictionarySuffixKeys_;
     uint32_t dictionaryWordCount_ = 0;
+    uint32_t dictionarySeparatorCount_ = 0;
     int dictionarySuffixLen_ = 0;
     DictionaryHashes dictionaryHashes_ = DictionaryHashes::HashA;
     uint32_t dictionaryTargetA_ = 0;
@@ -442,9 +444,10 @@ void MetalBackend::beginDictionarySearch(const DictionaryConstants& constants) {
     dictionaryBasenameKey_ = constants.basenameKey;
     dictionarySuffixLen_ = (int) constants.suffix.size();
     dictionaryWordCount_ = (uint32_t) constants.words.size();
+    dictionarySeparatorCount_ = (uint32_t) constants.separators.size();
 
     DictionaryWordTable table;
-    if (!makeDictionaryWordTable(constants.words, table)) {
+    if (!makeDictionaryWordTable(constants.words, constants.separators, table)) {
         // runDictionarySearch's word lists are far smaller.
         fprintf(stderr, "INTERNAL ERROR: the word list is too long for the GPU's 32-bit offsets - exiting\n");
         exit(1);
@@ -509,6 +512,7 @@ id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
             @"WORDS_PER_THREAD": @(kDictionaryWordsPerThread),
             @"TAILS": @(dictionaryHasTails_ ? 1 : 0),
             @"TAILS_PER_CELL": @(kDictionaryTailsPerCell),
+            @"PAIR_SLOTS": @(kDictionaryPairSlots),
             @"FILTER_BITS": @(kDictionaryFilterBits),
             @"FILTER_WORDS": @(kDictionaryFilterWords),
             @"HASHA_MATCH_MASK": @(kHashAMatchMask),
@@ -542,10 +546,12 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
     const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? kDictionaryTailsPerCell : 1, dictionaryLaunch_);
     uint64_t candidates = 0;
     for (const DictionaryBatch& batch : batches)
-        candidates += (uint64_t) batch.wordCount * batch.tailCount;
-    if (segments > UINT32_MAX || batches.size() > UINT32_MAX) {
+        candidates += dictionaryBatchCandidates(batch);
+    // The kernel counts a batch's cells in 32 bits.
+    if (segments > UINT32_MAX || batches.size() > UINT32_MAX || candidates > UINT32_MAX) {
         // runDictionarySearch's calls are far smaller (dictionaryCandidatesPerCall).
-        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments - exiting\n", (unsigned long long) segments);
+        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments, %llu candidates - exiting\n", (unsigned long long) segments,
+                (unsigned long long) candidates);
         exit(1);
     }
     const size_t batchBytes = dictionaryLaunch_.size() * sizeof(DictionaryLaunchBatch);
@@ -569,6 +575,7 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
         args.targetA = dictionaryTargetA_;
         args.basenameKey = dictionaryBasenameKey_;
         args.capacity = dictionaryHitCapacity_;
+        args.separatorCount = dictionarySeparatorCount_;
         @autoreleasepool {
             id<MTLCommandBuffer> commands = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
@@ -615,11 +622,10 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
     counts[0] = counts[1] = 0;
     for (const std::vector<DictionaryHit>* hits : {&hashA, &basename}) {
         for (const DictionaryHit& hit : *hits) {
-            const DictionaryBatch* batch = hit.batch < batches.size() ? &batches[hit.batch] : nullptr;
-            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount || hit.tail < batch->firstTail ||
-                hit.tail - batch->firstTail >= batch->tailCount) {
-                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u, tail %u of batch %u, which it doesn't have - exiting\n",
-                        hit.word, hit.tail, hit.batch);
+            if (!dictionaryHitInBatches(batches, hit)) {
+                fprintf(stderr,
+                        "INTERNAL ERROR: the dictionary kernel reported word %u, tail %u, pair %u of batch %u, which it doesn't have - exiting\n",
+                        hit.word, hit.tail, hit.pair, hit.batch);
                 exit(1);
             }
         }

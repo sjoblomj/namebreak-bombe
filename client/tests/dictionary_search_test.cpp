@@ -128,7 +128,8 @@ static bool basenamesAre(const std::vector<std::string>& lines, const std::vecto
 }
 
 // Forwards everything to another backend, counting its runDictionaryBatches
-// calls - and setting `abortAfter`'s flag once it has made that many.
+// calls, and the batches with pairs they had (see DictionaryBatch) - and
+// setting `abortAfter`'s flag once it has made that many calls.
 class CountingBackend : public SearchBackend {
 public:
     explicit CountingBackend(SearchBackend& inner) : inner_(inner) {}
@@ -149,6 +150,8 @@ public:
         inner_.beginDictionarySearch(constants);
     }
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override {
+        for (const DictionaryBatch& batch : batches)
+            pairBatches += batch.pairCount > 0;
         DictionaryOutcome outcome = inner_.runDictionaryBatches(batches);
         if (++calls == abortAfter && abortFlag)
             abortFlag->store(true);
@@ -161,6 +164,7 @@ public:
 
     std::atomic<int> calls{0};
     int begun = 0, ended = 0;
+    uint64_t pairBatches = 0;
     int abortAfter = -1;
     std::atomic<bool>* abortFlag = nullptr;
 
@@ -307,8 +311,9 @@ static DictionaryRequest randomRequest(std::mt19937& rng, int round) {
     return req;
 }
 
-static void testAgainstBruteForce(SearchBackend& backend) {
+static void testAgainstBruteForce(SearchBackend& inner) {
     printf("--- against brute force ---\n");
+    CountingBackend backend(inner);
     std::mt19937 rng(20261007);
     int rounds = 0, found = 0, withHits = 0, withBasenames = 0, mismatches = 0;
     for (int round = 0; round < 150; ++round) {
@@ -372,14 +377,16 @@ static void testAgainstBruteForce(SearchBackend& backend) {
     check(withBasenames >= 30, "... " + std::to_string(withBasenames) + " of them recording basenames");
     if (kHashAMatchMask != 0xFFFFFFFFu)
         check(withHits >= 40, "... " + std::to_string(withHits) + " of them with hashA hits to compare");
+    check(backend.pairBatches >= 100, "... " + std::to_string(backend.pairBatches) + " batches of them with pairs");
 }
 
 // Many words, of every length from 1 to 12 characters, some with a '\':
 // enough that a batch of every word spans several of a GPU backend's thread
 // blocks in the builds that make them small (see CMakeLists.txt), which
 // search a whole batch's words in another order than a part of it.
-static void testManyWords(SearchBackend& backend) {
+static void testManyWords(SearchBackend& inner) {
     printf("--- many words ---\n");
+    CountingBackend backend(inner);
     std::mt19937 rng(7102026);
     int mismatches = 0, found = 0;
     const int rounds = 20;
@@ -427,6 +434,10 @@ static void testManyWords(SearchBackend& backend) {
     }
     check(mismatches == 0, std::to_string(rounds) + " searches of 50 to 300 words: as brute force (" + std::to_string(mismatches) + " differ)");
     check(found >= 5, "... " + std::to_string(found) + " of them finding a planted match of both hashes");
+#ifndef NAMEBREAK_DICTIONARY_CANDIDATES_PER_CALL
+    // Calls with room for a pair's candidates: some of them with pairs.
+    check(backend.pairBatches > 0, "... " + std::to_string(backend.pairBatches) + " batches of them with pairs");
+#endif
 }
 
 // Many tails - more than a cell of a GPU backend has, so that every word's

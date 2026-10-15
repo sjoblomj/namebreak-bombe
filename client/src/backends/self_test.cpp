@@ -712,13 +712,16 @@ std::vector<std::string> dictionarySelfTestWords() {
     return std::vector<std::string>(words.begin(), words.end());
 }
 
-// A batch of a dictionary case: its leading part, its words, and its tails.
+// A batch of a dictionary case: its leading part, its words, its tails, and
+// its pairs (see DictionaryBatch).
 struct DictionarySelfTestBatch {
     std::string leading;
     uint32_t firstWord;
     uint32_t wordCount;
     uint32_t firstTail = 0;
     uint32_t tailCount = 1;
+    uint32_t firstPair = 0;
+    uint32_t pairCount = 0;
 };
 
 DictionaryBatch dictionaryBatchOf(const DictionarySelfTestBatch& b, const uint32_t* cryptTable) {
@@ -734,6 +737,8 @@ DictionaryBatch dictionaryBatchOf(const DictionarySelfTestBatch& b, const uint32
     batch.wordCount = b.wordCount;
     batch.firstTail = b.firstTail;
     batch.tailCount = b.tailCount;
+    batch.firstPair = b.firstPair;
+    batch.pairCount = b.pairCount;
     return batch;
 }
 
@@ -748,24 +753,31 @@ enum class DictionaryCaseKey {
 };
 
 // One dictionary case: `batches`, searched in one call, with the candidate
-// made of batch `plantBatch`'s leading part, word `plantWord`, tail
-// `plantTail` and `suffix` as the target - and its basename's hash as the
-// key, as `key` says. It must be found (as matching both hashes, and its
-// basename as matching the key, if the basenames are recorded) exactly when
-// the word and the tail are one of the batch's.
+// made of batch `plantBatch`'s leading part, if it has pairs pair
+// `plantPair` (word plantPair / S and separator plantPair % S, of
+// `separators`' S), word `plantWord`, tail `plantTail` and `suffix` as the
+// target - and its basename's hash as the key, as `key` says. It must be
+// found (as matching both hashes, and its basename as matching the key, if
+// the basenames are recorded) exactly when the word, the tail and the pair
+// are one of the batch's.
 bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& words, const std::vector<std::string>& tails,
-                       const std::vector<DictionarySelfTestBatch>& batches, const std::string& suffix, int plantBatch, uint32_t plantWord,
-                       uint32_t plantTail, DictionaryCaseKey key, const uint32_t* cryptTable, std::string& error) {
+                       const std::vector<std::string>& separators, const std::vector<DictionarySelfTestBatch>& batches,
+                       const std::string& suffix, int plantBatch, uint32_t plantPair, uint32_t plantWord, uint32_t plantTail,
+                       DictionaryCaseKey key, const uint32_t* cryptTable, std::string& error) {
+    auto pairText = [&](uint32_t pair) { return words[pair / separators.size()] + separators[pair % separators.size()]; };
     const DictionarySelfTestBatch& planted = batches[plantBatch];
-    const std::string plantedName = planted.leading + words[plantWord] + tails[plantTail] + suffix;
+    const std::string plantedName =
+        planted.leading + (planted.pairCount ? pairText(plantPair) : "") + words[plantWord] + tails[plantTail] + suffix;
     const size_t slash = plantedName.rfind('\\');
     const std::string plantedBasename = slash == std::string::npos ? plantedName : plantedName.substr(slash + 1);
     const bool inside = plantWord >= planted.firstWord && plantWord - planted.firstWord < planted.wordCount && plantTail >= planted.firstTail &&
-                        plantTail - planted.firstTail < planted.tailCount;
+                        plantTail - planted.firstTail < planted.tailCount &&
+                        (!planted.pairCount || (plantPair >= planted.firstPair && plantPair - planted.firstPair < planted.pairCount));
 
     DictionaryConstants constants;
     constants.words = words;
     constants.tails = tails;
+    constants.separators = separators;
     constants.suffix = suffix;
     constants.cryptTable = cryptTable;
     constants.targetHashA = hashFromScratch(plantedName, cryptTable, kHashAOffset);
@@ -785,24 +797,30 @@ bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& w
     static const char* const keyNames[] = {"", ", its key", ", its key, basenames not recorded", ", its key, every hashA",
                                            ", another key, every hashA"};
     char where[200];
-    snprintf(where, sizeof where, " (dictionary search: %zu batch(es), planted in batch %d, word %u of %zu, tail %u of %zu, suffix length %zu%s)",
-             batches.size(), plantBatch, plantWord, words.size(), plantTail, tails.size(), suffix.size(), keyNames[(int) key]);
+    snprintf(where, sizeof where,
+             " (dictionary search: %zu batch(es), planted in batch %d, pair %u, word %u of %zu, tail %u of %zu, suffix length %zu%s)",
+             batches.size(), plantBatch, planted.pairCount ? plantPair : 0, plantWord, words.size(), plantTail, tails.size(), suffix.size(),
+             keyNames[(int) key]);
     // Whether a reported filename is a candidate of a batch: its leading
-    // part, a word and a tail of the batch's, and the suffix.
+    // part, a pair of the batch's if it has pairs, a word and a tail of the
+    // batch's, and the suffix.
     auto isCandidate = [&](const std::string& filename) {
         for (const DictionarySelfTestBatch& b : batches) {
-            if (filename.compare(0, b.leading.size(), b.leading) != 0 || filename.size() < b.leading.size() + suffix.size() ||
-                filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) != 0)
-                continue;
-            const std::string middle = filename.substr(b.leading.size(), filename.size() - b.leading.size() - suffix.size());
-            for (uint32_t t = b.firstTail; t < b.firstTail + b.tailCount; ++t) {
-                const std::string& tail = tails[t];
-                if (middle.size() < tail.size() || middle.compare(middle.size() - tail.size(), tail.size(), tail) != 0)
+            for (uint32_t p = b.firstPair; p < b.firstPair + std::max<uint32_t>(b.pairCount, 1); ++p) {
+                const std::string leading = b.leading + (b.pairCount ? pairText(p) : "");
+                if (filename.compare(0, leading.size(), leading) != 0 || filename.size() < leading.size() + suffix.size() ||
+                    filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) != 0)
                     continue;
-                const std::string word = middle.substr(0, middle.size() - tail.size());
-                const auto it = std::lower_bound(words.begin(), words.end(), word);
-                if (it != words.end() && *it == word && (uint32_t) (it - words.begin()) - b.firstWord < b.wordCount)
-                    return true;
+                const std::string middle = filename.substr(leading.size(), filename.size() - leading.size() - suffix.size());
+                for (uint32_t t = b.firstTail; t < b.firstTail + b.tailCount; ++t) {
+                    const std::string& tail = tails[t];
+                    if (middle.size() < tail.size() || middle.compare(middle.size() - tail.size(), tail.size(), tail) != 0)
+                        continue;
+                    const std::string word = middle.substr(0, middle.size() - tail.size());
+                    const auto it = std::lower_bound(words.begin(), words.end(), word);
+                    if (it != words.end() && *it == word && (uint32_t) (it - words.begin()) - b.firstWord < b.wordCount)
+                        return true;
+                }
             }
         }
         return false;
@@ -858,7 +876,16 @@ bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& w
     return true;
 }
 
-// A dictionary case without tails (see above).
+// A dictionary case without pairs (see above).
+bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& words, const std::vector<std::string>& tails,
+                       const std::vector<DictionarySelfTestBatch>& batches, const std::string& suffix, int plantBatch, uint32_t plantWord,
+                       uint32_t plantTail, DictionaryCaseKey key, const uint32_t* cryptTable, std::string& error) {
+    static const std::vector<std::string> noSeparators = {""};
+    return runDictionaryCase(backend, words, tails, noSeparators, batches, suffix, plantBatch, 0, plantWord, plantTail, key, cryptTable,
+                             error);
+}
+
+// A dictionary case without tails or pairs.
 bool runDictionaryCase(SearchBackend& backend, const std::vector<std::string>& words, const std::vector<DictionarySelfTestBatch>& batches,
                        const std::string& suffix, int plantBatch, uint32_t plantWord, DictionaryCaseKey key, const uint32_t* cryptTable,
                        std::string& error) {
@@ -1009,6 +1036,53 @@ bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
         for (DictionaryCaseKey key : {DictionaryCaseKey::Recorded, DictionaryCaseKey::EveryHashA, DictionaryCaseKey::None}) {
             for (const uint32_t t : {(uint32_t) (longest - longTails.begin()), (uint32_t) (five - longTails.begin()), (uint32_t) longTails.size() - 1}) {
                 if (!runDictionaryCase(backend, words, longTails, longBatches, wav, 0, 3005, t, key, cryptTable, error))
+                    return false;
+            }
+        }
+    }
+
+    // Pairs (see DictionaryBatch): a word and a separator before the last
+    // word, the states after which a GPU backend's block works out first.
+    // In one call: every word after three pairs - more of a pair's cells
+    // than a GPU backend's segment has (8,192), so that a pair is cut into
+    // several - three words after each of 600 pairs, many pairs to a
+    // segment, more than it has room for (256); pairs of a word with a '\'
+    // and the next word, with every separator, some with a '\' too, and 222
+    // tails (more than a cell's 32); and a batch without pairs. Names
+    // planted at the first and last pairs, words and tails, at the edges of
+    // segments and cells, and just outside each batch's - each with the
+    // basenames hashed alone, with hashA too, and without a key.
+    {
+        const std::vector<std::string> separators = {"", "_", "\\", "-\\-"};
+        const uint32_t separatorCount = (uint32_t) separators.size();
+        std::vector<std::string> tails;
+        std::string tailError;
+        expandDictionaryTails({"digits:0-2", "_|"}, tails, tailError);
+        const uint32_t tailCount = (uint32_t) tails.size();
+        const uint32_t slashedPair = indexOf("AB\\CD") * separatorCount;
+        std::vector<uint32_t> byLength(count);
+        for (uint32_t w = 0; w < count; ++w)
+            byLength[w] = w;
+        std::stable_sort(byLength.begin(), byLength.end(), [&](uint32_t a, uint32_t b) { return words[a].size() < words[b].size(); });
+        const std::vector<DictionarySelfTestBatch> pairBatches = {
+            {"MUSIC\\", 0, count, 0, 1, 40, 3},
+            {"P_", 2000, 3, 0, 1, 0, 600},
+            {"T\\", 500, 7, 0, tailCount, slashedPair, 2 * separatorCount},
+            {"N", 4321, 2, 0, 1},
+        };
+        const struct { int batch; uint32_t pair, word, tail; } pairPlanted[] = {
+            {0, 40, 0, 0}, {0, 42, count - 1, 0}, {0, 41, byLength[8191], 0}, {0, 41, byLength[8192], 0}, {0, 42, byLength[0], 0},
+            {0, 39, 5, 0}, {0, 43, 5, 0},
+            {1, 0, 2000, 0}, {1, 255, 2002, 0}, {1, 256, 2000, 0}, {1, 511, 2001, 0}, {1, 512, 2002, 0}, {1, 599, 2002, 0},
+            {1, 600, 2000, 0}, {1, 5, 1999, 0}, {1, 5, 2003, 0},
+            {2, slashedPair, 500, 0}, {2, slashedPair + 2, 506, tailCount - 1}, {2, slashedPair + 5, 503, 31},
+            {2, slashedPair + 5, 503, 32}, {2, slashedPair + 7, 506, 221}, {2, slashedPair + 8, 500, 0}, {2, slashedPair - 1, 500, 0},
+            {3, 0, 4321, 0}, {3, 0, 4322, 0}, {3, 0, 4323, 0},
+        };
+        for (DictionaryCaseKey key : {DictionaryCaseKey::Recorded, DictionaryCaseKey::EveryHashA, DictionaryCaseKey::None}) {
+            for (const auto& p : pairPlanted) {
+                if (!runDictionaryCase(backend, words, tails, separators, pairBatches, wav, p.batch, p.pair, p.word, p.tail, key,
+                                       cryptTable, error))
                     return false;
             }
         }

@@ -266,6 +266,7 @@ private:
     cl_mem dictionaryTails_ = nullptr; // dictionaryTailTable
     bool dictionaryHasTails_ = false;
     cl_uint dictionaryWordCount_ = 0;
+    cl_uint dictionarySeparatorCount_ = 0;
     int dictionarySuffixLen_ = 0;
     DictionaryHashes dictionaryHashes_ = DictionaryHashes::HashA;
     cl_uint dictionaryTargetA_ = 0;
@@ -594,9 +595,10 @@ void OpenClBackend::beginDictionarySearch(const DictionaryConstants& constants) 
     dictionaryBasenameKey_ = constants.basenameKey;
     dictionarySuffixLen_ = (int) constants.suffix.size();
     dictionaryWordCount_ = (cl_uint) constants.words.size();
+    dictionarySeparatorCount_ = (cl_uint) constants.separators.size();
 
     DictionaryWordTable table;
-    if (!makeDictionaryWordTable(constants.words, table)) {
+    if (!makeDictionaryWordTable(constants.words, constants.separators, table)) {
         // runDictionarySearch's word lists are far smaller.
         fprintf(stderr, "INTERNAL ERROR: the word list is too long for the GPU's 32-bit offsets - exiting\n");
         exit(1);
@@ -663,6 +665,7 @@ const OpenClBackend::CompiledKernel& OpenClBackend::dictionaryKernel() {
                                 " -DWORDS_PER_THREAD=" + std::to_string(kDictionaryWordsPerThread) +
                                 " -DTAILS=" + (dictionaryHasTails_ ? "1" : "0") +
                                 " -DTAILS_PER_CELL=" + std::to_string(kDictionaryTailsPerCell) +
+                                " -DPAIR_SLOTS=" + std::to_string(kDictionaryPairSlots) +
                                 " -DFILTER_BITS=" + std::to_string(kDictionaryFilterBits) +
                                 " -DFILTER_WORDS=" + std::to_string(kDictionaryFilterWords) +
                                 " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
@@ -687,10 +690,12 @@ DictionaryOutcome OpenClBackend::runDictionaryBatches(const std::vector<Dictiona
     const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? kDictionaryTailsPerCell : 1, dictionaryLaunch_);
     uint64_t candidates = 0;
     for (const DictionaryBatch& batch : batches)
-        candidates += (uint64_t) batch.wordCount * batch.tailCount;
-    if (segments > UINT32_MAX || batches.size() > UINT32_MAX) {
+        candidates += dictionaryBatchCandidates(batch);
+    // The kernel counts a batch's cells in 32 bits.
+    if (segments > UINT32_MAX || batches.size() > UINT32_MAX || candidates > UINT32_MAX) {
         // runDictionarySearch's calls are far smaller (dictionaryCandidatesPerCall).
-        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments - exiting\n", (unsigned long long) segments);
+        fprintf(stderr, "INTERNAL ERROR: a dictionary launch of %llu segments, %llu candidates - exiting\n", (unsigned long long) segments,
+                (unsigned long long) candidates);
         exit(1);
     }
     if (dictionaryLaunch_.size() > dictionaryBatchesCapacity_) {
@@ -723,6 +728,7 @@ DictionaryOutcome OpenClBackend::runDictionaryBatches(const std::vector<Dictiona
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryEntries_));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryPositions_));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(dictionaryWordCount_), &dictionaryWordCount_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(dictionarySeparatorCount_), &dictionarySeparatorCount_));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryTails_));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryCryptKeys_));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &dictionaryFilters_));
@@ -775,11 +781,10 @@ DictionaryOutcome OpenClBackend::runDictionaryBatches(const std::vector<Dictiona
     CL_CHECK(clEnqueueWriteBuffer(queue_, dictionaryCounts_, CL_FALSE, 0, sizeof(kZeros), kZeros, 0, nullptr, nullptr));
     for (const std::vector<DictionaryHit>* hits : {&hashAHits, &basenameHits}) {
         for (const DictionaryHit& hit : *hits) {
-            const DictionaryBatch* batch = hit.batch < batches.size() ? &batches[hit.batch] : nullptr;
-            if (!batch || hit.word < batch->firstWord || hit.word - batch->firstWord >= batch->wordCount || hit.tail < batch->firstTail ||
-                hit.tail - batch->firstTail >= batch->tailCount) {
-                fprintf(stderr, "INTERNAL ERROR: the dictionary kernel reported word %u, tail %u of batch %u, which it doesn't have - exiting\n",
-                        hit.word, hit.tail, hit.batch);
+            if (!dictionaryHitInBatches(batches, hit)) {
+                fprintf(stderr,
+                        "INTERNAL ERROR: the dictionary kernel reported word %u, tail %u, pair %u of batch %u, which it doesn't have - exiting\n",
+                        hit.word, hit.tail, hit.pair, hit.batch);
                 exit(1);
             }
         }

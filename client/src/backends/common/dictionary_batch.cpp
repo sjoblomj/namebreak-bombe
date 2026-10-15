@@ -9,33 +9,39 @@
 #include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 
-bool makeDictionaryWordTable(const std::vector<std::string>& words, DictionaryWordTable& out) {
+bool makeDictionaryWordTable(const std::vector<std::string>& words, const std::vector<std::string>& separators, DictionaryWordTable& out) {
     out = DictionaryWordTable();
     uint64_t total = 0;
-    for (const std::string& word : words)
-        total += (word.size() + 3) / 4;
-    if (total > UINT32_MAX || words.size() > UINT32_MAX)
+    for (const std::vector<std::string>* list : {&words, &separators}) {
+        for (const std::string& text : *list)
+            total += (text.size() + 3) / 4;
+    }
+    if (total > UINT32_MAX || words.size() + separators.size() > UINT32_MAX)
         return false;
     std::vector<uint32_t> order(words.size());
     for (uint32_t w = 0; w < (uint32_t) words.size(); ++w)
         order[w] = w;
     std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return words[a].size() < words[b].size(); });
     out.chars.reserve((size_t) total);
-    out.entries.reserve(words.size());
+    out.entries.reserve(words.size() + separators.size());
     out.positions.resize(words.size());
-    for (uint32_t w : order) {
-        const std::string& word = words[w];
-        const size_t slash = word.rfind('\\');
-        out.positions[w] = (uint32_t) out.entries.size();
-        out.entries.push_back({(uint32_t) out.chars.size(), (uint32_t) word.size(),
-                               slash == std::string::npos ? 0 : (uint32_t) slash + 1, w});
-        for (size_t i = 0; i < word.size(); i += 4) {
+    auto add = [&](const std::string& text, uint32_t index) {
+        const size_t slash = text.rfind('\\');
+        out.entries.push_back({(uint32_t) out.chars.size(), (uint32_t) text.size(),
+                               slash == std::string::npos ? 0 : (uint32_t) slash + 1, index});
+        for (size_t i = 0; i < text.size(); i += 4) {
             uint32_t four = 0;
-            for (size_t j = 0; j < 4 && i + j < word.size(); ++j)
-                four |= (uint32_t) (unsigned char) word[i + j] << (8 * j);
+            for (size_t j = 0; j < 4 && i + j < text.size(); ++j)
+                four |= (uint32_t) (unsigned char) text[i + j] << (8 * j);
             out.chars.push_back(four);
         }
+    };
+    for (uint32_t w : order) {
+        out.positions[w] = (uint32_t) out.entries.size();
+        add(words[w], w);
     }
+    for (uint32_t s = 0; s < (uint32_t) separators.size(); ++s)
+        add(separators[s], s);
     return true;
 }
 
@@ -119,8 +125,20 @@ uint64_t planDictionaryLaunch(const std::vector<DictionaryBatch>& batches, uint3
         b.firstTail = batch.firstTail;
         b.tailCount = batch.tailCount;
         b.tailChunks = (batch.tailCount + tailsPerCell - 1) / tailsPerCell;
+        b.firstPair = batch.firstPair;
+        b.pairCount = batch.pairCount;
+        // Pairs no segment has part of (see DictionaryLaunchBatch).
+        const uint64_t pairCells = (uint64_t) batch.wordCount * b.tailChunks, pairs = std::max<uint32_t>(batch.pairCount, 1);
+        if (pairCells > cellsPerSegment) {
+            b.segmentsPerPair = (uint32_t) ((pairCells + cellsPerSegment - 1) / cellsPerSegment);
+            b.pairsPerSegment = 1;
+        } else {
+            b.segmentsPerPair = 1;
+            b.pairsPerSegment = (uint32_t) std::min<uint64_t>(kDictionaryPairSlots, pairCells ? cellsPerSegment / pairCells : 1);
+        }
         out.push_back(b);
-        segments += ((uint64_t) batch.wordCount * b.tailChunks + cellsPerSegment - 1) / cellsPerSegment;
+        if (pairCells)
+            segments += (pairs * b.segmentsPerPair + b.pairsPerSegment - 1) / b.pairsPerSegment;
     }
     return segments;
 }
@@ -149,9 +167,19 @@ uint32_t dictionaryBatchOfSegment(const std::vector<DictionaryLaunchBatch>& batc
     return lo;
 }
 
+bool dictionaryHitInBatches(const std::vector<DictionaryBatch>& batches, const DictionaryHit& hit) {
+    if (hit.batch >= batches.size())
+        return false;
+    const DictionaryBatch& batch = batches[hit.batch];
+    return hit.word >= batch.firstWord && hit.word - batch.firstWord < batch.wordCount && hit.tail >= batch.firstTail &&
+           hit.tail - batch.firstTail < batch.tailCount &&
+           (batch.pairCount == 0 || (hit.pair >= batch.firstPair && hit.pair - batch.firstPair < batch.pairCount));
+}
+
 void DictionaryHitVerifier::begin(const DictionaryConstants& constants) {
     words_ = constants.words;
     tails_ = constants.tails;
+    separators_ = constants.separators;
     suffix_ = constants.suffix;
     cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
     targetA_ = constants.targetHashA;
@@ -165,10 +193,17 @@ void DictionaryHitVerifier::begin(const DictionaryConstants& constants) {
                              basenameKeyMatches(continueBasenameHash(kInitialHashState, suffix_.substr(slash), cryptTable_.data()).first, basenameKey_);
 }
 
+std::string DictionaryHitVerifier::filenameOf(const DictionaryBatch& batch, uint32_t word, uint32_t tail, uint32_t pair) const {
+    std::string filename = batch.leading;
+    if (batch.pairCount)
+        filename += words_[pair / separators_.size()] + separators_[pair % separators_.size()];
+    return filename + words_[word] + tails_[tail] + suffix_;
+}
+
 void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches, const std::vector<DictionaryHit>& hashAHits,
                                     const std::vector<DictionaryHit>& basenameHits, DictionaryOutcome& outcome) const {
     const uint32_t* table = cryptTable_.data();
-    auto filenameOf = [&](const DictionaryHit& hit) { return batches[hit.batch].leading + words_[hit.word] + tails_[hit.tail] + suffix_; };
+    auto nameOf = [&](const DictionaryHit& hit) { return filenameOf(batches[hit.batch], hit.word, hit.tail, hit.pair); };
     // A candidate whose hashA matches: a hashA hit, and the match if its
     // hashB does too.
     auto addHashAHit = [&](const std::string& filename) {
@@ -179,7 +214,7 @@ void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches,
         }
     };
     for (const DictionaryHit& hit : hashAHits) {
-        const std::string filename = filenameOf(hit);
+        const std::string filename = nameOf(hit);
         const uint32_t hashA = continueHash(kInitialHashState, filename, kHashAOffset, table).first;
         if (!hashAMatches(hashA, targetA_)) {
             printf("WARNING: hashA mismatch for '%s' - the backend reported a hit, the full filename hashes to 0x%08X\n", filename.c_str(),
@@ -191,7 +226,7 @@ void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches,
     if (!checkBasename_)
         return;
     for (const DictionaryHit& hit : basenameHits) {
-        const std::string filename = filenameOf(hit);
+        const std::string filename = nameOf(hit);
         if (!basenameKeyMatches(continueBasenameHash(kInitialHashState, filename, table).first, basenameKey_)) {
             printf("WARNING: basename hash mismatch for '%s' - the backend reported a hit, the full filename doesn't match\n",
                    filename.c_str());
@@ -205,5 +240,5 @@ void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches,
             addHashAHit(filename);
     }
     if (suffixBasenameMatches_ && !batches.empty())
-        outcome.basenameHits.push_back(batches[0].leading + words_[batches[0].firstWord] + tails_[batches[0].firstTail] + suffix_);
+        outcome.basenameHits.push_back(filenameOf(batches[0], batches[0].firstWord, batches[0].firstTail, batches[0].firstPair));
 }

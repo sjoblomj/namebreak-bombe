@@ -51,9 +51,11 @@ static std::string wordOf(const DictionaryWordTable& table, const DictionaryWord
 static void testWordTable() {
     printf("--- the word table ---\n");
     const std::vector<std::string> words = {"ABCDE", "B", "C\\D", "\\E", "F\\", "GHIJ", "\xC9T\xE9", "KL", "MNOPQRSTU", "VW"};
+    const std::vector<std::string> separators = {"", "_", "\\", "--\\--", "LONG SEPARATOR"};
     DictionaryWordTable table;
-    check(makeDictionaryWordTable(words, table), "made");
-    check(table.entries.size() == words.size() && table.positions.size() == words.size(), "an entry and a position for every word");
+    check(makeDictionaryWordTable(words, separators, table), "made");
+    check(table.entries.size() == words.size() + separators.size() && table.positions.size() == words.size(),
+          "an entry for every word and separator, and a position for every word");
 
     bool readBack = true, positions = true, starts = true;
     for (uint32_t w = 0; w < words.size(); ++w) {
@@ -67,17 +69,28 @@ static void testWordTable() {
     check(readBack, "every word's characters read back as they were, those past ASCII too");
     check(starts, "a word's basename starts after its last '\\', or at 0 if it has none");
     std::vector<uint32_t> lengths;
-    for (const DictionaryWordEntry& entry : table.entries)
-        lengths.push_back(entry.length);
-    check(std::is_sorted(lengths.begin(), lengths.end()), "the entries in the order of the words' lengths");
+    for (size_t i = 0; i < words.size(); ++i)
+        lengths.push_back(table.entries[i].length);
+    check(std::is_sorted(lengths.begin(), lengths.end()), "the words' entries in the order of their lengths");
     bool stable = true;
-    for (size_t i = 1; i < table.entries.size(); ++i)
+    for (size_t i = 1; i < words.size(); ++i)
         stable = stable && (table.entries[i - 1].length < table.entries[i].length || table.entries[i - 1].index < table.entries[i].index);
     check(stable, "... and of the list among words of the same length");
+    bool separatorsAfter = true;
+    for (uint32_t s = 0; s < separators.size(); ++s) {
+        const DictionaryWordEntry& entry = table.entries[words.size() + s];
+        const size_t slash = separators[s].rfind('\\');
+        separatorsAfter = separatorsAfter && entry.index == s && wordOf(table, entry) == separators[s] &&
+                          entry.basenameStart == (slash == std::string::npos ? 0 : slash + 1);
+    }
+    check(separatorsAfter, "then the separators' entries, in the list's order, read back as they were");
     size_t uint32s = 0;
-    for (const std::string& word : words)
-        uint32s += (word.size() + 3) / 4;
-    check(table.chars.size() == uint32s, "every word from a uint32 of its own: " + std::to_string(table.chars.size()) + " uint32s");
+    for (const std::vector<std::string>* list : {&words, &separators}) {
+        for (const std::string& text : *list)
+            uint32s += (text.size() + 3) / 4;
+    }
+    check(table.chars.size() == uint32s,
+          "every word and separator from a uint32 of its own: " + std::to_string(table.chars.size()) + " uint32s");
     bool padded = true;
     for (const DictionaryWordEntry& entry : table.entries) {
         if (entry.length % 4 != 0)
@@ -86,7 +99,7 @@ static void testWordTable() {
     check(padded, "the rest of a word's last uint32 is zero");
 
     DictionaryWordTable empty;
-    check(makeDictionaryWordTable({}, empty) && empty.chars.empty() && empty.entries.empty(), "no words: an empty table");
+    check(makeDictionaryWordTable({}, {}, empty) && empty.chars.empty() && empty.entries.empty(), "no words: an empty table");
 }
 
 static void testSuffixKeys() {
@@ -220,10 +233,69 @@ static void testLaunchPlan() {
               launch[2].tailCount == 5 && launch[0].firstSegment == 0 && launch[1].firstSegment == 4 && launch[2].firstSegment == 5,
           "each batch's tails, their chunks and its first segment");
 
+    // With pairs: a pair of more cells than a segment cut into segments of
+    // it, and smaller ones taken several to a segment - as many as it has
+    // room for, at most kDictionaryPairSlots.
+    std::vector<DictionaryBatch> withPairs = {batchOf("A", 0, 10), batchOf("B", 3, 1), batchOf("C", 0, 3), batchOf("D", 0, 2)};
+    withPairs[0].firstPair = 4, withPairs[0].pairCount = 3;                               // pairs of 10 cells: 2 segments each
+    withPairs[1].firstPair = 0, withPairs[1].pairCount = 20;                              // pairs of 1 cell: 8 to a segment
+    withPairs[2].firstPair = 7, withPairs[2].pairCount = 2, withPairs[2].tailCount = 5; // 2 chunks of 3 words, 6 cells: 1 to a segment
+    withPairs[3].firstPair = 1, withPairs[3].pairCount = 5;                               // pairs of 2 cells: 4 to a segment
+    const uint32_t onePerCell = std::min<uint32_t>(8, kDictionaryPairSlots), fourPerSegment = std::min<uint32_t>(4, kDictionaryPairSlots);
+    const uint64_t onePerCellSegments = (20 + onePerCell - 1) / onePerCell, fourSegments = (5 + fourPerSegment - 1) / fourPerSegment;
+    const uint64_t pairSegments = planDictionaryLaunch(withPairs, 8, 4, launch);
+    check(pairSegments == 6 + onePerCellSegments + 2 + fourSegments,
+          "segments of 8 cells, with pairs: 6 + " + std::to_string(onePerCellSegments) + " + 2 + " + std::to_string(fourSegments) + " = " +
+              std::to_string(pairSegments));
+    check(launch[0].segmentsPerPair == 2 && launch[0].pairsPerSegment == 1 && launch[1].segmentsPerPair == 1 &&
+              launch[1].pairsPerSegment == onePerCell && launch[2].segmentsPerPair == 1 && launch[2].pairsPerSegment == 1 &&
+              launch[3].segmentsPerPair == 1 && launch[3].pairsPerSegment == fourPerSegment,
+          "... each batch's segments a pair, or pairs a segment");
+    check(launch[0].firstPair == 4 && launch[0].pairCount == 3 && launch[1].firstPair == 0 && launch[1].pairCount == 20 &&
+              launch[2].firstPair == 7 && launch[2].pairCount == 2 && launch[2].tailChunks == 2 && launch[1].firstSegment == 6 &&
+              launch[2].firstSegment == 6 + onePerCellSegments && launch[3].firstSegment == 8 + onePerCellSegments,
+          "... each batch's pairs as they are, and its first segment");
+    std::vector<DictionaryLaunchBatch> noPairs;
+    planDictionaryLaunch(batches, 8, 1, noPairs);
+    check(noPairs[0].segmentsPerPair == 2 && noPairs[0].pairsPerSegment == 1 && noPairs[1].segmentsPerPair == 1 &&
+              noPairs[1].pairsPerSegment == std::min<uint32_t>(8, kDictionaryPairSlots) && noPairs[3].segmentsPerPair == 4,
+          "without pairs, a batch as if it had one");
+    DictionaryBatch counted = withPairs[2];
+    check(dictionaryBatchCandidates(counted) == 2 * 3 * 5, "a batch of 2 pairs, 3 words and 5 tails: 30 candidates");
+    counted.pairCount = 0;
+    check(dictionaryBatchCandidates(counted) == 3 * 5, "... and without pairs, 15");
+
     // The tail table: two uint32s of characters, the length.
     const std::vector<uint32_t> table = dictionaryTailTable({"", "7", "_07B", "ABCDEFGH"});
     check(table == std::vector<uint32_t>{0, 0, 0, 0, 0x37, 0, 1, 0, 0x4237305F, 0, 4, 0, 0x44434241, 0x48474645, 8, 0},
           "the tail table: characters four to a uint32, the first in the lowest byte, and the length");
+}
+
+static void testHitInBatches() {
+    printf("--- a hit's batch ---\n");
+    std::vector<DictionaryBatch> batches = {batchOf("A", 2, 3), batchOf("B", 0, 1)};
+    batches[0].firstTail = 4, batches[0].tailCount = 2;
+    batches[1].firstPair = 10, batches[1].pairCount = 5;
+    struct Case {
+        DictionaryHit hit;
+        bool in;
+        const char* what;
+    };
+    const Case cases[] = {
+        {{0, 2, 4, 0}, true, "its first word and tail"},
+        {{0, 4, 5, 99}, true, "its last word and tail - a pair ignored without pairs"},
+        {{0, 1, 4, 0}, false, "the word before its first"},
+        {{0, 5, 4, 0}, false, "the word after its last"},
+        {{0, 2, 3, 0}, false, "the tail before its first"},
+        {{0, 2, 6, 0}, false, "the tail after its last"},
+        {{1, 0, 0, 10}, true, "its first pair"},
+        {{1, 0, 0, 14}, true, "its last pair"},
+        {{1, 0, 0, 9}, false, "the pair before its first"},
+        {{1, 0, 0, 15}, false, "the pair after its last"},
+        {{2, 0, 0, 0}, false, "a batch the launch doesn't have"},
+    };
+    for (const Case& c : cases)
+        check(dictionaryHitInBatches(batches, c.hit) == c.in, std::string(c.in ? "in: " : "not in: ") + c.what);
 }
 
 static void testVerifier() {
@@ -319,6 +391,36 @@ static void testVerifier() {
     outcome = DictionaryOutcome();
     verifier.addHits(batches, {}, {}, outcome);
     check(outcome.basenameHits.empty(), "... nor if the basenames aren't recorded");
+
+    // Pairs: a hit's pair - word pair / S and separator pair % S - between
+    // its batch's leading part and its word.
+    constants = DictionaryConstants();
+    constants.words = words;
+    constants.separators = {"", "_", "\\"};
+    constants.suffix = ".TXT";
+    constants.cryptTable = g_table;
+    constants.targetHashA = hashOf("REZ\\CRDT_LST.TXT", 0x100);
+    constants.targetHashB = hashOf("REZ\\CRDT_LST.TXT", 0x200);
+    constants.checkBasename = true;
+    constants.basenameKey = hashOf("CRDT_LST.TXT", 0x300);
+    verifier.begin(constants);
+    std::vector<DictionaryBatch> pairBatches = {batchOf("REZ\\", 0, 4), batchOf("SCRIPTS\\", 1, 1)};
+    pairBatches[0].firstPair = 0, pairBatches[0].pairCount = 12;
+    pairBatches[1].firstPair = 0, pairBatches[1].pairCount = 3;
+    outcome = DictionaryOutcome();
+    // Pair 1: CRDT and '_' - pair 2: CRDT and '\', which makes another
+    // basename.
+    verifier.addHits(pairBatches, {}, {{0, 1, 0, 1}, {1, 1, 0, 1}, {0, 1, 0, 2}}, outcome);
+    check(outcome.basenameHits == std::vector<std::string>{"REZ\\CRDT_LST.TXT", "SCRIPTS\\CRDT_LST.TXT"},
+          "with pairs: a hit's pair between its leading part and its word - one that doesn't match dropped");
+    check(outcome.hits == std::vector<std::string>{"REZ\\CRDT_LST.TXT"} && outcome.found, "... and found, matching hashA and hashB");
+    constants.suffix = "\\CRDT_LST.TXT";
+    verifier.begin(constants);
+    pairBatches[0].firstPair = 5, pairBatches[0].firstWord = 2;
+    outcome = DictionaryOutcome();
+    verifier.addHits(pairBatches, {}, {}, outcome);
+    check(outcome.basenameHits == std::vector<std::string>{"REZ\\LST\\MAP\\CRDT_LST.TXT"},
+          "a suffix with a '\\': the call's first candidate, its first pair's, reported");
 }
 
 int main() {
@@ -327,6 +429,7 @@ int main() {
     testSuffixKeys();
     testSuffixFilters();
     testLaunchPlan();
+    testHitInBatches();
     testVerifier();
     if (g_failures) {
         fprintf(stderr, "%d check(s) FAILED\n", g_failures);

@@ -71,6 +71,10 @@ namespace {
 // A run of candidates the walk below hands on: `leading` followed by the
 // last word and the tail - items [firstItem, firstItem + itemCount) of
 // those, item word * T + tail with T tails - numbered from firstNumber.
+// With `pairs`, `leading` stops a word earlier, and a pair - a word and the
+// separator after it - comes before the last word: item (pair * W + word) *
+// T + tail with W words, pair p being word p / S and separator p % S of S
+// separators.
 struct Leaf {
     const std::string* leading;
     HashState hashA;
@@ -78,15 +82,18 @@ struct Leaf {
     uint64_t firstNumber;
     uint64_t firstItem;
     uint64_t itemCount;
+    bool pairs;
 };
 
 // Walks a dictionary search's candidates from a start number up to (not
 // including) an end number, in number order, as the runs of them within the
 // bounds: depth first, one level per word and the separator after it, down
 // to the last word. A leading part the bounds put wholly outside is skipped,
-// and one they put wholly inside isn't compared again below it. Without
-// onLeaf, it only counts the candidates (and doesn't descend into a part
-// wholly inside at all); without a crypt table, it doesn't hash.
+// and one they put wholly inside isn't compared again below it - nor
+// descended into for its last two words: its runs are handed on with pairs
+// (see Leaf), which a backend hashes rather than this. Without onLeaf, it
+// only counts the candidates (and doesn't descend into a part wholly inside
+// at all); without a crypt table, it doesn't hash.
 class Walker {
 public:
     Walker(const DictionarySpace& space, const std::string& prefix, const std::string& suffix, const FilenameBounds& bounds,
@@ -132,6 +139,13 @@ private:
         const std::vector<std::string>& words = space_.words();
         const std::vector<std::string>& separators = space_.separators();
         const uint64_t pairs = (uint64_t) words.size() * separators.size();
+        if (pairsLeft == 1 && inside && pairs <= UINT32_MAX) {
+            // Every candidate within the bounds: its last two words as pairs
+            // and words (see DictionaryBatch).
+            const uint64_t first = start_ > nodeStart ? start_ - nodeStart : 0;
+            const uint64_t last = std::min(end_ - nodeStart, nodeSize); // exclusive
+            return emit(nodeStart, text, hashA, basename, first, last - first, true);
+        }
         const uint64_t childSize = nodeSize / pairs;
         // A child is a word and the separator after it - the separator
         // turning faster.
@@ -201,12 +215,12 @@ private:
 
     // Hands on a run of (at least one) candidates.
     bool emit(uint64_t nodeStart, const std::string& leading, HashState hashA, HashState basename, uint64_t firstItem,
-              uint64_t itemCount) {
+              uint64_t itemCount, bool pairs = false) {
         if (!onLeaf_) {
             counted_ += itemCount;
             return true;
         }
-        return onLeaf_(Leaf{&leading, hashA, basename, nodeStart + firstItem, firstItem, itemCount});
+        return onLeaf_(Leaf{&leading, hashA, basename, nodeStart + firstItem, firstItem, itemCount, pairs});
     }
 
     const DictionarySpace& space_;
@@ -511,6 +525,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     DictionaryConstants constants;
     constants.words = space.words();
     constants.tails = space.tails();
+    constants.separators = space.separators();
     constants.suffix = req.suffix;
     constants.cryptTable = cryptTable;
     constants.targetHashA = req.targetHashA;
@@ -648,22 +663,25 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
         return true;
     };
 
-    // A leaf's run of candidates, as batches of whole words, each with every
-    // tail - but a word the run, or a call, has only some of the tails of,
-    // which is a batch of its own: so a batch's candidates are numbered one
-    // after another, and so are a call's.
+    // A run of candidates without pairs - `leading`, then items
+    // [firstItem, firstItem + itemCount) of its words and tails, numbered
+    // from firstNumber - as batches of whole words, each with every tail -
+    // but a word the run, or a call, has only some of the tails of, which is
+    // a batch of its own: so a batch's candidates are numbered one after
+    // another, and so are a call's.
     const uint64_t tailCount = space.tails().size();
-    Walker walker(space, req.prefix, req.suffix, req.bounds, start, end, cryptTable, [&](const Leaf& leaf) {
-        uint64_t item = leaf.firstItem;
-        const uint64_t itemsEnd = leaf.firstItem + leaf.itemCount;
+    auto addRun = [&](const std::string& leading, HashState hashA, HashState basename, uint64_t firstNumber, uint64_t firstItem,
+                      uint64_t itemCount) {
+        uint64_t item = firstItem;
+        const uint64_t itemsEnd = firstItem + itemCount;
         while (item < itemsEnd) {
             const uint64_t room = perCall - pendingCount, word = item / tailCount, tail = item % tailCount;
             DictionaryBatch batch;
-            batch.leading = *leaf.leading;
-            batch.seed1 = leaf.hashA.first;
-            batch.seed2 = leaf.hashA.second;
-            batch.basenameSeed1 = leaf.basename.first;
-            batch.basenameSeed2 = leaf.basename.second;
+            batch.leading = leading;
+            batch.seed1 = hashA.first;
+            batch.seed2 = hashA.second;
+            batch.basenameSeed1 = basename.first;
+            batch.basenameSeed2 = basename.second;
             batch.firstWord = (uint32_t) word;
             if (tail != 0 || itemsEnd - item < tailCount || room < tailCount) {
                 batch.wordCount = 1;
@@ -678,9 +696,59 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
             pending.push_back(std::move(batch));
             pendingCount += count;
             item += count;
-            pendingEnd = leaf.firstNumber + (item - leaf.firstItem);
+            pendingEnd = firstNumber + (item - firstItem);
             if ((pendingCount >= perCall || pending.size() >= batchesPerCall) && !searchPending())
                 return false;
+        }
+        return true;
+    };
+    // A leaf's run: with pairs, as batches of as many whole pairs as a call
+    // has room for - each with every word and tail - and a pair the run, or
+    // a call, has only some of, as a run of its own, its pair added to the
+    // leading part.
+    const std::vector<std::string>& words = space.words();
+    const std::vector<std::string>& separatorList = space.separators();
+    const uint64_t pairItems = (uint64_t) words.size() * tailCount;
+    Walker walker(space, req.prefix, req.suffix, req.bounds, start, end, cryptTable, [&](const Leaf& leaf) {
+        if (!leaf.pairs)
+            return addRun(*leaf.leading, leaf.hashA, leaf.basename, leaf.firstNumber, leaf.firstItem, leaf.itemCount);
+        uint64_t item = leaf.firstItem;
+        const uint64_t itemsEnd = leaf.firstItem + leaf.itemCount;
+        while (item < itemsEnd) {
+            const uint64_t pair = item / pairItems, within = item % pairItems;
+            const uint64_t room = perCall - pendingCount;
+            const uint64_t wholePairs = within == 0 ? std::min((itemsEnd - item) / pairItems, room / pairItems) : 0;
+            if (wholePairs > 0) {
+                DictionaryBatch batch;
+                batch.leading = *leaf.leading;
+                batch.seed1 = leaf.hashA.first;
+                batch.seed2 = leaf.hashA.second;
+                batch.basenameSeed1 = leaf.basename.first;
+                batch.basenameSeed2 = leaf.basename.second;
+                batch.firstPair = (uint32_t) pair;
+                batch.pairCount = (uint32_t) wholePairs;
+                batch.firstWord = 0;
+                batch.wordCount = (uint32_t) words.size();
+                batch.firstTail = 0;
+                batch.tailCount = (uint32_t) tailCount;
+                pending.push_back(std::move(batch));
+                pendingCount += wholePairs * pairItems;
+                item += wholePairs * pairItems;
+                pendingEnd = leaf.firstNumber + (item - leaf.firstItem);
+                if ((pendingCount >= perCall || pending.size() >= batchesPerCall) && !searchPending())
+                    return false;
+                continue;
+            }
+            const std::string& word = words[pair / separatorList.size()];
+            const std::string& separator = separatorList[pair % separatorList.size()];
+            const HashState hashA =
+                continueHash(continueHash(leaf.hashA, word, kHashAOffset, cryptTable), separator, kHashAOffset, cryptTable);
+            const HashState basename =
+                continueBasenameHash(continueBasenameHash(leaf.basename, word, cryptTable), separator, cryptTable);
+            const uint64_t count = std::min(pairItems - within, itemsEnd - item);
+            if (!addRun(*leaf.leading + word + separator, hashA, basename, leaf.firstNumber + (item - leaf.firstItem), within, count))
+                return false;
+            item += count;
         }
         return true;
     });

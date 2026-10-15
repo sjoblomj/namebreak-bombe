@@ -108,9 +108,11 @@ struct BatchOutcome {
 struct DictionaryConstants {
     // The words a candidate's last word is one of - DictionaryBatch::firstWord
     // indexes them - and the tails that follow it (DictionaryBatch::firstTail;
-    // {""} for none).
+    // {""} for none). And the separators: a batch's pairs are a word and a
+    // separator each (see DictionaryBatch).
     std::vector<std::string> words;
     std::vector<std::string> tails = {""};
+    std::vector<std::string> separators = {""};
     std::string suffix;
     const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
     uint32_t targetHashA = 0;
@@ -158,6 +160,15 @@ inline DictionaryHashes dictionaryHashes(const DictionaryConstants& constants) {
 // tailCount candidates. A search only gives a batch of one word part of the
 // tails, so that a batch's candidates are numbered one after another - but a
 // backend searches any.
+//
+// With pairCount > 0, the leading part stops one word earlier, and a *pair*
+// - a word and the separator after it - comes between it and the last word:
+// pair p is word p / S and then separator p % S, of S separators
+// (DictionaryConstants::separators), as a candidate's number has them. The
+// batch's candidates are then `leading`, each of the pairs [firstPair,
+// firstPair + pairCount), and each word and tail as above - pairCount *
+// wordCount * tailCount of them, pair by pair. A search only gives a batch
+// of pairs every word and every tail.
 struct DictionaryBatch {
     std::string leading;
     // hashA's state after `leading` (see mpqHashWithPrefixCache_CPU).
@@ -171,7 +182,14 @@ struct DictionaryBatch {
     uint32_t wordCount = 0;
     uint32_t firstTail = 0;
     uint32_t tailCount = 1;
+    uint32_t firstPair = 0;
+    uint32_t pairCount = 0;
 };
+
+// How many candidates `batch` has.
+inline uint64_t dictionaryBatchCandidates(const DictionaryBatch& batch) {
+    return (uint64_t) (batch.pairCount ? batch.pairCount : 1) * batch.wordCount * batch.tailCount;
+}
 
 // What one runDictionaryBatches() call found - every hit, in no particular
 // order.

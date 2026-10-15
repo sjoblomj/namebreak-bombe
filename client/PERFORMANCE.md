@@ -737,19 +737,65 @@ afternoon).
     2,970; OpenCL 29.4-30.8, 89.1-93.0 and 75.9-77.3. Two words of all of
     `english-1` with those 2,970 tails, 4.8 * 10^13 candidates, would take
     about ten minutes.
+- [x] **Pairs: the last two words on the GPU** (`separators`, README.md's
+  *Dictionary searches on the GPU*). A batch was a leading part - every
+  word but the last - and the list's words after it, so a short list made
+  short batches: the first 337 words of `english-1`, five a candidate,
+  made batches of 337 candidates (3,707 with `digits:0-1`'s 11 tails),
+  each built by the engine (about 80 ns; 184 with the laptop in its
+  power-saving mode) and each a thread block of its own on the GPU, 337 of
+  its 8,192 cells busy. Now a batch whose leading part the bounds put
+  wholly inside stops a word earlier, and has *pairs* - a word and the
+  separator after it, pair p word p / S and separator p % S, numbered as a
+  candidate is - before its words (`DictionaryBatch::pairCount`): 1,348
+  times fewer batches for those 337 words and four separators. A segment
+  never cuts a pair with another's cells - a pair of more cells than a
+  segment is cut into several, each of that pair alone, and smaller ones
+  are taken whole, up to 256 to a segment (`kDictionaryPairSlots`,
+  `planDictionaryLaunch`) - and a block works out the states after its
+  pairs into shared memory first. Its threads take runs of 32 cells
+  (`dictionaryLanesPerRun`), and walk each pair's in an inner loop of its
+  own: the loop before, but for where its states come from. CUDA's kernel
+  is compiled to fit six blocks to an SM (`kDictionaryMinBlocksPerSm`), 40
+  registers, as before; it took 40 to 50 without.
+  - Tried first, and slower: segments of consecutive cells, cutting
+    through pairs anywhere, a block working out its pairs in rounds of 256
+    and a thread finding each cell's. It took 48 to 56 registers, or
+    spilled some to stay at 40, and 6% more instructions: 1.7% longer a
+    launch at Nsight Compute's fixed clocks (all of `english-1`, two
+    words, a key) but 15% at the GPU's own (8.66 -> 9.95 ms): at its 80 W
+    cap the GPU clocked lower for the extra work. What a kernel costs in
+    energy decides here, not only its time at fixed clocks.
+  - **Measured** (`dictionary_bench`, alternating with the code before,
+    RTX 3080 Ti Laptop, the laptop in its performance mode): a long list
+    stays about even, a short one with many words a candidate wins big. The
+    large shapes hold within a few percent - all 63,875 words of
+    `english-1`, two a candidate, a key: CUDA 30-31 G candidates/s, OpenCL
+    25; 20,000 words and `digits:0-1`'s 11 tails: 100 and 83; three words:
+    26-27 and 23 - the pair code's cost, lost in the noise. The short ones
+    leap: 337 words, five a candidate, with those 11 tails, 24 -> 63-66
+    (OpenCL 24 -> 58), 2.7 times; without tails, 2.7 -> 30 (OpenCL 2.6 ->
+    27), 11 times; 40 words, eight a candidate, 0.36 -> 21 (OpenCL 0.34 ->
+    17), 60 times - a batch had filled a sliver of a block.
+  - The self-test has a case of pairs now (every word after three pairs,
+    600 pairs of three words, pairs of a word with a `\` and 222 tails),
+    and takes about 0.1 s longer: 0.55 s instead of 0.45 with CUDA.
 - [ ] **Hide the word table's loads.** Since **One hash a candidate**, both
   kernels wait on a word's entry and characters more than they compute
   (73% of issue slots busy at fixed clocks): loading the next word's while
   hashing this one's might win back some of the 10% the fixed clocks
   didn't show.
 - [ ] **Overlap the host with the GPU.** The engine builds a call's batches
-  (about 4,000 leading parts for a launch of 2^28) while the GPU waits,
-  and the GPU then runs while the engine waits. **Measured** with a
-  backend that hashes nothing: 85 ns a batch, 22 ms for the 255,561
-  batches of two words of `english-1` - under 3% of the GPU's time, and
-  the same share with three words, as it's per batch of every word. Would
-  take building the next call's batches during the launch, in the engine;
-  not worth it yet.
+  while the GPU waits, and the GPU then runs while the engine waits.
+  **Pairs** made this mostly moot: what was a batch per leading part is now
+  a batch's pairs, so a call builds far fewer - the two words of
+  `english-1` that this was **measured** at (a backend that hashes
+  nothing: 85 ns a batch, 22 ms for 255,561 batches, under 3% of the GPU's
+  time, the same share with three words) fold into a handful of batches of
+  tens of thousands of pairs each. A list long enough to still make many
+  batches fills the GPU with each of them, so the host keeps up. Would take
+  building the next call's batches during the launch, in the engine; not
+  worth it.
 - [ ] **Persistent blocks.** A block per segment pays for its batch's
   binary search and its tables every 8,192 words; blocks that each search
   many segments wouldn't (**estimated**: a few percent, from the

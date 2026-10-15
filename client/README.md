@@ -305,7 +305,10 @@ modes. On the RTX 3080 Ti Laptop, up to two words of `english-1` with four
 separators and an encryption key - 16.3 billion candidates,
 `run_dictionary_bench` - take about 0.6 s on the GPU, 26-27 G candidates/s
 with CUDA and about 25.5 with OpenCL (with the GPU at 77-82 C), and about
-28 s on the CPU backend, 0.6 G candidates/s. A
+28 s on the CPU backend, 0.6 G candidates/s. A short word list with many
+words a candidate, where each batch once filled a fraction of a block, is
+several times faster now (see [PERFORMANCE.md](PERFORMANCE.md)'s *Pairs*):
+337 words, five a candidate, go from 2.7 to 30 G candidates/s on CUDA. A
 dictionary search runs a
 self-test of its own first (`selfTestDictionaryBackend`,
 `src/backends/self_test.h`): known answers planted among 9,000 words, which
@@ -1298,14 +1301,19 @@ the last word. The engine (`runDictionarySearch`) walks the leading parts on
 the CPU, hashing each once, and hands the backend *batches*: a leading part's
 two hash states (hashA's, and the basename hash's - hash type 3 of what
 follows the last `\`), followed by a run of the word list's words, each with
-a run of the tails, and then the suffix. A GPU launch is a call's batches,
-up to 2^28 candidates, cut into *segments* of up to 8,192 *cells* of one
-batch (32 cells to each of 256 threads), one per thread block
+a run of the tails, and then the suffix. A batch whose leading part the
+bounds put wholly inside stops a word earlier and carries *pairs* - a word
+of the list and the separator after it - before its words, so a short
+list's many leading parts become one batch's pairs rather than a batch each
+(see *The last two words* below). A GPU launch is a call's batches, up to
+2^28 candidates, cut into *segments* of up to 8,192 *cells* of one batch,
+along its pairs (32 cells to each of 256 threads), one per thread block
 (`planDictionaryLaunch`, `src/backends/common/dictionary_batch.h`). A cell
 is a word and a chunk of up to 32 of its tails - without tails, a word. A
 block finds its batch by a binary search over the batches' first segments,
-and its threads take neighbouring cells: neighbouring words, with the same
-chunk of tails.
+works out the states after each of its pairs, and its threads take
+neighbouring cells: neighbouring words of one pair, with the same chunk of
+tails.
 
 What makes it fast (see [PERFORMANCE.md](PERFORMANCE.md)'s *Dictionary
 searches* for the measurements):
@@ -1325,6 +1333,21 @@ searches* for the measurements):
   neighbouring words, so they read the same tail, as one load, and go round
   its loop together. A search without tails gets a kernel without the loop
   (each is compiled both ways).
+- **The last two words.** A short word list makes short batches - 337 words
+  are 337 cells, and a block has 8,192 - so a batch that was a leading part
+  and the list's last word now stops a word earlier and holds the list's
+  *pairs* (a word and a separator, pair `p` being word `p / S` and
+  separator `p % S`) before its last word: 337 words and four separators
+  are one batch of 1,348 pairs, not 1,348 batches. A segment is cells of
+  one batch along its pairs, so it never mixes a pair's cells with
+  another's - a pair of more than 8,192 cells is cut into segments of its
+  own, and smaller pairs share a segment, up to `kDictionaryPairSlots` of
+  them. A block hashes the state after each of its pairs into shared memory
+  first (one `__syncthreads` away), then its threads take runs of 32 cells
+  (`dictionaryLanesPerRun`), each run a pair's, hashing on from that pair's
+  state. The engine builds whole pairs into the batch and searches a pair a
+  call or a bound stops inside as a run of its own, its word and separator
+  on the leading part.
 - **Words by length.** A warp goes round a word's loop as many times as its
   longest word needs. The word table the kernels read
   (`DictionaryWordTable`) has the words in the order of their lengths, so
@@ -1347,9 +1370,10 @@ A word with a `\` starts the basename hash over after its last one (the
 table has where), so what comes before it isn't hashed at all, and a suffix
 with a `\` makes every candidate's basename the same, its end - checked once
 a call on the host, not per candidate (`DictionaryHitVerifier`), while the
-kernel hashes hashA. The kernel records hits as (batch, word); the host
-rebuilds each filename, hashes it from scratch and checks hashB - and, for a
-basename hit, hashA first - as for the row search. A launch has room for 4,096 hits of each kind - a
+kernel hashes hashA. The kernel records hits as (batch, word, tail, pair);
+the host rebuilds each filename - the batch's leading part, the pair's word
+and separator, the word and the tail - hashes it from scratch and checks
+hashB - and, for a basename hit, hashA first - as for the row search. A launch has room for 4,096 hits of each kind - a
 search with a 32-bit target has about one hit per 2^32 candidates - and one
 that has more is searched again with room for all of them, so none is ever
 lost. The OpenCL and Metal kernels are the CUDA one ported, compiled at

@@ -81,9 +81,17 @@ DictionaryOutcome ReferenceBackend::runDictionaryBatches(const std::vector<Dicti
     // candidate's hashA is to be recorded (see dictionaryHashes).
     const bool basenameFirst =
         dictionary_.checkBasename && !dictionary_.recordHashAMatches && dictionary_.suffix.find('\\') == std::string::npos;
+    const std::vector<std::string>& separators = dictionary_.separators;
     for (const DictionaryBatch& batch : batches) {
-        for (uint64_t c = 0; c < (uint64_t) batch.wordCount * batch.tailCount; ++c) {
-            const std::string filename = batch.leading + dictionary_.words[batch.firstWord + c / batch.tailCount] +
+        const uint64_t perPair = (uint64_t) batch.wordCount * batch.tailCount;
+        for (uint64_t c = 0; c < dictionaryBatchCandidates(batch); ++c) {
+            // Its pair, if the batch has pairs (see DictionaryBatch).
+            std::string pair;
+            if (batch.pairCount) {
+                const uint64_t p = batch.firstPair + c / perPair;
+                pair = dictionary_.words[p / separators.size()] + separators[p % separators.size()];
+            }
+            const std::string filename = batch.leading + pair + dictionary_.words[batch.firstWord + c % perPair / batch.tailCount] +
                                          dictionary_.tails[batch.firstTail + c % batch.tailCount] + dictionary_.suffix;
             bool basenameMatches = false;
             if (dictionary_.checkBasename) {

@@ -12,10 +12,12 @@
 // as a launch's, and turning what a backend found into a DictionaryOutcome.
 //
 // A dictionary kernel hashes each of a batch's words, and then the suffix,
-// on from the batch's state - one candidate per word. A launch's work is
-// cut into *segments*: up to wordsPerSegment consecutive words of one batch,
-// one per block of threads (work-group, threadgroup), so that each block
-// reads its batch once and its threads read neighbouring words.
+// on from the batch's state - or with pairs, the state after the batch's
+// leading part and each pair (see DictionaryBatch) - one candidate per word.
+// A launch's work is cut into *segments*: up to wordsPerSegment
+// consecutive words of one batch, one per block of threads (work-group,
+// threadgroup), so that each block reads its batch once and its threads
+// read neighbouring words.
 
 // The words as a kernel reads them. A kernel's threads take neighbouring
 // words, and a warp (wavefront, SIMD-group) goes round a word's loop as
@@ -29,7 +31,9 @@
 // word from a uint32 of its own - its length, the index of the character
 // its basename starts at (just after its last '\', or 0 if it has none, when
 // the basename is the batch's, continued) and its index in the list.
-// positions[w] is word w's entry.
+// positions[w] is word w's entry. After the words' entries come the
+// separators', in their list's order - entries[words + s] is separator s's,
+// which a pair ends with (see DictionaryBatch).
 struct DictionaryWordEntry {
     uint32_t offset;
     uint32_t length;
@@ -42,8 +46,9 @@ struct DictionaryWordTable {
     std::vector<DictionaryWordEntry> entries;
     std::vector<uint32_t> positions;
 };
-// False if the words take more uint32s than 32 bits can index.
-bool makeDictionaryWordTable(const std::vector<std::string>& words, DictionaryWordTable& out);
+// False if the words and separators take more uint32s than 32 bits can
+// index.
+bool makeDictionaryWordTable(const std::vector<std::string>& words, const std::vector<std::string>& separators, DictionaryWordTable& out);
 
 // The suffix's characters as a kernel hashes them: for character i,
 // keys[3 * i] (hashA's crypt-table key), keys[3 * i + 1] (the basename
@@ -89,15 +94,22 @@ bool checkDictionarySuffixFilter(const std::vector<uint32_t>& filter, const std:
                                  uint32_t target, uint32_t mask, uint64_t seed, std::string& error);
 
 // One batch of a launch, as a kernel reads it: the batch's states, its
-// words and tails, and the launch's first segment of them. A kernel's thread
-// takes a *cell*: a word, and a chunk of up to tailsPerCell of the batch's
-// tails - tailChunks of them - so that one word with many tails is hashed by
-// many threads. The batch's cells are its first chunk of each word, in
-// turn, then its second, and so on: cell c is word c % wordCount (of the
-// batch's) with chunk c / wordCount. Segments firstSegment .. firstSegment +
-// ceil(wordCount * tailChunks / cellsPerSegment) - 1 are its. Must match its
-// namesakes in the kernels (cuda_backend.cu, dictionary.cl,
-// dictionary.metal).
+// words and tails, its pairs, and the launch's segments of them. A kernel's
+// thread takes a *cell*: a word, and a chunk of up to tailsPerCell of the
+// batch's tails - tailChunks of them - so that one word with many tails is
+// hashed by many threads. A pair's cells (all of a batch without pairs, as
+// if it had one) are its first chunk of each word, in turn, then its
+// second, and so on: its cell c is word c % wordCount (of the batch's) with
+// chunk c / wordCount.
+//
+// A segment never has part of a pair with any of another: a pair of more
+// cells than a segment has is cut into segmentsPerPair segments, each of
+// cellsPerSegment of its cells but the last, and smaller pairs are taken
+// pairsPerSegment at a time - as many as a segment has room for, and at
+// most kDictionaryPairSlots - one of the two 1. Segments firstSegment ..
+// firstSegment + max(pairCount, 1) * segmentsPerPair / pairsPerSegment
+// (rounded up) - 1 are the batch's. Must match its namesakes in the kernels
+// (cuda_backend.cu, dictionary.cl, dictionary.metal).
 struct DictionaryLaunchBatch {
     uint32_t seed1;
     uint32_t seed2;
@@ -109,8 +121,33 @@ struct DictionaryLaunchBatch {
     uint32_t firstTail;
     uint32_t tailCount;
     uint32_t tailChunks;
+    uint32_t firstPair;
+    uint32_t pairCount;
+    uint32_t segmentsPerPair;
+    uint32_t pairsPerSegment;
 };
-static_assert(sizeof(DictionaryLaunchBatch) == 40, "DictionaryLaunchBatch is laid out as in the kernels");
+static_assert(sizeof(DictionaryLaunchBatch) == 56, "DictionaryLaunchBatch is laid out as in the kernels");
+
+// How many pairs a segment has at most: a kernel works out the states after
+// the leading part and each of its segment's pairs first, into its block's
+// shared memory. Set small at compile time by the tests
+// (-DNAMEBREAK_DICTIONARY_PAIR_SLOTS=N), so that a word list's pairs make
+// many segments.
+#ifndef NAMEBREAK_DICTIONARY_PAIR_SLOTS
+#define NAMEBREAK_DICTIONARY_PAIR_SLOTS 256
+#endif
+constexpr int kDictionaryPairSlots = NAMEBREAK_DICTIONARY_PAIR_SLOTS;
+static_assert(kDictionaryPairSlots >= 1, "NAMEBREAK_DICTIONARY_PAIR_SLOTS must be at least 1");
+
+// A block's threads take its segment's cells in runs, one per group of
+// threads: lane l of the group's G threads takes cell l of the run, then
+// l + G, l + 2 * G and so on - so that a warp's lanes (wavefront's,
+// SIMD-group's) take neighbouring cells, and each thread's cells, G apart,
+// are mostly of the same pair. G is 32 or, for a block of a size 32
+// doesn't divide, the largest power of two that does.
+constexpr uint32_t dictionaryLanesPerRun(uint32_t blockSize) {
+    return blockSize % 32 == 0 ? 32 : blockSize & (0u - blockSize);
+}
 
 // `batches` as a launch's, in `out`. Returns how many segments they have.
 uint64_t planDictionaryLaunch(const std::vector<DictionaryBatch>& batches, uint32_t cellsPerSegment, uint32_t tailsPerCell,
@@ -126,13 +163,20 @@ std::vector<uint32_t> dictionaryTailTable(const std::vector<std::string>& tails)
 uint32_t dictionaryBatchOfSegment(const std::vector<DictionaryLaunchBatch>& batches, uint64_t segment);
 
 // A candidate a kernel reports: word `word` (its index in the list) and tail
-// `tail` (in the tails) of the launch's batch `batch`. Must match its
-// namesakes in the kernels.
+// `tail` (in the tails) of the launch's batch `batch` - and if the batch has
+// pairs, pair `pair` (see DictionaryBatch). Must match its namesakes in the
+// kernels.
 struct DictionaryHit {
     uint32_t batch;
     uint32_t word;
     uint32_t tail;
+    uint32_t pair;
 };
+static_assert(sizeof(DictionaryHit) == 16, "DictionaryHit is laid out as in the kernels");
+
+// Whether `hit` is one of `batches`' candidates: its batch one of them, and
+// its word, tail and (if the batch has pairs) pair the batch's.
+bool dictionaryHitInBatches(const std::vector<DictionaryBatch>& batches, const DictionaryHit& hit);
 
 // Turns the hits a backend reports into what runDictionaryBatches returns:
 // rebuilds each candidate's filename, hashes it from scratch - independent
@@ -155,8 +199,12 @@ public:
                  const std::vector<DictionaryHit>& basenameHits, DictionaryOutcome& outcome) const;
 
 private:
+    // The filename of `batch`'s candidate with that word, tail and pair.
+    std::string filenameOf(const DictionaryBatch& batch, uint32_t word, uint32_t tail, uint32_t pair) const;
+
     std::vector<std::string> words_;
     std::vector<std::string> tails_;
+    std::vector<std::string> separators_;
     std::string suffix_;
     std::vector<uint32_t> cryptTable_;
     uint32_t targetA_ = 0;
