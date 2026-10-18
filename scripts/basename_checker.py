@@ -146,20 +146,36 @@ def auto_int(x):
 
 def main():
     parser = argparse.ArgumentParser(description="Verify MPQ bare filename against encryption key (HashType 3).")
-    parser.add_argument("bare_filename", help="The filename guess to check (without directory)")
+    parser.add_argument("bare_filename", nargs="?", help="The filename guess to check (without directory)")
     parser.add_argument("-a", "--archive", help="Path to MPQ archive file")
     parser.add_argument("--hash-a", type=auto_int, help="Target file Hash A (hex or decimal)")
     parser.add_argument("--hash-b", type=auto_int, help="Target file Hash B (hex or decimal)")
     parser.add_argument("-k", "--key", type=auto_int, help="Encryption key (HashType 3, hex or decimal)")
-    parser.add_argument("--print-key", action="store_true", help="Print the encryption key (HashType 3) of bare_filename and exit")
+    parser.add_argument("--print-key", action="store_true", help="Print the encryption key (HashType 3) and exit: of bare_filename, or with --archive, of the file at --hash-a/--hash-b")
 
     args = parser.parse_args()
 
+    has_archive_info = args.archive and args.hash_a is not None and args.hash_b is not None
+
     if args.print_key:
-        print(f"{hash_string(args.bare_filename, 3):08x}")
+        if args.archive:
+            if not has_archive_info:
+                parser.error("--print-key with --archive requires --hash-a and --hash-b.")
+            if args.bare_filename is not None:
+                parser.error("--print-key with --archive prints the archive file's key; do not supply bare_filename.")
+            recovered_key = extract_mpq_encryption_key(args.archive, args.hash_a, args.hash_b)
+            if recovered_key is None:
+                print("Error: Failed to recover encryption key from sector table.")
+                sys.exit(1)
+            print(f"{recovered_key:08x}")
+        else:
+            if args.bare_filename is None:
+                parser.error("--print-key requires bare_filename, or --archive, --hash-a and --hash-b.")
+            print(f"{hash_string(args.bare_filename, 3):08x}")
         sys.exit(0)
 
-    has_archive_info = args.archive and args.hash_a is not None and args.hash_b is not None
+    if args.bare_filename is None:
+        parser.error("bare_filename is required unless using --print-key with --archive.")
 
     if not has_archive_info and args.key is None:
         parser.error("You must supply either --key/-k, full MPQ parameters (--archive, --hash-a, --hash-b) or --print-key.")
