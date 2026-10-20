@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "engine/candidate.h"
+#include "engine/junction.h"
 #include "engine/limits.h"
 
 // What runSearch() (search.h) needs from the hardware it runs on. The engine
@@ -208,6 +209,52 @@ struct DictionaryOutcome {
     std::vector<std::string> basenameHits;
 };
 
+// Everything that stays the same for a whole junction search
+// (engine/junction_search.h).
+struct JunctionConstants {
+    std::string alphabet;
+    // The hash state after the unknown directory, which the backward walk
+    // rewinds from - hashA's. (hashB's, and the file's own two hashes, the
+    // engine checks itself, on the few tails that get this far.)
+    HashState junction{0, 0};
+    const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
+    // The forward half: every directory of the table's length, by the state
+    // it reaches. The engine builds it and keeps it for the whole search.
+    const JunctionTable* table = nullptr;
+    // The rules a tail must pass, and the state the directory's last
+    // character is checked from - tailPruneStart(suffix) (junction.h). Every
+    // backend skips exactly the tails they reject, so that a search covers
+    // the same directories whichever one runs it.
+    PruneRules rules;
+    TailPruneState tailEntry;
+};
+
+// One runJunctionBatch() call's worth of work: the tails of `tailLength`
+// characters whose index is in [start, start + count) - see JunctionSpace
+// (junction.h) for the numbering.
+struct JunctionBatch {
+    int tailLength = 0;
+    uint64_t start = 0;
+    uint64_t count = 0;
+};
+
+// A tail whose state the table holds: the directory is one of the table's
+// prefixes followed by this tail. Which prefix, the engine works out (the
+// table keeps only the states), and then checks the directory in full.
+struct JunctionHit {
+    int tailLength = 0;
+    uint64_t index = 0;
+};
+
+// What one runJunctionBatch() call found.
+struct JunctionOutcome {
+    // Every hit, in no particular order.
+    std::vector<JunctionHit> hits;
+    // How many of the batch's tails were looked up in the table - the rules
+    // skipped the rest.
+    uint64_t probed = 0;
+};
+
 class SearchBackend {
 public:
     virtual ~SearchBackend() = default;
@@ -264,6 +311,20 @@ public:
     // Hashes every candidate of every batch.
     virtual DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches);
     virtual void endDictionarySearch() {}
+
+    // Junction searches (engine/junction_search.h) - only on the backends
+    // that say they can. The others never get these calls.
+    virtual bool supportsJunction() const { return false; }
+    // About how many tails one runJunctionBatch() call should cover: enough
+    // to be worth a call, few enough for pause and abort to feel immediate.
+    virtual uint64_t junctionTailsPerCall() const { return 1u << 22; }
+    // Called once before a junction search's first runJunctionBatch(), and
+    // endJunctionSearch() once after its last.
+    virtual void beginJunctionSearch(const JunctionConstants& constants);
+    // Rewinds every tail of the batch that the rules allow and looks its
+    // state up in the table, reporting the ones it holds.
+    virtual JunctionOutcome runJunctionBatch(const JunctionBatch& batch);
+    virtual void endJunctionSearch() {}
 };
 
 

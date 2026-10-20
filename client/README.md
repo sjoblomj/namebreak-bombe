@@ -18,7 +18,7 @@ suffix** - the prefix and suffix are fixed, known strings (e.g. `REZ\` and
 
 ## Modes
 
-`namebreak` runs in one of four modes, set via `config.conf`'s `mode = ...`
+`namebreak` runs in one of five modes, set via `config.conf`'s `mode = ...`
 (or overridden by passing `--mode <mode>`, e.g. `build/namebreak --mode bounded`).
 A different config file can be used instead of `config.conf` via
 `--config <file>`.
@@ -46,6 +46,10 @@ unknown name lists the ones the build has.
   (`english-1`) and word lists of your own - and, given the file's
   encryption key, records every candidate whose basename matches it. See
   [Dictionary mode](#dictionary-mode).
+- **`junction`** - for a file whose directory is unknown, but where the hash
+  state right after that directory is known: it searches the directory from
+  both ends at once, which buys back one character of brute force for every
+  character it can keep a table of. See [Junction mode](#junction-mode).
 
 Exit code is `0` if both hashes matched, `2` if the search space was
 exhausted without a match, `1` on any setup/config error.
@@ -159,7 +163,8 @@ They all go in one directory -
 `matches_dir = <directory>` line (next to `mode`) says; it's created if
 missing. `bounded`/`continuous` mode writes `matches.txt` there (or
 `matches-<matches_name>.txt`), `dictionary` mode the same and two more files
-(see [Dictionary mode](#dictionary-mode)), and `coordinator` mode one
+(see [Dictionary mode](#dictionary-mode)), `junction` mode the same and a
+progress file (see [Junction mode](#junction-mode)), and `coordinator` mode one
 `matches-<target name>.txt` per target - and, for a dictionary target, the
 basenames not sent yet and the word lists it downloaded (see [Dictionary
 targets in coordinator mode](#dictionary-targets-in-coordinator-mode)).
@@ -359,6 +364,178 @@ The dictionary engine itself is unchanged by this: a range is a
 file, and with `DictionarySearchHooks` (`src/engine/dictionary_search.h`)
 telling the coordinator loop each basename and how far it has got.
 
+## Junction mode
+
+`mode = junction` is for a file whose name is a known prefix, an **unknown
+directory**, and a known suffix - and where the MPQ hash state right after
+that directory is already known, for Hash A and for Hash B. That state is
+the *junction*, and it, rather than the file's hashes, is what the search
+looks for: the directory is whatever string takes the hash from the prefix's
+state to it.
+
+A junction comes from the files *around* the one being searched. When an
+archive holds a run of files whose basenames are known but whose directory
+isn't - the install scripts of Brood War's `INSTALL.EXE`, say, where the
+basenames are in the scripts themselves - then every one of them is
+`<the same unknown directory>` + `\` + `<a known basename>`. Two of those
+are enough to pin down the state after the directory, by trying all 2^32
+values of `seed2` against the first name and checking each survivor against
+the second: that's what [`tools/mitm/junction.c`](../tools/mitm/junction.c)
+does, and it prints exactly the four numbers this mode wants.
+
+### Both ends at once
+
+Every step of the MPQ hash
+
+```
+seed1 = cryptTable[hash + ch] ^ (seed1 + seed2)
+seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3
+```
+
+can be *undone* when the character is known. `seed2`'s step multiplies it by
+`1 + (1 << 5)`, and 33 is odd, so dividing by it is a plain multiplication
+by 33's inverse modulo 2^32 (`0x3E0F83E1`):
+
+```
+seed2_before = (seed2_after - ch - seed1_after - 3) * 0x3E0F83E1
+seed1_before = (seed1_after ^ cryptTable[hash + ch]) - seed2_before
+```
+
+So the search can work from both ends of the directory and meet in the
+middle:
+
+- **forward**, from the state after the prefix: every directory of
+  `table_length` characters, kept in a table by the state it reaches;
+- **backward**, from the junction: every *tail* - a directory's last
+  characters - rewound character by character, and the state it reaches
+  looked up in that table.
+
+A tail of *j* characters whose state is in the table means a directory of
+`table_length` + *j* characters: the table's prefix, then the tail. So the
+work is about `alphabet^(n - table_length)` tails for a directory of *n*
+characters, instead of the `alphabet^n` candidates a plain search hashes -
+the table buys back one character of brute force for every character it
+holds. Directories shorter than the table are found while it's being built,
+by the same walk, and cost nothing extra.
+
+What the table costs is memory: eight bytes per directory of its length,
+plus about one more for the filter that keeps most lookups away from the
+keys. With the 43-character alphabet above:
+
+| `table_length` | Memory | Tails for an 8-character directory | for 10 | for 12 |
+|---|---|---|---|---|
+| 3 | 0.7 MB | 147 M | 272 G | 503 T |
+| 4 | 31 MB | 3.4 M | 6.3 G | 11.7 T |
+| 5 | 1.4 GB | 79.5 k | 147 M | 272 G |
+| *(a plain search)* | - | 11.7 T | 21.6 P | 40.0 E |
+
+`table_memory` is what the table may take, and the longest length that fits
+in it is used; `table_length` sets it outright instead. A character more
+costs as many times more memory as the alphabet has characters, so in
+practice the table is 4 or 5 characters long and the walk does the rest.
+
+Only the CPU searches junctions so far - it manages tens of millions of
+tails a second on every core, which is enough for the table lengths above.
+The GPU backends don't implement this mode yet (`--backend cuda` says so).
+
+### An example
+
+The directory of Brood War's `SETUPDAT\BWUNIN.PIF`, had it not been known,
+from the junction `tools/mitm/junction.c` recovers for it:
+
+```ini
+mode = junction
+
+[junction]
+alphabet = " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\_"
+suffix = \BWUNIN.PIF
+junction_a_seed1 = 0x92F62345
+junction_a_seed2 = 0xB9F61953
+junction_b_seed1 = 0xB95115E6
+junction_b_seed2 = 0x7609B4F4
+hash_a = 0x5BAB63FE
+hash_b = 0x8DF2CB08
+max_length = 8
+table_memory = 1G
+prune_symbol_runs = true
+prune_adjacent_backslashes = true
+matches_name = bwunin
+```
+
+That finds `SETUPDAT\BWUNIN.PIF` in about half a second on a laptop CPU: a
+4-character table (31 MB) and 3.5 million tails, where the 43^8 = 11.7
+trillion candidates of a plain 8-character search would take a GPU hours.
+
+`[junction]` keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `alphabet` | yes | The characters the unknown directory is made of (at most 63, each once). A `\` among them searches directories with subdirectories in them. |
+| `prefix` | no (default none) | Known text before the unknown directory. The junction must be the state after the prefix *and* the directory. |
+| `suffix` | yes | Known text after it - for a file in that directory, the `\` and the basename. |
+| `junction_a_seed1`, `junction_a_seed2` | yes | Hash A's state after the directory, hex. |
+| `junction_b_seed1`, `junction_b_seed2` | yes | Hash B's state after the directory, hex. |
+| `hash_a`, `hash_b` | yes | The file's own two hashes, hex. Hashing `suffix` onto the junction must give them, or the search refuses to start - see below. |
+| `min_length` | no (default 1) | The shortest directory to report. |
+| `max_length` | yes | The longest to search, up to `MAX_CANDIDATE_LEN` (16). |
+| `table_length` | no | How many of a directory's first characters the table holds. Left out, the longest that fits in `table_memory`. |
+| `table_memory` | no (default `1G`) | How much memory the table may take: bytes, or with a `K`, `M` or `G` after it. |
+| `prune_symbol_runs`, `prune_unopened_brackets`, `prune_adjacent_backslashes`, `max_backslash_count`, `min_backslash_count` | no | The same cheap rules as `[search]` - but applied to *every* character of the directory, not only its leading ones, and `prune_adjacent_backslashes` also counts a `\` the suffix begins with next to one the directory ends with. |
+| `matches_name` | no | Names the files it writes: `matches-<name>.txt` and `junction-<name>.txt` instead of `matches.txt` and `junction.txt`. |
+| `resume_from_last_candidate` | no (default false) | Carry on from the progress file - unless that was written by a search with other settings, which it refuses to resume. |
+
+### The junction has to fit the hashes
+
+The junction and the file's hashes come from different places - the junction
+from a recovery like `junction.c`, the hashes from the archive - so before
+anything is searched, hashing the suffix onto the junction must give the
+file's two hashes. A junction for the state after the wrong position in the
+name, or for another file's directory, would otherwise have the search walk
+the whole space and quietly find nothing. The search says which of the two
+doesn't fit and stops.
+
+It means the two halves of the search are checked against each other too: a
+directory that reaches the junction's 64-bit state necessarily hashes to
+Hash A, and the search reports it, then checks Hash B in full. Both together
+leave about one directory in 2^96 to match by chance - the search says how
+many it expects before it starts, which for a real search is 0.
+
+### Pruning, and what it may skip
+
+The rules work on the two halves separately. A run of three symbols, two
+backslashes in a row and `max_backslash_count` can each be judged from a
+piece of the directory on its own, so the table skips a first part that
+breaks one, and the walk skips a tail that does - and with it every longer
+tail that ends in those characters, which is what makes the rules worth
+having here: rejecting one character of a tail skips the whole subtree
+behind it.
+
+`min_backslash_count` and `prune_unopened_brackets` can't be judged from a
+piece: characters further left could always supply the missing backslash, or
+open the bracket the piece closes. Those are checked once a whole directory
+is in hand, as every rule is before anything is reported - so a junction
+search reports exactly the directories that match the junction and pass the
+rules in full, and the halves' own skipping only ever drops directories that
+check would reject anyway. That property is what `tests/junction_test.cpp`
+checks exhaustively, over every directory of a small alphabet at every split
+between the two halves.
+
+### Progress, resuming and ranges
+
+The search goes through the backward walk's *nodes*: one per tail, shortest
+first, and within a length in the order of the tail *reversed* - the
+directory's last character changes slowest, because it's the first the walk
+rewinds and so the one whose state the most tails share. A node's number is
+what the progress file (`matches/junction.txt`) records, and what a range of
+a search is given in, so `resume_from_last_candidate = true` carries on
+exactly where the last run stopped.
+
+Note that the node order is not the order the directories themselves sort
+in, as the other modes' candidates are searched - the search reports a
+directory when the walk reaches *its tail*, and the tails of one length come
+before every longer one. The coordinator can't hand out junction ranges yet;
+the numbering is what it will use when it can.
+
 ## Compiling
 
 Requires CMake (3.24 or later), the CUDA Toolkit (`nvcc`), a CUDA-capable
@@ -493,7 +670,7 @@ backends' tests actually run there.
 
 | Directory | What's in it |
 |---|---|
-| `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU; and the dictionary search, `runDictionarySearch()`, with its word lists |
+| `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU; the dictionary search, `runDictionarySearch()`, with its word lists; and the junction search, `runJunctionSearch()`, with the hash run backwards |
 | `src/backends/` | What the search runs its batches on (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
 | `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop, and a dictionary target's word lists and the basenames waiting to be sent (left out by `NAMEBREAK_NETWORK=OFF`) |

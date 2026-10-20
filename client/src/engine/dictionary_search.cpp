@@ -38,15 +38,6 @@ DictionaryOutcome SearchBackend::runDictionaryBatches(const std::vector<Dictiona
     std::abort();
 }
 
-HashState continueHash(HashState state, const std::string& text, int offset, const uint32_t* cryptTable) {
-    uint32_t seed1 = state.first, seed2 = state.second;
-    for (unsigned char ch : text) {
-        seed1 = cryptTable[offset + ch] ^ (seed1 + seed2);
-        seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
-    }
-    return {seed1, seed2};
-}
-
 HashState continueBasenameHash(HashState state, const std::string& text, const uint32_t* cryptTable) {
     uint32_t seed1 = state.first, seed2 = state.second;
     for (unsigned char ch : text) {
@@ -303,24 +294,6 @@ std::string trimmed(const std::string& s) {
 }
 
 } // namespace
-
-std::string formatDuration(double seconds) {
-    if (seconds < 0 || seconds > 1e12)
-        return "?";
-    uint64_t s = (uint64_t) (seconds + 0.5);
-    char buf[64];
-    if (s >= 86400)
-        snprintf(buf, sizeof buf, "%llud%02lluh%02llum", (unsigned long long) (s / 86400), (unsigned long long) (s / 3600 % 24),
-                 (unsigned long long) (s / 60 % 60));
-    else if (s >= 3600)
-        snprintf(buf, sizeof buf, "%lluh%02llum%02llus", (unsigned long long) (s / 3600), (unsigned long long) (s / 60 % 60),
-                 (unsigned long long) (s % 60));
-    else if (s >= 60)
-        snprintf(buf, sizeof buf, "%llum%02llus", (unsigned long long) (s / 60), (unsigned long long) (s % 60));
-    else
-        snprintf(buf, sizeof buf, "%llus", (unsigned long long) s);
-    return buf;
-}
 
 uint64_t countDictionaryCandidates(const DictionarySpace& space, const std::string& prefix, const std::string& suffix,
                                    const FilenameBounds& bounds, uint64_t startNumber, uint64_t endNumber) {

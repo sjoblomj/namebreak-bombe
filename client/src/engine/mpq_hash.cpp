@@ -14,6 +14,12 @@ void prepareCryptTable(uint32_t* table) {
     }
 }
 
+HashState continueHash(HashState state, const std::string& text, int offset, const uint32_t* cryptTable) {
+    for (unsigned char ch : text)
+        state = hashStep(state, ch, cryptTable + offset);
+    return state;
+}
+
 std::pair<uint32_t, uint32_t> mpqHashWithPrefixCache_CPU(const char* str, const uint32_t* cryptTable) {
     uint32_t seed1 = 0x7FED7FED;
     uint32_t seed2 = 0xEEEEEEEE;
@@ -30,12 +36,13 @@ std::pair<uint32_t, uint32_t> mpqHashWithPrefixCache_CPU(const char* str, const 
     return {seed1, seed2};
 }
 
-// One step of the same MPQ hash recurrence as mpqHashWithPrefixCache_CPU
-// above (and cuda_backend.cu's mpqStep on the device side) - factored
-// out so IncrementalPrefixHasher's reset()/advance() can't drift from it.
+// One hashA step on a (seed1, seed2) pair held in two variables - the same
+// recurrence as hashStep (mpq_hash.h), which it calls, so that
+// IncrementalPrefixHasher's reset()/advance() can't drift from it.
 static inline void mpqHashStepCPU(unsigned char ch, const uint32_t* cryptTable, uint32_t& seed1, uint32_t& seed2) {
-    seed1 = cryptTable[0x100 + ch] ^ (seed1 + seed2);
-    seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
+    const HashState next = hashStep({seed1, seed2}, ch, cryptTable + kHashAOffset);
+    seed1 = next.first;
+    seed2 = next.second;
 }
 
 IncrementalPrefixHasher::IncrementalPrefixHasher(std::pair<uint32_t, uint32_t> baseState, int leadingLen,

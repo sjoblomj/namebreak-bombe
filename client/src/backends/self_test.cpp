@@ -11,6 +11,7 @@
 #include "engine/candidate.h"
 #include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
+#include "engine/junction.h"
 #include "engine/limits.h"
 #include "engine/mpq_hash.h"
 
@@ -1127,6 +1128,223 @@ bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
                         " (dictionary search: 20 words with the basename FLOOD.WAV in 210 batches)";
                 return false;
             }
+        }
+    }
+    return true;
+}
+
+// --- Junction searches -------------------------------------------------------
+
+namespace {
+
+// One junction self-test case: a name whose directory is planted as the one
+// the junction belongs to, and how much of it the table holds.
+struct JunctionCase {
+    std::string alphabet;
+    std::string prefix;
+    std::string suffix;
+    std::string dir; // made of the alphabet's characters
+    int tableLength;
+    PruneRules rules;
+};
+
+// What a batch must find: every tail of it that the rules allow (checked
+// from the right, a tail at a time, as the reference backend does) whose
+// state the table holds.
+void expectedJunctionBatch(const JunctionCase& c, const JunctionSpace& space, const JunctionTable& table, const HashState& junction,
+                           const JunctionBatch& batch, const uint32_t* cryptTable, std::vector<uint64_t>& hits, uint64_t& probed) {
+    hits.clear();
+    probed = 0;
+    for (uint64_t index = batch.start; index < batch.start + batch.count; ++index) {
+        const std::string tail = space.tailOf(space.numberOf(batch.tailLength, index));
+        bool pruned = false;
+        if (c.rules.any()) {
+            TailPruneState prune = tailPruneStart(c.suffix);
+            for (int k = batch.tailLength - 1; k >= 0 && !pruned; --k)
+                pruned = !tailPruneStep(c.rules, prune, tail[k]);
+        }
+        if (pruned)
+            continue;
+        ++probed;
+        if (table.holds(junctionKey(rewindHash(junction, tail, kHashAOffset, cryptTable))))
+            hits.push_back(index);
+    }
+}
+
+std::string junctionCaseName(const JunctionCase& c, const JunctionBatch& batch) {
+    return "alphabet '" + c.alphabet + "', '" + c.prefix + "' + '" + c.dir + "' + '" + c.suffix + "', table " +
+           std::to_string(c.tableLength) + ", tails of " + std::to_string(batch.tailLength) + " from " + std::to_string(batch.start) +
+           " for " + std::to_string(batch.count);
+}
+
+// Runs one batch and compares what the backend found with the loop above.
+bool runJunctionBatch(SearchBackend& backend, const JunctionCase& c, const JunctionSpace& space, const JunctionTable& table,
+                      const HashState& junction, const JunctionBatch& batch, const uint32_t* cryptTable, std::string& error) {
+    std::vector<uint64_t> wanted;
+    uint64_t wantedProbed = 0;
+    expectedJunctionBatch(c, space, table, junction, batch, cryptTable, wanted, wantedProbed);
+
+    const JunctionOutcome outcome = backend.runJunctionBatch(batch);
+    std::vector<uint64_t> got;
+    for (const JunctionHit& hit : outcome.hits) {
+        if (hit.tailLength != batch.tailLength) {
+            error = "reported a hit among tails of " + std::to_string(hit.tailLength) + " characters, not " +
+                    std::to_string(batch.tailLength) + " (" + junctionCaseName(c, batch) + ")";
+            return false;
+        }
+        if (hit.index < batch.start || hit.index >= batch.start + batch.count) {
+            error = "reported a hit at index " + std::to_string(hit.index) + ", outside the batch (" + junctionCaseName(c, batch) + ")";
+            return false;
+        }
+        got.push_back(hit.index);
+    }
+    std::sort(got.begin(), got.end());
+    if (got != wanted) {
+        std::string gotText, wantedText;
+        for (uint64_t index : got)
+            gotText += " " + std::to_string(index);
+        for (uint64_t index : wanted)
+            wantedText += " " + std::to_string(index);
+        error = "found tails" + (gotText.empty() ? std::string(" (none)") : gotText) + ", not" +
+                (wantedText.empty() ? std::string(" (none)") : wantedText) + " (" + junctionCaseName(c, batch) + ")";
+        return false;
+    }
+    if (outcome.probed != wantedProbed) {
+        error = "looked up " + std::to_string(outcome.probed) + " tails in the table, not " + std::to_string(wantedProbed) + " (" +
+                junctionCaseName(c, batch) + ")";
+        return false;
+    }
+    return true;
+}
+
+bool runJunctionCase(SearchBackend& backend, const JunctionCase& c, const uint32_t* cryptTable, std::string& error) {
+    const int length = (int) c.dir.size();
+    JunctionSpace space;
+    if (!JunctionSpace::create(c.alphabet, 1, length, c.tableLength, space, error))
+        return false;
+    const HashState startState = continueHash(kInitialHashState, c.prefix, kHashAOffset, cryptTable);
+    const HashState junction = continueHash(startState, c.dir, kHashAOffset, cryptTable);
+    std::vector<std::string> shortMatches;
+    JunctionTable table;
+    if (!JunctionTable::build(space, startState, dirPruneStart(c.prefix), c.rules, cryptTable, junction, shortMatches, table, error))
+        return false;
+
+    // The planted directory's own tail, which the table's characters leave:
+    // the one tail of the walk that must be found.
+    const std::string plantedTail = c.dir.substr(c.tableLength);
+    uint64_t plantedIndex = 0;
+    if (!space.indexOfTail(plantedTail, plantedIndex, error))
+        return false;
+    const int plantedLength = (int) plantedTail.size();
+    {
+        // Without the rules in the way, the planted directory must be there
+        // to be found - otherwise the case tests nothing at all, whatever
+        // the backend does. (With them, whether its tail survives them
+        // depends on where the table's characters end, which is the point of
+        // the cases that have them.)
+        std::vector<uint64_t> wanted;
+        uint64_t probed = 0;
+        expectedJunctionBatch(c, space, table, junction, {plantedLength, plantedIndex, 1}, cryptTable, wanted, probed);
+        if (!c.rules.any() && wanted.size() != 1) {
+            error = "the planted directory '" + c.dir + "' isn't where the self-test put it (table " + std::to_string(c.tableLength) +
+                    ", tail '" + plantedTail + "' at " + std::to_string(plantedIndex) + ") - the test itself is broken";
+            return false;
+        }
+    }
+
+    JunctionConstants constants;
+    constants.alphabet = c.alphabet;
+    constants.junction = junction;
+    constants.cryptTable = cryptTable;
+    constants.table = &table;
+    constants.rules = c.rules;
+    constants.tailEntry = tailPruneStart(c.suffix);
+    backend.beginJunctionSearch(constants);
+
+    std::vector<JunctionBatch> batches;
+    // Every tail length as one batch - the planted one among them, and the
+    // others, which have nothing to find.
+    for (int tailLength = 0; tailLength <= space.maxTailLength(); ++tailLength)
+        batches.push_back({tailLength, 0, space.countOf(tailLength)});
+    // The planted tail as the first, the last and the only tail of a batch,
+    // and just outside one at either end.
+    const uint64_t count = space.countOf(plantedLength);
+    batches.push_back({plantedLength, plantedIndex, count - plantedIndex});
+    batches.push_back({plantedLength, 0, plantedIndex + 1});
+    batches.push_back({plantedLength, plantedIndex, 1});
+    if (plantedIndex > 0) {
+        batches.push_back({plantedLength, 0, plantedIndex});
+        batches.push_back({plantedLength, plantedIndex - 1, 1});
+    }
+    if (plantedIndex + 1 < count) {
+        batches.push_back({plantedLength, plantedIndex + 1, count - plantedIndex - 1});
+        batches.push_back({plantedLength, plantedIndex + 1, 1});
+    }
+    // And in pieces, so that a backend that works a tail out from where it
+    // starts rather than from its index has to get the start right.
+    for (uint64_t piece : {(uint64_t) 1, (uint64_t) 2, (uint64_t) 3, (uint64_t) 7}) {
+        for (uint64_t from = 0; from < count; from += piece)
+            batches.push_back({plantedLength, from, std::min(piece, count - from)});
+    }
+
+    for (const JunctionBatch& batch : batches) {
+        if (batch.count == 0)
+            continue;
+        if (!runJunctionBatch(backend, c, space, table, junction, batch, cryptTable, error)) {
+            backend.endJunctionSearch();
+            return false;
+        }
+    }
+    backend.endJunctionSearch();
+    return true;
+}
+
+} // namespace
+
+bool selfTestJunctionBackend(SearchBackend& backend, std::string& error) {
+    if (!backend.supportsJunction()) {
+        error = std::string("the ") + backend.name() + " backend can't search junctions";
+        return false;
+    }
+    uint32_t cryptTable[0x500];
+    prepareCryptTable(cryptTable);
+
+    PruneRules rules;
+    rules.symbolRuns = true;
+    rules.unopenedBrackets = true;
+    rules.adjacentBackslashes = true;
+    rules.maxBackslashCount = 1;
+
+    std::vector<JunctionCase> cases;
+    // Every split of a four-character directory between the table and the
+    // walk, from all of it in the table (nothing but the empty tail to walk)
+    // to none of it (the whole directory rewound).
+    for (int tableLength = 0; tableLength <= 4; ++tableLength) {
+        cases.push_back({"AB-\\", "", "\\X.Y", "A\\BA", tableLength, {}});
+        cases.push_back({"AB-\\", "SETUPDAT\\", "\\X.Y", "B-AB", tableLength, {}});
+        // The same with the rules on: the directory passes them, so it's
+        // still to be found, but most of the tails around it are skipped.
+        cases.push_back({"AB-\\", "SETUPDAT\\", "\\X.Y", "BA-B", tableLength, rules});
+    }
+    // A directory the rules reject - a run of three symbols - which must not
+    // be found however the walk is split up.
+    cases.push_back({"AB-\\", "", "\\X.Y", "A---", 1, rules});
+    cases.push_back({"AB-\\", "", "\\X.Y", "A---", 3, rules});
+    // A directory ending with a '\', which a suffix that starts with one
+    // makes two in a row - rejected as well.
+    cases.push_back({"AB-\\", "", "\\X.Y", "AB\\", 1, rules});
+    // No suffix at all, a longer one, and an alphabet of one character.
+    cases.push_back({"AB-\\", "P\\", "", "AB-", 1, {}});
+    cases.push_back({"AB-\\", "", "\\A_VERY_LONG_BASENAME_INDEED.TXT", "BB", 1, {}});
+    cases.push_back({"A", "", "\\X.Y", "AAA", 1, {}});
+    // A single character, with and without anything around it.
+    cases.push_back({"AB-\\", "", "\\X.Y", "B", 0, {}});
+    cases.push_back({"AB-\\", "Q\\", "\\X.Y", "B", 1, {}});
+
+    for (const JunctionCase& c : cases) {
+        if (!runJunctionCase(backend, c, cryptTable, error)) {
+            error = "junction search: " + error;
+            return false;
         }
     }
     return true;

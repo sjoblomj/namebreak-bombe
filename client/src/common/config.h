@@ -9,6 +9,7 @@
 
 #include "common/matches_file.h"
 #include "engine/dictionary_search.h"
+#include "engine/junction_search.h"
 #include "engine/search.h"
 
 // Where namebreak reads its config from absent a --config <file> argument -
@@ -22,13 +23,15 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 
 // namebreak's on-disk config.conf - read from "./config.conf" (the current
 // working directory) unless overridden via --config <file>. A flat key=value
-// file with three possible [section] headers:
+// file with four possible [section] headers:
 //   [search]      - bounded/continuous parameters (mode picks which of the
 //                   two actually runs; both take the same parameters)
 //   [coordinator] - coordinator-mode parameters (see coordinator_runner.h)
 //   [dictionary]  - dictionary-mode parameters (see buildDictionaryRequest)
+//   [junction]    - junction-mode parameters (see buildJunctionRequest)
 // plus four keys allowed before any section: `mode = continuous|bounded|
-// coordinator|dictionary` (overridable by passing --mode <mode> - see main()),
+// coordinator|dictionary|junction` (overridable by passing --mode <mode> -
+// see main()),
 // `matches_dir = <directory>` (optional - see matches_file.h),
 // `backend = <name>` (optional, overridable by --backend <name> - see
 // backends/backends.h; unset, the first one that can run here), and
@@ -49,6 +52,7 @@ struct ConfigFile {
     // so starts and ends with a '"' of its own. buildDictionaryRequest
     // unquotes the values that aren't lists.
     std::map<std::string, std::string> dictionary;
+    std::map<std::string, std::string> junction;
 };
 
 // Returns false with a human-readable `error` (including path:line) on any
@@ -86,6 +90,34 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
 // A list is items separated by commas, each either "quoted" - kept as it
 // is, spaces and commas included - or not, and then trimmed.
 bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, std::vector<std::string>& warnings, std::string& error);
+
+// Builds a JunctionRequest from `config`'s [junction] section (and
+// matches_dir). Returns false with `error` set if a required key is missing,
+// a value doesn't parse, or - with resume_from_last_candidate - the progress
+// file is from a different search.
+//
+// Keys (see README.md's "Junction mode"):
+//   alphabet            required
+//   prefix              optional, default none
+//   suffix              required - what follows the unknown directory
+//   junction_a_seed1, junction_a_seed2   required, the hash state after the
+//   junction_b_seed1, junction_b_seed2   directory for hashA and for hashB
+//   hash_a, hash_b      required - the file's own two hashes
+//   min_length          optional, default 1
+//   max_length          required
+//   table_length        optional, default: as long as table_memory allows
+//   table_memory        optional, default 1G - bytes, or with a K/M/G suffix
+//   prune_symbol_runs, prune_unopened_brackets,
+//   prune_adjacent_backslashes, max_backslash_count,
+//   min_backslash_count                 optional, as in [search] - but
+//                       applied to every character of the directory
+//   matches_name        names the files: matches-<name>.txt, ...
+//   resume_from_last_candidate          default false
+//
+// Unlike runJunctionSearch's own default, `table_length` is worked out here
+// when it isn't given, so that `out.tableLength` is always the length the
+// search will really use - the progress file's fingerprint depends on it.
+bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::string& error);
 
 // Reads a list value as described above buildDictionaryRequest. False, with
 // `error` set, on an empty unquoted item, an unterminated quote, or text

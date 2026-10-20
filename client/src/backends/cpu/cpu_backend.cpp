@@ -264,10 +264,22 @@ public:
     }
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
 
+    // A junction search: the tails of a batch rewound from the junction on
+    // every core, their states looked up in the engine's table.
+    bool supportsJunction() const override { return true; }
+    uint64_t junctionTailsPerCall() const override { return 1u << 24; }
+    void beginJunctionSearch(const JunctionConstants& constants) override {
+        junction_ = constants;
+        cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
+        junction_.cryptTable = cryptTable_.data();
+    }
+    JunctionOutcome runJunctionBatch(const JunctionBatch& batch) override;
+
 private:
     unsigned threadCount_;
     DictionaryConstants dictionary_;
     DictionaryHitVerifier dictionaryVerifier_;
+    JunctionConstants junction_;
     HitVerifier verifier_;
     int alphabetSize_ = 0;
     std::string alphabet_;
@@ -496,6 +508,61 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
     }
     DictionaryOutcome outcome;
     dictionaryVerifier_.addHits(batches, all.hashA, all.basename, outcome);
+    return outcome;
+}
+
+JunctionOutcome CpuBackend::runJunctionBatch(const JunctionBatch& batch) {
+    const JunctionTable& table = *junction_.table;
+
+    // Work items: slices of the batch's tails, about eight per thread, taken
+    // in turn as the threads finish (as in runBatches). All on this thread,
+    // for a small call.
+    const uint64_t threads = std::min<uint64_t>(threadCount_, std::max<uint64_t>(1, batch.count / kMinCandidatesPerThread));
+    const uint64_t tailsPerItem = std::max<uint64_t>(1, (batch.count + threads * 8 - 1) / (threads * 8));
+    struct Item {
+        uint64_t from, to;
+    };
+    std::vector<Item> items;
+    for (uint64_t from = batch.start; from < batch.start + batch.count; from += tailsPerItem)
+        items.push_back({from, std::min(batch.start + batch.count, from + tailsPerItem)});
+
+    struct Found {
+        std::vector<JunctionHit> hits;
+        uint64_t probed = 0;
+    };
+    std::vector<Found> found(threads);
+    std::atomic<size_t> next{0};
+    auto work = [&](Found& mine) {
+        // One walk per thread, re-seeded for each item it takes.
+        JunctionWalk walk(junction_.alphabet, batch.tailLength, junction_.junction, junction_.cryptTable + kHashAOffset, junction_.rules,
+                          junction_.tailEntry);
+        for (size_t i = next++; i < items.size(); i = next++) {
+            for (bool more = walk.start(items[i].from, items[i].to); more; more = walk.next()) {
+                ++mine.probed;
+                const uint64_t key = junctionKey(walk.state());
+                // The filter first: all but about one lookup in
+                // kFilterBitsPerKey stop there, without touching the keys.
+                if (table.mayHold(key) && table.holds(key))
+                    mine.hits.push_back({batch.tailLength, walk.index()});
+            }
+        }
+    };
+    if (threads == 1) {
+        work(found[0]);
+    } else {
+        std::vector<std::thread> workers;
+        for (uint64_t t = 1; t < threads; ++t)
+            workers.emplace_back(work, std::ref(found[t]));
+        work(found[0]);
+        for (std::thread& worker : workers)
+            worker.join();
+    }
+
+    JunctionOutcome outcome;
+    for (const Found& mine : found) {
+        outcome.hits.insert(outcome.hits.end(), mine.hits.begin(), mine.hits.end());
+        outcome.probed += mine.probed;
+    }
     return outcome;
 }
 
