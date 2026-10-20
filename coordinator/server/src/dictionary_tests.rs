@@ -24,6 +24,7 @@ fn config(chunk: f64) -> RangeConfig {
         target_chunk_seconds: chunk,
         default_rate_per_sec: 1.0,
         default_dictionary_rate_per_sec: 1.0,
+        default_junction_rate_per_sec: 1.0,
         min_chunk_candidates: 1,
         max_chunk_candidates: 1_000_000_000_000,
         lease_seconds: 60,
@@ -99,7 +100,7 @@ async fn claim(state: &AppState, user: &User) -> Option<ClaimResponse> {
 }
 
 fn report(next: Option<i64>, basenames: &[&str]) -> HeartbeatRequest {
-    HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: next, basenames: basenames.iter().map(|b| b.to_string()).collect() }
+    HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: next, next_tail_index: None, basenames: basenames.iter().map(|b| b.to_string()).collect() }
 }
 
 async fn heartbeat(state: &AppState, user: &User, range_id: i64, req: HeartbeatRequest) -> Result<bool, AppError> {
@@ -107,7 +108,7 @@ async fn heartbeat(state: &AppState, user: &User, range_id: i64, req: HeartbeatR
 }
 
 async fn quit(state: &AppState, user: &User, range_id: i64, next: Option<i64>, basenames: &[&str]) -> Result<StatusCode, AppError> {
-    let req = QuitRequest { last_hash_a_match_filename: None, next_candidate_number: next, basenames: basenames.iter().map(|b| b.to_string()).collect() };
+    let req = QuitRequest { last_hash_a_match_filename: None, next_candidate_number: next, next_tail_index: None, basenames: basenames.iter().map(|b| b.to_string()).collect() };
     handlers::quit(State(state.clone()), AuthedUser(user.clone()), Path(range_id), Json(req)).await
 }
 
@@ -470,7 +471,7 @@ async fn heartbeats_checkpoint_by_candidate_number() {
     assert_eq!(progress(range(&state, c.range_id).await), Some(6), "never backwards");
     heartbeat(&state, &client, c.range_id, report(Some(21), &[])).await.unwrap();
     assert_eq!(progress(range(&state, c.range_id).await), Some(6), "past the end: ignored");
-    let filename_only = HeartbeatRequest { last_hash_a_match_filename: Some("MUSIC\\ECHO_ECHO.WAV".into()), next_candidate_number: None, basenames: vec![] };
+    let filename_only = HeartbeatRequest { last_hash_a_match_filename: Some("MUSIC\\ECHO_ECHO.WAV".into()), next_candidate_number: None, next_tail_index: None, basenames: vec![] };
     heartbeat(&state, &client, c.range_id, filename_only).await.unwrap();
     assert_eq!(progress(range(&state, c.range_id).await), Some(6), "a dictionary range goes by numbers only");
     heartbeat(&state, &client, c.range_id, report(Some(20), &[])).await.unwrap();
@@ -689,7 +690,7 @@ async fn basenames_are_stored_compressed() {
     let words: Vec<String> = (0..3000).map(|i| format!("W{}{}", ["ALPHA", "BRAVO", "ECHO", "TANGO"][i % 4], i * 7)).collect();
     let many: Vec<String> =
         (0..MAX_BASENAMES_PER_REPORT).map(|i| format!("{}_{}-{}.WAV", words[i % 3000], words[(i * 7 + i / 3000) % 3000], words[i * 13 % 3000])).collect();
-    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, basenames: many.clone() };
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone() };
     heartbeat(&state, &client, c.range_id, req).await.unwrap();
     let (stored, count): (i64, i64) =
         sqlx::query_as("SELECT SUM(LENGTH(names)), SUM(count) FROM basename_reports WHERE target_id = ?").bind(id).fetch_one(&state.pool).await.unwrap();
@@ -736,7 +737,7 @@ async fn big_answers_are_gzipped_for_whoever_takes_gzip() {
     let client = user(&state, "u", "1.5.0").await;
     let c = claim(&state, &client).await.unwrap();
     let many: Vec<String> = (0..2000).map(|i| format!("SOME_LONGER_NAME_{i:05}.WAV")).collect();
-    heartbeat(&state, &client, c.range_id, HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, basenames: many.clone() })
+    heartbeat(&state, &client, c.range_id, HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone() })
         .await
         .unwrap();
     let all: String = many.iter().map(|n| format!("{n}\n")).collect();
@@ -767,10 +768,10 @@ async fn too_many_basenames_at_once_are_refused() {
     let client = user(&state, "u", "1.5.0").await;
     let c = claim(&state, &client).await.unwrap();
     let many: Vec<String> = (0..=MAX_BASENAMES_PER_REPORT).map(|i| format!("N{i}.WAV")).collect();
-    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, basenames: many.clone() };
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone() };
     assert!(matches!(heartbeat(&state, &client, c.range_id, req).await, Err(AppError::BadRequest(_))));
     assert!(basenames(&state, id).await.is_empty());
-    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, basenames: many[1..].to_vec() };
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many[1..].to_vec() };
     heartbeat(&state, &client, c.range_id, req).await.unwrap();
     assert_eq!(basenames(&state, id).await.len(), MAX_BASENAMES_PER_REPORT, "as many as are allowed");
 }
@@ -933,10 +934,10 @@ async fn a_dictionary_canary_plants_a_name_the_client_must_find() {
         )
         .unwrap();
         assert!((start..end).any(|n| format!("MUSIC\\{}.WAV", space.text(n)) == planted), "{planted} in {start}..{end}");
-        assert_eq!(c.hash_a_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x100)));
-        assert_eq!(c.hash_b_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x200)));
+        assert_eq!(c.hash_a_hex, format!("0x{:08X}", crate::mpq::mpq_hash(&planted, 0x100)));
+        assert_eq!(c.hash_b_hex, format!("0x{:08X}", crate::mpq::mpq_hash(&planted, 0x200)));
         let basename = planted.strip_prefix("MUSIC\\").unwrap();
-        assert_eq!(c.encryption_key_hex, Some(format!("0x{:08X}", crate::canary::mpq_hash(basename, 0x300))), "the planted name's key");
+        assert_eq!(c.encryption_key_hex, Some(format!("0x{:08X}", crate::mpq::mpq_hash(basename, 0x300))), "the planted name's key");
 
         // The basenames sent for it aren't kept, and it measures nothing.
         heartbeat(&state, &client, c.range_id, report(Some(start + 1), &[basename])).await.unwrap();

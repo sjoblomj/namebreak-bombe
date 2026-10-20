@@ -91,10 +91,21 @@ impl std::str::FromStr for Version {
 ///   `HeartbeatRequest::next_candidate_number`, and the basenames a client
 ///   sends (`HeartbeatRequest::basenames` and so on). Older clients are
 ///   never handed a dictionary target's work.
-pub const PROTOCOL_VERSION: Version = Version::new(1, 5, 0);
+/// - 1.6.0 - junction targets: a claim of one (`ClaimResponse::junction` and
+///   the fields after it), `RegisterRequest::junction_table_bytes`, which
+///   says how much memory the client will give the search's table, and
+///   `HeartbeatRequest::next_tail_index`. Older clients are never handed a
+///   junction target's work.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 6, 0);
 
 /// The first protocol version whose clients search dictionary targets.
 pub const DICTIONARY_SINCE: Version = Version::new(1, 5, 0);
+
+/// The first protocol version whose clients search junction targets - the
+/// one that also says how much memory it will give a junction search's
+/// table (`RegisterRequest::junction_table_bytes`), without which it gets
+/// none of that work anyway.
+pub const JUNCTION_SINCE: Version = Version::new(1, 6, 0);
 
 /// The most basenames one heartbeat, quit or completion may carry - see
 /// `HeartbeatRequest::basenames`. A client with more sends the rest with
@@ -118,6 +129,13 @@ pub struct RegisterRequest {
     /// which then count as older than any release.
     #[serde(default)]
     pub client_release: Option<String>,
+    /// How much memory, in bytes, this client will give a junction search's
+    /// table (its `[coordinator]` `junction_table_memory`) - see
+    /// `ClaimResponse::junction`. The server hands it no junction target
+    /// whose table is bigger than this, and none at all without it (a
+    /// client older than protocol 1.6, or one that won't spare any).
+    #[serde(default)]
+    pub junction_table_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +279,48 @@ pub struct ClaimResponse {
     /// file's name has that basename. Clients before 1.5 don't read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_hex: Option<String>,
+    /// True for a junction target's range (see
+    /// `AdminCreateTargetRequest::junction`): the unknown part of the name is
+    /// a directory, and what this range hands out is a stretch of the tails
+    /// of one of its lengths - `directory_length` characters, of which the
+    /// client's table holds the first `junction_table_length` and the walk
+    /// rewinds the rest. The junction below is what it searches for, rather
+    /// than the hashes, which it checks on what it finds; `prefix`, `suffix`,
+    /// `alphabet` and the pruning rules apply as they do to an alphabet
+    /// target, and `candidate_count` is how many tails the range is. Only
+    /// clients of protocol 1.6 and later are given one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub junction: bool,
+    /// The hash state after the directory: hashA's two seeds, then hashB's,
+    /// as 8-digit hex (`"0x92F62345"`). Hashing the suffix onto them gives
+    /// the file's two hashes - the client checks that before it starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junction_a_seed1_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junction_a_seed2_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junction_b_seed1_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junction_b_seed2_hex: Option<String>,
+    /// How long the directories this range covers are. One length a range:
+    /// a tail is the directory minus the table's characters, so a range's
+    /// tails are all of one length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_length: Option<i64>,
+    /// How many of a directory's first characters the client's table holds -
+    /// fixed for the whole target, since what a tail is depends on it. Its
+    /// memory is what the client declared it would give one
+    /// (`RegisterRequest::junction_table_bytes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junction_table_length: Option<i64>,
+    /// The tails to rewind: those numbered `[first_tail_index,
+    /// end_tail_index)` among the `directory_length` tails, numbered by the
+    /// tail reversed (the directory's last character turning slowest) as the
+    /// client numbers them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_tail_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_tail_index: Option<i64>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -288,6 +348,13 @@ pub struct HeartbeatRequest {
     /// progress checkpoint, as `last_hash_a_match_filename` is otherwise.
     #[serde(default)]
     pub next_candidate_number: Option<i64>,
+    /// And for a junction target's range: every tail numbered below this
+    /// has been rewound and looked up (see `ClaimResponse::junction`). A
+    /// junction search knows exactly how far it has got, so - unlike an
+    /// alphabet search, which only knows when it happens on a Hash A match -
+    /// every heartbeat carries real progress.
+    #[serde(default)]
+    pub next_tail_index: Option<i64>,
     /// Basenames that matched the encryption key since the client's last
     /// report that got an answer (`send_basenames` - see `ClaimResponse`),
     /// at most `MAX_BASENAMES_PER_REPORT`. `next_candidate_number` is never
@@ -331,6 +398,9 @@ pub struct QuitRequest {
     /// See `HeartbeatRequest::next_candidate_number`.
     #[serde(default)]
     pub next_candidate_number: Option<i64>,
+    /// See `HeartbeatRequest::next_tail_index`.
+    #[serde(default)]
+    pub next_tail_index: Option<i64>,
     /// See `HeartbeatRequest::basenames`.
     #[serde(default)]
     pub basenames: Vec<String>,
@@ -496,6 +566,14 @@ pub struct AdminCreateTargetRequest {
     /// `auto_priority` are then not for it, nor are priority and skip ranges.
     #[serde(default)]
     pub dictionary: Option<DictionarySettings>,
+    /// Given, the target's unknown part is a *directory*, searched from both
+    /// ends at once from the hash state after it - see `JunctionSettings`.
+    /// The alphabet and the pruning rules are for it as usual, but the
+    /// bounds, the insertions, `start_len`, `prune_whole_candidate`,
+    /// `auto_priority`, `send_basenames` and priority and skip ranges are
+    /// not, and neither is `dictionary`.
+    #[serde(default)]
+    pub junction: Option<JunctionSettings>,
     /// For a dictionary target with an `encryption_key_hex`: have clients
     /// compare every candidate's basename (what follows its last '\') to
     /// the key, and send every one that matches, which the server keeps -
@@ -536,6 +614,39 @@ pub struct DictionarySettings {
     /// none.
     #[serde(default)]
     pub tails: Vec<String>,
+}
+
+/// What a junction target searches: an unknown directory, from both ends at
+/// once, meeting on the hash state after it. A directory is `min_length` to
+/// `max_length` characters of the target's alphabet; the client keeps a
+/// table of every directory of the first `table_length` characters and
+/// rewinds the rest from the junction, so that is also what the search costs
+/// in memory - and a client that won't give a table that much gets none of
+/// this target's work. The filename is prefix + directory + suffix, and the
+/// target's pruning rules apply to the directory. None of this can be
+/// changed once the target is made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JunctionSettings {
+    /// The hash state after the directory, as hex (`"0x92F62345"`, or
+    /// without the `0x`): hashA's two seeds, then hashB's. Recovered from
+    /// other files of the same unknown directory whose basenames are known.
+    /// Hashing the suffix onto them must give the target's two hashes, or
+    /// the target is refused.
+    pub junction_a_seed1_hex: String,
+    pub junction_a_seed2_hex: String,
+    pub junction_b_seed1_hex: String,
+    pub junction_b_seed2_hex: String,
+    /// How long the directory may be, in characters. `min_length` (default
+    /// 1, and never less than `table_length`) to `max_length`, which is at
+    /// most 16 - and no more tails of one length than 2^63.
+    #[serde(default = "default_min_words")]
+    pub min_length: i64,
+    pub max_length: i64,
+    /// How many of a directory's first characters the client's table holds,
+    /// 0 to `min_length`. Every character of it divides the tails to rewind
+    /// by the alphabet's size and multiplies the table's memory by it: for
+    /// the 43-character alphabet, 4 characters is 30 MiB and 5 is 1.4 GiB.
+    pub table_length: i64,
 }
 
 fn default_start_len() -> i64 {

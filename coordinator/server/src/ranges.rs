@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, MAX_BASENAMES_PER_REPORT};
+use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, JUNCTION_SINCE, MAX_BASENAMES_PER_REPORT};
 use sqlx::SqlitePool;
 
 use crate::alphabet::{
@@ -14,7 +14,8 @@ use crate::alphabet::{
 use crate::error::AppError;
 use crate::dictionary::DictionaryTarget;
 use crate::disk::DiskSpace;
-use crate::models::{i64_to_u32, PriorityRange, Range, Segment, SkipRange, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME};
+use crate::junction::JunctionTarget;
+use crate::models::{i64_to_u32, PriorityRange, Range, Segment, SkipRange, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME, JUNCTION_ALPHABET_NAME};
 use crate::state::{now_unix, RangeConfig};
 
 fn effective_rate(config: &RangeConfig, user: &User) -> f64 {
@@ -30,6 +31,22 @@ fn effective_dictionary_rate(config: &RangeConfig, user: &User) -> f64 {
 /// How many of a dictionary target's candidates to carve for a client
 /// searching them at `rate`, so it takes about `target_chunk_seconds`.
 fn dictionary_chunk_size(config: &RangeConfig, rate: f64) -> i64 {
+    ((rate * config.target_chunk_seconds).round() as i64).clamp(config.min_chunk_candidates, config.max_chunk_candidates).max(1)
+}
+
+/// `effective_rate` for a junction target's ranges, which is in tails a
+/// second - see `User::ema_junction_rate_per_sec`.
+fn effective_junction_rate(config: &RangeConfig, user: &User) -> f64 {
+    user.ema_junction_rate_per_sec.unwrap_or(config.default_junction_rate_per_sec)
+}
+
+/// How many of a junction target's tails to carve for a client rewinding
+/// them at `rate`, so it takes about `target_chunk_seconds`. The client
+/// builds the table afresh for every range it claims, which that time has to
+/// cover too - a few seconds for a table of four characters, a quarter of a
+/// minute for five - so junction ranges want a generous
+/// `TARGET_CHUNK_SECONDS`.
+fn junction_chunk_size(config: &RangeConfig, rate: f64) -> i64 {
     ((rate * config.target_chunk_seconds).round() as i64).clamp(config.min_chunk_candidates, config.max_chunk_candidates).max(1)
 }
 
@@ -114,6 +131,15 @@ pub(crate) fn to_claim_response(
         filename_upper_bound: None,
         send_basenames: false,
         encryption_key_hex: None,
+        junction: false,
+        junction_a_seed1_hex: None,
+        junction_a_seed2_hex: None,
+        junction_b_seed1_hex: None,
+        junction_b_seed2_hex: None,
+        directory_length: None,
+        junction_table_length: None,
+        first_tail_index: None,
+        end_tail_index: None,
     }
 }
 
@@ -161,6 +187,83 @@ pub(crate) fn to_dictionary_claim_response(target: &Target, dictionary: &Diction
         filename_upper_bound: dictionary.bounds.upper.clone(),
         send_basenames,
         encryption_key_hex,
+        junction: false,
+        junction_a_seed1_hex: None,
+        junction_a_seed2_hex: None,
+        junction_b_seed1_hex: None,
+        junction_b_seed2_hex: None,
+        directory_length: None,
+        junction_table_length: None,
+        first_tail_index: None,
+        end_tail_index: None,
+    }
+}
+
+/// A claim of the tails numbered `[start, end)` of directories of `length`
+/// characters of junction target `target` - see `ClaimResponse::junction`.
+pub(crate) fn to_junction_claim_response(
+    target: &Target,
+    junction: &JunctionTarget,
+    range_id: i64,
+    length: i64,
+    start: i64,
+    end: i64,
+    lease_seconds: i64,
+) -> ClaimResponse {
+    let space = &junction.space;
+    // What a tail looks like as a whole directory, for a human: the table's
+    // characters aren't searched one by one, so they show as '?'.
+    let filename = |index: i64| format!("{}{}{}", target.prefix, space.directory(length, index), target.suffix);
+    let hex = |value: u32| format!("0x{value:08X}");
+    ClaimResponse {
+        range_id,
+        target_id: target.id,
+        target_name: target.name.clone(),
+        prefix: target.prefix.clone(),
+        suffix: target.suffix.clone(),
+        hash_a_hex: hex(i64_to_u32(target.hash_a)),
+        hash_b_hex: hex(i64_to_u32(target.hash_b)),
+        prune_symbol_runs: target.prune_symbol_runs != 0,
+        prune_unopened_brackets: target.prune_unopened_brackets != 0,
+        // A junction search checks the rules over the whole directory
+        // always, so there's no "leading characters only" to ask for.
+        prune_whole_candidate: false,
+        max_backslash_count: target.max_backslash_count,
+        min_backslash_count: target.min_backslash_count,
+        prune_adjacent_backslashes: target.prune_adjacent_backslashes != 0,
+        insert_from_start_text: None,
+        insert_from_start_position: 0,
+        insert_from_end_text: None,
+        insert_from_end_position: 0,
+        lower_bound_filename: filename(start),
+        upper_bound_filename: filename(end - 1),
+        alphabet: space.alphabet().to_string(),
+        candidate_count: end - start,
+        lease_seconds,
+        dictionary: false,
+        word_lists: None,
+        word_list_checksums: None,
+        words_checksum: None,
+        separators: None,
+        tails: None,
+        tails_checksum: None,
+        min_words: None,
+        max_words: None,
+        first_candidate_number: None,
+        end_candidate_number: None,
+        filename_lower_bound: None,
+        filename_upper_bound: None,
+        send_basenames: false,
+        encryption_key_hex: None,
+        junction: true,
+        junction_a_seed1_hex: Some(hex(junction.junction_a.0)),
+        junction_a_seed2_hex: Some(hex(junction.junction_a.1)),
+        junction_b_seed1_hex: Some(hex(junction.junction_b.0)),
+        junction_b_seed2_hex: Some(hex(junction.junction_b.1)),
+        directory_length: Some(length),
+        junction_table_length: Some(space.table_length()),
+        first_tail_index: Some(start),
+        end_tail_index: Some(end),
     }
 }
 
@@ -914,6 +1017,23 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             continue;
         }
 
+        // A junction target's - only for a client that knows them and has
+        // room for this target's table (see junction.rs). A client that
+        // hasn't got the memory gets no work from it at all, as one that
+        // can't search a target's alphabet gets none: the table's length is
+        // what a tail even means here, so there's no smaller piece of this
+        // target to give it.
+        if target.is_junction() {
+            if client_version < JUNCTION_SINCE || !junction_table_fits(&target, user)? {
+                continue;
+            }
+            if let Some(claim) = claim_junction_range(&mut tx, config, &target, user, now).await? {
+                tx.commit().await?;
+                return Ok(Some(claim));
+            }
+            continue;
+        }
+
         // A client that can't search the target's alphabet - it knows
         // neither that alphabet nor any bigger one containing it (see
         // alphabet::client_alphabet_for) - gets no work from this target at
@@ -1221,6 +1341,67 @@ async fn claim_dictionary_range(tx: &mut sqlx::SqliteConnection, config: &RangeC
     Ok(Some(to_dictionary_claim_response(target, &dictionary, range_id, start, end, lease_seconds)))
 }
 
+/// Whether `user` will give a table as big as junction target `target`'s -
+/// what it said at `/register`
+/// (`namebreak_protocol::RegisterRequest::junction_table_bytes`). A client
+/// that said nothing (one older than protocol 1.6) gives none.
+pub(crate) fn junction_table_fits(target: &Target, user: &User) -> Result<bool, AppError> {
+    let Some(budget) = user.junction_table_bytes else { return Ok(false) };
+    if budget < 0 {
+        return Ok(false);
+    }
+    Ok(crate::junction::of_target(target)?.space.table_bytes() <= budget as u64)
+}
+
+/// A junction target's next range for `user`: the unsearched rest of a
+/// released range first, as a dictionary target's claim does, then a fresh
+/// chunk of the length the cursor is on. One length a range - a tail is
+/// the directory minus the table's characters, so the tails of two lengths
+/// aren't the same thing.
+async fn claim_junction_range(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, target: &Target, user: &User, now: i64) -> Result<Option<ClaimResponse>, AppError> {
+    let junction = crate::junction::of_target(target)?;
+    let chunk = junction_chunk_size(config, effective_junction_rate(config, user));
+    let lease_seconds = config.lease_seconds;
+
+    let pending = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1")
+        .bind(target.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(range) = pending {
+        let range = split_off_searched_portion(&mut *tx, range, now).await?;
+        let range = split_off_chunk(&mut *tx, range, chunk as Pos).await?;
+        sqlx::query(
+            "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
+             assigned_at = ?, lease_seconds = ?, lease_expires_at = ?, last_progress_at = ? WHERE id = ?",
+        )
+        .bind(user.id)
+        .bind(user.id)
+        .bind(now)
+        .bind(lease_seconds)
+        .bind(now + lease_seconds)
+        .bind(now)
+        .bind(range.id)
+        .execute(&mut *tx)
+        .await?;
+        let (start, end) = (range.start() as i64, range.end() as i64);
+        return Ok(Some(to_junction_claim_response(target, &junction, range.id, range.candidate_len, start, end, lease_seconds)));
+    }
+
+    let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?").bind(target.id).fetch_one(&mut *tx).await?;
+    let next = progress.next() as i64;
+    // The cursor's own length first, then the lengths after it: its index
+    // is a tail index of its length, so a length that's run out leaves the
+    // next starting from its own first tail.
+    let Some(window) = junction.space.windows().into_iter().find(|w| w.length > progress.candidate_len || (w.length == progress.candidate_len && w.end > next)) else {
+        return Ok(None);
+    };
+    let start = if window.length == progress.candidate_len { next.max(window.start) } else { window.start };
+    let end = start + chunk.min(window.end - start);
+    persist_progress(&mut *tx, target.id, window.length, end as Pos, JUNCTION_ALPHABET_NAME, "").await?;
+    let range_id = insert_claimed_range(&mut *tx, target.id, window.length, start as Pos, end as Pos, JUNCTION_ALPHABET_NAME, "", None, user, lease_seconds, now).await?;
+    Ok(Some(to_junction_claim_response(target, &junction, range_id, window.length, start, end, lease_seconds)))
+}
+
 pub struct HeartbeatOutcome {
     pub lease_seconds: i64,
     pub range_released: bool,
@@ -1233,6 +1414,7 @@ pub async fn heartbeat_range(
     range_id: i64,
     last_hash_a_match_filename: Option<String>,
     next_candidate_number: Option<i64>,
+    next_tail_index: Option<i64>,
 ) -> Result<HeartbeatOutcome, AppError> {
     let mut tx = pool.begin().await?;
 
@@ -1278,7 +1460,7 @@ pub async fn heartbeat_range(
     // nothing new *to* report) will naturally repeat itself heartbeat after
     // heartbeat. This is the only signal heartbeat_range has for "is this
     // range actually still being worked" - see last_progress_at below.
-    let made_progress = record_progress(&mut tx, &mut range, last_hash_a_match_filename.as_deref(), next_candidate_number).await?;
+    let made_progress = record_progress(&mut tx, &mut range, last_hash_a_match_filename.as_deref(), next_candidate_number, next_tail_index).await?;
 
     // The current setting, not the range's stored lease_seconds - that's
     // whatever was in force when it was claimed.
@@ -1324,22 +1506,27 @@ pub async fn heartbeat_range(
 
 /// Records the checkpoint a client reported for `range` (see
 /// `HeartbeatRequest::last_hash_a_match_filename`, and for a dictionary
-/// target's range `next_candidate_number`), in the database and in `range`
-/// itself. Returns whether it's further than the one already recorded -
-/// progress never moves backwards, whatever order reports arrive in.
+/// target's range `next_candidate_number` or a junction target's
+/// `next_tail_index`), in the database and in `range` itself. Returns
+/// whether it's further than the one already recorded - progress never moves
+/// backwards, whatever order reports arrive in.
 async fn record_progress(
     tx: &mut sqlx::SqliteConnection,
     range: &mut Range,
     last_hash_a_match_filename: Option<&str>,
     next_candidate_number: Option<i64>,
+    next_tail_index: Option<i64>,
 ) -> Result<bool, AppError> {
-    let new_progress = if range.is_dictionary() {
-        match next_candidate_number {
+    let new_progress = if range.is_dictionary() || range.is_junction() {
+        // A dictionary range's candidate numbers, a junction range's tail
+        // indices: either way, how far the client has got.
+        let (what, next) = if range.is_junction() { ("tail index", next_tail_index) } else { ("candidate number", next_candidate_number) };
+        match next {
             // The last candidate searched. Nothing yet at the range's
             // start, and nothing to believe past its end.
             Some(next) if next > range.start() as i64 && next <= range.end() as i64 => Some(next as Pos - 1),
             Some(next) => {
-                tracing::warn!(range_id = range.id, next, "heartbeat's candidate number falls outside the range, ignoring");
+                tracing::warn!(range_id = range.id, next, what, "heartbeat's position falls outside the range, ignoring");
                 None
             }
             None => None,
@@ -1382,7 +1569,14 @@ async fn record_progress(
 /// Accepted from whoever holds the range, and from its last holder while
 /// it's pending and nobody else has claimed it - a client that lost its
 /// lease but kept searching, see `heartbeat_range`.
-pub async fn quit_range(pool: &SqlitePool, user: &User, range_id: i64, last_hash_a_match_filename: Option<&str>, next_candidate_number: Option<i64>) -> Result<(), AppError> {
+pub async fn quit_range(
+    pool: &SqlitePool,
+    user: &User,
+    range_id: i64,
+    last_hash_a_match_filename: Option<&str>,
+    next_candidate_number: Option<i64>,
+    next_tail_index: Option<i64>,
+) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
     let mut range = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?")
         .bind(range_id)
@@ -1395,7 +1589,7 @@ pub async fn quit_range(pool: &SqlitePool, user: &User, range_id: i64, last_hash
         return Err(AppError::Conflict("range is not currently assigned to you".into()));
     }
 
-    record_progress(&mut tx, &mut range, last_hash_a_match_filename, next_candidate_number).await?;
+    record_progress(&mut tx, &mut range, last_hash_a_match_filename, next_candidate_number, next_tail_index).await?;
     let now = now_unix();
     release_range(&mut tx, &range, now).await?;
     let is_virtual: bool = sqlx::query_scalar("SELECT is_virtual FROM targets WHERE id = ?").bind(range.target_id).fetch_one(&mut *tx).await?;
@@ -1536,7 +1730,9 @@ pub async fn complete_range(
             let observed_rate = candidates_processed as f64 / elapsed_seconds;
             // A dictionary search's rate is kept apart - see
             // User::ema_dictionary_rate_per_sec.
-            let (old_ema, sql) = if range.is_dictionary() {
+            let (old_ema, sql) = if range.is_junction() {
+                (user.ema_junction_rate_per_sec, "UPDATE users SET ema_junction_rate_per_sec = ? WHERE id = ?")
+            } else if range.is_dictionary() {
                 (user.ema_dictionary_rate_per_sec, "UPDATE users SET ema_dictionary_rate_per_sec = ? WHERE id = ?")
             } else {
                 (user.ema_rate_per_sec, "UPDATE users SET ema_rate_per_sec = ? WHERE id = ?")
@@ -2354,6 +2550,7 @@ mod tests {
             target_chunk_seconds: 1.0,
             default_rate_per_sec: 1.0,
             default_dictionary_rate_per_sec: 1.0,
+        default_junction_rate_per_sec: 1.0,
             // Deliberately larger than either test length's full space, so every
             // claim greedily takes "the rest of the current length" in one chunk -
             // that's what forces a length boundary to actually be crossed between
@@ -2392,6 +2589,8 @@ mod tests {
             token,
             ema_rate_per_sec: None,
             ema_dictionary_rate_per_sec: None,
+            ema_junction_rate_per_sec: None,
+            junction_table_bytes: None,
             created_at: now,
             last_seen_at: now,
             protocol_version: "1.0.0".to_string(),
@@ -2425,6 +2624,8 @@ mod tests {
             token,
             ema_rate_per_sec: None,
             ema_dictionary_rate_per_sec: None,
+            ema_junction_rate_per_sec: None,
+            junction_table_bytes: None,
             created_at: now,
             last_seen_at: now,
             protocol_version: protocol_version.to_string(),
@@ -2735,7 +2936,7 @@ mod tests {
         let config = test_config(1_000);
         let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
         assert_eq!(claim.candidate_count, 2);
-        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(format!("PRE{lower}.SUF")), None).await.unwrap();
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(format!("PRE{lower}.SUF")), None, None).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
         reclaim_expired(&pool).await.unwrap();
@@ -2804,7 +3005,7 @@ mod tests {
 
         let midpoint_index = space_size(DEFAULT, 3) / 2;
         let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
-        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None).await.unwrap();
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None, None).await.unwrap();
 
         // Simulate the client disconnecting: force its lease into the past and run
         // the same sweep the background task runs.
@@ -2872,7 +3073,7 @@ mod tests {
 
         let match_index = space_size(DEFAULT, 3) / 2;
         let match_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, match_index, 3));
-        quit_range(&pool, &first_user, claim.range_id, Some(&match_filename), None).await.unwrap();
+        quit_range(&pool, &first_user, claim.range_id, Some(&match_filename), None, None).await.unwrap();
 
         let end = space_size(DEFAULT, 3);
         assert_eq!(
@@ -2897,7 +3098,7 @@ mod tests {
         let config = test_config(space_size(DEFAULT, 3));
         let claim = claim_range(&pool, &config, &first_user).await.unwrap().expect("work available");
 
-        quit_range(&pool, &first_user, claim.range_id, None, None).await.unwrap();
+        quit_range(&pool, &first_user, claim.range_id, None, None, None).await.unwrap();
 
         assert_eq!(range_rows(&pool).await, vec![("pending".to_string(), 0, space_size(DEFAULT, 3), Some(first_user.id))]);
         let (assigned, progress): (Option<i64>, Option<i64>) =
@@ -2923,13 +3124,13 @@ mod tests {
         let filename = |index: i64| format!("PRE{}.SUF", index_to_candidate(DEFAULT, index, 3));
 
         let first = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
-        heartbeat_range(&pool, &config, &user, first.range_id, Some(filename(100)), None).await.unwrap();
-        quit_range(&pool, &user, first.range_id, Some(&filename(50)), None).await.unwrap();
+        heartbeat_range(&pool, &config, &user, first.range_id, Some(filename(100)), None, None).await.unwrap();
+        quit_range(&pool, &user, first.range_id, Some(&filename(50)), None, None).await.unwrap();
         assert_eq!(range_rows(&pool).await[..2], [("completed".to_string(), 0, 101, Some(user.id)), ("pending".to_string(), 101, end / 2, None)]);
 
         // The pending remainder is claimed first, then quit at its very last candidate.
         let second = claim_range(&pool, &config, &user).await.unwrap().expect("the remainder");
-        quit_range(&pool, &user, second.range_id, Some(&filename(end / 2 - 1)), None).await.unwrap();
+        quit_range(&pool, &user, second.range_id, Some(&filename(end / 2 - 1)), None, None).await.unwrap();
         assert_eq!(range_rows(&pool).await[1], ("completed".to_string(), 101, end / 2, Some(user.id)));
         assert_eq!(range_rows(&pool).await.len(), 2);
     }
@@ -2945,10 +3146,10 @@ mod tests {
         let config = test_config(space_size(DEFAULT, 3));
         let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work available");
 
-        assert!(matches!(quit_range(&pool, &other, claim.range_id, None, None).await, Err(AppError::Conflict(_))));
+        assert!(matches!(quit_range(&pool, &other, claim.range_id, None, None, None).await, Err(AppError::Conflict(_))));
         complete_range(&pool, &config, &user, claim.range_id, false, None, 1.0, 1).await.unwrap();
-        assert!(matches!(quit_range(&pool, &user, claim.range_id, None, None).await, Err(AppError::Conflict(_))));
-        assert!(matches!(quit_range(&pool, &user, 9999, None, None).await, Err(AppError::NotFound)));
+        assert!(matches!(quit_range(&pool, &user, claim.range_id, None, None, None).await, Err(AppError::Conflict(_))));
+        assert!(matches!(quit_range(&pool, &user, 9999, None, None, None).await, Err(AppError::NotFound)));
     }
 
     /// Releasing a range with real progress must *not* split it straight
@@ -2969,7 +3170,7 @@ mod tests {
 
         let midpoint_index = space_size(DEFAULT, 3) / 2;
         let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
-        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None).await.unwrap();
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None, None).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
             .bind(claim.range_id)
@@ -3016,7 +3217,7 @@ mod tests {
 
         let quarter_index = space_size(DEFAULT, 3) / 4;
         let quarter_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, quarter_index, 3));
-        heartbeat_range(&pool, &config, &user, claim.range_id, Some(quarter_filename), None).await.unwrap();
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some(quarter_filename), None, None).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
             .bind(claim.range_id)
@@ -3028,7 +3229,7 @@ mod tests {
         // Back online, having kept searching past the midpoint meanwhile.
         let midpoint_index = space_size(DEFAULT, 3) / 2;
         let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
-        let outcome = heartbeat_range(&pool, &config, &user, claim.range_id, Some(midpoint_filename), None).await.unwrap();
+        let outcome = heartbeat_range(&pool, &config, &user, claim.range_id, Some(midpoint_filename), None, None).await.unwrap();
         assert!(!outcome.range_released);
 
         let (status, start, end, progress, assigned, lease_expires_at, last_progress_at): (String, i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
@@ -3069,7 +3270,7 @@ mod tests {
 
         let quarter_index = space_size(DEFAULT, 3) / 4;
         let quarter_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, quarter_index, 3));
-        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(quarter_filename), None).await.unwrap();
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(quarter_filename), None, None).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
             .bind(claim.range_id)
@@ -3079,7 +3280,7 @@ mod tests {
         assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
 
         // Some other user's heartbeat against the pending row mustn't adopt it either.
-        let result = heartbeat_range(&pool, &config, &second_user, claim.range_id, None, None).await;
+        let result = heartbeat_range(&pool, &config, &second_user, claim.range_id, None, None, None).await;
         assert!(matches!(result, Err(AppError::Conflict(_))));
 
         let resumed = claim_range(&pool, &config, &second_user).await.unwrap().expect("reassignable");
@@ -3087,7 +3288,7 @@ mod tests {
 
         let midpoint_index = space_size(DEFAULT, 3) / 2;
         let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
-        let result = heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None).await;
+        let result = heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None, None).await;
         assert!(matches!(result, Err(AppError::Conflict(_))));
 
         let (status, end, progress): (String, i64, Option<i64>) =
@@ -3122,7 +3323,7 @@ mod tests {
 
         let last_index = space_size(DEFAULT, 2) - 1;
         let last_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, last_index, 2));
-        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(last_filename), None).await.unwrap();
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(last_filename), None, None).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?")
             .bind(claim.range_id)
@@ -3251,13 +3452,13 @@ mod tests {
             range.progress().map(|p| crate::alphabet::index_to_candidate(SIZE42, p, 2))
         };
         // '!' isn't in size42 and comes right after ' ': only "  " is certainly searched.
-        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE !.SUF".into()), None).await.unwrap();
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE !.SUF".into()), None, None).await.unwrap();
         assert_eq!(progress(pool.clone()).await.as_deref(), Some("  "));
         // '[' comes between 'Z' and '_'.
-        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE [.SUF".into()), None).await.unwrap();
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE [.SUF".into()), None, None).await.unwrap();
         assert_eq!(progress(pool.clone()).await.as_deref(), Some(" Z"));
         // '~' is in no alphabet at all: ignored.
-        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE ~.SUF".into()), None).await.unwrap();
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some("PRE ~.SUF".into()), None, None).await.unwrap();
         assert_eq!(progress(pool.clone()).await.as_deref(), Some(" Z"));
     }
 
@@ -3294,10 +3495,10 @@ mod tests {
             let range: Range = sqlx::query_as("SELECT * FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
             range.progress().map(|p| crate::alphabet::index_to_candidate(SIZE42, p, 2))
         };
-        heartbeat_range(&pool, &config, &new_client, claim.range_id, Some("PRE \\A_.SUF".into()), None).await.unwrap();
+        heartbeat_range(&pool, &config, &new_client, claim.range_id, Some("PRE \\A_.SUF".into()), None, None).await.unwrap();
         assert_eq!(progress(pool.clone()).await.as_deref(), Some(" A"));
         // Without the text where a two-character candidate has it: ignored.
-        heartbeat_range(&pool, &config, &new_client, claim.range_id, Some("PRE B.SUF".into()), None).await.unwrap();
+        heartbeat_range(&pool, &config, &new_client, claim.range_id, Some("PRE B.SUF".into()), None, None).await.unwrap();
         assert_eq!(progress(pool.clone()).await.as_deref(), Some(" A"));
     }
 
@@ -3599,7 +3800,7 @@ mod tests {
 
         let (start_index,): (i64,) = sqlx::query_as("SELECT start_index FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
         let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(letters, start_index + 338, 3));
-        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None).await.unwrap();
+        heartbeat_range(&pool, &config, &first_user, claim.range_id, Some(midpoint_filename), None, None).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
         assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
@@ -4488,7 +4689,7 @@ mod tests {
             .await
             .unwrap();
         let before = now_unix();
-        let outcome = heartbeat_range(&pool, &config, &user, claim.range_id, None, None).await.unwrap();
+        let outcome = heartbeat_range(&pool, &config, &user, claim.range_id, None, None, None).await.unwrap();
         assert_eq!(outcome.lease_seconds, config.lease_seconds);
         let lease_expires_at: i64 =
             sqlx::query_scalar("SELECT lease_expires_at FROM ranges WHERE id = ?").bind(claim.range_id).fetch_one(&pool).await.unwrap();
@@ -4569,7 +4770,7 @@ mod tests {
         assert_ne!(claim_a.range_id, claim_b.range_id);
 
         // Before anything is found: heartbeat behaves normally.
-        let before = heartbeat_range(&pool, &config, &other, claim_b.range_id, None, None).await.unwrap();
+        let before = heartbeat_range(&pool, &config, &other, claim_b.range_id, None, None, None).await.unwrap();
         assert!(!before.range_released);
 
         // `finder` reports a match, solving the target.
@@ -4580,7 +4781,7 @@ mod tests {
 
         // `other`'s next heartbeat must now signal abort, and its range should be
         // closed out rather than left dangling.
-        let after = heartbeat_range(&pool, &config, &other, claim_b.range_id, None, None).await.unwrap();
+        let after = heartbeat_range(&pool, &config, &other, claim_b.range_id, None, None, None).await.unwrap();
         assert!(after.range_released);
 
         let status: String = sqlx::query_scalar("SELECT status FROM ranges WHERE id = ?")
@@ -4614,7 +4815,7 @@ mod tests {
         // Claiming already starts the clock (last_progress_at defaults to
         // assigned_at) - a heartbeat with nothing new to report yet is not
         // itself released, and the lease is still renewed normally.
-        let first = heartbeat_range(&pool, &config, &user, claim.range_id, None, None).await.unwrap();
+        let first = heartbeat_range(&pool, &config, &user, claim.range_id, None, None, None).await.unwrap();
         assert!(!first.range_released);
 
         let (status, last_progress_at, lease_expires_at): (String, Option<i64>, Option<i64>) =
@@ -4636,7 +4837,7 @@ mod tests {
             .await
             .unwrap();
 
-        let second = heartbeat_range(&pool, &config, &user, claim.range_id, None, None).await.unwrap();
+        let second = heartbeat_range(&pool, &config, &user, claim.range_id, None, None, None).await.unwrap();
         assert!(second.range_released, "a heartbeat past the release threshold must release the claim");
 
         let (status, assigned_user_id, last_progress_at): (String, Option<i64>, Option<i64>) =
@@ -4657,7 +4858,7 @@ mod tests {
         // A further heartbeat against the now-released range_id, from the
         // original (no longer owning) user, must be rejected exactly like any
         // other stale-ownership heartbeat - not a special case.
-        let result = heartbeat_range(&pool, &config, &user, claim.range_id, None, None).await;
+        let result = heartbeat_range(&pool, &config, &user, claim.range_id, None, None, None).await;
         assert!(matches!(result, Err(AppError::Conflict(_))));
     }
 
@@ -4680,7 +4881,7 @@ mod tests {
 
         let midpoint_index = space_size(DEFAULT, 3) / 2;
         let midpoint_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, midpoint_index, 3));
-        heartbeat_range(&pool, &config, &user, claim.range_id, Some(midpoint_filename.clone()), None).await.unwrap();
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some(midpoint_filename.clone()), None, None).await.unwrap();
 
         // Back the clock right up against the release threshold - the very
         // next heartbeat would release the claim if nothing resets it.
@@ -4693,7 +4894,7 @@ mod tests {
 
         // Repeating the same match (a paused/stuck client's only heartbeat
         // shape) must NOT reset the clock.
-        let repeated = heartbeat_range(&pool, &config, &user, claim.range_id, Some(midpoint_filename), None).await.unwrap();
+        let repeated = heartbeat_range(&pool, &config, &user, claim.range_id, Some(midpoint_filename), None, None).await.unwrap();
         assert!(!repeated.range_released, "still under the threshold, even though nothing reset the clock");
         let last_progress_at: i64 = sqlx::query_scalar("SELECT last_progress_at FROM ranges WHERE id = ?")
             .bind(claim.range_id)
@@ -4705,7 +4906,7 @@ mod tests {
         // A genuinely later match, by contrast, must reset it.
         let later_index = midpoint_index + 1000;
         let later_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, later_index, 3));
-        let advanced = heartbeat_range(&pool, &config, &user, claim.range_id, Some(later_filename), None).await.unwrap();
+        let advanced = heartbeat_range(&pool, &config, &user, claim.range_id, Some(later_filename), None, None).await.unwrap();
         assert!(!advanced.range_released);
         let last_progress_at: i64 = sqlx::query_scalar("SELECT last_progress_at FROM ranges WHERE id = ?")
             .bind(claim.range_id)
@@ -4829,7 +5030,7 @@ mod tests {
 
         let quarter_index = space_size(DEFAULT, 2) / 4;
         let quarter_filename = format!("PRE{}.SUF", index_to_candidate(DEFAULT, quarter_index, 2));
-        heartbeat_range(&pool, &config, &user, claim.range_id, Some(quarter_filename), None).await.unwrap();
+        heartbeat_range(&pool, &config, &user, claim.range_id, Some(quarter_filename), None, None).await.unwrap();
 
         sqlx::query("UPDATE ranges SET lease_expires_at = 0 WHERE id = ?").bind(claim.range_id).execute(&pool).await.unwrap();
         assert_eq!(reclaim_expired(&pool).await.unwrap(), 1);
@@ -4984,8 +5185,8 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-            assert_eq!(claim.hash_a_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x100)));
-            assert_eq!(claim.hash_b_hex, format!("0x{:08X}", crate::canary::mpq_hash(&planted, 0x200)));
+            assert_eq!(claim.hash_a_hex, format!("0x{:08X}", crate::mpq::mpq_hash(&planted, 0x100)));
+            assert_eq!(claim.hash_b_hex, format!("0x{:08X}", crate::mpq::mpq_hash(&planted, 0x200)));
             assert!(claim.lower_bound_filename <= planted && planted <= claim.upper_bound_filename, "{planted} in {claim:?}");
 
             let filename = report_it.then(|| planted.clone());
