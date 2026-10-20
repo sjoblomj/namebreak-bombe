@@ -121,8 +121,10 @@
   .subhead.stale #status-dot { background: var(--pending); }
   .subhead .active-now { margin-top: 4px; }
   .notify {
-    margin-left: 14px;
+    display: block;
+    margin-top: 8px;
   }
+  .notify[hidden] { display: none; }
   .notify-btn {
     font: inherit;
     font-size: 12px;
@@ -693,7 +695,7 @@
       <a class="header-link primary" href="https://github.com/sjoblomj/namebreak-bombe/releases" target="_blank" rel="noopener">Download client</a>
     </nav>
   </header>
-  <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><span class="notify" id="notify" hidden></span><div class="active-now" id="active-now" title="Ranges being searched right now" hidden></div></div>
+  <div class="subhead"><span id="status-dot"></span><span id="status-text">loading…</span><div class="active-now" id="active-now" title="Ranges being searched right now" hidden></div><div class="notify" id="notify" hidden></div></div>
   <nav class="page-tabs tab-bar" id="page-tabs" role="tablist">
     <button type="button" class="tab-btn" role="tab" data-page="targets">Targets</button>
     <button type="button" class="tab-btn" role="tab" data-page="matches">Matches</button>
@@ -2115,7 +2117,9 @@
       const now = fmtTime(Math.floor(Date.now() / 1000));
       statusEl.textContent = 'updated ' + now.display;
       statusEl.title = now.iso;
-      activeNowEl.textContent = 'Active now: ' + fmtNum(data.active_ranges || 0);
+      const activeCount = document.createElement('strong');
+      activeCount.textContent = fmtNum(data.active_ranges || 0);
+      activeNowEl.replaceChildren('Active now: ', activeCount);
       activeNowEl.hidden = false;
 
       const lowDisk = data.low_disk;
