@@ -1270,24 +1270,19 @@
   // A run of more than this many consecutive same-status, same-length ranges
   // collapses down to its first and last plus one placeholder row, so a
   // board with thousands of routine completed/skipped ranges at one length
-  // doesn't bury the handful of rows that actually need a look.
+  // doesn't bury the handful of rows that actually need a look. In-progress
+  // ranges are never folded - they're exactly the rows worth watching.
   const COLLAPSE_THRESHOLD = 5;
   const REVEAL_BATCH = 10;
-
-  function statusWord(status) {
-    switch (status) {
-      case 'in_progress': return 'in-progress';
-      default: return status;
-    }
-  }
 
   // Walks `items` (ranges in table order, with gap and sweep-marker items
   // between them - see rangesContent) and folds any run of more than
   // COLLAPSE_THRESHOLD consecutive ranges sharing the same status and length
-  // down to {first, collapsed-middle, last}. Only consecutive runs are
-  // folded - a status that briefly interrupts an otherwise-long run (e.g. a
-  // reclaimed split), a gap or the sweep marker ends the run, so neither of
-  // the latter two is ever hidden inside a collapsed one.
+  // down to {first, collapsed-middle, last}; in-progress runs are always
+  // shown in full. Only consecutive runs are folded - a status that briefly
+  // interrupts an otherwise-long run (e.g. a reclaimed split), a gap or the
+  // sweep marker ends the run, so neither of the latter two is ever hidden
+  // inside a collapsed one.
   function groupRanges(t, items) {
     const groups = [];
     let i = 0;
@@ -1303,7 +1298,7 @@
         j++;
       }
       const run = items.slice(i, j).map((item) => item.range);
-      if (run.length > COLLAPSE_THRESHOLD) {
+      if (run.length > COLLAPSE_THRESHOLD && first.status !== 'in_progress') {
         groups.push({ kind: 'range', range: run[0] });
         groups.push({ kind: 'collapsed', status: run[0].status, lengthLabel: lengthLabel(t, run[0].candidate_len), hidden: run.slice(1, -1) });
         groups.push({ kind: 'range', range: run[run.length - 1] });
@@ -1368,7 +1363,7 @@
         tr.remove();
         return;
       }
-      label.textContent = `${hidden.length} more ${statusWord(group.status)} · ${group.lengthLabel}`;
+      label.textContent = `${hidden.length} more ${group.status} · ${group.lengthLabel}`;
       const n = Math.min(REVEAL_BATCH, hidden.length);
       // When hidden.length <= REVEAL_BATCH, "first n" and "last n" reveal
       // the exact same set as "all" - no point offering three identical
