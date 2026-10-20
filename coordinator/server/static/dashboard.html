@@ -2170,6 +2170,8 @@
     notifyEl.replaceChildren();
     if (Notification.permission === 'denied') {
       notifyEl.textContent = 'Notifications are blocked for this site in your browser settings';
+      notifyEl.title = 'To get a notification when a target is found, allow notifications for this site '
+        + "in your browser's site settings, then reload the page.";
       return;
     }
     const btn = document.createElement('button');
@@ -2178,7 +2180,15 @@
     const on = notificationsOn();
     btn.className = 'notify-btn' + (on ? ' on' : '');
     btn.textContent = on ? 'Notifications on' : 'Notify me when a target is found';
-    btn.title = on ? 'Click to stop desktop notifications for finds' : 'Get a desktop notification while this page is open';
+    notifyEl.removeAttribute('title');
+    btn.title = on
+      ? 'You get a desktop notification when a target is found, showing its filename. '
+        + 'This page checks once a minute, so keep it open in a tab. '
+        + 'Finds made while it was closed are announced the next time you open it.\n\nClick to turn notifications off.'
+      : 'Get a desktop notification when a target is found, showing its filename. '
+        + 'Your browser will ask for permission first. '
+        + 'This page checks once a minute, so it only works while the page is open in a tab; '
+        + 'finds made while it was closed are announced the next time you open it.';
     btn.addEventListener('click', async () => {
       if (notificationsOn()) {
         storageSet(NOTIFY_ENABLED_KEY, 'false');
