@@ -48,6 +48,43 @@ bool parseInsertion(const std::string& s, Insertion& out) {
     return true;
 }
 
+// A number of bytes, as `table_memory` gives it: digits, optionally
+// followed by K, M or G (1024, 1024^2, 1024^3 - case doesn't matter).
+bool parseBytes(const std::string& s, uint64_t& out) {
+    const std::string text = trim(s);
+    if (text.empty())
+        return false;
+    size_t digits = text.find_first_not_of("0123456789");
+    if (digits == 0)
+        return false;
+    uint64_t multiplier = 1;
+    if (digits != std::string::npos) {
+        if (digits + 1 != text.size())
+            return false;
+        switch (std::tolower((unsigned char) text[digits])) {
+        case 'k': multiplier = 1024; break;
+        case 'm': multiplier = 1024 * 1024; break;
+        case 'g': multiplier = 1024 * 1024 * 1024; break;
+        default: return false;
+        }
+    } else {
+        digits = text.size();
+    }
+    const std::string number = text.substr(0, digits);
+    // Far more than any machine has, rather than an overflow.
+    if (number.size() > 19)
+        return false;
+    try {
+        const uint64_t value = std::stoull(number);
+        if (value > UINT64_MAX / multiplier)
+            return false;
+        out = value * multiplier;
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
 // Inverse of unquote() above: wraps `s` in "..." only if writing it plain
 // would lose meaningful leading/trailing whitespace when re-read.
 std::string quoteIfNeeded(const std::string& s) {
@@ -222,9 +259,11 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 currentSection = &out.coordinator;
             } else if (name == "dictionary") {
                 currentSection = &out.dictionary;
+            } else if (name == "junction") {
+                currentSection = &out.junction;
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": unknown section [" + name +
-                        "] (expected [search], [coordinator] or [dictionary])";
+                        "] (expected [search], [coordinator], [dictionary] or [junction])";
                 return false;
             }
             continue;
@@ -258,8 +297,8 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 out.checkForUpdates = value == "true";
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search], [coordinator] or [dictionary] section (only 'mode', 'matches_dir', 'backend' "
-                        "and 'check_for_updates' are allowed before any section)";
+                        "' must be inside a [search], [coordinator], [dictionary] or [junction] section (only 'mode', 'matches_dir', "
+                        "'backend' and 'check_for_updates' are allowed before any section)";
                 return false;
             }
         } else {
@@ -372,6 +411,129 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
             printf("Resuming from the last match in %s: %s%s%s\n", out.outputFilePath.c_str(), prefix.c_str(),
                    insertIntoCandidate(lastMatch, out.insertFromStart, out.insertFromEnd).c_str(), suffix.c_str());
             out.startCandidate = lastMatch;
+        }
+    }
+    return true;
+}
+
+bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::string& error) {
+    out = JunctionRequest();
+    ConfigSectionReader r(config.junction);
+    std::string suffix, maxLengthStr, hashAHex, hashBHex;
+    std::string junctionHex[4];
+    static const char* kJunctionKeys[4] = {"junction_a_seed1", "junction_a_seed2", "junction_b_seed1", "junction_b_seed2"};
+
+    if (!r.getRequired("alphabet", out.alphabet, error)) return false;
+    out.prefix = r.getOptional("prefix", "");
+    if (!r.getRequired("suffix", suffix, error)) return false;
+    for (int i = 0; i < 4; ++i) {
+        if (!r.getRequired(kJunctionKeys[i], junctionHex[i], error))
+            return false;
+    }
+    if (!r.getRequired("hash_a", hashAHex, error)) return false;
+    if (!r.getRequired("hash_b", hashBHex, error)) return false;
+    const std::string minLengthStr = r.getOptional("min_length", "1");
+    if (!r.getRequired("max_length", maxLengthStr, error)) return false;
+    const std::string tableLengthStr = r.getOptional("table_length", "");
+    const std::string tableMemoryStr = r.getOptional("table_memory", "1G");
+    const std::string pruneStr = r.getOptional("prune_symbol_runs", "false");
+    const std::string pruneBracketsStr = r.getOptional("prune_unopened_brackets", "false");
+    const std::string pruneAdjacentStr = r.getOptional("prune_adjacent_backslashes", "false");
+    const std::string maxBackslashStr = r.getOptional("max_backslash_count", "0");
+    const std::string minBackslashStr = r.getOptional("min_backslash_count", "0");
+    const std::string matchesName = r.getOptional("matches_name", "");
+    const std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
+
+    const std::string unknown = r.firstUnknownKey();
+    if (!unknown.empty()) {
+        error = "unknown key '" + unknown + "' in [junction] section";
+        return false;
+    }
+
+    uint32_t seeds[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        if (!hexToU32(junctionHex[i], seeds[i])) {
+            error = std::string("invalid ") + kJunctionKeys[i] + ": " + junctionHex[i];
+            return false;
+        }
+    }
+    out.junctionA = {seeds[0], seeds[1]};
+    out.junctionB = {seeds[2], seeds[3]};
+    if (!hexToU32(hashAHex, out.targetHashA)) {
+        error = "invalid hash_a: " + hashAHex;
+        return false;
+    }
+    if (!hexToU32(hashBHex, out.targetHashB)) {
+        error = "invalid hash_b: " + hashBHex;
+        return false;
+    }
+
+    auto parseCount = [&](const std::string& key, const std::string& value, int& count) {
+        if (value.empty() || value.size() > 3 || value.find_first_not_of("0123456789") != std::string::npos) {
+            error = "invalid " + key + ": '" + value + "' (expected a number)";
+            return false;
+        }
+        count = std::stoi(value);
+        return true;
+    };
+    if (!parseCount("min_length", minLengthStr, out.minLength) || !parseCount("max_length", maxLengthStr, out.maxLength))
+        return false;
+    if (!parseCount("max_backslash_count", maxBackslashStr, out.rules.maxBackslashCount) ||
+        !parseCount("min_backslash_count", minBackslashStr, out.rules.minBackslashCount))
+        return false;
+    if (!parseBool(pruneStr, out.rules.symbolRuns)) {
+        error = "invalid prune_symbol_runs: '" + pruneStr + "' (expected true/false)";
+        return false;
+    }
+    if (!parseBool(pruneBracketsStr, out.rules.unopenedBrackets)) {
+        error = "invalid prune_unopened_brackets: '" + pruneBracketsStr + "' (expected true/false)";
+        return false;
+    }
+    if (!parseBool(pruneAdjacentStr, out.rules.adjacentBackslashes)) {
+        error = "invalid prune_adjacent_backslashes: '" + pruneAdjacentStr + "' (expected true/false)";
+        return false;
+    }
+    bool resume = false;
+    if (!parseBool(resumeStr, resume)) {
+        error = "invalid resume_from_last_candidate: '" + resumeStr + "' (expected true/false)";
+        return false;
+    }
+    if (!parseBytes(tableMemoryStr, out.tableBytes)) {
+        error = "invalid table_memory: '" + tableMemoryStr + "' (expected a number of bytes, or one with a K, M or G after it)";
+        return false;
+    }
+
+    out.suffix = suffix;
+    // The table's length is settled here rather than left to the search, so
+    // that it's part of what the progress file's fingerprint identifies: it
+    // decides where the walk's nodes are cut, and a `next` from a search
+    // that split the directory elsewhere means something else entirely.
+    if (tableLengthStr.empty()) {
+        out.tableLength = junctionTableLengthForBytes((int) out.alphabet.size(), out.maxLength, out.tableBytes);
+    } else if (!parseCount("table_length", tableLengthStr, out.tableLength)) {
+        return false;
+    } else if (out.tableLength > out.maxLength) {
+        error = "table_length " + tableLengthStr + " is more than max_length " + maxLengthStr;
+        return false;
+    }
+    out.outputFilePath = namedFilePath(config.matchesDir, "matches", matchesName);
+    out.progressFilePath = namedFilePath(config.matchesDir, "junction", matchesName);
+
+    if (resume) {
+        JunctionProgress progress;
+        bool exists = false;
+        if (!readJunctionProgress(out.progressFilePath, progress, exists, error))
+            return false;
+        if (!exists) {
+            printf("resume_from_last_candidate: no progress file %s yet - starting from the beginning\n", out.progressFilePath.c_str());
+        } else if (progress.fingerprint != junctionFingerprint(out)) {
+            error = "resume_from_last_candidate: " + out.progressFilePath +
+                    " is from a search with different settings (alphabet, prefix, suffix, junction, hashes, lengths, table length or "
+                    "rules) - remove it, or set resume_from_last_candidate = false, to start this one from the beginning";
+            return false;
+        } else {
+            out.startNumber = progress.next;
+            printf("Resuming from node %llu, from %s\n", (unsigned long long) progress.next, out.progressFilePath.c_str());
         }
     }
     return true;
@@ -642,6 +804,7 @@ bool ensureConfigForMode(const std::string& path, const std::string& mode, const
     }
     const std::map<std::string, std::string>& existingSection = sectionName == "coordinator" ? existing.coordinator
                                                                : sectionName == "dictionary"  ? existing.dictionary
+                                                               : sectionName == "junction"    ? existing.junction
                                                                                               : existing.search;
 
     for (const auto& kv : keys) {

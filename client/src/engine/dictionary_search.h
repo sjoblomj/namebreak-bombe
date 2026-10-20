@@ -10,6 +10,8 @@
 
 #include "engine/backend.h"
 #include "engine/dictionary.h"
+#include "engine/duration.h"
+#include "engine/mpq_hash.h"
 
 // A dictionary search: every candidate made of words from a list, with
 // separators between them (see dictionary.h for which candidates, and their
@@ -24,18 +26,9 @@
 // only the leading parts the bounds cut through have their candidates
 // compared one by one.
 
-// The MPQ hash's state: (seed1, seed2).
-using HashState = std::pair<uint32_t, uint32_t>;
-constexpr HashState kInitialHashState{0x7FED7FED, 0xEEEEEEEE};
+// HashState, kInitialHashState, the crypt-table offsets and continueHash are
+// mpq_hash.h's - the hash itself, which every mode shares.
 
-// The crypt-table offsets of the hashes a search uses: hashA (Storm's hash
-// type 1), hashB (2), and the one an encryption key is made with (3).
-constexpr int kHashAOffset = 0x100;
-constexpr int kHashBOffset = 0x200;
-constexpr int kFileKeyOffset = 0x300;
-
-// `state` continued over `text` with the crypt table at `offset`.
-HashState continueHash(HashState state, const std::string& text, int offset, const uint32_t* cryptTable);
 // The basename hash's state continued over `text`: hash type 3 of what
 // follows the last '\' - every '\' starts it over from kInitialHashState.
 // From kInitialHashState over a whole filename, its first value is the
@@ -150,10 +143,6 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
 // `bounds` - what a search of them hashes.
 uint64_t countDictionaryCandidates(const DictionarySpace& space, const std::string& prefix, const std::string& suffix,
                                    const FilenameBounds& bounds, uint64_t startNumber, uint64_t endNumber = UINT64_MAX);
-
-// `seconds` for a human: "6s", "4m05s", "1h02m03s", "2d03h04m" - or "?" if
-// it's negative or absurdly long.
-std::string formatDuration(double seconds);
 
 // Identifies everything that decides which candidates a search checks and
 // what it looks for - every field of `req` but the start and end, the file

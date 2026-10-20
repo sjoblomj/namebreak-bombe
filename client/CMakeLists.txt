@@ -124,6 +124,8 @@ set(SEARCH_SOURCES
     src/engine/candidate.cpp
     src/engine/dictionary.cpp
     src/engine/dictionary_search.cpp
+    src/engine/junction.cpp
+    src/engine/junction_search.cpp
     src/engine/wordlist.cpp
     src/backends/backends.cpp
     src/backends/self_test.cpp
@@ -364,11 +366,45 @@ namebreak_test(wordlist_test wordlist_test)
 namebreak_test_executable(dictionary_test tests/dictionary_test.cpp namebreak_search)
 namebreak_test(dictionary_test dictionary_test)
 
+# A junction search's own parts (src/engine/junction.h,
+# junction_search.h): the hash run backwards, the tails' numbering, the
+# backward walk, the table, the rules split between the two halves, the
+# fingerprint and the progress file - against brute force. CPU only.
+namebreak_test_executable(junction_test tests/junction_test.cpp namebreak_search)
+namebreak_test(junction_test junction_test)
+
 # What the backends that search dictionaries share (src/backends/common/
 # dictionary_batch.h): the word table, the suffix filters, a launch's
 # segments, checking hits. CPU only.
 namebreak_test_executable(dictionary_batch_test tests/dictionary_batch_test.cpp namebreak_search)
 namebreak_test(dictionary_batch_test dictionary_batch_test)
+
+# runJunctionSearch (src/engine/junction_search.h) end to end on every
+# backend that can search junctions, against brute force - after the junction
+# self-test (src/backends/self_test.h), as createJunctionBackend runs it. As
+# built; with only three bits of each of the junction state's two seeds
+# compared (NAMEBREAK_JUNCTION_MATCH_BITS), so that about one directory in 64
+# matches the junction by chance and the lists of them really get
+# compared; and with that and only a few tails handed to the backend per call
+# (NAMEBREAK_JUNCTION_TAILS_PER_CALL), on several threads, so that a tail
+# length is split across many calls and the walk is restarted part way
+# through over and over.
+set(JUNCTION_BACKENDS cpu reference)
+namebreak_test_executable(junction_search_test tests/junction_search_test.cpp namebreak_search)
+foreach(backend IN LISTS JUNCTION_BACKENDS)
+    namebreak_test(junction-search-${backend} junction_search_test --backend ${backend})
+endforeach()
+if(NAMEBREAK_TEST_VARIANTS)
+    namebreak_search_library(namebreak_search_junction_dense NAMEBREAK_JUNCTION_MATCH_BITS=3)
+    namebreak_test_executable(junction_search_test_dense tests/junction_search_test.cpp namebreak_search_junction_dense)
+    namebreak_search_library(namebreak_search_junction_small NAMEBREAK_JUNCTION_MATCH_BITS=3
+                             NAMEBREAK_JUNCTION_TAILS_PER_CALL=7 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=4)
+    namebreak_test_executable(junction_search_test_small tests/junction_search_test.cpp namebreak_search_junction_small)
+    foreach(backend IN LISTS JUNCTION_BACKENDS)
+        namebreak_test(junction-search-${backend}-dense junction_search_test_dense --backend ${backend})
+        namebreak_test(junction-search-${backend}-small junction_search_test_small --backend ${backend})
+    endforeach()
+endif()
 
 # runDictionarySearch (src/engine/dictionary_search.h) end to end on every
 # backend, against brute force - after the dictionary self-test (src/backends/
@@ -440,6 +476,30 @@ add_test(NAME dictionary-cli-no-basenames-file
     COMMAND ${CMAKE_COMMAND} -DFILE=matches/basenames-credits.txt -P ${CMAKE_SOURCE_DIR}/tests/check_basenames_file.cmake
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/dictionary-cli-no-basenames)
 set_tests_properties(dictionary-cli-no-basenames-file PROPERTIES FIXTURES_REQUIRED dictionary-cli-no-basenames-ran)
+
+# The program itself in junction mode (src/cli/main.cpp), on the config
+# tests/data/junction_cli.conf.in makes: recovering the directory of
+# SETUPDAT\BWUNIN.PIF from the hash state after it (exit code 0); not
+# finding it, with the directory longer than the lengths searched and the
+# mode given with --mode; a config without max_length; and a junction that
+# doesn't fit the file's hashes.
+# junction_cli_test(<name> <mode> <junction_a_seed1> <max_length line> <pass regex or ""> [<argument>...])
+function(junction_cli_test name mode seed_a1 max_length regex)
+    set(JUNCTION_CLI_MODE ${mode})
+    set(JUNCTION_CLI_SEED_A1 ${seed_a1})
+    set(JUNCTION_CLI_MAX_LENGTH ${max_length})
+    configure_file(tests/data/junction_cli.conf.in ${CMAKE_BINARY_DIR}/testrun/${name}/config.conf @ONLY)
+    namebreak_test(${name} namebreak --config config.conf ${ARGN})
+    if(regex)
+        set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
+    endif()
+endfunction()
+junction_cli_test(junction-cli-found junction 0x92F62345 "max_length = 8" "BOTH HASHES MATCH: SETUPDAT.BWUNIN.PIF")
+junction_cli_test(junction-cli-not-found bounded 0x92F62345 "max_length = 7"
+                  "Searched every directory - no match of both hashes" --mode junction)
+junction_cli_test(junction-cli-bad-config junction 0x92F62345 "" "missing required key 'max_length'")
+junction_cli_test(junction-cli-bad-junction junction 0x92F62344 "max_length = 8"
+                  "the junction state for hashA .* doesn't fit the file")
 
 # Where buildSearchRequest (src/common/config.h) starts a search -
 # start_candidate and resume_from_last_candidate. CPU only.

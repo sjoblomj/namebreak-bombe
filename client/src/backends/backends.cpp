@@ -61,19 +61,40 @@ std::vector<std::string> backendNames() {
 
 namespace {
 
-// Whether `backend` passes its self-tests - with `dictionary`, the
-// dictionary search's too. If not, `why` says why.
-bool passesSelfTests(SearchBackend& backend, bool dictionary, std::string& why) {
+// Which mode a backend is being picked for - each has its own self-test, and
+// its own question of whether a backend can search that way at all.
+enum class Mode { Plain, Dictionary, Junction };
+
+bool supportsMode(const SearchBackend& backend, Mode mode) {
+    switch (mode) {
+    case Mode::Dictionary:
+        return backend.supportsDictionary();
+    case Mode::Junction:
+        return backend.supportsJunction();
+    default:
+        return true;
+    }
+}
+
+const char* cannotSearch(Mode mode) {
+    return mode == Mode::Dictionary ? "can't search dictionaries" : "can't search junctions";
+}
+
+// Whether `backend` passes its self-tests - the mode's own too. If not,
+// `why` says why.
+bool passesSelfTests(SearchBackend& backend, Mode mode, std::string& why) {
     if (!selfTestBackend(backend, why))
         return false;
-    if (dictionary && !selfTestDictionaryBackend(backend, why)) {
+    if (mode == Mode::Dictionary && !selfTestDictionaryBackend(backend, why)) {
         why = "dictionary search: " + why;
         return false;
     }
+    if (mode == Mode::Junction && !selfTestJunctionBackend(backend, why))
+        return false;
     return true;
 }
 
-std::unique_ptr<SearchBackend> create(const std::string& name, std::string& error, bool* selfTestFailed, bool dictionary) {
+std::unique_ptr<SearchBackend> create(const std::string& name, std::string& error, bool* selfTestFailed, Mode mode) {
     if (selfTestFailed)
         *selfTestFailed = false;
     if (name.empty()) {
@@ -83,13 +104,13 @@ std::unique_ptr<SearchBackend> create(const std::string& name, std::string& erro
         for (const BackendEntry& entry : backendEntries()) {
             std::string why;
             std::unique_ptr<SearchBackend> backend = entry.make(why);
-            if (backend && dictionary && !backend->supportsDictionary()) {
-                // Not one to pick for a dictionary search - and not one that
-                // failed anything either.
-                reasons += std::string(reasons.empty() ? "" : "; ") + entry.name + ": can't search dictionaries";
+            if (backend && !supportsMode(*backend, mode)) {
+                // Not one to pick for this mode - and not one that failed
+                // anything either.
+                reasons += std::string(reasons.empty() ? "" : "; ") + entry.name + ": " + cannotSearch(mode);
                 continue;
             }
-            if (backend && passesSelfTests(*backend, dictionary, why))
+            if (backend && passesSelfTests(*backend, mode, why))
                 return backend;
             if (backend) {
                 // It could run, but searches wrongly here: say so, rather than
@@ -108,10 +129,10 @@ std::unique_ptr<SearchBackend> create(const std::string& name, std::string& erro
             std::unique_ptr<SearchBackend> backend = entry.make(why);
             if (!backend) {
                 error = "the " + name + " backend can't run on this machine: " + why;
-            } else if (dictionary && !backend->supportsDictionary()) {
-                error = "the " + name + " backend can't search dictionaries";
+            } else if (!supportsMode(*backend, mode)) {
+                error = "the " + name + " backend " + cannotSearch(mode);
                 backend = nullptr;
-            } else if (!passesSelfTests(*backend, dictionary, why)) {
+            } else if (!passesSelfTests(*backend, mode, why)) {
                 error = "the " + name + " backend failed its self-test on this machine: " + why;
                 if (selfTestFailed)
                     *selfTestFailed = true;
@@ -130,9 +151,13 @@ std::unique_ptr<SearchBackend> create(const std::string& name, std::string& erro
 } // namespace
 
 std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
-    return create(name, error, selfTestFailed, false);
+    return create(name, error, selfTestFailed, Mode::Plain);
 }
 
 std::unique_ptr<SearchBackend> createDictionaryBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
-    return create(name, error, selfTestFailed, true);
+    return create(name, error, selfTestFailed, Mode::Dictionary);
+}
+
+std::unique_ptr<SearchBackend> createJunctionBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
+    return create(name, error, selfTestFailed, Mode::Junction);
 }

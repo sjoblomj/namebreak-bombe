@@ -13,6 +13,30 @@
 // Fills `table` (0x500 entries) with the MPQ crypt table.
 void prepareCryptTable(uint32_t* table);
 
+// The MPQ hash's state: (seed1, seed2), and what every hash starts from.
+using HashState = std::pair<uint32_t, uint32_t>;
+constexpr HashState kInitialHashState{0x7FED7FED, 0xEEEEEEEE};
+
+// The crypt-table offsets of the hashes this program uses: hashA (Storm's
+// hash type 1), hashB (2), and the one an encryption key is made with (3).
+constexpr int kHashAOffset = 0x100;
+constexpr int kHashBOffset = 0x200;
+constexpr int kFileKeyOffset = 0x300;
+
+// One step of the recurrence above, with the crypt table at one hash's
+// offset (`table` = cryptTable + kHashAOffset): the state after `ch` is
+// hashed onto `state`. Every walk of the hash in this program goes through
+// here or through the copy in the GPU kernels, so that none of them can
+// drift from the others.
+inline HashState hashStep(HashState state, unsigned char ch, const uint32_t* table) {
+    const uint32_t seed1 = table[ch] ^ (state.first + state.second);
+    const uint32_t seed2 = ch + seed1 + state.second + (state.second << 5) + 3;
+    return {seed1, seed2};
+}
+
+// `state` continued over `text` with the crypt table at `offset`.
+HashState continueHash(HashState state, const std::string& text, int offset, const uint32_t* cryptTable);
+
 // Hash state (seed1, seed2) after feeding `str` through the hashA recurrence
 // (crypt table offset 0x100), starting from the standard initial seeds. Used
 // to precompute a prefix's contribution once, rather than per candidate.
