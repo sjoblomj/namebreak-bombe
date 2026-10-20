@@ -1,6 +1,8 @@
-// Correctness test for where buildSearchRequest (common/config.h) starts a
-// search: start_candidate, which is optional, and resume_from_last_candidate,
-// which may move the start to the last line of the matches file. Pure CPU.
+// Correctness test for what the config file (common/config.h) makes of a
+// search: where buildSearchRequest starts one - start_candidate, which is
+// optional, and resume_from_last_candidate, which may move the start to the
+// last line of the matches file - and the [dictionary] and [junction]
+// sections, every key of them and what they refuse. Pure CPU.
 //
 // Writes matches files under ./config_test/ - ctest runs this from its own
 // directory under build/testrun/.
@@ -387,6 +389,137 @@ static void testEnsureDictionaryConfig() {
     }
 }
 
+// A valid [junction] section: the directory of SETUPDAT\BWUNIN.PIF, from the
+// hash state after it (the same values as tests/data/junction_cli.conf.in).
+static ConfigFile makeJunctionConfig() {
+    ConfigFile config;
+    config.matchesDir = kDir;
+    config.junction = {
+        {"alphabet", "SETUPDA"},           {"suffix", "\\BWUNIN.PIF"},        {"junction_a_seed1", "0x92F62345"},
+        {"junction_a_seed2", "0xB9F61953"}, {"junction_b_seed1", "0xB95115E6"}, {"junction_b_seed2", "0x7609B4F4"},
+        {"hash_a", "0x5BAB63FE"},          {"hash_b", "0x8DF2CB08"},           {"max_length", "8"},
+    };
+    return config;
+}
+
+static bool buildJunction(const ConfigFile& config, JunctionRequest& req, std::string& error) {
+    return buildJunctionRequest(config, req, error);
+}
+
+// What buildJunctionRequest says about `config`: "" if it accepts it.
+static std::string junctionErrorOf(const ConfigFile& config) {
+    JunctionRequest req;
+    std::string error;
+    return buildJunctionRequest(config, req, error) ? "" : error;
+}
+
+static void testJunctionRequest() {
+    printf("--- [junction] ---\n");
+    ConfigFile config = makeJunctionConfig();
+    JunctionRequest req;
+    std::string error;
+    check(buildJunction(config, req, error) && req.alphabet == "SETUPDA" && req.suffix == "\\BWUNIN.PIF" && req.prefix.empty(),
+          "the alphabet, the suffix and no prefix");
+    check(req.junctionA == HashState{0x92F62345, 0xB9F61953} && req.junctionB == HashState{0xB95115E6, 0x7609B4F4},
+          "both junction states");
+    check(req.targetHashA == 0x5BAB63FE && req.targetHashB == 0x8DF2CB08, "both hashes");
+    check(req.minLength == 1 && req.maxLength == 8, "the lengths, the shortest one by default");
+    check(!req.rules.any(), "no pruning rules by default");
+    check(req.outputFilePath == kDir + "/matches.txt" && req.progressFilePath == kDir + "/junction.txt", "the files it writes");
+
+    // The table's length: worked out from the memory it may use, so that the
+    // progress file's fingerprint is of the split the search really uses.
+    check(req.tableLength == junctionTableLengthForBytes(7, 8, (uint64_t) 1 << 30),
+          "no table_length: as long as the default table_memory allows (" + std::to_string(req.tableLength) + " characters)");
+    for (const auto& pair : std::vector<std::pair<std::string, uint64_t>>{
+             {"4096", 4096}, {"64K", 64ull * 1024}, {"512M", 512ull * 1024 * 1024}, {"2G", 2ull * 1024 * 1024 * 1024}}) {
+        config.junction["table_memory"] = pair.first;
+        check(buildJunction(config, req, error) && req.tableBytes == pair.second, "table_memory = " + pair.first);
+    }
+    config.junction["table_memory"] = "1T";
+    check(junctionErrorOf(config).find("table_memory") != std::string::npos, "table_memory with an unknown suffix: an error");
+    config.junction["table_memory"] = "lots";
+    check(junctionErrorOf(config).find("table_memory") != std::string::npos, "table_memory that isn't a number: an error");
+    config.junction.erase("table_memory");
+
+    config.junction["table_length"] = "5";
+    check(buildJunction(config, req, error) && req.tableLength == 5, "table_length given: used as it is");
+    config.junction["table_length"] = "9";
+    check(junctionErrorOf(config).find("max_length") != std::string::npos, "table_length past max_length: an error");
+    config.junction.erase("table_length");
+
+    config.junction["prefix"] = "SETUPDAT\\";
+    check(buildJunction(config, req, error) && req.prefix == "SETUPDAT\\", "a prefix");
+    config.junction.erase("prefix");
+
+    config.junction["min_length"] = "3";
+    config.junction["prune_symbol_runs"] = "true";
+    config.junction["prune_unopened_brackets"] = "true";
+    config.junction["prune_adjacent_backslashes"] = "true";
+    config.junction["max_backslash_count"] = "2";
+    config.junction["min_backslash_count"] = "1";
+    check(buildJunction(config, req, error) && req.minLength == 3 && req.rules.symbolRuns && req.rules.unopenedBrackets &&
+              req.rules.adjacentBackslashes && req.rules.maxBackslashCount == 2 && req.rules.minBackslashCount == 1,
+          "the lengths and every rule");
+    config.junction["prune_symbol_runs"] = "sometimes";
+    check(junctionErrorOf(config).find("prune_symbol_runs") != std::string::npos, "a rule that isn't a boolean: an error");
+    config = makeJunctionConfig();
+
+    config.junction["matches_name"] = "bwunin";
+    check(buildJunction(config, req, error) && req.outputFilePath == kDir + "/matches-bwunin.txt" &&
+              req.progressFilePath == kDir + "/junction-bwunin.txt",
+          "matches_name names both files");
+    config.junction.erase("matches_name");
+
+    for (const char* key : {"alphabet", "suffix", "hash_a", "hash_b", "max_length", "junction_a_seed1", "junction_b_seed2"}) {
+        ConfigFile missing = makeJunctionConfig();
+        missing.junction.erase(key);
+        check(junctionErrorOf(missing).find(std::string("missing required key '") + key + "'") != std::string::npos,
+              std::string("without ") + key + ": an error");
+    }
+    config.junction["junction_a_seed1"] = "not hex";
+    check(junctionErrorOf(config).find("junction_a_seed1") != std::string::npos, "a seed that isn't hex: an error");
+    config = makeJunctionConfig();
+    config.junction["prune_whole_candidate"] = "true";
+    check(junctionErrorOf(config).find("unknown key") != std::string::npos, "a key [junction] doesn't have: an error");
+}
+
+static void testJunctionResume() {
+    printf("--- resume_from_last_candidate in [junction] ---\n");
+    ConfigFile config = makeJunctionConfig();
+    config.junction["matches_name"] = "resume";
+    config.junction["table_length"] = "5";
+    JunctionRequest req;
+    std::string error;
+    buildJunction(config, req, error);
+    const std::string progressPath = req.progressFilePath;
+    std::filesystem::remove(progressPath);
+    const std::string fingerprint = junctionFingerprint(req);
+
+    config.junction["resume_from_last_candidate"] = "true";
+    check(buildJunction(config, req, error) && req.startNumber == 0, "no progress file: from the beginning");
+    writeJunctionProgress(progressPath, {fingerprint, 11}, 400, "?????AT", error);
+    check(buildJunction(config, req, error) && req.startNumber == 11, "a progress file from this search: resumes from its node");
+    config.junction["resume_from_last_candidate"] = "false";
+    check(buildJunction(config, req, error) && req.startNumber == 0, "resume_from_last_candidate = false: from the beginning anyway");
+    config.junction["resume_from_last_candidate"] = "true";
+
+    // The table's length decides where the walk's nodes are cut, so a search
+    // that split the directory elsewhere mustn't be resumed as this one.
+    config.junction["table_length"] = "4";
+    check(junctionErrorOf(config).find("different settings") != std::string::npos,
+          "a progress file from a search with another table length: refuses to resume, saying why");
+    config.junction["table_length"] = "5";
+    config.junction["min_length"] = "2";
+    check(junctionErrorOf(config).find("different settings") != std::string::npos, "... or with other lengths");
+    config.junction.erase("min_length");
+    check(buildJunction(config, req, error) && req.startNumber == 11, "and resumes again once it's the same search");
+
+    writeFile(progressPath, "fingerprint = 0123456789abcdef\n");
+    check(junctionErrorOf(config).find("isn't a junction search's progress file") != std::string::npos, "a broken progress file: an error");
+    std::filesystem::remove(progressPath);
+}
+
 int main() {
     printf("--- without resume_from_last_candidate ---\n");
     writeMatches("REZ\\QQQ.WAV"); // must be ignored
@@ -516,6 +649,8 @@ int main() {
     testDictionaryRequest();
     testDictionaryResume();
     testEnsureDictionaryConfig();
+    testJunctionRequest();
+    testJunctionResume();
 
     std::filesystem::remove_all(kDir);
     if (g_failures) {

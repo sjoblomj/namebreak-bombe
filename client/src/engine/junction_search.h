@@ -30,9 +30,10 @@ struct JunctionRequest {
     // basename.
     std::string prefix;
     std::string suffix;
-    // The hash state after prefix + the directory, for hashA and for hashB
-    // (tools/mitm/junction.c recovers these). Hashing `suffix` onto them
-    // must give the file's two hashes, or the search refuses to start.
+    // The hash state after prefix + the directory, for hashA and for hashB -
+    // recovered from other files of the same directory (see README.md's
+    // "Junction mode"). Hashing `suffix` onto them must give the file's two
+    // hashes, or the search refuses to start.
     HashState junctionA{0, 0};
     HashState junctionB{0, 0};
     uint32_t targetHashA = 0;
@@ -124,8 +125,8 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
 
 // Whether the junction states and the file's hashes agree: hashing the
 // suffix onto the junction must give the hash, for hashA and for hashB. They
-// come from different places (the junction from a recovery like
-// tools/mitm/junction.c, the hashes from the archive), and a junction that
+// come from different places (the junction from the other files of its
+// directory, the hashes from the archive), and a junction that
 // doesn't fit the hashes - the state after the wrong position in the name,
 // say, or the state of another file's directory - would have the search walk
 // the whole space and find nothing, so it's checked before it starts.

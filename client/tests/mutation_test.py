@@ -11,6 +11,15 @@ three checks that guard the search, on its own:
   integration        tests/search_integration_test.cpp
   stress             tests/search_stress_test.cpp
 
+And two for a junction search (engine/junction_search.h):
+tests/junction_search_test.cpp, built with three bits of each of the
+junction state's seeds compared ("junction") and with that plus small
+launches with room for a single hit ("junction-small" - see
+junction_search_test_small in CMakeLists.txt). The self-test there is
+createJunctionBackend's too. A junction mutation is caught by those - or
+some of them - and none of the others. A backend that can't search
+junctions (Metal) doesn't run those two checks at all.
+
 And two more for a dictionary search: tests/dictionary_search_test.cpp,
 built with few of hashA's and the basename hash's bits compared
 ("dictionary") and to make its GPU launches small ("dictionary-small" -
@@ -399,6 +408,123 @@ CUDA_DICT_MUTATIONS = [
              caught_by=DICT_CAUGHT),
 ] + DICT_COMMON_MUTATIONS
 
+# A junction search (engine/junction.h): caught by the junction self-test -
+# which compares what a backend's walk finds with a plain loop over the same
+# tails - and by the junction search test, which compares whole searches
+# with brute force at every split between the table and the walk, built with
+# three bits of each of the junction's two seeds compared ("junction") and
+# with that plus launches with room for a single hit ("junction-small").
+JUNCTION_CAUGHT = ("self-test", "junction", "junction-small")
+
+# The engine's half of it, shared by every backend that searches junctions:
+# the table and the walk (src/engine/junction.cpp).
+JUNCTION_ENGINE = "src/engine/junction.cpp"
+JUNCTION_MUTATIONS = [
+    Mutation("jwalkskip", "a rejected tail skipped together with its siblings, not just its own subtree",
+             [(JUNCTION_ENGINE, "        if (!skip(reached + 1))", "        if (!skip(reached))")],
+             caught_by=JUNCTION_CAUGHT),
+    # The table's filter is indexed by the host and read by the kernels, each
+    # with its own copy of the mixing: this is what holds the two together.
+    Mutation("jfiltermix", "the table's filter indexed with another mixing than a kernel reads it with",
+             [("src/engine/junction.h", "        return (key * 0x9E3779B97F4A7C15ull) >> filterShift_;",
+               "        return ((key + 1) * 0x9E3779B97F4A7C15ull) >> filterShift_;")],
+             caught_by=JUNCTION_CAUGHT),
+    # The directories shorter than the table, which only its build sees - the
+    # self-test doesn't look at them.
+    Mutation("jshortdirs", "a directory of exactly the table's length reported by its build as well as by the walk",
+             [(JUNCTION_ENGINE, "            if ((int) dir.size() < space.tableLength() && (int) dir.size() >= space.minLength()",
+               "            if ((int) dir.size() <= space.tableLength() && (int) dir.size() >= space.minLength()")],
+             caught_by=("junction", "junction-small")),
+]
+
+# The CUDA/HIP junction kernel (junctionKernel).
+CUDA_JUNCTION_MUTATIONS = [
+    Mutation("jstepback", "the hash undone by another multiplier than 33's inverse",
+             [(KERNEL, "    const uint32_t before2 = (seed2 - ord - seed1 - 3) * 0x3E0F83E1u;",
+               "    const uint32_t before2 = (seed2 - ord - seed1 - 3) * 0x3E0F83E3u;")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jrowdigits", "a row's characters rewound in the wrong order",
+             [(KERNEL, "                digit[i] = (uint32_t) (rest % p.alphabetSize);",
+               "                digit[p.tailLength - 2 - i] = (uint32_t) (rest % p.alphabetSize);")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jlastk", "a row's last tail never looked up",
+             [(KERNEL, "            const uint32_t toK = row == p.lastRow ? p.lastRowEndK : p.alphabetSize;",
+               "            const uint32_t toK = row == p.lastRow ? p.lastRowEndK : p.alphabetSize - 1;")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jfirstk", "a batch's first row walked from its own start, not the batch's",
+             [(KERNEL, "            const uint32_t fromK = row == p.firstRow ? p.firstRowStartK : 0;",
+               "            const uint32_t fromK = 0;")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jfilterbit", "the table's filter read at the wrong bit of its word",
+             [(KERNEL, "    if (!((__ldg(&p.filter[bit >> 6]) >> (bit & 63)) & 1))",
+               "    if (!((__ldg(&p.filter[bit >> 6]) >> (bit & 31)) & 1))")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jbinary", "the table's keys searched so that an equal one is passed by",
+             [(KERNEL, "        if (__ldg(&p.keys[mid]) < key)", "        if (__ldg(&p.keys[mid]) <= key)")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jprobed", "the tails looked up never counted",
+             [(KERNEL, "                ++probed;", "")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jentry", "the rules started as if nothing followed the directory",
+             [(KERNEL, "    p.entry = junctionEntry_;", "    p.entry = JunctionPrune();")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jhitindex", "a hit reported as the first tail of its row",
+             [(KERNEL, "                        results.hits[slot] = row * p.alphabetSize + k;",
+               "                        results.hits[slot] = row * p.alphabetSize;")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jregrow", "a launch with more hits than room for them not launched again",
+             [(KERNEL, "        if (counts[1] <= junctionHitCapacity_)\n            break;", "        if (true)\n            break;")],
+             caught_by=("junction-small",)),
+]
+
+# The OpenCL junction kernel (junction.cl) and its host side.
+CL_JUNCTION_KERNEL = "src/backends/opencl/junction.cl"
+OPENCL_JUNCTION_MUTATIONS = [
+    Mutation("jstepback", "the hash undone by another multiplier than 33's inverse",
+             [(CL_JUNCTION_KERNEL, "    const uint before2 = (*seed2 - ord - *seed1 - 3) * 0x3E0F83E1u;",
+               "    const uint before2 = (*seed2 - ord - *seed1 - 3) * 0x3E0F83E3u;")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jrowdigits", "a row's characters rewound in the wrong order",
+             [(CL_JUNCTION_KERNEL, "                digit[i] = (uint) (rest % ALPHABET_SIZE);",
+               "                digit[tailLength - 2 - i] = (uint) (rest % ALPHABET_SIZE);")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jlastk", "a row's last tail never looked up",
+             [(CL_JUNCTION_KERNEL, "            const uint toK = row == lastRow ? lastRowEndK : ALPHABET_SIZE;",
+               "            const uint toK = row == lastRow ? lastRowEndK : ALPHABET_SIZE - 1;")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jfirstk", "a batch's first row walked from its own start, not the batch's",
+             [(CL_JUNCTION_KERNEL, "            const uint fromK = row == firstRow ? firstRowStartK : 0;",
+               "            const uint fromK = 0;")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jfilterbit", "the table's filter read at the wrong bit of its word",
+             [(CL_JUNCTION_KERNEL, "    if (!((filter[bit >> 6] >> (bit & 63)) & 1))", "    if (!((filter[bit >> 6] >> (bit & 31)) & 1))")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jbinary", "the table's keys searched so that an equal one is passed by",
+             [(CL_JUNCTION_KERNEL, "        if (keys[mid] < key)", "        if (keys[mid] <= key)")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jprobed", "the tails looked up never counted",
+             [(CL_JUNCTION_KERNEL, "                ++probed;", "")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jseedmask", "the junction's key made of seed1 alone",
+             [(CL_JUNCTION_KERNEL, "    const ulong key = ((ulong) (seed2 & JUNCTION_SEED_MASK) << 32) | (seed1 & JUNCTION_SEED_MASK);",
+               "    const ulong key = (ulong) (seed1 & JUNCTION_SEED_MASK);")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jregrow", "a launch with more hits than room for them not launched again",
+             [(CL_HOST, "        if (counts[1] <= junctionHitCapacity_)\n            break;", "        if (true)\n            break;")],
+             caught_by=("junction-small",)),
+]
+
+# The CPU backend's junction walk.
+CPU_JUNCTION_MUTATIONS = [
+    Mutation("jcpuonetail", "only the first tail of a work item looked up",
+             [(CPU, "            for (bool more = walk.start(items[i].from, items[i].to); more; more = walk.next()) {",
+               "            for (bool more = walk.start(items[i].from, items[i].to); more; more = false) {")],
+             caught_by=JUNCTION_CAUGHT),
+    Mutation("jcpufilter", "a tail's state looked up in the filter alone, never in the keys",
+             [(CPU, "                if (table.mayHold(key) && table.holds(key))", "                if (table.mayHold(key) && !table.holds(key))")],
+             caught_by=JUNCTION_CAUGHT),
+]
+
 CUDA_MUTATIONS = [
     # The lookup filter's mask.
     Mutation("mask32", "a row's mask cut to 32 bits",
@@ -539,7 +665,7 @@ CUDA_MUTATIONS = [
              edits=[(KERNEL, ">= groups * NAMEBREAK_LIST_MIN_PRUNED_PERCENT);", ">= 0);")]),
     Mutation("neverlisted", "no launch walking its lists", expect="harmless",
              edits=[(KERNEL, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
-] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS + CUDA_DICT_MUTATIONS
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS + CUDA_DICT_MUTATIONS + CUDA_JUNCTION_MUTATIONS + JUNCTION_MUTATIONS
 
 OPENCL_DICT_MUTATIONS = [
     Mutation("dictlastcell", "the last cell of every segment of a pair cut into several skipped",
@@ -763,7 +889,7 @@ OPENCL_MUTATIONS = [
              edits=[(CL_HOST, ">= groups * kListMinPrunedPercent);", ">= 0);")]),
     Mutation("neverlisted", "no launch walking its lists", expect="harmless",
              edits=[(CL_HOST, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
-] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + OPENCL_DICT_MUTATIONS
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + OPENCL_DICT_MUTATIONS + OPENCL_JUNCTION_MUTATIONS + JUNCTION_MUTATIONS
 
 # The Metal ones can only be run on a Mac (--backend metal).
 METAL_MUTATIONS = [
@@ -937,7 +1063,7 @@ CPU_MUTATIONS = [
              [(CPU, "for (uint64_t p = 0; p < std::max<uint32_t>(batch.pairCount, 1); ++p) {",
                "for (uint64_t p = 0; p + 1 < std::max<uint32_t>(batch.pairCount, 1); ++p) {")],
              caught_by=DICT_CAUGHT + ("dictionary",)),
-] + ENGINE_PRUNING_MUTATIONS
+] + ENGINE_PRUNING_MUTATIONS + CPU_JUNCTION_MUTATIONS + JUNCTION_MUTATIONS
 
 # Per backend: how to build it, what its createBackend name is, and its mutations.
 BACKENDS = {
@@ -973,13 +1099,18 @@ int main(int argc, char** argv) {
         printf("self-test FAILED: dictionary search: %s\n", why.c_str());
         return 1;
     }
+    if (backend->supportsJunction() && !selfTestJunctionBackend(*backend, why)) {
+        printf("self-test FAILED: %s\n", why.c_str());
+        return 1;
+    }
     printf("self-test passed\n");
     return 0;
 }
 '''
 
 TARGETS = ["search_integration_test", "search_stress_test", "search_overflow_test", "search_stress_test_small_launch",
-           "dictionary_search_test_dense", "dictionary_search_test_small", "mutation_self_test_runner"]
+           "dictionary_search_test_dense", "dictionary_search_test_small", "junction_search_test_dense", "junction_search_test_small",
+           "mutation_self_test_runner"]
 CHECKS = [
     ("self-test", "mutation_self_test_runner"),
     ("integration", "search_integration_test"),
@@ -988,7 +1119,14 @@ CHECKS = [
     ("stress-small", "search_stress_test_small_launch"),
     ("dictionary", "dictionary_search_test_dense"),
     ("dictionary-small", "dictionary_search_test_small"),
+    ("junction", "junction_search_test_dense"),
+    ("junction-small", "junction_search_test_small"),
 ]
+# The junction checks, and the backends that can run them: a backend that
+# can't search junctions would only skip them (exit 77), which the runner
+# takes for a backend that can't run here at all.
+JUNCTION_CHECKS = ("junction", "junction-small")
+JUNCTION_BACKENDS = ("cuda", "hip", "opencl", "cpu")
 
 
 class ExperimentError(Exception):
@@ -1041,11 +1179,11 @@ def prepare_base(work):
         shutil.copytree(CLIENT / sub, base / sub, ignore=shutil.ignore_patterns("__pycache__"))
     backends = base / "src/backends/backends.cpp"
     text = backends.read_text()
-    head = "bool passesSelfTests(SearchBackend& backend, bool dictionary, std::string& why) {\n"
+    head = "bool passesSelfTests(SearchBackend& backend, Mode mode, std::string& why) {\n"
     if text.count(head) != 1:
-        raise ExperimentError("couldn't find passesSelfTests, which createBackend and createDictionaryBackend run the self-tests with, in "
-                              "src/backends/backends.cpp - update prepare_base() in tests/mutation_test.py")
-    backends.write_text(text.replace(head, head + "    (void) backend, (void) dictionary, (void) why;\n    return true;\n"))
+        raise ExperimentError("couldn't find passesSelfTests, which createBackend, createDictionaryBackend and createJunctionBackend run "
+                              "the self-tests with, in src/backends/backends.cpp - update prepare_base() in tests/mutation_test.py")
+    backends.write_text(text.replace(head, head + "    (void) backend, (void) mode, (void) why;\n    return true;\n"))
     (base / "tests/mutation_self_test_runner.cpp").write_text(SELF_TEST_RUNNER)
     with open(base / "CMakeLists.txt", "a") as cmake:
         cmake.write("\n# Added by tests/mutation_test.py.\n"
@@ -1105,7 +1243,7 @@ def summarize(check, log_text, capture_text, exit_code, timed_out):
         m = re.search(r"(\d+) check\(s\) FAILED", log_text)
         if m:
             return f"{m.group(1)} check(s) failed"
-    elif check.startswith("dictionary"):
+    elif check.startswith("dictionary") or check.startswith("junction"):
         m = re.search(r"ALL (\d+) CHECKS PASSED", log_text)
         if m:
             return f"all {m.group(1)} checks passed"
@@ -1183,6 +1321,12 @@ def main():
     parser.add_argument("--no-ccache", dest="ccache", action="store_false",
                         help="don't run the compilers through ccache (it is used when found, to cache unchanged files across mutations)")
     args = parser.parse_args()
+
+    # A backend that can't search junctions doesn't run those checks: they
+    # would skip (exit 77), which the runner takes for a backend that can't
+    # run on this machine at all.
+    if args.backend not in JUNCTION_BACKENDS:
+        CHECKS[:] = [check for check in CHECKS if check[0] not in JUNCTION_CHECKS]
 
     mutations = BACKENDS[args.backend][1]
     if args.list:

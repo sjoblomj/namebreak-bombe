@@ -488,10 +488,10 @@ static void testFitsHashes() {
     wrongSuffix.suffix = "\\BWUNIN.EXE";
     check(!junctionFitsHashes(wrongSuffix, g_cryptTable, error), "a junction at the wrong place in the name is caught");
 
-    // A known answer: the two hashes of "SETUPDAT\BWUNIN.PIF" worked out
-    // independently (tools/mpq_hash.py) must fit the state after the
-    // directory "SETUPDAT" - the same shape of thing a junction search is
-    // given, with every value in it checked by something other than this
+    // A known answer: the two hashes of "SETUPDAT\BWUNIN.PIF", worked out by
+    // another implementation of the MPQ hash altogether, must fit the state
+    // after the directory "SETUPDAT" - the same shape of thing a junction
+    // search is given, with the hashes in it from something other than this
     // code.
     JunctionRequest known;
     known.suffix = "\\BWUNIN.PIF";
@@ -500,7 +500,7 @@ static void testFitsHashes() {
     known.targetHashA = 0x5BAB63FE;
     known.targetHashB = 0x8DF2CB08;
     check(junctionFitsHashes(known, g_cryptTable, error),
-          "the state after 'SETUPDAT' fits the hashes mpq_hash.py gives for 'SETUPDAT\\BWUNIN.PIF'");
+          "the state after 'SETUPDAT' fits the known hashes of 'SETUPDAT\\BWUNIN.PIF'");
 }
 
 // --- The fingerprint and the progress file -----------------------------------

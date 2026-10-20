@@ -192,8 +192,8 @@ static Run run(SearchBackend& backend, JunctionRequest req, int tableLength, std
 }
 
 // A request for a file whose directory is `dir`: the junction states and the
-// two hashes worked out here, from scratch, as a recovery like
-// tools/mitm/junction.c would give them.
+// two hashes worked out here, from scratch, as a recovery from the other
+// files of that directory would give them.
 static JunctionRequest requestFor(const std::string& alphabet, const std::string& prefix, const std::string& dir,
                                   const std::string& suffix, int minLength, int maxLength) {
     JunctionRequest req;
@@ -409,7 +409,8 @@ static void testRanges(SearchBackend& backend) {
 static void testFindsItAndWritesIt(SearchBackend& backend) {
     printf("--- the file, and the files ---\n");
     // A real directory of eight characters, with the hashes of the name it
-    // makes worked out independently (tools/mpq_hash.py). Only the seven
+    // makes worked out by another implementation of the MPQ hash
+    // altogether, not by anything here. Only the seven
     // characters it is made of are searched, so the whole thing is small -
     // but it is a real recovery: five characters in the table, three rewound
     // from the junction.
