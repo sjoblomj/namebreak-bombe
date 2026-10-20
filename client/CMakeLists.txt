@@ -185,6 +185,7 @@ if(WITH_OPENCL)
     list(APPEND SEARCH_SOURCES src/backends/opencl/opencl_backend.cpp)
     embed_kernel(src/backends/opencl/search.cl backends/opencl/search_kernel.h kSearchKernelSource)
     embed_kernel(src/backends/opencl/dictionary.cl backends/opencl/dictionary_kernel.h kDictionaryKernelSource)
+    embed_kernel(src/backends/opencl/junction.cl backends/opencl/junction_kernel.h kJunctionKernelSource)
 endif()
 
 # embed_word_list(<word list file> <header to generate, under generated/> <C++ name>)
@@ -386,10 +387,21 @@ namebreak_test(dictionary_batch_test dictionary_batch_test)
 # compared (NAMEBREAK_JUNCTION_MATCH_BITS), so that about one directory in 64
 # matches the junction by chance and the lists of them really get
 # compared; and with that and only a few tails handed to the backend per call
-# (NAMEBREAK_JUNCTION_TAILS_PER_CALL), on several threads, so that a tail
-# length is split across many calls and the walk is restarted part way
-# through over and over.
-set(JUNCTION_BACKENDS cpu reference)
+# (NAMEBREAK_JUNCTION_TAILS_PER_CALL), on several threads and in GPU
+# launches with room for a single hit (NAMEBREAK_JUNCTION_HIT_CAPACITY), so
+# that a tail length is split across many calls, the walk is restarted part
+# way through over and over, and a launch's hits overflow all the time and
+# have to be found again with room for them.
+# Every backend that can search junctions: the CUDA-dialect one, OpenCL, and
+# the two CPU ones (Metal doesn't implement this mode yet).
+set(JUNCTION_BACKENDS "")
+if(NOT NAMEBREAK_GPU STREQUAL "none")
+    list(APPEND JUNCTION_BACKENDS ${NAMEBREAK_GPU})
+endif()
+if(WITH_OPENCL)
+    list(APPEND JUNCTION_BACKENDS opencl)
+endif()
+list(APPEND JUNCTION_BACKENDS cpu reference)
 namebreak_test_executable(junction_search_test tests/junction_search_test.cpp namebreak_search)
 foreach(backend IN LISTS JUNCTION_BACKENDS)
     namebreak_test(junction-search-${backend} junction_search_test --backend ${backend})
@@ -398,7 +410,8 @@ if(NAMEBREAK_TEST_VARIANTS)
     namebreak_search_library(namebreak_search_junction_dense NAMEBREAK_JUNCTION_MATCH_BITS=3)
     namebreak_test_executable(junction_search_test_dense tests/junction_search_test.cpp namebreak_search_junction_dense)
     namebreak_search_library(namebreak_search_junction_small NAMEBREAK_JUNCTION_MATCH_BITS=3
-                             NAMEBREAK_JUNCTION_TAILS_PER_CALL=7 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=4)
+                             NAMEBREAK_JUNCTION_TAILS_PER_CALL=7 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=4
+                             NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH=7 NAMEBREAK_JUNCTION_HIT_CAPACITY=1)
     namebreak_test_executable(junction_search_test_small tests/junction_search_test.cpp namebreak_search_junction_small)
     foreach(backend IN LISTS JUNCTION_BACKENDS)
         namebreak_test(junction-search-${backend}-dense junction_search_test_dense --backend ${backend})
@@ -501,8 +514,10 @@ junction_cli_test(junction-cli-bad-config junction 0x92F62345 "" "missing requir
 junction_cli_test(junction-cli-bad-junction junction 0x92F62344 "max_length = 8"
                   "the junction state for hashA .* doesn't fit the file")
 
-# Where buildSearchRequest (src/common/config.h) starts a search -
-# start_candidate and resume_from_last_candidate. CPU only.
+# What the config file (src/common/config.h) makes of a search: where
+# buildSearchRequest starts one (start_candidate and
+# resume_from_last_candidate), and the [dictionary] and [junction] sections,
+# every key of them and what they refuse. CPU only.
 namebreak_test_executable(config_test tests/config_test.cpp namebreak_common)
 namebreak_test(config_test config_test)
 

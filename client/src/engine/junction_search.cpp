@@ -369,14 +369,19 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
     // in its range, so that a resumed search, or one range of several,
     // doesn't report them all over again.
     bool stop = false;
-    for (const std::string& dir : start == 0 ? shortMatches : std::vector<std::string>()) {
-        if (!checkDir(dir)) {
-            stop = true;
-            break;
+    if (start == 0) {
+        for (const std::string& dir : shortMatches) {
+            if (!checkDir(dir)) {
+                stop = true;
+                break;
+            }
         }
     }
 
-    backend.beginJunctionSearch(constants);
+    // Nothing to walk if one of those was the file: a backend would upload
+    // the whole table for a search that's already over.
+    if (!stop)
+        backend.beginJunctionSearch(constants);
     const uint64_t perCall = std::max<uint64_t>(1, std::min<uint64_t>(backend.junctionTailsPerCall(), NAMEBREAK_JUNCTION_TAILS_PER_CALL));
     uint64_t number = start;
     while (!stop && number < end) {
@@ -430,7 +435,8 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
         if (now - lastStatus >= req.statusInterval)
             printStatus();
     }
-    backend.endJunctionSearch();
+    if (!stop)
+        backend.endJunctionSearch();
 
     if (!result.found && !result.aborted) {
         result.nextNumber = end;

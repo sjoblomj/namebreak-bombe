@@ -15,8 +15,8 @@
 // directory, where the suffix begins, is already known for hashA and for
 // hashB. That state is the junction, and it's what the search looks for: the
 // directory is whatever string takes the hash from the prefix's state to it.
-// (tools/mitm/junction.c recovers a junction from two files of the same
-// directory whose names are known; see README.md's "Junction mode".)
+// (A junction is recovered from two files of the same unknown directory
+// whose basenames are known - see README.md's "Junction mode".)
 //
 // Knowing the state at both ends is what makes the mode worth having,
 // because every step of the hash
@@ -253,6 +253,10 @@ public:
     const uint64_t* filter() const { return filter_.data(); }
     uint64_t filterWords() const { return filter_.size(); }
     uint64_t filterBits() const { return filterBits_; }
+    // How far down filterBit shifts a key's mixed bits: 64 - log2(filterBits).
+    // A backend that probes the filter itself does the mixing in its kernel,
+    // but takes the shift from here rather than working it out again.
+    int filterShift() const { return filterShift_; }
     // The bit of the filter `key` is kept in. The same mixing a backend's
     // own copy of the filter must use.
     uint64_t filterBit(uint64_t key) const {

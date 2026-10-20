@@ -17,6 +17,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "backends/common/junction_launch.h"
 #include "backends/common/launch_waiter.h"
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
@@ -949,6 +950,206 @@ dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batches, uint32_t bat
 
 namespace {
 
+// --- Junction searches -------------------------------------------------------
+//
+// The backward half of a junction search (engine/junction.h): every tail of
+// a batch rewound from the junction, and the state it reaches looked up in
+// the table the engine built of the forward half. The table is the one thing
+// here that doesn't fit in a kernel argument - up to a gigabyte and more of
+// keys, uploaded once per search by beginJunctionSearch.
+//
+// One thread takes one *row*: the alphabetSize tails that share every
+// character but the one rewound last - the first character of the tail,
+// which is the directory's own. Everything before it, and the pruning rules
+// over it, is then done once for the whole row, and a tail costs one step of
+// the hash undone and one lookup. (A row here is the mirror of the search
+// kernel's, whose rows share everything but the candidate's *last*
+// character: the walk rewinds a tail's last character first, so it's that
+// one the most tails have in common.)
+
+// What the pruning rules make of one character - as much of them as a tail
+// can be judged by (see tailPruneStep, engine/junction.h).
+constexpr uint32_t kJunctionSymbol = 1;    // neither alphanumeric nor a space
+constexpr uint32_t kJunctionBackslash = 2;
+
+// The alphabet, as the junction kernel needs each character: its hashA
+// crypt-table key, its own value, and those flags. In constant memory, as
+// the search kernel's d_alphabetKey/d_alphabetOrd are - every lane of a warp
+// usually reads the same entry (the rows of a warp differ in their high
+// digits, and their k loops run in step), which the constant cache serves
+// without serializing.
+struct JunctionChar {
+    uint32_t key;
+    uint32_t ord;
+    uint32_t flags;
+};
+__device__ __constant__ JunctionChar d_junctionChars[MAX_ALPHABET_SIZE];
+
+// The rules themselves - PruneRules, less the two only a whole directory
+// settles - and the state of them over the characters rewound so far
+// (TailPruneState).
+struct JunctionRules {
+    int symbolRuns;
+    int adjacentBackslashes;
+    int maxBackslashCount;
+    int any;
+};
+struct JunctionPrune {
+    int symbolRun;
+    int backslashes;
+    int nextIsBackslash;
+};
+
+// Steps `state` over a character, to the left of the ones so far; false if it
+// breaks one of `rules`. Must agree with tailPruneStep (engine/junction.cpp)
+// exactly, or the GPU would search other tails than the CPU.
+__device__ __forceinline__ bool junctionPruneStep(const JunctionRules& rules, JunctionPrune& state, uint32_t flags) {
+    if (flags & kJunctionSymbol) {
+        if (++state.symbolRun >= 3 && rules.symbolRuns)
+            return false;
+        state.symbolRun = state.symbolRun < 2 ? state.symbolRun : 2;
+    } else {
+        state.symbolRun = 0;
+    }
+    if (flags & kJunctionBackslash) {
+        if (state.nextIsBackslash && rules.adjacentBackslashes)
+            return false;
+        if (++state.backslashes > rules.maxBackslashCount && rules.maxBackslashCount != 0)
+            return false;
+    }
+    state.nextIsBackslash = (flags & kJunctionBackslash) != 0;
+    return true;
+}
+
+// One step of the hash undone: the state the character `ord`, whose crypt
+// table key is `key`, was hashed onto. Must match hashStepBack
+// (engine/junction.h) exactly - 0x3E0F83E1 is 33's inverse modulo 2^32.
+__device__ __forceinline__ void mpqStepBack(uint32_t& seed1, uint32_t& seed2, uint32_t key, uint32_t ord) {
+    const uint32_t before2 = (seed2 - ord - seed1 - 3) * 0x3E0F83E1u;
+    seed1 = (seed1 ^ key) - before2;
+    seed2 = before2;
+}
+
+// What a junction launch reports: how many tails it looked up in the table
+// (the rules skipped the rest) and how many of them the table held - every
+// one of them, past `capacity` too - and the first `capacity` hits, as the
+// tails' indices. A launch with more hits than it had room for is launched
+// again with room for them all (see runJunctionBatch), as a dictionary
+// launch is.
+struct JunctionResults {
+    unsigned int* counts; // counts[0]: tails looked up, counts[1]: hits
+    uint64_t* hits;
+    uint32_t capacity;
+};
+
+// Everything else one launch needs - a kernel argument, so passed by value.
+struct JunctionLaunch {
+    const uint64_t* keys; // the table's, sorted
+    const uint64_t* filter;
+    uint64_t keyCount;
+    uint64_t firstRow;
+    uint64_t lastRow;
+    uint32_t junctionSeed1;
+    uint32_t junctionSeed2;
+    uint32_t alphabetSize;
+    uint32_t firstRowStartK; // the batch starts mid-row at its first row, ends mid-row at its last
+    uint32_t lastRowEndK;
+    int filterShift;
+    int tailLength;
+    JunctionRules rules;
+    JunctionPrune entry; // the rules' state to the directory's right (tailPruneStart)
+};
+
+// Whether the table holds `key`: the filter first - all but about one lookup
+// in JunctionTable::kFilterBitsPerKey stops there, without touching the keys
+// - and then a binary search of the keys themselves.
+__device__ __forceinline__ bool junctionTableHolds(const JunctionLaunch& p, uint64_t key) {
+    const uint64_t bit = (key * 0x9E3779B97F4A7C15ull) >> p.filterShift;
+    if (!((__ldg(&p.filter[bit >> 6]) >> (bit & 63)) & 1))
+        return false;
+    uint64_t lo = 0, hi = p.keyCount;
+    while (lo < hi) {
+        const uint64_t mid = lo + (hi - lo) / 2;
+        if (__ldg(&p.keys[mid]) < key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < p.keyCount && __ldg(&p.keys[lo]) == key;
+}
+
+__global__ void junctionKernel(JunctionLaunch p, JunctionResults results) {
+    // The launch's tails looked up, counted per block and added to the
+    // global count once - an atomic per tail would cost more than the
+    // lookups do.
+    __shared__ unsigned int sProbed;
+    if (threadIdx.x == 0)
+        sProbed = 0;
+    __syncthreads();
+
+    const uint64_t row = p.firstRow + (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int probed = 0;
+    if (row <= p.lastRow) {
+        uint32_t seed1 = p.junctionSeed1, seed2 = p.junctionSeed2;
+        JunctionPrune prune = p.entry;
+        bool pruned = false;
+        // The characters rewound before the row's own: the row's digits, most
+        // significant first - the directory's last character first (see
+        // JunctionSpace for the numbering).
+        if (p.tailLength > 1) {
+            uint32_t digit[MAX_CANDIDATE_LEN];
+            uint64_t rest = row;
+            for (int i = p.tailLength - 2; i >= 0; --i) {
+                digit[i] = (uint32_t) (rest % p.alphabetSize);
+                rest /= p.alphabetSize;
+            }
+            for (int i = 0; i < p.tailLength - 1; ++i) {
+                const JunctionChar c = d_junctionChars[digit[i]];
+                if (p.rules.any && !junctionPruneStep(p.rules, prune, c.flags)) {
+                    // Every tail of the row breaks the rules, and so does
+                    // every row whose digits start like this one's - the
+                    // engine's own walk skips them all at once; here they
+                    // are threads that have nothing to do.
+                    pruned = true;
+                    break;
+                }
+                mpqStepBack(seed1, seed2, c.key, c.ord);
+            }
+        }
+        if (!pruned && p.tailLength == 0) {
+            // The one tail of no characters: the junction itself, which is
+            // where a directory of exactly the table's length ends.
+            probed = 1;
+            if (junctionTableHolds(p, junctionKey(seed1, seed2))) {
+                const unsigned int slot = atomicAdd(&results.counts[1], 1u);
+                if (slot < results.capacity)
+                    results.hits[slot] = 0;
+            }
+        } else if (!pruned) {
+            const uint32_t fromK = row == p.firstRow ? p.firstRowStartK : 0;
+            const uint32_t toK = row == p.lastRow ? p.lastRowEndK : p.alphabetSize;
+            for (uint32_t k = fromK; k < toK; ++k) {
+                const JunctionChar c = d_junctionChars[k];
+                JunctionPrune last = prune;
+                if (p.rules.any && !junctionPruneStep(p.rules, last, c.flags))
+                    continue;
+                uint32_t s1 = seed1, s2 = seed2;
+                mpqStepBack(s1, s2, c.key, c.ord);
+                ++probed;
+                if (junctionTableHolds(p, junctionKey(s1, s2))) {
+                    const unsigned int slot = atomicAdd(&results.counts[1], 1u);
+                    if (slot < results.capacity)
+                        results.hits[slot] = row * p.alphabetSize + k;
+                }
+            }
+        }
+    }
+    atomicAdd(&sProbed, probed);
+    __syncthreads();
+    if (threadIdx.x == 0 && sProbed != 0)
+        atomicAdd(&results.counts[0], sProbed);
+}
+
 class CudaBackend : public SearchBackend {
 public:
     // Not CUDA_CHECK'd, and its result deliberately ignored: this can run as
@@ -971,6 +1172,9 @@ public:
             if (hits)
                 (void) cudaFree(hits);
         }
+        freeJunctionBuffers();
+        if (pinnedJunctionCounts_)
+            (void) cudaFreeHost(pinnedJunctionCounts_);
     }
 
 #ifdef NAMEBREAK_HIP
@@ -1000,6 +1204,14 @@ public:
     void beginDictionarySearch(const DictionaryConstants& constants) override;
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
     void endDictionarySearch() override;
+
+    // A junction search: one launch of junctionKernel per call, over about
+    // NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH tails (tuning.h).
+    bool supportsJunction() const override { return true; }
+    uint64_t junctionTailsPerCall() const override { return NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH; }
+    void beginJunctionSearch(const JunctionConstants& constants) override;
+    JunctionOutcome runJunctionBatch(const JunctionBatch& batch) override;
+    void endJunctionSearch() override;
 
 private:
     int alphabetSize_ = 0;
@@ -1072,6 +1284,23 @@ private:
     DictionaryHit* dictionaryHashAHits_ = nullptr;
     DictionaryHit* dictionaryBasenameHits_ = nullptr;
     uint32_t dictionaryHitCapacity_ = 0;
+
+    // A junction search's: the engine's table, copied to the GPU by
+    // beginJunctionSearch and freed by endJunctionSearch, and what the kernel
+    // is launched with. The counts are read back behind the kernel into
+    // pinned host memory, as a dictionary launch's are.
+    void freeJunctionBuffers();
+    JunctionConstants junction_ = {};
+    uint64_t* junctionKeys_ = nullptr;
+    uint64_t* junctionFilter_ = nullptr;
+    uint64_t junctionKeyCount_ = 0;
+    int junctionFilterShift_ = 64;
+    JunctionRules junctionRules_ = {};
+    JunctionPrune junctionEntry_ = {};
+    unsigned int* junctionCounts_ = nullptr;
+    unsigned int* pinnedJunctionCounts_ = nullptr;
+    uint64_t* junctionHits_ = nullptr;
+    uint32_t junctionHitCapacity_ = 0;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -1450,6 +1679,152 @@ void CudaBackend::freeDictionaryBuffers() {
 void CudaBackend::endDictionarySearch() {
     CUDA_CHECK(cudaDeviceSynchronize());
     freeDictionaryBuffers();
+}
+
+void CudaBackend::beginJunctionSearch(const JunctionConstants& constants) {
+    junction_ = constants;
+    const JunctionTable& table = *constants.table;
+
+    // The alphabet, as the kernel reads it.
+    JunctionChar chars[MAX_ALPHABET_SIZE] = {};
+    for (size_t k = 0; k < constants.alphabet.size(); ++k) {
+        const unsigned char ch = (unsigned char) constants.alphabet[k];
+        chars[k].key = constants.cryptTable[kHashAOffset + ch];
+        chars[k].ord = ch;
+        chars[k].flags = (isRunSymbol_CPU((char) ch) ? kJunctionSymbol : 0) | (ch == '\\' ? kJunctionBackslash : 0);
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(d_junctionChars, chars, sizeof chars));
+    junctionRules_.symbolRuns = constants.rules.symbolRuns;
+    junctionRules_.adjacentBackslashes = constants.rules.adjacentBackslashes;
+    junctionRules_.maxBackslashCount = constants.rules.maxBackslashCount;
+    junctionRules_.any = constants.rules.any();
+    junctionEntry_.symbolRun = constants.tailEntry.symbolRun;
+    junctionEntry_.backslashes = constants.tailEntry.backslashes;
+    junctionEntry_.nextIsBackslash = constants.tailEntry.nextIsBackslash;
+
+    // The table: the one thing a junction search has that a kernel argument
+    // can't carry, and the one thing that can be too big for the GPU - the
+    // engine sizes it to the memory it was given, which is the machine's,
+    // not this device's.
+    junctionKeyCount_ = table.size();
+    junctionFilterShift_ = table.filterShift();
+    const size_t keyBytes = std::max<size_t>(1, table.size() * sizeof(uint64_t));
+    const size_t filterBytes = std::max<size_t>(1, (size_t) table.filterWords() * sizeof(uint64_t));
+    if (cudaMalloc(&junctionKeys_, keyBytes) != cudaSuccess || cudaMalloc(&junctionFilter_, filterBytes) != cudaSuccess) {
+        size_t freeBytes = 0, totalBytes = 0;
+        (void) cudaGetLastError();
+        (void) cudaMemGetInfo(&freeBytes, &totalBytes);
+        fprintf(stderr,
+                "The junction search's table needs %zu MB on the GPU, and this one has %zu MB free of %zu MB.\n"
+                "Give the table less memory (config.conf's table_memory, a character shorter is %u times smaller),\n"
+                "or search on the cpu backend (--backend cpu), which uses the machine's own memory.\n",
+                (keyBytes + filterBytes) / (1024 * 1024), freeBytes / (1024 * 1024), totalBytes / (1024 * 1024),
+                (unsigned) constants.alphabet.size());
+        exit(1);
+    }
+    CUDA_CHECK(cudaMemcpy(junctionKeys_, table.keys(), table.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(junctionFilter_, table.filter(), (size_t) table.filterWords() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+    if (!junctionCounts_) {
+        CUDA_CHECK(cudaMalloc(&junctionCounts_, 2 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMallocHost((void**) &pinnedJunctionCounts_, 2 * sizeof(unsigned int)));
+    }
+    CUDA_CHECK(cudaMemset(junctionCounts_, 0, 2 * sizeof(unsigned int)));
+    if (!junctionHits_) {
+        junctionHitCapacity_ = NAMEBREAK_JUNCTION_HIT_CAPACITY;
+        CUDA_CHECK(cudaMalloc(&junctionHits_, junctionHitCapacity_ * sizeof(uint64_t)));
+    }
+    waiter_.beginSearch();
+}
+
+void CudaBackend::freeJunctionBuffers() {
+    for (uint64_t** buffer : {&junctionKeys_, &junctionFilter_}) {
+        if (*buffer) {
+            (void) cudaFree(*buffer);
+            *buffer = nullptr;
+        }
+    }
+}
+
+void CudaBackend::endJunctionSearch() {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    freeJunctionBuffers();
+}
+
+JunctionOutcome CudaBackend::runJunctionBatch(const JunctionBatch& batch) {
+    JunctionOutcome outcome;
+    if (batch.count == 0)
+        return outcome;
+    const uint64_t alphabetSize = junction_.alphabet.size();
+
+    JunctionLaunch p = {};
+    p.keys = junctionKeys_;
+    p.filter = junctionFilter_;
+    p.keyCount = junctionKeyCount_;
+    p.junctionSeed1 = junction_.junction.first;
+    p.junctionSeed2 = junction_.junction.second;
+    p.alphabetSize = (uint32_t) alphabetSize;
+    p.filterShift = junctionFilterShift_;
+    p.tailLength = batch.tailLength;
+    p.rules = junctionRules_;
+    p.entry = junctionEntry_;
+    const JunctionRows rows = junctionRowsOf(batch, alphabetSize);
+    p.firstRow = rows.firstRow;
+    p.lastRow = rows.lastRow;
+    p.firstRowStartK = rows.firstRowStartK;
+    p.lastRowEndK = rows.lastRowEndK;
+    const uint64_t blocks = (rows.rowCount() + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    if (blocks > UINT32_MAX || batch.count > UINT32_MAX) {
+        // runJunctionSearch's calls are far smaller (junctionTailsPerCall).
+        fprintf(stderr, "INTERNAL ERROR: a junction launch of %llu tails, %llu blocks - exiting\n", (unsigned long long) batch.count,
+                (unsigned long long) blocks);
+        exit(1);
+    }
+
+    // Launched again, with room for every hit, as long as it had more than it
+    // had room for - which a real search, comparing the junction's whole
+    // 64-bit state, practically never does.
+    unsigned int counts[2];
+    for (;;) {
+        const JunctionResults results{junctionCounts_, junctionHits_, junctionHitCapacity_};
+        const auto launched = std::chrono::steady_clock::now();
+        junctionKernel<<<(unsigned) blocks, kThreadsPerBlock>>>(p, results);
+        CUDA_CHECK(cudaGetLastError());
+        // The counts' copy is queued right behind the kernel, as a
+        // dictionary launch's are (see launchDictionary).
+        CUDA_CHECK(cudaMemcpyAsync(pinnedJunctionCounts_, junctionCounts_, 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, 0));
+        waiter_.wait(batch.count, launched, [] { CUDA_CHECK(cudaDeviceSynchronize()); });
+        counts[0] = pinnedJunctionCounts_[0];
+        counts[1] = pinnedJunctionCounts_[1];
+        if (counts[0] > batch.count || counts[1] > batch.count) {
+            fprintf(stderr, "INTERNAL ERROR: a junction launch of %llu tails looked up %u of them and found %u - exiting\n",
+                    (unsigned long long) batch.count, counts[0], counts[1]);
+            exit(1);
+        }
+        if (counts[1] <= junctionHitCapacity_)
+            break;
+        CUDA_CHECK(cudaFree(junctionHits_));
+        junctionHitCapacity_ = std::max(counts[1], 2 * junctionHitCapacity_);
+        CUDA_CHECK(cudaMalloc(&junctionHits_, junctionHitCapacity_ * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(junctionCounts_, 0, 2 * sizeof(unsigned int)));
+    }
+
+    outcome.probed = counts[0];
+    if (counts[1] > 0) {
+        std::vector<uint64_t> hits(counts[1]);
+        CUDA_CHECK(cudaMemcpy(hits.data(), junctionHits_, counts[1] * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        for (uint64_t index : hits) {
+            if (index < batch.start || index >= batch.start + batch.count) {
+                fprintf(stderr, "INTERNAL ERROR: the junction kernel reported the tail at %llu, which its batch doesn't have - exiting\n",
+                        (unsigned long long) index);
+                exit(1);
+            }
+            outcome.hits.push_back({batch.tailLength, index});
+        }
+    }
+    if (counts[0] != 0 || counts[1] != 0)
+        CUDA_CHECK(cudaMemsetAsync(junctionCounts_, 0, 2 * sizeof(unsigned int), 0));
+    return outcome;
 }
 
 void CudaBackend::launchDictionary(uint32_t batchCount, uint64_t segments) {

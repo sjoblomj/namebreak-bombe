@@ -804,6 +804,60 @@ afternoon).
   (32 words per thread, 256 threads to a work-group); Metal's kernel has
   only run emulated on the CPU.
 
+## Junction searches
+
+A junction search (README.md's [Junction mode](README.md#junction-mode))
+splits the unknown directory between a table of its first characters, built
+on the CPU, and a backward walk of its last, which is what a backend runs:
+one work-item takes a *row* - the tails that share every character but the
+one rewound last - and each of the row's tails then costs one step of the
+hash undone, one bit of the table's filter, and, for the few that get past
+it, a binary search of the table's keys.
+
+Measured on the RTX 3080 Ti Laptop and i9-12900H: 43 characters, 6.47
+billion tails (a directory of 10 or 11 characters, with nothing to find, so
+that nothing stops part way).
+
+| Table | Memory | CUDA | OpenCL | `cpu` |
+|---|---|---|---|---|
+| 4 characters | 31 MB | 2,197 M tails/s | 2,373 M | 66 M |
+| 5 characters | 1.4 GB | 1,134 M | 1,216 M | *(not measured)* |
+
+The lookups are the whole cost: a table of gigabytes halves the rate, since
+every tail's filter bit, and every binary search behind it, misses every
+cache (*estimated*: about 2.9 random reads a tail - one filter bit, and the
+7% that get past it walking ~27 keys). It is still a bargain, which is why
+nothing below is urgent: the character that doubled the lookups' cost
+divided the tails by 43.
+
+- [ ] **The keys as a hash table, not a sorted array.** A lookup that gets
+  past the filter walks about 27 dependent reads of the sorted keys; an
+  open-addressed table of the same keys would be one or two. **Estimated**
+  up to 2x on a table of gigabytes, where those walks are about two thirds
+  of the random reads. But at a 50% load factor it doubles the keys'
+  memory, which is most of a character of reach - so it would have to be a
+  choice, not a replacement.
+- [ ] **A bucketed index over the sorted keys instead.** An array of 2^20
+  offsets, one per 20 bits of the key, is 4 MB (cache-resident) and lands
+  within about 140 keys of the answer, for a short scan rather than a walk
+  of the whole array - the same win without the memory. **Estimated** most
+  of the above, and it keeps the keys as they are, which the engine's own
+  `holds` and the GPU upload share.
+- [ ] **Build the table on the GPU.** 13 s of the 19 s an 11-character
+  search takes is the CPU hashing and sorting the table's 145.7 million
+  directories (**measured**); the walk itself is 5 s. Hashing them on the
+  GPU - the same backward-walk shape, forwards - and sorting them there
+  would cut most of it, and matters more the bigger the table gets.
+- [ ] **A wider row.** A row is one character wide, so a thread extracts the
+  row's digits (a division a character) for every 43 tails. Two characters
+  would amortize that over 1,849 - **estimated** small, since the digit
+  work is already a fraction of a tail's cost, and it would cost registers
+  for the second character's state.
+- [ ] **Metal.** There's no junction kernel for it yet, so the Metal backend
+  says it can't search junctions and isn't picked for one. The kernel is
+  the smallest of the three (one `mpqStepBack`, a filter bit, a binary
+  search); what it needs is a Mac to test on.
+
 ## Tooling
 
 - [x] **`search_bench`** counted pruned candidates as searched and pruned

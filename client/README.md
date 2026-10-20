@@ -380,8 +380,8 @@ basenames are in the scripts themselves - then every one of them is
 `<the same unknown directory>` + `\` + `<a known basename>`. Two of those
 are enough to pin down the state after the directory, by trying all 2^32
 values of `seed2` against the first name and checking each survivor against
-the second: that's what [`tools/mitm/junction.c`](../tools/mitm/junction.c)
-does, and it prints exactly the four numbers this mode wants.
+the second. The four numbers that comes to - `seed1` and `seed2` after the
+directory, for Hash A and for Hash B - are what this mode is given.
 
 ### Both ends at once
 
@@ -434,14 +434,50 @@ in it is used; `table_length` sets it outright instead. A character more
 costs as many times more memory as the alphabet has characters, so in
 practice the table is 4 or 5 characters long and the walk does the rest.
 
-Only the CPU searches junctions so far - it manages tens of millions of
-tails a second on every core, which is enough for the table lengths above.
-The GPU backends don't implement this mode yet (`--backend cuda` says so).
+Every backend but Metal searches junctions: the CUDA/HIP one, OpenCL, `cpu`
+and `reference`. On the RTX 3080 Ti Laptop, both GPU backends rewind about
+2.2 billion tails a second with the 31 MB table (CUDA 2.20, OpenCL 2.37) and
+about half that with the 1.4 GB one (1.13 and 1.22), whose lookups miss every
+cache; the `cpu` backend does about 66 million. Halving the lookups' speed
+to hold one character more is a bargain: that character divides the tails by
+43.
+
+So an 11-character directory takes a 5-character table (13 s to build on the
+CPU, 1.4 GB) and 6.5 billion tails (5 s on the GPU): under twenty seconds in
+all, where the 43^11 = 9.3 * 10^17 names of that space are about a week of
+the same GPU's time to search through. One character further on, where a
+plain search is a year, a junction search is four minutes.
+
+The table lives in the device's own memory, so it has to fit there. A search
+whose table is bigger than the GPU has says so and stops, rather than
+crawling through host memory - give it less (`table_memory`), or run it on
+`--backend cpu`, which uses the machine's own.
+
+### On the GPU
+
+One work-item takes one *row*: the tails that share every character but the
+one rewound last - one per character of the alphabet - which is the first
+character of the tail. The rest of the rewinding, and the pruning rules over
+it, are then done once for the whole row - the mirror of the search kernel's
+rows, which share everything but the candidate's *last* character, because
+the walk rewinds a tail's last character first and that one the most tails
+have in common.
+
+Each of the row's tails then costs one step of the hash undone, one bit of
+the table's filter, and - for about one in eight - a binary search of its
+keys. A launch covers about 67 million tails
+(`NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH`), reports how many it looked up and
+the tails it found, and is launched again with more room if it found more
+than it had room for - as a dictionary launch is. The kernels are
+`junctionKernel` in `src/backends/cuda/cuda_backend.cu` and
+`src/backends/opencl/junction.cl`; `src/backends/common/junction_launch.h`
+is what the two share. Metal has no junction kernel yet, so the Metal
+backend says it can't search junctions and isn't picked for one.
 
 ### An example
 
 The directory of Brood War's `SETUPDAT\BWUNIN.PIF`, had it not been known,
-from the junction `tools/mitm/junction.c` recovers for it:
+from the junction a recovery like that gives for it:
 
 ```ini
 mode = junction
@@ -462,9 +498,10 @@ prune_adjacent_backslashes = true
 matches_name = bwunin
 ```
 
-That finds `SETUPDAT\BWUNIN.PIF` in about half a second on a laptop CPU: a
-4-character table (31 MB) and 3.5 million tails, where the 43^8 = 11.7
-trillion candidates of a plain 8-character search would take a GPU hours.
+That finds `SETUPDAT\BWUNIN.PIF` in about half a second, on the CPU or on
+the GPU: a 4-character table (31 MB) and 3.5 million tails, where a plain
+8-character search of the same alphabet is 43^8 = 11.7 trillion candidates,
+about eight seconds of this GPU's own time.
 
 `[junction]` keys:
 
@@ -612,7 +649,16 @@ matching the key by chance, with tails, and with few candidates and
 batches per call, stopped and resumed part way, the GPU kernels' thread
 blocks a few words each and three tails to a cell, room for a single hit
 and a one-bit suffix filter, and cut into ranges of numbers as a
-coordinator hands them out) and
+coordinator hands them out). Junction mode has `junction_test` (the hash run
+backwards, the tails' numbering, the backward walk, the table and the
+pruning rules split between the two halves, all against brute force),
+`junction-search-*` (the junction self-test, then whole searches on each
+backend against brute force at every split between the table and the walk -
+also with three bits of each of the junction's seeds compared, so about one
+directory in 64 matches it by chance, and with a few tails per call, room
+for a single hit per launch, and ranges, stopping and resuming and pausing)
+and `junction-cli-*` (the program itself recovering `SETUPDAT` from the
+state after it). And
 `dictionary-cli-*` (the program itself). The coordinator client's own parts
 have `protocol_test` (the JSON, an
 alphabet claim as older clients read it and a dictionary claim with its
@@ -1198,10 +1244,12 @@ test (more hits in a launch than it can record), and the stress test built
 for tiny batches, a few per launch (`stress-small`) - with 16 leading
 values per launch, nearly every search of the other tests is a single
 launch, and only this one has many, where what one launch leaves behind can
-break the next. It first checks that the unchanged code passes all five
-checks, and that a change which mustn't matter (one thread, or one
-work-group, too few or too many launched) passes them too, so that it can't
-pass by always saying "caught". Against the CUDA kernel as it is now - row
+break the next. A dictionary search and a junction search have their own
+two checks each (the dictionary and junction search tests, built for dense
+hits and for small launches), which their own mutations are held to. It
+first checks that the unchanged code passes every check, and that a change
+which mustn't matter (one thread, or one work-group, too few or too many
+launched) passes them too, so that it can't pass by always saying "caught". Against the CUDA kernel as it is now - row
 groups split into chunks, 16 batches per launch, and its hits read back
 with its hit count - twenty-six mutations: rows' masks cut to
 32 bits; seed1 and seed2 swapped in the lookup; a batch's last row, or
