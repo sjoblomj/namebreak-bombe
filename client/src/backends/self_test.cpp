@@ -1325,6 +1325,15 @@ bool selfTestJunctionBackend(SearchBackend& backend, std::string& error) {
         // The same with the rules on: the directory passes them, so it's
         // still to be found, but most of the tails around it are skipped.
         cases.push_back({"AB-\\", "SETUPDAT\\", "\\X.Y", "BA-B", tableLength, rules});
+        // And with an alphabet whose symbols come *first*. With them last,
+        // as above, every character the rules reject is one of the
+        // alphabet's last - a run of three symbols can only be completed by
+        // another symbol, and only a '\' can be next to a '\' or one too many
+        // - so a walk that skipped a rejected tail's whole parent group,
+        // rather than only its own subtree, would lose nothing and no case
+        // above would notice. Here 'A' and 'B' come after the characters
+        // that are rejected, and such a walk loses them.
+        cases.push_back({"\\-AB", "SETUPDAT\\", "\\X.Y", "A-BA", tableLength, rules});
     }
     // A directory the rules reject - a run of three symbols - which must not
     // be found however the walk is split up.
