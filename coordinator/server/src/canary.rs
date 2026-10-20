@@ -22,16 +22,16 @@
 //! basenames found -
 //! and its result is kept in `canaries` (see `complete`).
 
-use std::sync::OnceLock;
-
-use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE};
+use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, JUNCTION_SINCE};
 use rand::RngExt;
 
 use crate::alphabet::{alphabet_size, candidate_to_index, client_alphabet_for, index_to_candidate, max_supported_len, space_size, split_end, Pos};
 use crate::error::AppError;
 use crate::dictionary::DictionarySpace;
-use crate::models::{u32_to_i64, Range, Target, User, DICTIONARY_ALPHABET_NAME};
-use crate::ranges::{insert_claimed_range, to_claim_response, to_dictionary_claim_response};
+use crate::junction::{self, JunctionSpace, JunctionTarget};
+use crate::mpq::{continue_hash, mpq_hash, FILE_KEY_OFFSET, HASH_A_OFFSET, HASH_B_OFFSET, INITIAL_STATE};
+use crate::models::{u32_to_i64, Range, Target, User, DICTIONARY_ALPHABET_NAME, JUNCTION_ALPHABET_NAME};
+use crate::ranges::{insert_claimed_range, junction_table_fits, to_claim_response, to_dictionary_claim_response, to_junction_claim_response};
 use crate::state::RangeConfig;
 
 /// Every canary's target's name. One name for all of them, as a client keeps
@@ -40,38 +40,6 @@ pub const CANARY_TARGET_NAME: &str = "virtual-canary";
 
 /// The shortest candidate a canary plants.
 const MIN_CANARY_LEN: i64 = 6;
-
-/// MPQ's crypt table, as the client's `prepareCryptTable` builds it.
-fn crypt_table() -> &'static [u32; 0x500] {
-    static TABLE: OnceLock<[u32; 0x500]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [0u32; 0x500];
-        let mut seed: u32 = 0x0010_0001;
-        for index1 in 0..0x100 {
-            let mut index2 = index1;
-            for _ in 0..5 {
-                seed = (seed * 125 + 3) % 0x2A_AAAB;
-                let high = (seed & 0xFFFF) << 16;
-                seed = (seed * 125 + 3) % 0x2A_AAAB;
-                table[index2] = high | (seed & 0xFFFF);
-                index2 += 0x100;
-            }
-        }
-        table
-    })
-}
-
-/// A name's MPQ hash with the crypt table at `offset` (0x100 for hash A,
-/// 0x200 for hash B), over its bytes as given - as the client hashes it.
-pub fn mpq_hash(name: &str, offset: usize) -> u32 {
-    let table = crypt_table();
-    let (mut seed1, mut seed2) = (0x7FED_7FEDu32, 0xEEEE_EEEEu32);
-    for byte in name.bytes() {
-        seed1 = table[offset + byte as usize] ^ seed1.wrapping_add(seed2);
-        seed2 = (byte as u32).wrapping_add(seed1).wrapping_add(seed2).wrapping_add(seed2 << 5).wrapping_add(3);
-    }
-    seed1
-}
 
 /// A canary for `user`, now and then: with probability
 /// `config.canary_probability`, copying the real target the client would
@@ -93,18 +61,30 @@ pub async fn maybe_claim(
     let templates = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE status = 'active' AND is_virtual = 0 ORDER BY priority DESC, created_at ASC")
         .fetch_all(&mut *tx)
         .await?;
-    let Some(template) = templates.into_iter().find(|t| {
-        if t.is_dictionary() {
+    let mut template = None;
+    for candidate in templates {
+        let searchable = if candidate.is_dictionary() {
             client_version >= DICTIONARY_SINCE
+        } else if candidate.is_junction() {
+            client_version >= JUNCTION_SINCE && junction_table_fits(&candidate, user)?
         } else {
-            client_alphabet_for(&t.alphabet_name, &t.alphabet, client_version) == Some(t.alphabet.as_str()) && t.insertions().searchable_by(client_version)
+            client_alphabet_for(&candidate.alphabet_name, &candidate.alphabet, client_version) == Some(candidate.alphabet.as_str())
+                && candidate.insertions().searchable_by(client_version)
+        };
+        if searchable {
+            template = Some(candidate);
+            break;
         }
-    }) else {
+    }
+    let Some(template) = template else {
         return Ok(None);
     };
     if template.is_dictionary() {
         let Some(rate) = user.ema_dictionary_rate_per_sec else { return Ok(None) };
         dictionary_canary(tx, config, user, &template, rate, now).await
+    } else if template.is_junction() {
+        let Some(rate) = user.ema_junction_rate_per_sec else { return Ok(None) };
+        junction_canary(tx, config, user, &template, rate, now).await
     } else {
         let Some(rate) = user.ema_rate_per_sec else { return Ok(None) };
         alphabet_canary(tx, config, user, &template, rate, now).await
@@ -131,8 +111,8 @@ async fn alphabet_canary(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, 
     .bind(CANARY_TARGET_NAME)
     .bind(&template.prefix)
     .bind(&template.suffix)
-    .bind(u32_to_i64(mpq_hash(&filename, 0x100)))
-    .bind(u32_to_i64(mpq_hash(&filename, 0x200)))
+    .bind(u32_to_i64(mpq_hash(&filename, HASH_A_OFFSET)))
+    .bind(u32_to_i64(mpq_hash(&filename, HASH_B_OFFSET)))
     .bind(&first)
     .bind(&last)
     .bind(template.prune_symbol_runs)
@@ -206,7 +186,7 @@ async fn dictionary_canary(
     let canary = plan_dictionary(space, words, (rate * config.canary_seconds).max(1.0) as i64);
     let filename = format!("{}{}{}", template.prefix, space.text(canary.planted), template.suffix);
     let basename = filename.rsplit('\\').next().expect("rsplit yields at least one piece");
-    let encryption_key = template.encryption_key.map(|_| u32_to_i64(mpq_hash(basename, 0x300)));
+    let encryption_key = template.encryption_key.map(|_| u32_to_i64(mpq_hash(basename, FILE_KEY_OFFSET)));
 
     let target_id: i64 = sqlx::query_scalar(
         "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, alphabet_name, alphabet, status, priority, \
@@ -216,8 +196,8 @@ async fn dictionary_canary(
     .bind(CANARY_TARGET_NAME)
     .bind(&template.prefix)
     .bind(&template.suffix)
-    .bind(u32_to_i64(mpq_hash(&filename, 0x100)))
-    .bind(u32_to_i64(mpq_hash(&filename, 0x200)))
+    .bind(u32_to_i64(mpq_hash(&filename, HASH_A_OFFSET)))
+    .bind(u32_to_i64(mpq_hash(&filename, HASH_B_OFFSET)))
     .bind(DICTIONARY_ALPHABET_NAME)
     .bind(encryption_key)
     .bind(&template.word_lists)
@@ -246,6 +226,83 @@ async fn dictionary_canary(
     claim.filename_lower_bound = None;
     claim.filename_upper_bound = None;
     Ok(Some(claim))
+}
+
+/// A canary copying junction target `template`: its alphabet, prefix,
+/// suffix, pruning rules and - so that the client searches exactly the way
+/// it does for the real target, within the memory it declared - the same
+/// table length. Its junction is the state after a directory planted in the
+/// range, and its hashes that directory's filename's, so finding it is
+/// finding that directory: to the client it's an ordinary junction claim.
+/// One length only, the planted directory's, so the walk has nothing else
+/// in it.
+async fn junction_canary(
+    tx: &mut sqlx::SqliteConnection,
+    config: &RangeConfig,
+    user: &User,
+    template: &Target,
+    rate: f64,
+    now: i64,
+) -> Result<Option<ClaimResponse>, AppError> {
+    let settings = junction::of_target(template)?;
+    let cursor_length: i64 = sqlx::query_scalar("SELECT candidate_len FROM target_progress WHERE target_id = ?").bind(template.id).fetch_one(&mut *tx).await?;
+    let length = cursor_length.clamp(settings.space.min_length(), settings.space.max_length());
+    let Some(canary) = plan_junction(&settings.space, length, (rate * config.canary_seconds).max(1.0) as i64) else {
+        return Ok(None);
+    };
+    // The junction of the planted directory - what the client searches for -
+    // and the hashes of the name it makes, which it checks what it finds
+    // against.
+    let directory = format!("{}{}", template.prefix, canary.planted);
+    let filename = format!("{directory}{}", template.suffix);
+    let junction_a = continue_hash(INITIAL_STATE, &directory, HASH_A_OFFSET);
+    let junction_b = continue_hash(INITIAL_STATE, &directory, HASH_B_OFFSET);
+
+    let target_id: i64 = sqlx::query_scalar(
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, \
+         prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, \
+         priority, start_len, kind, junction_a_seed1, junction_a_seed2, junction_b_seed1, junction_b_seed2, junction_max_length, \
+         junction_table_length, created_at, is_virtual) \
+         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, 0, ?, ?, ?, 'active', 0, ?, 'junction', ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
+    )
+    .bind(CANARY_TARGET_NAME)
+    .bind(&template.prefix)
+    .bind(&template.suffix)
+    .bind(u32_to_i64(mpq_hash(&filename, HASH_A_OFFSET)))
+    .bind(u32_to_i64(mpq_hash(&filename, HASH_B_OFFSET)))
+    .bind(template.prune_symbol_runs)
+    .bind(template.prune_unopened_brackets)
+    .bind(template.max_backslash_count)
+    .bind(template.prune_adjacent_backslashes)
+    .bind(&template.alphabet_name)
+    .bind(&template.alphabet)
+    // One length: the planted directory's, so start_len is also the longest.
+    .bind(length)
+    .bind(u32_to_i64(junction_a.0))
+    .bind(u32_to_i64(junction_a.1))
+    .bind(u32_to_i64(junction_b.0))
+    .bind(u32_to_i64(junction_b.1))
+    .bind(length)
+    .bind(settings.space.table_length())
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    // A cursor past its one range, as the other canaries'.
+    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, 0, ?, ?, '')")
+        .bind(target_id)
+        .bind(length)
+        .bind(canary.end)
+        .bind(JUNCTION_ALPHABET_NAME)
+        .execute(&mut *tx)
+        .await?;
+
+    let lease_seconds = config.lease_seconds;
+    let range_id =
+        insert_claimed_range(&mut *tx, target_id, length, canary.start as Pos, canary.end as Pos, JUNCTION_ALPHABET_NAME, "", None, user, lease_seconds, now)
+            .await?;
+    let target = record(tx, target_id, range_id, user, &filename, (canary.end - canary.start) as Pos, now).await?;
+    let junction = JunctionTarget { space: canary.space, junction_a, junction_b };
+    Ok(Some(to_junction_claim_response(&target, &junction, range_id, length, canary.start, canary.end, lease_seconds)))
 }
 
 /// Keeps a canary's planted `filename` in `canaries`, and reads its target
@@ -284,6 +341,40 @@ fn plan_dictionary(space: &DictionarySpace, words: i64, count: i64) -> Dictionar
     let offset = rng.random_range(0..count);
     let start = (planted - offset).clamp(block_start, block_start + block_size - count);
     DictionaryCanaryPlan { start, end: start + count, planted }
+}
+
+/// Where a junction canary goes: its range [start, end) of tail indices,
+/// the directory planted in it, and the space of its own one-length target.
+#[derive(Debug)]
+struct JunctionCanaryPlan {
+    space: JunctionSpace,
+    start: i64,
+    end: i64,
+    planted: String,
+}
+
+/// A junction canary of `count` tails (fewer, if that's more than the length
+/// has) at directory `length`, with a directory of letters and digits
+/// planted at a random place in it - no pruning rule skips one of those, as
+/// for an alphabet canary, and the canary leaves `min_backslash_count` at 0
+/// since the planted directory has no '\'. `None` if the alphabet has
+/// neither letters nor digits, or the length can't make a space of its own.
+fn plan_junction(space: &JunctionSpace, length: i64, count: i64) -> Option<JunctionCanaryPlan> {
+    let plantable: Vec<char> = space.alphabet().chars().filter(|c| c.is_ascii_uppercase() || c.is_ascii_digit()).collect();
+    if plantable.is_empty() {
+        return None;
+    }
+    // Its own target searches this length alone, with the template's table:
+    // the same memory, and a walk of just the tails around the planted one.
+    let one_length = JunctionSpace::new(space.alphabet(), length, length, space.table_length()).ok()?;
+    let tails = one_length.tails_at(length);
+    let count = count.clamp(1, tails);
+    let mut rng = rand::rng();
+    let planted: String = (0..length).map(|_| plantable[rng.random_range(0..plantable.len())]).collect();
+    let index = one_length.tail_index(&planted[space.table_length() as usize..]).expect("planted from the alphabet's own characters");
+    let offset = rng.random_range(0..count);
+    let start = (index - offset).clamp(0, tails - count);
+    Some(JunctionCanaryPlan { space: one_length, start, end: start + count, planted })
 }
 
 /// Where a canary goes: its range [start, end) of `len`-character
@@ -353,16 +444,6 @@ pub async fn complete(tx: &mut sqlx::SqliteConnection, range: &Range, found: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mpq_hash_matches_the_clients() {
-        // The client's own (client/src/engine/mpq_hash.cpp) - and (LISTFILE)'s
-        // are the well-known ones every MPQ tool has.
-        assert_eq!(mpq_hash("(LISTFILE)", 0x100), 0xFD65_7910);
-        assert_eq!(mpq_hash("(LISTFILE)", 0x200), 0x4E9B_98A7);
-        assert_eq!(mpq_hash("REZ\\ABC123.WAV", 0x100), 0xFCAA_88A2);
-        assert_eq!(mpq_hash("REZ\\ABC123.WAV", 0x200), 0xF559_2C3D);
-    }
 
     #[test]
     fn plan_puts_a_letters_and_digits_candidate_inside_a_range_of_the_asked_size() {

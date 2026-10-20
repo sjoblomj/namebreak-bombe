@@ -233,6 +233,38 @@ pub struct DashboardTarget {
     /// start ("" once everything has been handed out).
     pub kind: String,
     pub dictionary: Option<DashboardDictionary>,
+    /// Set for a `"junction"` target - one whose unknown part is a
+    /// directory, searched from both ends at once (see `junction.rs`). Its
+    /// ranges' `candidate_len` is the directory's length and their
+    /// candidates are tails, shown with the table's characters as '?'; it
+    /// has an alphabet and pruning rules like an alphabet target, but no
+    /// bounds, insertions, priority or skip ranges.
+    pub junction: Option<DashboardJunction>,
+}
+
+/// What a junction target searches, and what its table costs - see
+/// `AdminCreateTargetRequest::junction`.
+#[derive(Serialize)]
+pub struct DashboardJunction {
+    /// The hash state after the directory, `"seed1 seed2"` in hex: hashA's,
+    /// then hashB's.
+    pub junction_a: String,
+    pub junction_b: String,
+    pub min_length: i64,
+    pub max_length: i64,
+    /// How many of a directory's first characters the client's table holds,
+    /// how many directories that is, and what it takes in memory - which a
+    /// client has to be willing to give to get any of this work.
+    pub table_length: i64,
+    pub table_directories: u64,
+    pub table_bytes: u64,
+    /// How many tails there are to rewind, every length together - the work
+    /// itself - and how many directories they stand for (the tails times
+    /// the table's directories, at each length).
+    #[serde(serialize_with = "as_decimal")]
+    pub tail_count: Pos,
+    #[serde(serialize_with = "as_decimal")]
+    pub directory_count: Pos,
 }
 
 /// What a dictionary target's candidates are made of, and the basenames
@@ -672,6 +704,12 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         // Deleted since target_rows was read - leave it out, as the next refresh will.
         let Some(settings) = settings_by_target.remove(&id) else { continue };
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
+        if settings.is_junction() {
+            let (cursor_candidate_len, cursor_index) = progress_by_target.get(&id).map_or((0, 0), |p| (p.0, p.1));
+            let junction = crate::junction::of_target(&settings)?;
+            targets.push(junction_target(settings, &junction, range_rows, cursor_candidate_len, cursor_index as i64, found_by, found_by_backend, found_at));
+            continue;
+        }
         if let Some(dictionary) = dictionaries.get(&id) {
             let (cursor_candidate_len, cursor_number) = progress_by_target.get(&id).map_or((0, 0), |p| (p.0, p.1));
             targets.push(dictionary_target(
@@ -812,6 +850,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             gaps,
             kind: "alphabet".into(),
             dictionary: None,
+            junction: None,
         });
     }
 
@@ -821,6 +860,143 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     .fetch_one(&state.pool)
     .await?;
     Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await?, active_ranges, low_disk: state.disk.warning() }))
+}
+
+/// A junction target's `DashboardTarget` (see `DashboardTarget::junction`):
+/// its ranges are one directory length's tails, shown as directories with
+/// the table's characters - which aren't searched one at a time - as '?'.
+/// Each length is its own stretch of tails, so its gaps are worked out
+/// within a length, never across two.
+#[allow(clippy::too_many_arguments)]
+fn junction_target(
+    target: Target,
+    junction: &crate::junction::JunctionTarget,
+    range_rows: Vec<RangeRow>,
+    cursor_candidate_len: i64,
+    cursor_index: i64,
+    found_by: Option<String>,
+    found_by_backend: Option<String>,
+    found_at: Option<i64>,
+) -> DashboardTarget {
+    let space = &junction.space;
+    let hex = |state: (u32, u32)| format!("{:08X} {:08X}", state.0, state.1);
+    // Already in length and index order, as the query sorts them.
+    let ranges: Vec<(i64, i64, i64, DashboardRange)> = range_rows
+        .into_iter()
+        .map(|row| {
+            let length = row.candidate_len;
+            let start = join_pos("", length, row.start_block, row.start_index) as i64;
+            let end = join_pos("", length, row.end_block, row.end_index) as i64;
+            let progress = row.progress_index.map(|p| join_pos("", length, row.progress_block, p) as i64);
+            let range = DashboardRange {
+                id: row.id,
+                status: row.status,
+                candidate_len: length,
+                candidate_count: (end - start) as Pos,
+                first_candidate: space.directory(length, start),
+                last_candidate: space.directory(length, end - 1),
+                progress_candidate: progress.map(|p| space.directory(length, p)),
+                progress_percent: progress.map(|p| (p - start + 1) as f64 / (end - start) as f64 * 100.0),
+                worker: row.worker,
+                worker_backend: row.worker_backend,
+                assigned_at: row.assigned_at,
+                lease_expires_at: row.lease_expires_at,
+                completed_at: row.completed_at,
+                alphabet_name: String::new(),
+                alphabet: String::new(),
+                priority_range_id: None,
+                skip_range_id: None,
+            };
+            (length, start, end, range)
+        })
+        .collect();
+
+    // The tails no range covers, between two of the same length.
+    let mut gaps = Vec::new();
+    for window in space.windows() {
+        let mut reach = 0;
+        let at_length: Vec<&(i64, i64, i64, DashboardRange)> = ranges.iter().filter(|r| r.0 == window.length).collect();
+        for pair in at_length.windows(2) {
+            let (previous, next) = (pair[0], pair[1]);
+            reach = reach.max(previous.2);
+            if reach < next.1 {
+                gaps.push(DashboardGap {
+                    after_range_id: previous.3.id,
+                    first_len: window.length,
+                    first_candidate: space.directory(window.length, reach),
+                    last_len: window.length,
+                    last_candidate: space.directory(window.length, next.1 - 1),
+                    count: (next.1 - reach) as Pos,
+                });
+            }
+        }
+    }
+
+    // Where the next range will start: the cursor's own length while it has
+    // tails left, else the next length's first - "" once there's none.
+    let next = space
+        .windows()
+        .into_iter()
+        .find(|w| w.length > cursor_candidate_len || (w.length == cursor_candidate_len && w.end > cursor_index))
+        .map(|w| (w.length, if w.length == cursor_candidate_len { cursor_index.max(w.start) } else { w.start }));
+    let (cursor_candidate_len, cursor_candidate) = match next {
+        Some((length, index)) => (length, space.directory(length, index)),
+        None => (cursor_candidate_len, String::new()),
+    };
+    let sweep_after_range_id = next.and_then(|(length, index)| ranges.iter().filter(|r| r.0 == length).take_while(|r| r.1 < index).last().map(|r| r.3.id));
+    let table_directories = (space.alphabet_size() as u64).pow(space.table_length() as u32);
+
+    DashboardTarget {
+        id: target.id,
+        name: target.name,
+        status: target.status,
+        lower_bound: String::new(),
+        upper_bound: String::new(),
+        hash_a_hex: format!("0x{:08X}", i64_to_u32(target.hash_a)),
+        hash_b_hex: format!("0x{:08X}", i64_to_u32(target.hash_b)),
+        encryption_key_hex: None,
+        base_file_name: target.base_file_name,
+        prefix: target.prefix,
+        suffix: target.suffix,
+        prune_symbol_runs: target.prune_symbol_runs != 0,
+        prune_unopened_brackets: target.prune_unopened_brackets != 0,
+        prune_whole_candidate: false,
+        max_backslash_count: target.max_backslash_count,
+        min_backslash_count: target.min_backslash_count,
+        prune_adjacent_backslashes: target.prune_adjacent_backslashes != 0,
+        insert_from_start: None,
+        insert_from_end: None,
+        found_filename: target.found_filename,
+        found_by,
+        found_by_backend,
+        found_at,
+        priority: target.priority,
+        description: target.description,
+        alphabet_name: target.alphabet_name,
+        alphabet: target.alphabet,
+        start_len: space.min_length(),
+        auto_priority: false,
+        cursor_candidate_len,
+        cursor_candidate,
+        sweep_after_range_id,
+        priority_ranges: Vec::new(),
+        skip_ranges: Vec::new(),
+        ranges: ranges.into_iter().map(|r| r.3).collect(),
+        gaps,
+        kind: "junction".into(),
+        dictionary: None,
+        junction: Some(DashboardJunction {
+            junction_a: hex(junction.junction_a),
+            junction_b: hex(junction.junction_b),
+            min_length: space.min_length(),
+            max_length: space.max_length(),
+            table_length: space.table_length(),
+            table_directories,
+            table_bytes: space.table_bytes(),
+            tail_count: space.total_tails(),
+            directory_count: space.total_tails() * table_directories as Pos,
+        }),
+    }
 }
 
 /// A dictionary target's `DashboardTarget` (see `DashboardTarget::kind`):
@@ -942,6 +1118,7 @@ fn dictionary_target(
         ranges: ranges.into_iter().map(|r| r.2).collect(),
         gaps,
         kind: "dictionary".into(),
+        junction: None,
         dictionary: Some(DashboardDictionary {
             word_lists: dictionary.word_lists.clone(),
             word_list_word_counts: dictionary.word_lists.iter().map(|name| word_list_word_counts.get(name).copied().unwrap_or(0)).collect(),

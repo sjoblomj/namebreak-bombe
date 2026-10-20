@@ -7,8 +7,8 @@ use futures_util::StreamExt;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
     AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
-    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, DictionarySettings, HeartbeatRequest, HeartbeatResponse, QuitRequest, RegisterRequest,
-    RegisterResponse, StatusResponse, TargetStatus, Version, WordListInfo, PROTOCOL_VERSION,
+    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, DictionarySettings, HeartbeatRequest, HeartbeatResponse, JunctionSettings,
+    QuitRequest, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus, Version, WordListInfo, PROTOCOL_VERSION,
 };
 
 use crate::alphabet::{
@@ -18,8 +18,9 @@ use crate::alphabet::{
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::client_release;
 use crate::dictionary::{self, FilenameBounds};
+use crate::junction;
 use crate::error::AppError;
-use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME};
+use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME, JUNCTION_ALPHABET_NAME};
 use crate::ranges::{self, SegmentOwner};
 use crate::state::{generate_token, now_unix, AppState};
 
@@ -64,11 +65,12 @@ pub async fn register(
         // Refreshed on every registration, not just created once: a
         // returning client may have been upgraded (or downgraded) since it
         // last registered, and claim_range always wants the current picture.
-        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ?, client_release = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ?, client_release = ?, junction_table_bytes = ? WHERE id = ?")
             .bind(now)
             .bind(&client_version)
             .bind(backend)
             .bind(client_release)
+            .bind(req.junction_table_bytes)
             .bind(existing.id)
             .execute(&state.pool)
             .await?;
@@ -81,8 +83,8 @@ pub async fn register(
 
     let token = generate_token();
     let user_id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend, client_release) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend, client_release, junction_table_bytes) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(username)
     .bind(hostname)
@@ -92,6 +94,7 @@ pub async fn register(
     .bind(&client_version)
     .bind(backend)
     .bind(client_release)
+    .bind(req.junction_table_bytes)
     .fetch_one(&state.pool)
     .await?;
 
@@ -120,7 +123,7 @@ pub async fn heartbeat(
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
     ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
-    let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename, req.next_candidate_number).await?;
+    let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename, req.next_candidate_number, req.next_tail_index).await?;
     Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, range_released: outcome.range_released }))
 }
 
@@ -131,7 +134,7 @@ pub async fn quit(
     Json(req): Json<QuitRequest>,
 ) -> Result<StatusCode, AppError> {
     ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
-    ranges::quit_range(&state.pool, &user, range_id, req.last_hash_a_match_filename.as_deref(), req.next_candidate_number).await?;
+    ranges::quit_range(&state.pool, &user, range_id, req.last_hash_a_match_filename.as_deref(), req.next_candidate_number, req.next_tail_index).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -288,7 +291,13 @@ pub async fn admin_create_target(
         return Err(AppError::BadRequest("name is required".into()));
     }
     if let Some(settings) = &req.dictionary {
+        if req.junction.is_some() {
+            return Err(AppError::BadRequest("a target is searched by words or by a junction, not both".into()));
+        }
         return create_dictionary_target(&state, &req, settings).await;
+    }
+    if let Some(settings) = &req.junction {
+        return create_junction_target(&state, &req, settings).await;
     }
     if req.send_basenames {
         return Err(AppError::BadRequest("send_basenames is for dictionary targets - an alphabet search doesn't compare basenames".into()));
@@ -511,6 +520,112 @@ async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetReque
         .await?;
     tx.commit().await?;
     tracing::info!(target_id, candidates = loaded.window_candidates(), words = loaded.space.words().len(), "created a dictionary target");
+    Ok(Json(AdminCreateTargetResponse { target_id }))
+}
+
+/// The settings an alphabet target has that a junction target doesn't:
+/// it searches a directory of a known length range, with no bounds, no
+/// inserted text and no basenames, and its pruning rules always look at the
+/// whole directory. `start_len` is `junction.min_length` instead, and
+/// priority and skip ranges (patterns over candidate indices) aren't a
+/// junction target's either - the admin endpoints that make them refuse one.
+fn junction_settings_not_given(req: &AdminCreateTargetRequest) -> Vec<&'static str> {
+    [
+        ("lower_bound", !req.lower_bound.is_empty()),
+        ("upper_bound", !req.upper_bound.is_empty()),
+        ("prune_whole_candidate", req.prune_whole_candidate),
+        ("insert_from_start", req.insert_from_start.is_some()),
+        ("insert_from_end", req.insert_from_end.is_some()),
+        ("start_len", req.start_len != 1),
+        ("auto_priority", req.auto_priority),
+        ("send_basenames", req.send_basenames),
+        ("encryption_key_hex", req.encryption_key_hex.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, given)| given.then_some(name))
+    .collect()
+}
+
+/// `admin_create_target` for a junction target (`req.junction` - see
+/// `JunctionSettings`): its alphabet and lengths have to make a space whose
+/// tails can be numbered (`junction::JunctionSpace::new`), and its junction
+/// has to fit the file's hashes (`junction::fits_hashes`) - a junction for
+/// the wrong place in the name would have every client search the whole
+/// space and find nothing. Its cursor starts at the first tail of the
+/// shortest directory.
+async fn create_junction_target(state: &AppState, req: &AdminCreateTargetRequest, settings: &JunctionSettings) -> Result<Json<AdminCreateTargetResponse>, AppError> {
+    let not_given = junction_settings_not_given(req);
+    if !not_given.is_empty() {
+        return Err(AppError::BadRequest(format!("{} isn't for a junction target", not_given.join(", "))));
+    }
+    if let Some(name) = &req.base_file_name {
+        validate_base_file_name(name)?;
+    }
+    validate_backslash_counts(req.max_backslash_count, req.min_backslash_count)?;
+    let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
+    let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
+    let seed = |what: &str, hex: &str| parse_hash_hex(hex).map_err(|_| AppError::BadRequest(format!("invalid {what}")));
+    let junction_a = (seed("junction_a_seed1_hex", &settings.junction_a_seed1_hex)?, seed("junction_a_seed2_hex", &settings.junction_a_seed2_hex)?);
+    let junction_b = (seed("junction_b_seed1_hex", &settings.junction_b_seed1_hex)?, seed("junction_b_seed2_hex", &settings.junction_b_seed2_hex)?);
+    let (alphabet_name, alphabet) = resolve_alphabet(req.alphabet_name.as_deref(), req.alphabet.as_deref())?;
+    let space = junction::JunctionSpace::new(&alphabet, settings.min_length, settings.max_length, settings.table_length).map_err(AppError::BadRequest)?;
+    junction::fits_hashes(junction_a, junction_b, &req.suffix, hash_a, hash_b).map_err(AppError::BadRequest)?;
+    let longest = req.prefix.len() + space.max_length() as usize + req.suffix.len();
+    if longest > junction::MAX_FILENAME_LENGTH {
+        return Err(AppError::BadRequest(format!(
+            "the longest filename ({longest} characters) is longer than the {} a client searches",
+            junction::MAX_FILENAME_LENGTH
+        )));
+    }
+
+    let now = now_unix();
+    let mut tx = state.pool.begin().await?;
+    let target_id: i64 = sqlx::query_scalar(
+        "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, \
+         prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, \
+         priority, description, start_len, base_file_name, kind, junction_a_seed1, junction_a_seed2, junction_b_seed1, junction_b_seed2, \
+         junction_max_length, junction_table_length, created_at) \
+         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 'junction', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(&req.name)
+    .bind(&req.prefix)
+    .bind(&req.suffix)
+    .bind(u32_to_i64(hash_a))
+    .bind(u32_to_i64(hash_b))
+    .bind(req.prune_symbol_runs as i64)
+    .bind(req.prune_unopened_brackets as i64)
+    .bind(req.max_backslash_count)
+    .bind(req.min_backslash_count)
+    .bind(req.prune_adjacent_backslashes as i64)
+    .bind(&alphabet_name)
+    .bind(&alphabet)
+    .bind(req.priority)
+    .bind(&req.description)
+    .bind(space.min_length())
+    .bind(&req.base_file_name)
+    .bind(u32_to_i64(junction_a.0))
+    .bind(u32_to_i64(junction_a.1))
+    .bind(u32_to_i64(junction_b.0))
+    .bind(u32_to_i64(junction_b.1))
+    .bind(space.max_length())
+    .bind(space.table_length())
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, 0, 0, ?, '')")
+        .bind(target_id)
+        .bind(space.min_length())
+        .bind(JUNCTION_ALPHABET_NAME)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    tracing::info!(
+        target_id,
+        tails = %space.total_tails(),
+        table_length = space.table_length(),
+        table_bytes = space.table_bytes(),
+        "created a junction target"
+    );
     Ok(Json(AdminCreateTargetResponse { target_id }))
 }
 
@@ -822,6 +937,31 @@ pub async fn admin_patch_target(
     } else if req.send_basenames == Some(true) {
         return Err(AppError::BadRequest("send_basenames is for dictionary targets - an alphabet search doesn't compare basenames".into()));
     }
+    // A junction target's alphabet and lengths are what its tails are
+    // numbered by, so they're fixed once it has ranges; the rest of an
+    // alphabet target's search settings aren't a junction target's at all
+    // (see JunctionSettings). Its priority, description, status and pruning
+    // rules can be patched like any other target's.
+    if existing.is_junction() {
+        let fixed: Vec<&str> = [
+            ("alphabet_name", req.alphabet_name.is_some()),
+            ("alphabet", req.alphabet.is_some()),
+            ("start_len", req.start_len.is_some()),
+            ("prune_whole_candidate", req.prune_whole_candidate.is_some()),
+            ("insert_from_start", req.insert_from_start.is_some()),
+            ("insert_from_end", req.insert_from_end.is_some()),
+            ("auto_priority", req.auto_priority.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect();
+        if !fixed.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "{} isn't for a junction target - its alphabet and lengths are what its tails are numbered by, so make another target to                  search them differently",
+                fixed.join(", ")
+            )));
+        }
+    }
 
     let (alphabet_name, alphabet) = if req.alphabet_name.is_some() || req.alphabet.is_some() {
         let (name, chars) = resolve_alphabet_patch(&state.pool, target_id, req.alphabet_name.as_deref(), req.alphabet.as_deref()).await?;
@@ -977,6 +1117,12 @@ pub async fn admin_create_priority_range(
     if target.is_dictionary() {
         return Err(AppError::BadRequest("a dictionary target has no priority ranges - its candidates aren't strings of an alphabet".into()));
     }
+    if target.is_junction() {
+        return Err(AppError::BadRequest(
+            "a junction target has no priority ranges - what it hands out is the tails of a directory, not candidates a pattern can pin              down (see junction.rs)"
+                .into(),
+        ));
+    }
 
     let cap = max_supported_len(&target.alphabet);
     if req.length > cap {
@@ -1095,6 +1241,12 @@ pub async fn admin_create_skip_range(
     if target.is_dictionary() {
         return Err(AppError::BadRequest("a dictionary target has no skip ranges - its candidates aren't strings of an alphabet".into()));
     }
+    if target.is_junction() {
+        return Err(AppError::BadRequest(
+            "a junction target has no skip ranges - what it hands out is the tails of a directory, not candidates a pattern can pin down              (see junction.rs)"
+                .into(),
+        ));
+    }
     let skip_range_id = ranges::create_skip_range(&mut tx, &target, &req.pattern, req.length, &req.reason, now_unix()).await?;
     tx.commit().await?;
     Ok(Json(AdminCreateSkipRangeResponse { skip_range_id }))
@@ -1114,7 +1266,14 @@ mod tests {
     use super::*;
 
     fn register_request(protocol_version: &str) -> RegisterRequest {
-        RegisterRequest { username: "u".into(), hostname: "h".into(), backend: "cuda".into(), protocol_version: protocol_version.to_string(), client_release: None }
+        RegisterRequest {
+            username: "u".into(),
+            hostname: "h".into(),
+            backend: "cuda".into(),
+            protocol_version: protocol_version.to_string(),
+            client_release: None,
+            junction_table_bytes: None,
+        }
     }
 
     #[test]
@@ -1184,6 +1343,7 @@ mod tests {
             target_chunk_seconds: 1.0,
             default_rate_per_sec: 1.0,
             default_dictionary_rate_per_sec: 1.0,
+        default_junction_rate_per_sec: 1.0,
             min_chunk_candidates: 1,
             max_chunk_candidates: 1,
             lease_seconds: 60,

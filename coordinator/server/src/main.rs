@@ -9,10 +9,14 @@ mod dictionary;
 mod disk;
 #[cfg(test)]
 mod dictionary_tests;
+#[cfg(test)]
+mod junction_tests;
 mod error;
 mod handlers;
+mod junction;
 mod likely_prefixes;
 mod models;
+mod mpq;
 mod ranges;
 mod state;
 

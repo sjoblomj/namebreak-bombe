@@ -28,7 +28,10 @@ reclaim), and a solved target's find called out with a prominent banner. If a
 range was reassigned partway through (see progress checkpointing below), each
 finished portion shows up as its own row credited to whoever actually searched
 it, rather than the whole thing appearing under just the most recent claimer.
-That's the **Targets** tab. The **Matches** tab lists every name found, newest
+A junction target shows its junction, how much of the directory its table
+holds (and what that costs a client in memory), and how many tails that
+leaves to rewind, with its ranges as directories whose table characters are
+'?'. That's the **Targets** tab. The **Matches** tab lists every name found, newest
 first - who found it and when, its Hash A and Hash B, and the targets it
 solved (targets sharing a Hash A/Hash B pair share a row). The **Volunteers** tab ranks every username that
 has claimed work or found a name by candidates searched (the sizes of its
@@ -51,7 +54,8 @@ See the top-level plan/design notes for the full rationale; the short version:
   hands back an opaque bearer token. Every other endpoint requires it - this
   is the only thing standing between a real client and a generic bot scraping
   the API, so it's intentionally simple rather than absent.
-- **Protocol versioning**: every client declares its own `protocol_version`
+- **Protocol versioning** (now 1.6.0 - dictionary targets came with 1.5,
+  junction targets with 1.6): every client declares its own `protocol_version`
   (`X.Y.Z`) at `/register`; the server rejects registration outright on a
   MAJOR version mismatch against its own `PROTOCOL_VERSION`
   (`coordinator/protocol/src/lib.rs`), asking for an upgrade. A client's
@@ -274,6 +278,21 @@ See the top-level plan/design notes for the full rationale; the short version:
   get their work. With `send_basenames`, clients also send every candidate
   whose basename matches the target's encryption key, which the server
   keeps and the dashboard shows.
+- **Junction targets**: a target can be a file whose *directory* is unknown,
+  where the hash state right after that directory - the *junction* - is
+  known: the client then searches the directory from both ends at once,
+  meeting in the middle, which buys back one character of brute force for
+  every character it can keep a table of (see **Junction targets** below and
+  the client README's "Junction mode"). Its ranges are stretches of one
+  directory length's *tails* - the directory without the table's characters
+  - numbered as the client numbers them (`server/src/junction.rs`, the
+  server's half of the client's `engine/junction.h`). The table is what the
+  search costs in memory, and it's the same for every client of a target,
+  since a tail is whatever the table doesn't cover: a client says at
+  `/register` how much it will give one (`junction_table_bytes`), and gets
+  no work from a target whose table wouldn't fit in it - as a client that
+  can't search a target's alphabet gets none. Only clients of protocol 1.6
+  and later get any of it.
 - **Storage**: SQLite on a single Fly Volume. One server instance only - range
   assignment has to be centrally coordinated anyway, so this isn't a real
   limitation.
@@ -603,6 +622,101 @@ reversible):
 curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecret'
 ```
 
+### Junction targets
+
+A junction target is for a file whose name is a known prefix, an **unknown
+directory** and a known suffix, where the MPQ hash state right after that
+directory is already known - for Hash A and for Hash B. That state is the
+*junction*. It comes from the other files of the same unknown directory: two
+whose basenames are known pin it down, by trying all 2^32 values of `seed2`
+against the first name's hash and checking each survivor against the second.
+
+The client searches such a directory from both ends at once (the client
+README's "Junction mode" has the whole argument): forward from the prefix
+into a **table** of every directory of its first `table_length` characters,
+by the hash state each one reaches, and backward from the junction, every
+**tail** - the directory's last characters - rewound character by character
+and looked up in that table. A directory of *n* characters is therefore one
+of the table's prefixes followed by a tail of *n - table_length*
+characters, and the work is the tails: `alphabet^(n - table_length)` of
+them, not `alphabet^n` candidates.
+
+```sh
+curl -X POST localhost:8080/api/v1/admin/targets \
+  -H 'X-Admin-Token: devsecret' -H 'Content-Type: application/json' \
+  -d '{
+    "name": "setupdat-bwunin",
+    "prefix": "", "suffix": "\\BWUNIN.PIF",
+    "hash_a_hex": "0x5BAB63FE", "hash_b_hex": "0x8DF2CB08",
+    "alphabet": " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_",
+    "prune_symbol_runs": true, "prune_adjacent_backslashes": true,
+    "junction": {
+      "junction_a_seed1_hex": "0x92F62345", "junction_a_seed2_hex": "0xB9F61953",
+      "junction_b_seed1_hex": "0xB95115E6", "junction_b_seed2_hex": "0x7609B4F4",
+      "min_length": 6, "max_length": 9, "table_length": 4
+    }
+  }'
+```
+
+- `junction_a_seed1_hex`/`junction_a_seed2_hex` and the `_b_` pair: the hash
+  state after the directory, for Hash A and Hash B. Hashing the suffix onto
+  them must give the target's two hashes, or the target is refused, saying
+  which doesn't fit - a junction for the wrong position in the name would
+  otherwise have every client search the whole space and find nothing.
+- `min_length` (default 1) to `max_length`: how long the directory may be,
+  at most 16 characters, and no more tails of one length than 2^63.
+  `min_length` can't be less than `table_length`: a directory shorter than
+  the table has no tail to hand out, and there are few enough of those to
+  sweep with an ordinary alphabet target.
+- `table_length`: how many of a directory's first characters the table
+  holds, 0 (no table at all - the walk does everything) to `min_length`.
+  Every character of it divides the tails by the alphabet's size and
+  multiplies the table's memory by it. For the 43-character alphabet above:
+
+  | `table_length` | Table | Tails for a 9-character directory |
+  |---|---|---|
+  | 3 | 0.7 MiB | 271 G |
+  | 4 | 30 MiB | 6.3 G |
+  | 5 | 1.4 GiB | 147 M |
+
+  A table of more than 64 GiB is refused: no volunteer would hold one, and a
+  table one character longer than meant is an easy mistake to make.
+
+The target's `alphabet` (predefined or custom), `prefix`, `suffix` and
+pruning rules work as an alphabet target's, except that the rules always
+apply to the whole directory - `prune_whole_candidate` isn't a junction
+target's, nor are the bounds, the inserted text, `start_len`,
+`auto_priority`, `send_basenames`, an encryption key, or priority and skip
+ranges (what it hands out is tails, not candidates a pattern can pin down).
+`PATCH` can change its priority, description, status and pruning rules, but
+not its alphabet or lengths: those are what its tails are numbered by, so
+searching the same file another way means another target.
+
+**Memory.** The table is the whole memory cost, and the same for every
+client of the target - the ranges mean nothing without it. A client says how
+much it will give one when it registers; a client that won't give this
+target's table that much gets no work from it at all, and neither does one
+from before protocol 1.6, which doesn't say. For volunteers with less
+memory, make a second target on the same hashes with a shorter table: the
+dashboard already shows targets that share a Hash A/Hash B pair as one find.
+
+**Ranges.** A range is a stretch of one directory length's tails -
+`candidate_len` is the length, and the positions are tail indices, numbered
+by the tail *reversed* (the directory's last character turning slowest, as
+the client rewinds it first). The lengths are swept shortest first, a chunk
+at a time, and a chunk is sized from the client's measured tails a second
+(`ema_junction_rate_per_sec`, measured apart from the other kinds of
+search). A heartbeat's `next_tail_index` is the progress checkpoint, as a
+dictionary range's `next_candidate_number` is - and unlike an alphabet
+search, a junction search always knows exactly how far it has got, so every
+heartbeat carries real progress and a reassigned range is always split
+where its client actually left off.
+
+The client builds the table afresh for every range it claims (a few seconds
+for four characters, a quarter of a minute for five), so
+`TARGET_CHUNK_SECONDS` wants to stay comfortably above that - the default
+900 is fine.
+
 ## Running a client
 
 Build `namebreak` as usual first (see `../client/README.md` - the
@@ -649,7 +763,13 @@ at the word count its sweep is at, and - if it has an encryption key - a key
 made from the planted name's basename, so the client takes the same key-only
 path real work does (as well as `send_basenames`; the basenames sent for a
 canary aren't kept). It leaves out the target's bounds, which could leave
-out the planted name. Its result goes in the `canaries` table (`found` or `missed`; a missed
+out the planted name. When that first target is a junction target, the
+canary copies it instead: its alphabet, prefix, suffix, pruning rules and -
+so that it costs the client exactly what the real work does, within the
+memory that client declared - the same table length. Its junction is the
+state after a directory planted in the range, and its hashes are that
+directory's filename's, so finding it is finding that directory; it searches
+one length only, the planted directory's. Its result goes in the `canaries` table (`found` or `missed`; a missed
 one is also logged as a warning). Virtual targets (`targets.is_virtual`) are
 left out of everything else - other claims, the dashboard's targets and
 ranges, `/status`, the rate estimate, and a volunteer's candidates, ranges and
@@ -667,6 +787,7 @@ found/total". A canary still being searched isn't counted yet; one given up on
 | `TARGET_CHUNK_SECONDS` | `900` | desired wall-clock time per range |
 | `DEFAULT_RATE_PER_SEC` | `500000000` | assumed candidates/sec until a user's first completed range refines it |
 | `DEFAULT_DICTIONARY_RATE_PER_SEC` | `1000000000` | the same for a dictionary target's ranges, measured apart |
+| `DEFAULT_JUNCTION_RATE_PER_SEC` | `1000000000` | the same for a junction target's ranges, in tails a second (a GPU rewinds about 2 billion, a CPU 0.07) |
 | `MIN_CHUNK_CANDIDATES` / `MAX_CHUNK_CANDIDATES` | `1000000` / `100000000000000000` | clamp on carved chunk size |
 | `LEASE_SECONDS` | `21600` (6 hours) | how long a claimed range stays leased after the last sign of life from its client (the claim, then each heartbeat) |
 | `RECLAIM_INTERVAL_SECS` | `30` | how often expired leases are swept back to pending |

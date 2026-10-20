@@ -27,6 +27,7 @@
     --completed: #16a34a;
     --skipped: #7c3aed;
     --dictionary: #0d9488;
+    --junction: #7c3aed;
     --solved-bg: #fff8e1;
     --solved-border: #f5c518;
     --solved-text: #7a5b00;
@@ -57,6 +58,7 @@
       --completed: #3ecf6e;
       --skipped: #a78bfa;
       --dictionary: #14b8a6;
+      --junction: #a78bfa;
       --solved-bg: #2c2405;
       --solved-border: #caa314;
       --solved-text: #ffd75e;
@@ -293,6 +295,7 @@
   .badge.status-completed { background: var(--completed); }
   .badge.status-skipped { background: var(--skipped); }
   .badge.kind-dictionary { background: var(--dictionary); }
+  .badge.kind-junction { background: var(--junction); }
   /* Black in both themes; the border keeps it visible on the dark card. */
   .badge.status-gap { background: #000; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18); }
   .priority-chip {
@@ -1228,7 +1231,13 @@
     tr.className = 'sweep-row';
     const td = document.createElement('td');
     td.colSpan = DETAIL_COLSPAN;
-    if (t.kind !== 'dictionary') {
+    if (t.kind === 'junction') {
+      if (t.cursor_candidate) {
+        td.append('▶ Next range starts at ', candidateChip(t.cursor_candidate), ` (length ${t.cursor_candidate_len})`);
+      } else {
+        td.append('▶ Every tail has been handed out');
+      }
+    } else if (t.kind !== 'dictionary') {
       td.append('▶ Main sweep is here - next: ', candidateChip(t.cursor_candidate), ` (length ${t.cursor_candidate_len})`);
     } else if (t.cursor_candidate) {
       td.append('▶ Next range starts at ', candidateChip(t.cursor_candidate), ` (${words(t.cursor_candidate_len)})`);
@@ -1759,6 +1768,7 @@
       frag.appendChild(dictionarySettings(t.dictionary));
       return frag;
     }
+    if (t.junction) frag.appendChild(junctionSettings(t.junction));
 
     const rules = [];
     if (t.prune_symbol_runs) rules.push(hint('symbol runs', 'Skips candidates with 3+ consecutive non-alphanumeric, non-space characters'));
@@ -1790,6 +1800,38 @@
         'From 11 characters, the 2 (or from 12, 3) leading characters most words start with - in real filenames, then in English - get priority ranges of their own, one at a time')]));
     }
     return frag;
+  }
+
+  // What a junction target searches: the hash state after the unknown
+  // directory, which is what the client looks for, how much of the
+  // directory its table holds (and what that costs it in memory - a client
+  // that won't give that much gets none of this target's work), and how
+  // many tails that leaves to rewind.
+  function junctionSettings(j) {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(settingsLine('Junction', [
+      hint(`hashA ${j.junction_a}`, 'seed1 and seed2 of the hash state right after the directory'),
+      [`hashB ${j.junction_b}`],
+    ]));
+    frag.appendChild(settingsLine('Table', [
+      hint(`first ${characters(j.table_length)}`, 'Held by the client as a table, by the state each one reaches - the forward half of the search'),
+      [`${fmtNum(j.table_directories)} directories`],
+      hint(fmtBytes(j.table_bytes), 'A client that will not give a table this much memory gets no work from this target'),
+    ]));
+    frag.appendChild(settingsLine('To rewind', [
+      hint(`${j.tail_count} tails`, 'The backward half: a tail is a directory without the table\'s characters, rewound from the junction'),
+      [`for ${j.directory_count} directories`],
+    ]));
+    return frag;
+  }
+
+  // A size in bytes, as a human reads it.
+  function fmtBytes(bytes) {
+    const units = [['GiB', 1 << 30], ['MiB', 1 << 20], ['KiB', 1 << 10]];
+    for (const [unit, size] of units) {
+      if (bytes >= size) return `${(bytes / size).toFixed(bytes >= 10 * size ? 0 : 1)} ${unit}`;
+    }
+    return `${bytes} bytes`;
   }
 
   // What a dictionary target's candidates are made of: its word lists,
@@ -1972,6 +2014,13 @@
       kind.title = 'Candidates made of words from word lists';
       head.appendChild(kind);
     }
+    if (t.kind === 'junction') {
+      const kind = document.createElement('span');
+      kind.className = 'badge kind-junction';
+      kind.textContent = 'Junction';
+      kind.title = 'An unknown directory, searched from both ends at once from the hash state after it';
+      head.appendChild(kind);
+    }
     if (t.priority) {
       const prio = document.createElement('span');
       prio.className = 'priority-chip';
@@ -2019,7 +2068,10 @@
 
     const bounds = document.createElement('div');
     bounds.className = 'target-bounds';
-    if (t.kind !== 'dictionary') {
+    if (t.kind === 'junction') {
+      const j = t.junction;
+      bounds.append(`Directories of ${j.min_length === j.max_length ? characters(j.min_length) : `${j.min_length} to ${j.max_length} characters`}`);
+    } else if (t.kind !== 'dictionary') {
       bounds.append(candidateChip(t.lower_bound), ' → ', candidateChip(t.upper_bound));
     } else if (t.lower_bound || t.upper_bound) {
       // Whole filenames, either of which may be left out.
