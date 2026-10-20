@@ -417,12 +417,12 @@ CUDA_DICT_MUTATIONS = [
 JUNCTION_CAUGHT = ("self-test", "junction", "junction-small")
 
 # The engine's half of it, shared by every backend that searches junctions:
-# the table and the walk (src/engine/junction.cpp).
+# the table, which they all look their tails up in
+# (src/engine/junction.cpp). Not the walk - JunctionWalk is the CPU
+# backend's, the GPU kernels walking the tails themselves, so its mutations
+# are in CPU_JUNCTION_MUTATIONS, where they are reached.
 JUNCTION_ENGINE = "src/engine/junction.cpp"
 JUNCTION_MUTATIONS = [
-    Mutation("jwalkskip", "a rejected tail skipped together with its siblings, not just its own subtree",
-             [(JUNCTION_ENGINE, "        if (!skip(reached + 1))", "        if (!skip(reached))")],
-             caught_by=JUNCTION_CAUGHT),
     # The table's filter is indexed by the host and read by the kernels, each
     # with its own copy of the mixing: this is what holds the two together.
     Mutation("jfiltermix", "the table's filter indexed with another mixing than a kernel reads it with",
@@ -437,7 +437,12 @@ JUNCTION_MUTATIONS = [
              caught_by=("junction", "junction-small")),
 ]
 
-# The CUDA/HIP junction kernel (junctionKernel).
+# The CUDA/HIP junction kernel (junctionKernel). Nothing here breaks the key
+# the kernel compares states by: junctionKey (engine/hash_match.h) is the
+# host's too, so a mutation of it would break both sides the same way and
+# change nothing. The constants the kernel does keep its own copy of - 33's
+# inverse and the filter's mixing - are jstepback and jfiltermix. (The
+# OpenCL kernel builds the key itself, which is why its list has jseedmask.)
 CUDA_JUNCTION_MUTATIONS = [
     Mutation("jstepback", "the hash undone by another multiplier than 33's inverse",
              [(KERNEL, "    const uint32_t before2 = (seed2 - ord - seed1 - 3) * 0x3E0F83E1u;",
@@ -514,12 +519,20 @@ OPENCL_JUNCTION_MUTATIONS = [
              caught_by=("junction-small",)),
 ]
 
-# The CPU backend's junction walk.
+# The CPU backend's junction walk, and JunctionWalk itself, which only it
+# uses (a GPU kernel walks the tails its own way).
 CPU_JUNCTION_MUTATIONS = [
+    # These two are only reached where a work item holds more than one tail.
+    # The small variant's calls are seven tails, which it splits into items of
+    # one, so a walk that stops after the first tail of an item, or skips too
+    # much after a rejected one, is all the same to it.
+    Mutation("jwalkskip", "a rejected tail skipped together with its siblings, not just its own subtree",
+             [(JUNCTION_ENGINE, "        if (!skip(reached + 1))", "        if (!skip(reached))")],
+             caught_by=("self-test", "junction")),
     Mutation("jcpuonetail", "only the first tail of a work item looked up",
              [(CPU, "            for (bool more = walk.start(items[i].from, items[i].to); more; more = walk.next()) {",
                "            for (bool more = walk.start(items[i].from, items[i].to); more; more = false) {")],
-             caught_by=JUNCTION_CAUGHT),
+             caught_by=("self-test", "junction")),
     Mutation("jcpufilter", "a tail's state looked up in the filter alone, never in the keys",
              [(CPU, "                if (table.mayHold(key) && table.holds(key))", "                if (table.mayHold(key) && !table.holds(key))")],
              caught_by=JUNCTION_CAUGHT),
