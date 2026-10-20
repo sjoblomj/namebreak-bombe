@@ -8,13 +8,15 @@ std::string authHeader(const std::string& token) {
 }
 } // namespace
 
-bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, const std::string& backend, RegisterResponse& out,
-                                       std::string& error) {
+bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t junctionTableBytes,
+                                       RegisterResponse& out, std::string& error) {
     RegisterRequest req;
     req.username = username;
     req.hostname = hostname;
     req.backend = backend;
     req.clientRelease = namebreakVersion();
+    if (junctionTableBytes > 0)
+        req.junctionTableBytes = junctionTableBytes;
     HttpResponse resp = http_.post(baseUrl_ + "/api/v1/register", {}, toJson(req));
     upgradeRequired_ = resp.status == 426;
     if (resp.status == 0) {

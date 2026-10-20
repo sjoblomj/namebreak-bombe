@@ -738,7 +738,13 @@ EOF
 ```
 
 `hostname` (optional) defaults to the machine's actual hostname;
-`poll_interval_secs` (optional) defaults to 30. namebreak re-registers
+`poll_interval_secs` (optional) defaults to 30; and
+`junction_table_memory` (optional, default none) is how much memory this
+client will give a junction target's table - `1G`, `512M`, or a number of
+bytes. Without it, the server hands out no junction target's work: that
+table is memory a volunteer has to agree to spare, and on a GPU it has to
+fit in the device's own too (see **Junction targets** above). namebreak
+re-registers
 (idempotently) on every start, claims a range, searches it in-process against
 exactly that range, reports the result, and loops. If the search fails to
 even start (bad claim data, matches file not writable), it skips reporting

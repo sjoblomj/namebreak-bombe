@@ -48,9 +48,9 @@ bool parseInsertion(const std::string& s, Insertion& out) {
     return true;
 }
 
-// A number of bytes, as `table_memory` gives it: digits, optionally
-// followed by K, M or G (1024, 1024^2, 1024^3 - case doesn't matter).
-bool parseBytes(const std::string& s, uint64_t& out) {
+// parseConfigBytes (config.h), which [junction]'s `table_memory` and
+// [coordinator]'s `junction_table_memory` both read.
+bool parseBytesImpl(const std::string& s, uint64_t& out) {
     const std::string text = trim(s);
     if (text.empty())
         return false;
@@ -498,7 +498,7 @@ bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::s
         error = "invalid resume_from_last_candidate: '" + resumeStr + "' (expected true/false)";
         return false;
     }
-    if (!parseBytes(tableMemoryStr, out.tableBytes)) {
+    if (!parseConfigBytes(tableMemoryStr, out.tableBytes)) {
         error = "invalid table_memory: '" + tableMemoryStr + "' (expected a number of bytes, or one with a K, M or G after it)";
         return false;
     }
@@ -537,6 +537,10 @@ bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::s
         }
     }
     return true;
+}
+
+bool parseConfigBytes(const std::string& text, uint64_t& out) {
+    return parseBytesImpl(text, out);
 }
 
 bool parseConfigList(const std::string& value, std::vector<std::string>& out, std::string& error) {

@@ -30,6 +30,8 @@
 #include "engine/candidate.h"
 #include "common/platform.h"
 #include "engine/dictionary_search.h"
+#include "engine/junction.h"
+#include "engine/junction_search.h"
 #include "engine/match_writer.h"
 #include "engine/search.h"
 #include "engine/wordlist.h"
@@ -226,6 +228,35 @@ private:
     SearchBackend* chosen_ = nullptr;
 };
 
+// The backend a junction target's range is searched on - the main one if it
+// can and passes the junction self-test, else the cpu backend, as a
+// dictionary range's is.
+class JunctionBackend {
+public:
+    explicit JunctionBackend(SearchBackend& main) : main_(main) {}
+
+    // Null, with `error` set, if no backend can search junctions here.
+    SearchBackend* get(std::string& error) {
+        if (chosen_)
+            return chosen_;
+        std::string testError;
+        if (main_.supportsJunction() && selfTestJunctionBackend(main_, testError)) {
+            chosen_ = &main_;
+            return chosen_;
+        }
+        fprintf(stderr, "[coordinator] the %s backend %s - searching junction targets with the cpu backend instead\n", main_.name(),
+                main_.supportsJunction() ? ("failed the junction self-test: " + testError).c_str() : "can't search junctions");
+        cpu_ = createJunctionBackend("cpu", error);
+        chosen_ = cpu_.get();
+        return chosen_;
+    }
+
+private:
+    SearchBackend& main_;
+    std::unique_ptr<SearchBackend> cpu_;
+    SearchBackend* chosen_ = nullptr;
+};
+
 // How a range's search went, whichever kind of target it's of.
 struct RangeResult {
     bool ok = true;
@@ -245,8 +276,12 @@ struct RangeSearch {
     // heartbeat thread while `run` runs.
     std::function<void(std::optional<std::string>& lastHashAMatch)> progress;
     // A dictionary range's progress and the basenames waiting to be sent -
-    // null for an alphabet range.
+    // null for any other kind of range.
     BasenameOutbox* outbox = nullptr;
+    // A junction range's progress: every tail numbered below this has been
+    // looked up - null for any other kind of range. Called from the
+    // heartbeat thread while `run` runs.
+    std::function<std::optional<int64_t>()> nextTailIndex;
     // Where a match it finds is recorded (see MatchWriter).
     std::string outputFilePath;
 };
@@ -257,7 +292,9 @@ struct RangeSearch {
 // alphabet range's latest Hash A match.
 template <class Report>
 void fillReport(const RangeSearch& search, Report& req) {
-    if (search.outbox) {
+    if (search.nextTailIndex) {
+        req.nextTailIndex = search.nextTailIndex();
+    } else if (search.outbox) {
         BasenameOutbox::Report report = search.outbox->peek(kMaxBasenamesPerReport);
         req.nextCandidateNumber = (int64_t) report.next;
         req.basenames = std::move(report.basenames);
@@ -278,6 +315,8 @@ void basenamesDelivered(BasenameOutbox* outbox, const std::vector<std::string>& 
 std::string describeProgress(const QuitRequest& req) {
     if (req.nextCandidateNumber)
         return "searched every candidate numbered below " + std::to_string(*req.nextCandidateNumber);
+    if (req.nextTailIndex)
+        return "looked up every tail numbered below " + std::to_string(*req.nextTailIndex);
     return "searched up to " + *req.lastHashAMatchFilename;
 }
 
@@ -291,7 +330,7 @@ std::string describeProgress(const QuitRequest& req) {
 void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t rangeId, const QuitRequest& req, BasenameOutbox* outbox) {
     CoordinatorClient quitClient(args.serverUrl);
     quitClient.setToken(token);
-    const bool progressed = req.lastHashAMatchFilename || req.nextCandidateNumber;
+    const bool progressed = req.lastHashAMatchFilename || req.nextCandidateNumber || req.nextTailIndex;
     std::string err;
     switch (quitClient.quit(rangeId, req, err)) {
         case CoordinatorClient::QuitOutcome::Ok:
@@ -801,16 +840,134 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
     return true;
 }
 
+// The search of a junction target's range (see ClaimResponse::junction) -
+// false, with `error` set, if the claim can't make one. `base` is the node
+// number its first tail is, which turns the walk's progress back into a tail
+// index for a report.
+bool toJunctionRequest(const ClaimResponse& claim, const CoordinatorArgs& args, JunctionRequest& req, uint64_t& base, std::string& error) {
+    req.alphabet = claim.alphabet;
+    req.prefix = claim.prefix;
+    req.suffix = claim.suffix;
+    // One length a range: a tail is the directory without the table's
+    // characters, so the tails of two lengths aren't the same thing.
+    req.minLength = (int) claim.directoryLength;
+    req.maxLength = (int) claim.directoryLength;
+    req.tableLength = (int) claim.junctionTableLength;
+    req.rules.symbolRuns = claim.pruneSymbolRuns;
+    req.rules.unopenedBrackets = claim.pruneUnopenedBrackets;
+    req.rules.maxBackslashCount = (int) claim.maxBackslashCount;
+    req.rules.minBackslashCount = (int) claim.minBackslashCount;
+    req.rules.adjacentBackslashes = claim.pruneAdjacentBackslashes;
+    if (!hexToU32(claim.hashAHex, req.targetHashA) || !hexToU32(claim.hashBHex, req.targetHashB)) {
+        error = "malformed target hash in claim response (hashA=" + claim.hashAHex + " hashB=" + claim.hashBHex + ")";
+        return false;
+    }
+    uint32_t seeds[4] = {0, 0, 0, 0};
+    const std::string hex[4] = {claim.junctionASeed1Hex, claim.junctionASeed2Hex, claim.junctionBSeed1Hex, claim.junctionBSeed2Hex};
+    for (int i = 0; i < 4; ++i) {
+        if (!hexToU32(hex[i], seeds[i])) {
+            error = "malformed junction state in claim response (" + hex[i] + ")";
+            return false;
+        }
+    }
+    req.junctionA = {seeds[0], seeds[1]};
+    req.junctionB = {seeds[2], seeds[3]};
+    // The memory this range's table would take - never more than this client
+    // said it would give (RegisterRequest::junctionTableBytes). The server
+    // doesn't hand out more, so this only catches a server that got it
+    // wrong: a table is the volunteer's memory, not the server's to spend.
+    const uint64_t tableBytes = JunctionTable::bytesFor((int) req.alphabet.size(), req.tableLength);
+    if (tableBytes > (uint64_t) args.junctionTableBytes) {
+        error = "its table of " + std::to_string(req.tableLength) + " characters needs " + std::to_string(tableBytes / (1024 * 1024)) +
+                " MB, more than the " + std::to_string((uint64_t) args.junctionTableBytes / (1024 * 1024)) +
+                " MB junction_table_memory allows";
+        return false;
+    }
+    // Where the claim's tails are among the ones a search of this length
+    // walks - see JunctionSpace.
+    JunctionSpace space;
+    if (!JunctionSpace::create(req.alphabet, req.minLength, req.maxLength, req.tableLength, space, error))
+        return false;
+    const int tailLength = space.maxTailLength();
+    if ((uint64_t) claim.endTailIndex > space.countOf(tailLength)) {
+        error = "the claim's range ends at tail " + std::to_string(claim.endTailIndex) + ", past the last one (" +
+                std::to_string(space.countOf(tailLength) - 1) + ")";
+        return false;
+    }
+    base = space.numberOf(tailLength, 0);
+    req.startNumber = space.numberOf(tailLength, (uint64_t) claim.firstTailIndex);
+    req.endNumber = space.numberOf(tailLength, (uint64_t) claim.endTailIndex);
+    req.outputFilePath = matchesFilePath(args.matchesDir, claim.targetName);
+    // The server keeps the progress (a heartbeat's next_tail_index), so
+    // there's no progress file.
+    req.progressFilePath.clear();
+    return true;
+}
+
+// A junction target's range: runJunctionSearch over the tails the claim
+// names, its progress the tail it has got to. False if it can't be searched
+// at all - the range is handed back, and the caller should wait a while
+// before claiming again, rather than be handed the same one.
+bool runJunctionRange(JunctionBackend& backends, const CoordinatorArgs& args, const std::string& token, const ClaimResponse& claim,
+                      const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
+    std::string error;
+    JunctionRequest req;
+    uint64_t base = 0;
+    SearchBackend* backend = nullptr;
+    if (!toJunctionRequest(claim, args, req, base, error) || (backend = backends.get(error)) == nullptr) {
+        fprintf(stderr, "[coordinator] range %lld: can't search it (%s) - handing it back\n", (long long) claim.rangeId, error.c_str());
+        reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr);
+        return false;
+    }
+
+    if (callbacks && callbacks->onRangeClaimed) {
+        // What a caller can show of it: the directories it covers, with the
+        // table's characters as '?' - the claim's own bounds.
+        SearchRequest shown;
+        shown.prefix = req.prefix;
+        shown.suffix = req.suffix;
+        shown.alphabet = req.alphabet;
+        shown.lowerBound = claim.lowerBoundFilename;
+        shown.upperBound = claim.upperBoundFilename;
+        shown.outputFilePath = req.outputFilePath;
+        callbacks->onRangeClaimed(claim, shown);
+    }
+
+    std::mutex progressMutex;
+    std::optional<int64_t> reached;
+    RangeSearch search;
+    search.outputFilePath = req.outputFilePath;
+    search.nextTailIndex = [&]() {
+        std::lock_guard<std::mutex> lock(progressMutex);
+        return reached;
+    };
+    search.run = [&](std::atomic<bool>& abort) {
+        JunctionSearchHooks hooks;
+        hooks.onProgress = [&](uint64_t next) {
+            // The walk's node numbers are this length's tails, offset by
+            // where they start (see toJunctionRequest).
+            std::lock_guard<std::mutex> lock(progressMutex);
+            reached = (int64_t) (next - base);
+        };
+        JunctionResult found = runJunctionSearch(*backend, req, &abort, hooks, pauseRequested);
+        return RangeResult{found.ok, found.error, found.found, found.filename, found.aborted};
+    };
+    runRange(args, token, claim, search, pauseRequested, quitRequested, callbacks);
+    return true;
+}
+
 // Runs exactly one claimed range, of whichever kind of target. False if it
 // couldn't be searched at all, so the caller should wait a while before
 // claiming again (see runDictionaryRange).
-bool runOneRange(SearchBackend& backend, DictionaryBackend& dictionaryBackend, const CoordinatorArgs& args, const std::string& token,
-                 const ClaimResponse& claim, const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested,
+bool runOneRange(SearchBackend& backend, DictionaryBackend& dictionaryBackend, JunctionBackend& junctionBackend, const CoordinatorArgs& args,
+                 const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested,
                  const CoordinatorCallbacks* callbacks) {
     printf("[coordinator] starting range %lld (target %s) [%s .. %s]\n",
            (long long) claim.rangeId, claim.targetName.c_str(), claim.lowerBoundFilename.c_str(), claim.upperBoundFilename.c_str());
     if (claim.dictionary)
         return runDictionaryRange(dictionaryBackend, args, token, claim, pauseRequested, quitRequested, callbacks);
+    if (claim.junction)
+        return runJunctionRange(junctionBackend, args, token, claim, pauseRequested, quitRequested, callbacks);
     runAlphabetRange(backend, args, token, claim, pauseRequested, quitRequested, callbacks);
     return true;
 }
@@ -826,6 +983,7 @@ bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::s
     out.username = r.getOptional("username", "");
     out.hostname = r.getOptional("hostname", "");
     std::string pollStr = r.getOptional("poll_interval_secs", "30");
+    const std::string junctionMemoryStr = r.getOptional("junction_table_memory", "0");
 
     std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
@@ -839,6 +997,12 @@ bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::s
         error = "invalid poll_interval_secs: " + pollStr;
         return false;
     }
+    uint64_t junctionBytes = 0;
+    if (!parseConfigBytes(junctionMemoryStr, junctionBytes) || junctionBytes > (uint64_t) INT64_MAX) {
+        error = "invalid junction_table_memory: '" + junctionMemoryStr + "' (expected a number of bytes, or one with a K, M or G after it)";
+        return false;
+    }
+    out.junctionTableBytes = (int64_t) junctionBytes;
     out.matchesDir = config.matchesDir;
     out.backend = config.backend;
     return true;
@@ -869,7 +1033,7 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
     CoordinatorClient client(args.serverUrl);
     RegisterResponse registration;
     std::string error;
-    if (!client.registerClient(args.username, args.hostname, backend->name(), registration, error)) {
+    if (!client.registerClient(args.username, args.hostname, backend->name(), args.junctionTableBytes, registration, error)) {
         // Too old for the server (see CoordinatorClient::upgradeRequired):
         // its message says what to get.
         std::string msg = client.upgradeRequired() ? error : "failed to register with coordinator: " + error;
@@ -879,16 +1043,24 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
         return 1;
     }
     {
+        // What this client will give a junction target's table decides
+        // whether it's offered that work at all, so it's said out loud.
+        const std::string junction = args.junctionTableBytes > 0
+                                         ? std::to_string((uint64_t) args.junctionTableBytes / (1024 * 1024)) + " MB for a junction table"
+                                         : "no junction work (set junction_table_memory in [coordinator] to take it on)";
         std::string msg = "[coordinator] registered with coordinator as user " + std::to_string(registration.userId) + " (" + args.username +
-                           "@" + args.hostname + ", " + backend->name() + " backend) - namebreak " + namebreakVersion() + ", client protocol v" +
-                           kProtocolVersion + ", server protocol v" + registration.serverProtocolVersion;
+                           "@" + args.hostname + ", " + backend->name() + " backend, " + junction + ") - namebreak " + namebreakVersion() +
+                           ", client protocol v" + kProtocolVersion + ", server protocol v" + registration.serverProtocolVersion;
         printf("%s\n", msg.c_str());
+        fflush(stdout);
         if (callbacks && callbacks->onStatus)
             callbacks->onStatus(msg);
     }
 
-    // Dictionary ranges' backend, chosen when the first one comes.
+    // Dictionary and junction ranges' backends, each chosen when the first
+    // one of its kind comes.
     DictionaryBackend dictionaryBackend(*backend);
+    JunctionBackend junctionBackend(*backend);
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
     RetryBackoff claimBackoff(pollInterval);
@@ -950,13 +1122,14 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
 
         if (!claim) {
             printf("[coordinator] no work available, sleeping\n");
+            fflush(stdout);
             if (callbacks && callbacks->onStatus)
                 callbacks->onStatus("[coordinator] no work available, sleeping");
             interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(pollInterval), quitRequested);
             continue;
         }
 
-        if (!runOneRange(*backend, dictionaryBackend, args, client.token(), *claim, pauseRequested, quitRequested, callbacks)) {
+        if (!runOneRange(*backend, dictionaryBackend, junctionBackend, args, client.token(), *claim, pauseRequested, quitRequested, callbacks)) {
             // Most likely the next claim would be the same range again.
             interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(pollInterval), quitRequested);
         }

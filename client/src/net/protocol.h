@@ -32,7 +32,11 @@
 // 1.5.0: dictionary targets (ClaimResponse::dictionary and the fields after
 // it), word lists downloaded from the server, progress reported by
 // candidate number, and the basenames sent with every report.
-constexpr const char* kProtocolVersion = "1.5.0";
+// 1.6.0: junction targets (ClaimResponse::junction and the fields after it),
+// how much memory this client will give such a search's table
+// (RegisterRequest::junctionTableBytes - without it the server hands out
+// none of that work), and progress reported by tail index.
+constexpr const char* kProtocolVersion = "1.6.0";
 
 // The most basenames one heartbeat, quit or completion carries - the
 // server's MAX_BASENAMES_PER_REPORT. Any more wait for the next report (see
@@ -54,6 +58,11 @@ struct RegisterRequest {
     // This build's release (namebreakVersion() - see common/version.h), so
     // the server can refuse a client that's too old.
     std::string clientRelease;
+    // How much memory, in bytes, this client will give a junction search's
+    // table ([coordinator]'s junction_table_memory - see junction.h). The
+    // server hands out no junction target whose table is bigger, and none at
+    // all without this. Absent (null) if this client won't spare any.
+    std::optional<int64_t> junctionTableBytes;
 };
 
 struct RegisterResponse {
@@ -136,6 +145,29 @@ struct ClaimResponse {
     // only the candidates whose basename matches it are compared to the
     // hashes. Older servers send it only with sendBasenames.
     std::string encryptionKeyHex;
+
+    // A junction target's range (all optional in the response, and only ever
+    // in a junction target's claim): the unknown part of the name is a
+    // directory of directoryLength characters, of which a table holds the
+    // first junctionTableLength (see engine/junction.h) and the backward
+    // walk rewinds the rest from the junction below - the tails numbered
+    // [firstTailIndex, endTailIndex). The alphabet and the pruning rules
+    // apply as they do to an alphabet target (the rules to every character
+    // of the directory); lowerBoundFilename/upperBoundFilename are only the
+    // first and last directories it covers, for showing, with the table's
+    // characters as '?'.
+    bool junction = false;
+    // The hash state after the directory: hashA's two seeds, then hashB's.
+    // Hashing the suffix onto them gives the file's two hashes - the search
+    // refuses to start otherwise (junctionFitsHashes).
+    std::string junctionASeed1Hex;
+    std::string junctionASeed2Hex;
+    std::string junctionBSeed1Hex;
+    std::string junctionBSeed2Hex;
+    int64_t directoryLength = 0;
+    int64_t junctionTableLength = 0;
+    int64_t firstTailIndex = 0;
+    int64_t endTailIndex = 0;
 };
 
 struct HeartbeatRequest {
@@ -150,6 +182,10 @@ struct HeartbeatRequest {
     // A dictionary target's range's progress instead: every candidate
     // numbered below this has been searched.
     std::optional<int64_t> nextCandidateNumber;
+    // And a junction target's: every tail numbered below this has been
+    // rewound and looked up. A junction search always knows how far it has
+    // got, so every heartbeat carries this.
+    std::optional<int64_t> nextTailIndex;
     // Basenames that matched the key since the last report that got an
     // answer - at most kMaxBasenamesPerReport, and nextCandidateNumber never
     // past one left out (see BasenameOutbox). The server keeps them whatever
@@ -180,6 +216,7 @@ struct QuitRequest {
     std::optional<std::string> lastHashAMatchFilename;
     // As HeartbeatRequest's.
     std::optional<int64_t> nextCandidateNumber;
+    std::optional<int64_t> nextTailIndex;
     std::vector<std::string> basenames;
 };
 

@@ -37,8 +37,11 @@ unknown name lists the ones the build has.
 - **`coordinator`** - registers with a central coordinator server, claims a
   range of a shared target's search space, searches it, and reports back;
   repeats until stopped. A target is searched by alphabet, as `bounded` mode
-  searches, or by words, as `dictionary` mode does (see [Dictionary targets
-  in coordinator mode](#dictionary-targets-in-coordinator-mode)). See
+  searches, by words, as `dictionary` mode does (see [Dictionary targets
+  in coordinator mode](#dictionary-targets-in-coordinator-mode)), or from a
+  junction, as `junction` mode does - for which `junction_table_memory` says
+  how much memory you'll give its table, and without which the server hands
+  out none of that work (see [Junction mode](#junction-mode)). See
   [`../coordinator/README.md`](../coordinator/README.md) for the server side
   and how this mode is configured.
 - **`dictionary`** - searches candidates made of words: one word, or several
@@ -556,6 +559,30 @@ rules in full, and the halves' own skipping only ever drops directories that
 check would reject anyway. That property is what `tests/junction_test.cpp`
 checks exhaustively, over every directory of a small alphabet at every split
 between the two halves.
+
+### In coordinator mode
+
+A junction target can be shared out (the coordinator README's "Junction
+targets"): the server fixes how many characters the table holds - what a
+tail even is depends on it - and hands out a stretch of one directory
+length's tails at a time. What it costs in memory is therefore the same for
+every client of that target, so a client says how much it will give one in
+`[coordinator]`'s `junction_table_memory`:
+
+```ini
+[coordinator]
+server_url = https://namebreak-coordinator.fly.dev
+junction_table_memory = 1G
+```
+
+Left out (or 0), this client is handed no junction target's work at all -
+a table is memory you have to agree to spare, and on a GPU it has to fit in
+the device's own as well. The client says which it is when it registers, and
+a server hands out no target whose table is bigger than it. The table is
+built afresh for every range claimed (a few seconds for four characters of
+43, a quarter of a minute for five), and progress is reported as the tail
+the walk has got to, so a range taken over by someone else resumes exactly
+there.
 
 ### Progress, resuming and ranges
 

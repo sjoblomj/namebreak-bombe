@@ -31,6 +31,13 @@ struct CoordinatorArgs {
     // The backend to search with - config.conf's `backend`, or --backend;
     // empty for the first one that can run here (see backends/backends.h).
     std::string backend;
+    // How much memory this client will give a junction target's table
+    // ([coordinator]'s junction_table_memory - see engine/junction.h), in
+    // bytes. 0 (the default) takes no junction work at all: the server hands
+    // out none of it to a client that won't say what it will give, and a
+    // table is memory a volunteer has to agree to spare - on the GPU too,
+    // for a GPU backend, where it has to fit in the device's own.
+    int64_t junctionTableBytes = 0;
 };
 
 // Builds a CoordinatorArgs from `config`'s [coordinator] section (and its
