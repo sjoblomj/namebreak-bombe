@@ -1,6 +1,7 @@
 #ifndef NAMEBREAK_COMMON_CONFIG_H
 #define NAMEBREAK_COMMON_CONFIG_H
 
+#include <cstdint>
 #include <map>
 #include <set>
 #include <string>
@@ -26,7 +27,9 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 // file with four possible [section] headers:
 //   [search]      - bounded/continuous parameters (mode picks which of the
 //                   two actually runs; both take the same parameters)
-//   [coordinator] - coordinator-mode parameters (see coordinator_runner.h)
+//   [coordinator] - coordinator-mode parameters (see coordinator_runner.h),
+//                   including junction_table_memory: how much memory this
+//                   client will give a junction target's table
 //   [dictionary]  - dictionary-mode parameters (see buildDictionaryRequest)
 //   [junction]    - junction-mode parameters (see buildJunctionRequest)
 // plus four keys allowed before any section: `mode = continuous|bounded|
@@ -118,6 +121,11 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 // when it isn't given, so that `out.tableLength` is always the length the
 // search will really use - the progress file's fingerprint depends on it.
 bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::string& error);
+
+// A number of bytes, as [junction]'s `table_memory` and [coordinator]'s
+// `junction_table_memory` give it: digits, optionally followed by K, M or G
+// (1024, 1024^2, 1024^3 - case doesn't matter). False on anything else.
+bool parseConfigBytes(const std::string& text, uint64_t& out);
 
 // Reads a list value as described above buildDictionaryRequest. False, with
 // `error` set, on an empty unquoted item, an unterminated quote, or text

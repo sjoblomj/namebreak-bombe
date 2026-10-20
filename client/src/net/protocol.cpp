@@ -259,6 +259,24 @@ bool getOptionalStringArray(const std::map<std::string, JsonValue>& obj, const s
 
 // A dictionary claim's fields (see ClaimResponse::dictionary) - every one
 // of them needed once `dictionary` is true, none of them before.
+// A junction target's claim (see ClaimResponse::junction): its junction,
+// the directory's length, how much of it the table holds, and the tails to
+// rewind. Absent from any other claim.
+bool getJunctionClaim(const std::map<std::string, JsonValue>& obj, ClaimResponse& out) {
+    if (!getOptionalBool(obj, "junction", out.junction)) return false;
+    if (!out.junction) return true;
+    return getString(obj, "junction_a_seed1_hex", out.junctionASeed1Hex) &&
+           getString(obj, "junction_a_seed2_hex", out.junctionASeed2Hex) &&
+           getString(obj, "junction_b_seed1_hex", out.junctionBSeed1Hex) &&
+           getString(obj, "junction_b_seed2_hex", out.junctionBSeed2Hex) &&
+           getInt64(obj, "directory_length", out.directoryLength) &&
+           getInt64(obj, "junction_table_length", out.junctionTableLength) &&
+           getInt64(obj, "first_tail_index", out.firstTailIndex) &&
+           getInt64(obj, "end_tail_index", out.endTailIndex) &&
+           out.junctionTableLength >= 0 && out.junctionTableLength <= out.directoryLength &&
+           out.firstTailIndex >= 0 && out.endTailIndex >= out.firstTailIndex;
+}
+
 bool getDictionaryClaim(const std::map<std::string, JsonValue>& obj, ClaimResponse& out) {
     if (!getOptionalBool(obj, "dictionary", out.dictionary)) return false;
     if (!out.dictionary) return true;
@@ -294,10 +312,13 @@ std::string jsonStringArray(const std::vector<std::string>& items) {
 // The fields a heartbeat, quit and completion share beyond the first:
 // `next_candidate_number` if there is one, and `basenames` if any - left out
 // otherwise, so that a report is what it was before protocol 1.5.
-std::string progressAndBasenames(const std::optional<int64_t>& nextCandidateNumber, const std::vector<std::string>& basenames) {
+std::string progressAndBasenames(const std::optional<int64_t>& nextCandidateNumber, const std::optional<int64_t>& nextTailIndex,
+                                 const std::vector<std::string>& basenames) {
     std::string out;
     if (nextCandidateNumber)
         out += ",\"next_candidate_number\":" + std::to_string(*nextCandidateNumber);
+    if (nextTailIndex)
+        out += ",\"next_tail_index\":" + std::to_string(*nextTailIndex);
     if (!basenames.empty())
         out += ",\"basenames\":" + jsonStringArray(basenames);
     return out;
@@ -322,13 +343,14 @@ bool getOptionalInsertion(const std::map<std::string, JsonValue>& obj, const std
 std::string toJson(const RegisterRequest& req) {
     return "{\"username\":" + escapeJsonString(req.username) + ",\"hostname\":" + escapeJsonString(req.hostname) +
            ",\"backend\":" + escapeJsonString(req.backend) + ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) +
-           ",\"client_release\":" + escapeJsonString(req.clientRelease) + "}";
+           ",\"client_release\":" + escapeJsonString(req.clientRelease) +
+           ",\"junction_table_bytes\":" + (req.junctionTableBytes ? std::to_string(*req.junctionTableBytes) : "null") + "}";
 }
 
 std::string toJson(const HeartbeatRequest& req) {
     std::string out = "{\"last_hash_a_match_filename\":";
     out += req.lastHashAMatchFilename ? escapeJsonString(*req.lastHashAMatchFilename) : "null";
-    out += progressAndBasenames(req.nextCandidateNumber, req.basenames);
+    out += progressAndBasenames(req.nextCandidateNumber, req.nextTailIndex, req.basenames);
     out += "}";
     return out;
 }
@@ -336,7 +358,7 @@ std::string toJson(const HeartbeatRequest& req) {
 std::string toJson(const QuitRequest& req) {
     std::string out = "{\"last_hash_a_match_filename\":";
     out += req.lastHashAMatchFilename ? escapeJsonString(*req.lastHashAMatchFilename) : "null";
-    out += progressAndBasenames(req.nextCandidateNumber, req.basenames);
+    out += progressAndBasenames(req.nextCandidateNumber, req.nextTailIndex, req.basenames);
     out += "}";
     return out;
 }
@@ -349,7 +371,7 @@ std::string toJson(const CompleteRequest& req) {
     out += req.filename ? escapeJsonString(*req.filename) : "null";
     out += ",\"elapsed_seconds\":" + std::to_string(req.elapsedSeconds);
     out += ",\"candidates_processed\":" + std::to_string(req.candidatesProcessed);
-    out += progressAndBasenames(std::nullopt, req.basenames);
+    out += progressAndBasenames(std::nullopt, std::nullopt, req.basenames);
     out += "}";
     return out;
 }
@@ -384,7 +406,8 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getString(obj, "alphabet", out.alphabet) &&
            getInt64( obj, "candidate_count", out.candidateCount) &&
            getInt64( obj, "lease_seconds", out.leaseSeconds) &&
-           getDictionaryClaim(obj, out);
+           getDictionaryClaim(obj, out) &&
+           getJunctionClaim(obj, out);
 }
 
 bool parseHeartbeatResponse(const std::string& body, HeartbeatResponse& out) {

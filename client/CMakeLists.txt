@@ -571,6 +571,12 @@ if(NAMEBREAK_NETWORK)
     find_program(CARGO_EXECUTABLE cargo)
     find_program(PYTHON3_EXECUTABLE python3)
     if(CARGO_EXECUTABLE AND PYTHON3_EXECUTABLE)
+        # Junction targets end to end: the memory a client has to declare
+        # before it's offered any, a planted directory found, a quit part
+        # way through a range of tails, and a canary - see the script.
+        namebreak_test(coordinator-junction ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_junction_test.py
+            --client $<TARGET_FILE:namebreak> --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
+        set_tests_properties(coordinator-junction PROPERTIES TIMEOUT 900)
         namebreak_test(coordinator-dictionary ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_dictionary_test.py
             --client $<TARGET_FILE:namebreak> --client-heartbeat-1s $<TARGET_FILE:namebreak_heartbeat_1s>
             --client-one-basename $<TARGET_FILE:namebreak_one_basename_per_report>
