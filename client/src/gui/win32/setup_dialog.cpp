@@ -1,8 +1,11 @@
 // First-run setup dialog - a hand-rolled modal window (CreateWindowEx + its
 // own nested message loop) rather than a .rc dialog template, so the GUI
-// needs no resource-compiler build step. Only ever shown once, before the
-// main window/worker thread exist, so there's no other message loop running
-// concurrently to conflict with.
+// needs no resource-compiler build step. Shown before the main window and
+// the worker thread exist at first run, and again - over a running search -
+// from the tray menu's Settings... (editSettings, app_config.cpp), which is
+// the one case where this window's own nested message loop runs inside the
+// main window's: see the loop at the end of showSetupDialog for what that
+// takes.
 //
 // One SysTabControl32 with four tabs - Coordinator; Local Search (which
 // covers both bounded and continuous, since they share the exact same
@@ -549,7 +552,7 @@ BOOL CALLBACK setFontEnumProc(HWND child, LPARAM font) {
 
 namespace gui {
 
-bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
+bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopened) {
     static bool classRegistered = false;
     if (!classRegistered) {
         WNDCLASSEXA wc{};
@@ -575,8 +578,9 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     constexpr DWORD kExStyle = WS_EX_DLGMODALFRAME;
     RECT rect = {0, 0, 620, 640}; // desired client area
     AdjustWindowRectEx(&rect, kStyle, FALSE, kExStyle);
-    HWND hwndDialog = CreateWindowExA(kExStyle, kSetupClassName, "namebreak - first-run setup", kStyle, CW_USEDEFAULT, CW_USEDEFAULT,
-                                       rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, hInstance, nullptr);
+    HWND hwndDialog = CreateWindowExA(kExStyle, kSetupClassName, reopened ? "namebreak - settings" : "namebreak - first-run setup",
+                                       kStyle, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr,
+                                       nullptr, hInstance, nullptr);
     if (!hwndDialog)
         return false;
     SetWindowLongPtr(hwndDialog, GWLP_USERDATA, (LONG_PTR) &state);
@@ -587,8 +591,10 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
     HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 150, 14, 450, 28, hwndDialog, nullptr, hInstance, nullptr);
     CreateWindowExA(0, "STATIC",
-                     "First-run setup. Choose how this machine should search, then press OK - your choices are saved to the configuration "
-                     "file and used on every later start. Hover over a blue ? for help with any option.",
+                     reopened ? "Settings. Change how this machine searches, then press OK - your choices replace what the configuration "
+                                "file says, and are used the next time namebreak starts. Hover over a blue ? for help with any option."
+                              : "First-run setup. Choose how this machine should search, then press OK - your choices are saved to the "
+                                "configuration file and used on every later start. Hover over a blue ? for help with any option.",
                      WS_CHILD | WS_VISIBLE, 150, 46, 455, 46, hwndDialog, nullptr, hInstance, nullptr);
 
     // --- Tabs, each with a page window over the tab body ---
@@ -707,25 +713,35 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     else if (!parseConfigBytes(fields.meetInTheMiddleTableMemory, tableMemory))
         tableMemory = 0;
 
-    constexpr int kMemoryY = 240;
-    makeLabel(pc, "Meet-in-the-middle work", 8, kMemoryY, 200);
+    // A group box of its own, because none of it is about joining a server
+    // as such: it only matters if that server has meet-in-the-middle work,
+    // and the memory is the one thing a client has to agree to spare before
+    // it is handed any.
+    constexpr int kMemoryY = 222, kMemoryX = 20;
+    CreateWindowExA(0, "BUTTON", "Meet-in-the-middle work", WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 8, kMemoryY, 570, 186, pc, nullptr,
+                     hInstance, nullptr);
+    makeLabel(pc,
+              "Only relevant if the coordinator has meet-in-the-middle targets to hand out - a file whose directory is unknown, "
+              "searched from both ends at once (see the Meet in the Middle tab). That needs a table in memory, and the server hands "
+              "this client such a target only if the table fits in what you give here. Everything else about coordinator mode works "
+              "the same either way.",
+              kMemoryX, kMemoryY + 20, 546, 62);
     const std::string machineMemory = "This machine has " + memoryText(memory.ullTotalPhys) + " of memory, " +
                                       memoryText(memory.ullAvailPhys) + " of it free right now.";
-    makeLabel(pc, machineMemory.c_str(), 8, kMemoryY + 22, 560);
-    makeLabel(pc, "Give at most:", 8, kMemoryY + 56, 100);
+    makeLabel(pc, machineMemory.c_str(), kMemoryX, kMemoryY + 86, 546);
+    makeLabel(pc, "Give at most:", kMemoryX, kMemoryY + 115, 100);
     state.hwndTableMemory =
-        CreateWindowExA(0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_AUTOTICKS | TBS_HORZ, 110, kMemoryY + 50, 330, 32,
-                         pc, (HMENU) (INT_PTR) kIdSetupTableMemory, hInstance, nullptr);
+        CreateWindowExA(0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_AUTOTICKS | TBS_HORZ, kMemoryX + 104,
+                         kMemoryY + 109, 320, 32, pc, (HMENU) (INT_PTR) kIdSetupTableMemory, hInstance, nullptr);
     SendMessage(state.hwndTableMemory, TBM_SETRANGE, TRUE, MAKELONG(0, (int) state.tableMemoryStops.size() - 1));
     SendMessage(state.hwndTableMemory, TBM_SETPAGESIZE, 0, 1);
     SendMessage(state.hwndTableMemory, TBM_SETPOS, TRUE, stopIndexFor(state.tableMemoryStops, tableMemory));
-    addHelp(pc, 450, kMemoryY + 56,
-            "How much memory this client will give the table of a meet-in-the-middle target - a file whose directory is unknown, "
-            "searched from both ends at once (see the Meet in the Middle tab). The server hands out such a target only if its table "
-            "fits in this, so None means no work of that kind at all.\r\n"
+    addHelp(pc, kMemoryX + 432, kMemoryY + 115,
+            "How much memory this client will give the table of a meet-in-the-middle target. The server hands out such a target only "
+            "if its table fits in this, so None means no work of that kind at all - and no other kind is affected by it.\r\n"
             "The table is only held while such a range is being searched, and on a GPU it is held in the card's own memory too - so "
             "keep this under what your GPU has free if you search with one.");
-    state.hwndTableMemoryText = makeLabel(pc, "", 8, kMemoryY + 88, 560, 34);
+    state.hwndTableMemoryText = makeLabel(pc, "", kMemoryX, kMemoryY + 145, 546, 30);
     syncTableMemoryText(&state);
 
     // --- Local Search page (two columns: label, field, help) ---
@@ -934,79 +950,99 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     // than the other pages' (kRowStep).
     constexpr int kMitmRow0 = 140, kMitmRowStep = 30;
     auto rowM = [&](int n) { return kMitmRow0 + n * kMitmRowStep; };
+    // Every field in a column is the same width, and every "?" sits in that
+    // column's own help position - so the whole page reads as two columns,
+    // however little a field has to hold (a length is three characters, an
+    // alphabet is forty).
+    constexpr int kMitmEdit1 = 150, kMitmEdit2 = 120;
 
     makeLabel(pm, "Alphabet:", kL1, rowM(0) + 3, 100);
-    state.hwndMitmAlphabet = makeEdit(pm, mitm.alphabet, kE1, rowM(0), 150);
+    state.hwndMitmAlphabet = makeEdit(pm, mitm.alphabet, kE1, rowM(0), kMitmEdit1);
     const std::string mitmAlphabetHelp = "Every character the unknown directory may be made of, typed out with no separators - at most " +
                                          std::to_string(MAX_ALPHABET_SIZE) + " of them. A space is one of them if you type one, and "
                                          "spaces at either end are kept, so type it exactly. A backslash searches directories with "
                                          "subdirectories in them.";
     addHelp(pm, kH1, rowM(0) + 2, mitmAlphabetHelp.c_str());
     makeLabel(pm, "Matches name:", kL2, rowM(0) + 3, 110);
-    state.hwndMitmMatchesName = makeEdit(pm, mitm.matchesName, kE2, rowM(0), 120);
+    state.hwndMitmMatchesName = makeEdit(pm, mitm.matchesName, kE2, rowM(0), kMitmEdit2);
     addHelp(pm, kH2, rowM(0) + 2,
             "Optional. Names the files the search writes - matches-<name>.txt and meet-in-the-middle-<name>.txt (where its progress "
             "is kept) - so searches for different files keep theirs apart. Blank: matches.txt and meet-in-the-middle.txt.");
 
     makeLabel(pm, "Prefix:", kL1, rowM(1) + 3, 100);
-    state.hwndMitmPrefix = makeEdit(pm, mitm.prefix, kE1, rowM(1), 150);
+    state.hwndMitmPrefix = makeEdit(pm, mitm.prefix, kE1, rowM(1), kMitmEdit1);
     addHelp(pm, kH1, rowM(1) + 2,
             "Optional. Known text before the unknown directory. The meeting point must be the hash state after the prefix and the "
             "directory together.");
     makeLabel(pm, "Suffix:", kL2, rowM(1) + 3, 110);
-    state.hwndMitmSuffix = makeEdit(pm, mitm.suffix, kE2, rowM(1), 120);
+    state.hwndMitmSuffix = makeEdit(pm, mitm.suffix, kE2, rowM(1), kMitmEdit2);
     addHelp(pm, kH2, rowM(1) + 2,
             "What follows the directory - for a file inside it, the backslash and the basename, for example \\BWUNIN.PIF.");
 
+    // A seed in each column, rather than both of them in the left one -
+    // seed1 above seed1, seed2 above seed2.
     makeLabel(pm, "Meeting point A:", kL1, rowM(2) + 3, 104);
-    state.hwndMitmASeed1 = makeEdit(pm, mitm.meetingPointASeed1, kE1, rowM(2), 150);
-    state.hwndMitmASeed2 = makeEdit(pm, mitm.meetingPointASeed2, kE1 + 158, rowM(2), 150);
-    addHelp(pm, kE1 + 316, rowM(2) + 2,
-            "Hash A's two seeds right after the directory, in hex (a 0x prefix is optional): seed1 on the left, seed2 on the right. "
-            "This is what the search looks for - a directory that takes the hash from the prefix's state to it.");
+    state.hwndMitmASeed1 = makeEdit(pm, mitm.meetingPointASeed1, kE1, rowM(2), kMitmEdit1);
+    addHelp(pm, kH1, rowM(2) + 2,
+            "Hash A's first seed (seed1) right after the directory, in hex (a 0x prefix is optional). The two seeds together are what "
+            "the search looks for - a directory that takes the hash from the prefix's state to them.");
+    makeLabel(pm, "A, seed 2:", kL2, rowM(2) + 3, 110);
+    state.hwndMitmASeed2 = makeEdit(pm, mitm.meetingPointASeed2, kE2, rowM(2), kMitmEdit2);
+    addHelp(pm, kH2, rowM(2) + 2, "Hash A's second seed (seed2) right after the directory, in hex.");
+
     makeLabel(pm, "Meeting point B:", kL1, rowM(3) + 3, 104);
-    state.hwndMitmBSeed1 = makeEdit(pm, mitm.meetingPointBSeed1, kE1, rowM(3), 150);
-    state.hwndMitmBSeed2 = makeEdit(pm, mitm.meetingPointBSeed2, kE1 + 158, rowM(3), 150);
-    addHelp(pm, kE1 + 316, rowM(3) + 2, "The same two seeds for Hash B, in hex.");
+    state.hwndMitmBSeed1 = makeEdit(pm, mitm.meetingPointBSeed1, kE1, rowM(3), kMitmEdit1);
+    addHelp(pm, kH1, rowM(3) + 2, "Hash B's first seed right after the directory, in hex.");
+    makeLabel(pm, "B, seed 2:", kL2, rowM(3) + 3, 110);
+    state.hwndMitmBSeed2 = makeEdit(pm, mitm.meetingPointBSeed2, kE2, rowM(3), kMitmEdit2);
+    addHelp(pm, kH2, rowM(3) + 2, "Hash B's second seed, in hex.");
 
     makeLabel(pm, "Hash A (hex):", kL1, rowM(4) + 3, 100);
-    state.hwndMitmHashA = makeEdit(pm, mitm.hashA, kE1, rowM(4), 150);
+    state.hwndMitmHashA = makeEdit(pm, mitm.hashA, kE1, rowM(4), kMitmEdit1);
     addHelp(pm, kH1, rowM(4) + 2,
             "The file's own first MPQ hash, in hex. Hashing the suffix onto the meeting point must give it, or the search refuses to "
             "start - a meeting point for the wrong place in the name would otherwise search everything and find nothing.");
     makeLabel(pm, "Hash B (hex):", kL2, rowM(4) + 3, 110);
-    state.hwndMitmHashB = makeEdit(pm, mitm.hashB, kE2, rowM(4), 120);
+    state.hwndMitmHashB = makeEdit(pm, mitm.hashB, kE2, rowM(4), kMitmEdit2);
     addHelp(pm, kH2, rowM(4) + 2, "The file's own second MPQ hash, in hex - checked against the meeting point the same way.");
 
     makeLabel(pm, "Min length:", kL1, rowM(5) + 3, 100);
-    state.hwndMitmMinLength = makeEdit(pm, mitm.minLength, kE1, rowM(5), 60);
-    addHelp(pm, kE1 + 68, rowM(5) + 2, "The shortest the unknown directory may be, in characters. Default: 1.");
+    state.hwndMitmMinLength = makeEdit(pm, mitm.minLength, kE1, rowM(5), kMitmEdit1);
+    addHelp(pm, kH1, rowM(5) + 2,
+            "The shortest the unknown directory may be, in characters - the directory alone, not the whole filename: the prefix and "
+            "the suffix are known and aren't counted. Default: 1.");
     makeLabel(pm, "Max length:", kL2, rowM(5) + 3, 110);
-    state.hwndMitmMaxLength = makeEdit(pm, mitm.maxLength, kE2, rowM(5), 60);
-    const std::string mitmMaxLengthHelp = "Required. The longest the unknown directory may be - at most " +
+    state.hwndMitmMaxLength = makeEdit(pm, mitm.maxLength, kE2, rowM(5), kMitmEdit2);
+    const std::string mitmMaxLengthHelp = "Required. The longest the unknown directory may be, in characters - at most " +
                                           std::to_string(MAX_CANDIDATE_LEN) +
-                                          " characters. Every length from the shortest up to it is searched, shortest first.";
-    addHelp(pm, kE2 + 68, rowM(5) + 2, mitmMaxLengthHelp.c_str());
+                                          ". Every length from Min length up to it is searched, shortest first, so this is as long a "
+                                          "directory as the search will consider; one character more costs about as many times more "
+                                          "work as the alphabet has characters.";
+    addHelp(pm, kH2, rowM(5) + 2, mitmMaxLengthHelp.c_str());
 
     makeLabel(pm, "Table length:", kL1, rowM(6) + 3, 100);
-    state.hwndMitmTableLength = makeEdit(pm, mitm.tableLength, kE1, rowM(6), 60);
-    addHelp(pm, kE1 + 68, rowM(6) + 2,
-            "Optional. How many of the directory's first characters the table holds; the rest are what the search walks backwards. "
+    state.hwndMitmTableLength = makeEdit(pm, mitm.tableLength, kE1, rowM(6), kMitmEdit1);
+    addHelp(pm, kH1, rowM(6) + 2,
+            "Optional. How many of the directory's first characters go in the table, which holds the hash state of every beginning of "
+            "that length. Only the characters after them are brute-forced - walked backwards from the meeting point - so this is how "
+            "many characters the memory buys you, and each one of them makes the search about as many times shorter as the alphabet "
+            "has characters.\r\n"
             "Blank: as many as Table memory allows, which is what you usually want.");
     makeLabel(pm, "Table memory:", kL2, rowM(6) + 3, 110);
-    state.hwndMitmTableMemory = makeEdit(pm, mitm.tableMemory, kE2, rowM(6), 80);
-    addHelp(pm, kE2 + 88, rowM(6) + 2,
-            "The most memory the table may take - a plain number of bytes, or one with a K, M or G after it (1G by default). Each "
-            "character more needs about as many times more memory as the alphabet has characters, so this decides how far the search "
-            "reaches. On a GPU the table has to fit in the card's own memory too.");
+    state.hwndMitmTableMemory = makeEdit(pm, mitm.tableMemory, kE2, rowM(6), kMitmEdit2);
+    addHelp(pm, kH2, rowM(6) + 2,
+            "The most memory that table may take - a plain number of bytes, or one with a K, M or G after it (1G by default). It is "
+            "what decides Table length when that's left blank: a character more needs about as many times more memory as the alphabet "
+            "has characters, so with a 43-character one it's about 30 MB for 4 characters, 1.4 GB for 5 and 59 GB for 6. On a GPU the "
+            "table has to fit in the card's own memory too.");
 
     makeLabel(pm, "Min backslash:", kL1, rowM(7) + 3, 100);
-    state.hwndMitmMinBackslash = makeEdit(pm, mitm.minBackslashCount, kE1, rowM(7), 60);
-    addHelp(pm, kE1 + 68, rowM(7) + 2,
+    state.hwndMitmMinBackslash = makeEdit(pm, mitm.minBackslashCount, kE1, rowM(7), kMitmEdit1);
+    addHelp(pm, kH1, rowM(7) + 2,
             "Optional. The fewest backslashes the directory may contain without being skipped. 0 (or blank) means none are needed.");
     makeLabel(pm, "Max backslash:", kL2, rowM(7) + 3, 110);
-    state.hwndMitmMaxBackslash = makeEdit(pm, mitm.maxBackslashCount, kE2, rowM(7), 60);
-    addHelp(pm, kE2 + 68, rowM(7) + 2,
+    state.hwndMitmMaxBackslash = makeEdit(pm, mitm.maxBackslashCount, kE2, rowM(7), kMitmEdit2);
+    addHelp(pm, kH2, rowM(7) + 2,
             "The most backslashes the directory may contain before it is skipped. 0 means no limit (to forbid them entirely, leave "
             "the backslash out of the alphabet instead).");
 
@@ -1049,10 +1085,29 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     UpdateWindow(hwndDialog);
     SetForegroundWindow(hwndDialog);
 
+    // Shown from the tray menu's Settings..., this loop is pumping the whole
+    // thread's messages, the main window's among them - so it can be handed
+    // the WM_QUIT of a search that stopped while the dialog was up (see
+    // WM_APP_WORKER_STOPPED, main_window.cpp). Swallowing it here would
+    // leave the process with no window and nothing to wake it; the outer
+    // loop is the one waiting for it, so put it back and leave.
     MSG msg;
-    while (!state.done && GetMessage(&msg, nullptr, 0, 0) > 0) {
+    while (!state.done) {
+        const BOOL got = GetMessage(&msg, nullptr, 0, 0);
+        if (got <= 0) {
+            if (got == 0)
+                PostQuitMessage((int) msg.wParam);
+            break;
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+    }
+    // The window is already gone if OK/Cancel/close ended the loop; it isn't
+    // if a WM_QUIT did, and it must not outlive `state`, which it holds a
+    // pointer to.
+    if (IsWindow(hwndDialog)) {
+        SetWindowLongPtr(hwndDialog, GWLP_USERDATA, 0);
+        DestroyWindow(hwndDialog);
     }
 
     DeleteObject(logo);

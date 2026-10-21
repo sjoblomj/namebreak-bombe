@@ -124,14 +124,19 @@ void onRangeClaimed(const ClaimResponse& claim, const SearchRequest& req) {
     g_status.insertFromEnd = req.insertFromEnd;
     g_status.lowerBound = req.lowerBound;
     g_status.upperBound = req.upperBound;
-    // A dictionary range counts its own candidates - from 0, until its first
-    // count (see DictionaryProgressText::count) replaces the status line too.
-    g_status.progressFraction = claim.dictionary ? 0 : -1;
+    // A dictionary range counts its own candidates, and a meet-in-the-middle
+    // one its own tails - from 0, until its first count (see
+    // CountedProgressText::count) replaces the status line too. Neither has
+    // a candidate order for the matches file to be measured against, so the
+    // count is all there is to go by.
+    g_status.progressFraction = claim.dictionary || claim.meetInTheMiddle ? 0 : -1;
     g_status.hasActiveRange = true;
     g_status.rangeJustFinished = false;
     g_status.statusText = "Searching '" + claim.lowerBoundFilename + "' to '" + claim.upperBoundFilename + "'";
     if (claim.dictionary)
         g_dictionaryProgress.start();
+    else if (claim.meetInTheMiddle)
+        g_meetInTheMiddleProgress.start();
 }
 
 void onRangeFinished(bool found) {
@@ -322,6 +327,9 @@ void workerThreadMain(AppConfig config, HWND notifyWindow) {
         callbacks.onDictionaryCount = [](uint64_t searched, uint64_t toSearch) { g_dictionaryProgress.count(searched, toSearch); };
         callbacks.onDictionaryStatus = [](const std::string& filename) { g_dictionaryProgress.position(filename); };
         callbacks.onDictionaryBasename = [](const std::string& basename) { g_dictionaryProgress.hit(basename); };
+        callbacks.onMeetInTheMiddleCount = [](uint64_t searched, uint64_t toSearch) { g_meetInTheMiddleProgress.count(searched, toSearch); };
+        callbacks.onMeetInTheMiddleStatus = [](const std::string& tail) { g_meetInTheMiddleProgress.position(tail); };
+        callbacks.onMeetInTheMiddleMatch = [](const std::string& filename) { g_meetInTheMiddleProgress.hit(filename); };
         runCoordinator(config.coordinatorArgs, &g_pauseRequested, &g_quitRequested, &callbacks, &g_finishRangeThenPause);
     } else if (config.mode == "dictionary") {
         runLocalDictionarySearch(config.dictionaryRequest, config.backend);

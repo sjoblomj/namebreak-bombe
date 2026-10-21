@@ -128,7 +128,11 @@ std::vector<std::pair<std::string, std::string>> meetInTheMiddleConfigKeys(const
 // Shows the setup form pre-filled from `fields`; on OK, fills `fields` with
 // whatever tab was active and its values (plus `fields.mode`) and returns
 // true. Returns false (leaving `fields` untouched) on Cancel/close.
-bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields);
+// `reopened` is for the same form shown again later from the tray menu's
+// Settings... rather than at first run (see editSettings, app_config.h): it
+// only changes the window's title and the paragraph at the top, which would
+// otherwise call itself first-run setup.
+bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopened = false);
 
 } // namespace gui
 

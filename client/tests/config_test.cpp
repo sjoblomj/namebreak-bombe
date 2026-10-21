@@ -389,6 +389,56 @@ static void testEnsureDictionaryConfig() {
     }
 }
 
+// What the Windows GUI's Settings writes: the same keys again, but over
+// whatever the file already said.
+static void testUpdateConfig() {
+    printf("--- updateConfigForMode ---\n");
+    const std::string path = kDir + "/update.conf";
+    const std::string before =
+        "# this file is hand-written\n"
+        "mode = coordinator\n"
+        "matches_dir = matches\n"
+        "\n"
+        "[coordinator]\n"
+        "# the one we registered with\n"
+        "server_url = https://old.example.com\n"
+        "username = sjoblomj\n"
+        "# poll_interval_secs = 300\n"
+        "\n"
+        "[search]\n"
+        "alphabet = ABC\n";
+    writeFile(path, before);
+    std::string error;
+    const bool written = updateConfigForMode(path, "coordinator", "coordinator",
+                                              {{"server_url", "https://new.example.com"},
+                                               {"username", ""},
+                                               {"poll_interval_secs", "45"},
+                                               {"meet_in_the_middle_table_memory", "4G"}},
+                                              error);
+    ConfigFile config;
+    check(written && loadConfigFile(path, config, error), "writes and reads back (" + error + ")");
+    check(config.coordinator["server_url"] == "https://new.example.com", "a key it already had: the new value, not the old one");
+    check(config.coordinator.find("username") == config.coordinator.end(), "a key left empty: its line is gone");
+    check(config.coordinator["poll_interval_secs"] == "45", "a key only commented out: set, the comment left as it was");
+    check(config.coordinator["meet_in_the_middle_table_memory"] == "4G", "a key the section never had: added to it");
+    std::string text;
+    {
+        std::ifstream in(path);
+        for (std::string line; std::getline(in, line);)
+            text += line + "\n";
+    }
+    check(text.find("# this file is hand-written") != std::string::npos && text.find("# the one we registered with") != std::string::npos &&
+              text.find("# poll_interval_secs = 300") != std::string::npos,
+          "every comment is still there");
+    check(text.find("[search]\nalphabet = ABC") != std::string::npos && text.find("matches_dir = matches") != std::string::npos,
+          "the other section, and the keys outside both, are untouched");
+    // Switching tabs in the dialog switches the mode, and the section the
+    // values go in - the old one's keys stay where they are.
+    check(updateConfigForMode(path, "bounded", "search", {{"alphabet", "XYZ"}}, error) && loadConfigFile(path, config, error) &&
+              config.mode == "bounded" && config.search["alphabet"] == "XYZ" && config.coordinator["poll_interval_secs"] == "45",
+          "another mode: its own section is written, the mode set, the rest kept");
+}
+
 // A valid [meet-in-the-middle] section: the directory of SETUPDAT\BWUNIN.PIF,
 // from the hash state after it (the same values as
 // tests/data/meet_in_the_middle_cli.conf.in).
@@ -651,6 +701,7 @@ int main() {
     testDictionaryRequest();
     testDictionaryResume();
     testEnsureDictionaryConfig();
+    testUpdateConfig();
     testMeetInTheMiddleRequest();
     testMeetInTheMiddleResume();
 

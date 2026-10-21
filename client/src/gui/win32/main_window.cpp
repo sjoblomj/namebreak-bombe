@@ -8,13 +8,15 @@
 // rather than requiring a WinMain() - which also means this GUI can honor the
 // same --config <file> the CLI does (kDefaultConfigPath, config.h).
 //
-// Supports all four of the CLI's modes (coordinator/bounded/continuous/
-// dictionary) - which one actually runs is read from config.conf's own
-// `mode = ...` exactly like the CLI, with no --mode override here (there'd
-// be nowhere to type it - see the first-run setup dialog, which has a
-// Coordinator tab, a Local Search tab covering bounded/continuous together,
-// since they share the same [search] config keys and only differ in that
-// one value, and a Local Dictionary tab).
+// Supports every one of the CLI's modes (coordinator/bounded/continuous/
+// dictionary/meet-in-the-middle) - which one actually runs is read from
+// config.conf's own `mode = ...` exactly like the CLI, with no --mode
+// override here (there'd be nowhere to type it - see the setup dialog,
+// which has a Coordinator tab, a Local Search tab covering bounded/
+// continuous together, since they share the same [search] config keys and
+// only differ in that one value, a Local Dictionary tab and a Meet in the
+// Middle tab). The same dialog is the tray menu's Settings... (see
+// openSettings), which is how any of it is changed later.
 //
 // This file is the main window and tray icon; the rest of the GUI is:
 //   app_config    loading the config, running the setup dialog if needed
@@ -70,6 +72,7 @@ constexpr int kIdTrayPause = 202;
 constexpr int kIdTrayQuit = 203;
 constexpr int kIdTrayAbout = 204;
 constexpr int kIdTrayFinish = 205;
+constexpr int kIdTraySettings = 206;
 
 constexpr const char* kFinishRangeText = "Finish current range, then pause";
 
@@ -115,6 +118,11 @@ std::string g_lastMatch;
 // "coordinator", "bounded", "continuous" or "dictionary" (window title,
 // Quit's confirmation wording).
 std::string g_activeMode;
+// Also set once in main(): what the tray menu's Settings... shows and
+// writes (the file this run was started from - kDefaultConfigPath, or
+// --config's), and the instance the form is created with.
+std::string g_configPath;
+HINSTANCE g_hInstance = nullptr;
 
 // ---------------------------------------------------------------------
 // Tray icon
@@ -155,6 +163,7 @@ void showTrayContextMenu(HWND hwnd) {
     if (g_activeMode == "coordinator")
         AppendMenuA(menu, MF_STRING | (g_finishRangeThenPause.load(std::memory_order_relaxed) ? MF_CHECKED : MF_UNCHECKED), kIdTrayFinish,
                     kFinishRangeText);
+    AppendMenuA(menu, MF_STRING, kIdTraySettings, "Settings...");
     AppendMenuA(menu, MF_STRING, kIdTrayAbout, "About...");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, kIdTrayQuit, "Quit");
@@ -207,6 +216,31 @@ void togglePause() {
     // fraction (see matchProgressFraction/updateUiFromSharedState) simply
     // stops advancing on its own while paused, with nothing to unwind on
     // resume.
+}
+
+// The tray menu's Settings...: the setup form again, over the config this
+// run started from (editSettings, app_config.cpp). The search carries on
+// throughout, and goes on using the settings it was started with - the file
+// is only read when namebreak starts, which is what the message box says.
+// The main window is disabled while the form is up, so its Pause and Quit
+// can't be pressed behind what looks like a modal window (the form runs a
+// message loop of its own - see showSetupDialog).
+void openSettings(HWND hwnd) {
+    EnableWindow(hwnd, FALSE);
+    const bool saved = editSettings(g_hInstance, g_configPath, hwnd);
+    // The window may be gone by now: a search that ended while the form was
+    // up takes it with it (see WM_APP_WORKER_STOPPED).
+    if (!IsWindow(hwnd))
+        return;
+    EnableWindow(hwnd, TRUE);
+    SetForegroundWindow(hwnd);
+    if (saved)
+        MessageBoxA(hwnd,
+                    ("Saved to " + g_configPath +
+                     ".\r\n\r\nThis run keeps searching with the settings it started with; the new ones are used the next time "
+                     "namebreak starts.")
+                        .c_str(),
+                    "namebreak settings", MB_OK | MB_ICONINFORMATION);
 }
 
 void requestQuit(HWND hwnd) {
@@ -448,6 +482,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 case kIdTrayAbout:
                     showAboutDialog(hwnd);
                     return 0;
+                case kIdTraySettings:
+                    openSettings(hwnd);
+                    return 0;
                 case kIdTrayShow:
                     showMainWindow(hwnd);
                     return 0;
@@ -539,6 +576,8 @@ int main(int argc, char* argv[]) {
     }
 
     HINSTANCE hInstance = GetModuleHandleA(nullptr);
+    g_hInstance = hInstance;
+    g_configPath = configPath;
 
     INITCOMMONCONTROLSEX icex{};
     icex.dwSize = sizeof(icex);
