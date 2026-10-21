@@ -4,6 +4,8 @@
 #include <chrono>
 #include <string>
 
+#include "engine/match_check.h"
+
 // Keeps a search's matches file (SearchRequest::outputFilePath) at its most
 // recent Hash-A match: one line, replaced rather than appended to. Appending
 // every hit - hundreds a second on a fast GPU - made a target's file
@@ -41,6 +43,11 @@ public:
     // found.txt. Every hit after it is ignored. Returns false (having
     // printed why) if either couldn't be written.
     bool found(const std::string& filename);
+    // A match of both hashes that isn't the file's name after all (see
+    // MatchCheck, match_check.h): appended to false_matches.txt next to the
+    // matches file (falseMatchesFilePath), with why. It's a Hash-A match
+    // too, which is how the matches file has it.
+    void falseMatch(const FalseMatch& falseMatch);
 
 private:
     void write();
@@ -69,5 +76,9 @@ bool replaceFileBytes(const std::string& path, const std::string& contents, std:
 // The file a search whose matches file is `matchesPath` appends its
 // both-hashes matches to: found.txt, in the same directory.
 std::string foundFilePath(const std::string& matchesPath);
+
+// And its false matches: false_matches.txt, in the same directory - a line
+// each, the filename, a tab and why it isn't the file's name.
+std::string falseMatchesFilePath(const std::string& matchesPath);
 
 #endif // NAMEBREAK_ENGINE_MATCH_WRITER_H

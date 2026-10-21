@@ -96,7 +96,15 @@ impl std::str::FromStr for Version {
 ///   says how much memory the client will give the search's table, and
 ///   `HeartbeatRequest::next_tail_index`. Older clients are never handed a
 ///   meet-in-the-middle target's work.
-pub const PROTOCOL_VERSION: Version = Version::new(1, 6, 0);
+/// - 1.7.0 - what's known about a target's file beyond its hashes, in every
+///   kind of target's claim: its encryption key (`ClaimResponse::encryption_key_hex`,
+///   until now only in a dictionary target's) and where its entry is in the
+///   archive's hash table (`ClaimResponse::hash_table_size` and the two
+///   after it), which a client checks a match of both hashes against; and
+///   the false matches that fail it, sent with every report
+///   (`HeartbeatRequest::false_matches`). Older clients are given neither,
+///   and the server checks what they find itself (see `false_matches.rs`).
+pub const PROTOCOL_VERSION: Version = Version::new(1, 7, 0);
 
 /// The first protocol version whose clients search dictionary targets.
 pub const DICTIONARY_SINCE: Version = Version::new(1, 5, 0);
@@ -106,6 +114,17 @@ pub const DICTIONARY_SINCE: Version = Version::new(1, 5, 0);
 /// search's table (`RegisterRequest::meet_in_the_middle_table_bytes`),
 /// without which it gets none of that work anyway.
 pub const MEET_IN_THE_MIDDLE_SINCE: Version = Version::new(1, 6, 0);
+
+/// The first protocol version whose clients check a match of both hashes
+/// against what else is known about the file (`ClaimResponse::encryption_key_hex`
+/// and `ClaimResponse::hash_table_size`), report the ones that fail it
+/// (`HeartbeatRequest::false_matches`) and search on past them.
+pub const FALSE_MATCHES_SINCE: Version = Version::new(1, 7, 0);
+
+/// The most false matches one heartbeat, quit or completion may carry - see
+/// `HeartbeatRequest::false_matches`. About one name in 2^64 is one, so a
+/// report has none, all but always.
+pub const MAX_FALSE_MATCHES_PER_REPORT: usize = 100;
 
 /// The most basenames one heartbeat, quit or completion may carry - see
 /// `HeartbeatRequest::basenames`. A client with more sends the rest with
@@ -275,11 +294,28 @@ pub struct ClaimResponse {
     /// `HeartbeatRequest::basenames`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub send_basenames: bool,
-    /// A dictionary target's encryption key, if it has one: a client compares
-    /// only the candidates whose basename matches it to the hashes - the
-    /// file's name has that basename. Clients before 1.5 don't read it.
+    /// The target's encryption key, if it has one. A client of protocol 1.7
+    /// or later takes a match of both hashes whose basename doesn't have it
+    /// for a false match (see `HeartbeatRequest::false_matches`) - and in a
+    /// dictionary target's range, which has it for clients from 1.5 on, it
+    /// compares only the candidates whose basename has it to the hashes at
+    /// all: the file's name has that basename. Any other target's claim has
+    /// it only for clients of 1.7 or later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_hex: Option<String>,
+    /// Where the file's entry is in its archive's hash table, if that's
+    /// known (see `AdminCreateTargetRequest::hash_table_position`): a match
+    /// of both hashes whose lookup - from slot hash type 0 % `hash_table_size`
+    /// on - doesn't start at a slot from `hash_table_first_start_slot` to
+    /// `hash_table_last_start_slot` (wrapping past the table's end if the
+    /// first is the greater) is a false match. All three or none, and only
+    /// for clients of protocol 1.7 or later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_table_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_table_first_start_slot: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_table_last_start_slot: Option<i64>,
     /// True for a meet-in-the-middle target's range (see
     /// `AdminCreateTargetRequest::meet_in_the_middle`): the unknown part of
     /// the name is a directory, and what this range hands out is a stretch of
@@ -370,6 +406,17 @@ pub struct HeartbeatRequest {
     /// error, leaves them to be sent with the next.
     #[serde(default)]
     pub basenames: Vec<String>,
+    /// Filenames that matched both of the target's hashes but not what else
+    /// is known about its file (`ClaimResponse::encryption_key_hex` and
+    /// `ClaimResponse::hash_table_size`) since the client's last report that
+    /// got an answer, at most `MAX_FALSE_MATCHES_PER_REPORT`. The client
+    /// searched on past them; the server keeps each one once per target, as
+    /// it does the basenames, whatever the rest of the report gets - and
+    /// takes one that passes the target's checks after all (they were
+    /// changed since the range was claimed) for the find it then is. Only
+    /// from clients of protocol 1.7 or later.
+    #[serde(default)]
+    pub false_matches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,8 +454,18 @@ pub struct QuitRequest {
     /// See `HeartbeatRequest::basenames`.
     #[serde(default)]
     pub basenames: Vec<String>,
+    /// See `HeartbeatRequest::false_matches`.
+    #[serde(default)]
+    pub false_matches: Vec<String>,
 }
 
+/// A range's search finished: `found` with the filename that matched both
+/// hashes, or not. A find is checked against what else is known about the
+/// target's file (see `ClaimResponse::encryption_key_hex`) - a client older
+/// than protocol 1.7 doesn't, and stops at the first match of both hashes -
+/// and one that fails it is kept as a false match instead, the target left
+/// unsolved and the rest of the range, past the match, handed out again
+/// (see `ranges::complete_range`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteRequest {
     pub found: bool,
@@ -418,6 +475,9 @@ pub struct CompleteRequest {
     /// See `HeartbeatRequest::basenames`.
     #[serde(default)]
     pub basenames: Vec<String>,
+    /// See `HeartbeatRequest::false_matches`.
+    #[serde(default)]
+    pub false_matches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -552,11 +612,19 @@ pub struct AdminCreateTargetRequest {
     /// `encryption-key-raw`, StormLib's `SFileInfoEncryptionKeyRaw`. That
     /// key is made from the file's name without its directory, so it's the
     /// same for every file of that name, wherever it lies. Shown on the
-    /// dashboard. An alphabet search doesn't use it; a dictionary target's
-    /// clients compare only the candidates whose basename matches it to the
-    /// hashes (see `ClaimResponse::encryption_key_hex`). Defaults to none.
+    /// dashboard. A match of both hashes whose basename doesn't have it is a
+    /// false match, not the file - and a dictionary target's clients compare
+    /// only the candidates whose basename matches it to the hashes at all
+    /// (see `ClaimResponse::encryption_key_hex`). Not for a meet-in-the-middle
+    /// target. Defaults to none.
     #[serde(default)]
     pub encryption_key_hex: Option<String>,
+    /// Where the file's entry is in its archive's hash table, if that's
+    /// known - see `HashTablePosition`. A match of both hashes whose lookup
+    /// wouldn't reach the entry is a false match, not the file. Shown on the
+    /// dashboard. For any kind of target. Defaults to none.
+    #[serde(default)]
+    pub hash_table_position: Option<HashTablePosition>,
     /// The target file's name without its directory, when that's known but
     /// the directory isn't - e.g. because its `encryption_key_hex` is that
     /// of a known name. No '\' or '/'. Only stored and shown on the
@@ -650,6 +718,25 @@ pub struct MeetInTheMiddleSettings {
     /// by the alphabet's size and multiplies the table's memory by it: for
     /// the 43-character alphabet, 4 characters is 30 MiB and 5 is 1.4 GiB.
     pub table_length: i64,
+}
+
+/// Where a target's file is in its archive's hash table: which slots a
+/// lookup of its name can start at and still reach its entry. Storm looks a
+/// name up from slot hash type 0 % `table_size`, slot by slot (wrapping past
+/// the end), and gives up at the first slot that has never been used - so a
+/// name whose lookup doesn't start between the first never-used slot before
+/// the entry and the entry itself would never be found in the archive, and
+/// can't be the file's. `first_start_slot` is the slot just after that
+/// never-used one, `last_start_slot` the entry's own; the first is the
+/// greater if they wrap past the table's end. About one name in
+/// `table_size` / (the slots in between) passes - for a table of 2048 and
+/// three slots, one in 680.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HashTablePosition {
+    /// A power of two, as an archive's hash table's size is: up to 2^31.
+    pub table_size: i64,
+    pub first_start_slot: i64,
+    pub last_start_slot: i64,
 }
 
 fn default_start_len() -> i64 {
@@ -765,6 +852,12 @@ pub struct AdminPatchTargetRequest {
     /// `encryption_key_hex`.
     #[serde(default, deserialize_with = "deserialize_present")]
     pub base_file_name: Option<Option<String>>,
+    /// See `AdminCreateTargetRequest::hash_table_position`, changed like
+    /// `encryption_key_hex`. Like it, it applies to ranges claimed after the
+    /// patch - and to every find reported from then on, whenever its range
+    /// was claimed.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub hash_table_position: Option<Option<HashTablePosition>>,
     /// See `AdminCreateTargetRequest::send_basenames`. Leave unset to leave it
     /// unchanged. Applies to ranges claimed after the patch.
     #[serde(default)]

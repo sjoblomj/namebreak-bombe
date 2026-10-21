@@ -247,6 +247,7 @@ MeetInTheMiddleResult runMeetInTheMiddleSearch(SearchBackend& backend, const Mee
                "wrong place in the name, this search will walk everything and find nothing\n");
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
+    printMatchCheck(req.matchCheck);
     printf("table: the first %d characters of a directory, %llu of them at most, %llu MB\n", space.tableLength(),
            (unsigned long long) meetInTheMiddleTableCount((int) req.alphabet.size(), space.tableLength()),
            (unsigned long long) MeetInTheMiddleTable::bytesFor((int) req.alphabet.size(), space.tableLength()) / (1024 * 1024));
@@ -348,6 +349,19 @@ MeetInTheMiddleResult runMeetInTheMiddleSearch(SearchBackend& backend, const Mee
         const uint32_t hashA = continueHash(afterDir, req.suffix, kHashAOffset, cryptTable).first;
         const uint32_t hashB = continueHash(kInitialHashState, filename, kHashBOffset, cryptTable).first;
         if (hashAMatches(hashA, req.targetHashA) && hashB == req.targetHashB) {
+            std::string reason = falseMatchReason(req.matchCheck, filename, cryptTable);
+            if (!reason.empty()) {
+                // Not the file after all: a hit like any other, and the
+                // search goes on.
+                printf("FALSE MATCH (both hashes, but %s): %s\n", reason.c_str(), filename.c_str());
+                fflush(stdout);
+                const FalseMatch falseMatch{filename, std::move(reason)};
+                matches.falseMatch(falseMatch);
+                if (hooks.onFalseMatch)
+                    hooks.onFalseMatch(falseMatch);
+                matches.hit(filename);
+                return true;
+            }
             matches.found(filename);
             printf("BOTH HASHES MATCH: %s\n", filename.c_str());
             fflush(stdout);

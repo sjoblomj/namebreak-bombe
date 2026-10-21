@@ -457,6 +457,40 @@ static void testFindsItAndWritesIt(SearchBackend& backend) {
 
     // The directory shorter than the table: found while the table is built.
     checkEverySplit(backend, requestFor("SETUPDA", "", "SET", "\\BWUNIN.PIF", 1, 5), "'SET', shorter than most of the tables");
+
+    // With a key that isn't BWUNIN.PIF's, the same name is a false match:
+    // reported as one, with why, and written to false_matches.txt - and the
+    // search goes on to the end of the walk, as if there were no file in it.
+    {
+        std::filesystem::remove_all(kDir);
+        MeetInTheMiddleRequest wrongKey = req;
+        wrongKey.matchCheck.checkKey = true;
+        wrongKey.matchCheck.key = stateOf("BWUNIN.PIF", kFileKeyOffset).first ^ 1;
+        wrongKey.tableLength = 5;
+        wrongKey.outputFilePath = kDir + "/matches.txt";
+        wrongKey.progressFilePath = kDir + "/meet-in-the-middle.txt";
+        std::vector<std::string> falseMatches, reasons, hits;
+        MeetInTheMiddleSearchHooks hooks;
+        hooks.onPartialMatch = [&](const std::string& filename) { hits.push_back(filename); };
+        hooks.onFalseMatch = [&](const FalseMatch& f) {
+            falseMatches.push_back(f.filename);
+            reasons.push_back(f.reason);
+        };
+        const MeetInTheMiddleResult r = runMeetInTheMiddleSearch(backend, wrongKey, nullptr, hooks);
+        Expected e = expectedOf(wrongKey, 5);
+        check(r.ok && !r.found && !r.aborted, "a wrong key: not found, and not stopped");
+        check(falseMatches == std::vector<std::string>{"SETUPDAT\\BWUNIN.PIF"} && reasons[0].rfind("its basename's key is", 0) == 0,
+              "... SETUPDAT\\BWUNIN.PIF a false match, once, with why");
+        MeetInTheMiddleSpace space;
+        std::string spaceError;
+        MeetInTheMiddleSpace::create(wrongKey.alphabet, wrongKey.minLength, wrongKey.maxLength, 5, space, spaceError);
+        check(hits.size() == e.dirs.size() && r.nextNumber == space.size(),
+              "... every directory meeting the meeting point reported, and the walk taken to its end, past it");
+        std::ifstream written(kDir + "/false_matches.txt");
+        std::string line;
+        check(std::getline(written, line) && line.rfind("SETUPDAT\\BWUNIN.PIF\t", 0) == 0, "... and false_matches.txt has it");
+        check(!std::filesystem::exists(kDir + "/found.txt"), "... but found.txt doesn't");
+    }
 }
 
 static void testStopAndResume(SearchBackend& backend) {

@@ -29,6 +29,7 @@ public:
         cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
         targetA_ = constants.targetHashA;
         targetB_ = constants.targetHashB;
+        matchCheck_ = constants.matchCheck;
         rules_ = constants.trailingRules;
         insertions_ = constants.trailingInsertions;
     }
@@ -69,6 +70,18 @@ private:
         seed2 = ch + seed1 + seed2 + (seed2 << 5) + 3;
     }
 
+    // A hit whose hashB matches too: the match, or a false match.
+    template <class Outcome>
+    void addBothHashesMatch(const std::string& filename, const MatchCheck& check, Outcome& outcome) const {
+        std::string reason = falseMatchReason(check, filename, cryptTable_.data());
+        if (!reason.empty()) {
+            outcome.falseMatches.push_back({filename, std::move(reason)});
+        } else if (!outcome.found) {
+            outcome.found = true;
+            outcome.foundFilename = filename;
+        }
+    }
+
     uint32_t hashFromScratch(const std::string& filename, int offset) const {
         uint32_t seed1 = 0x7FED7FED, seed2 = 0xEEEEEEEE;
         for (unsigned char ch : filename)
@@ -81,6 +94,7 @@ private:
     std::vector<uint32_t> cryptTable_;
     uint32_t targetA_ = 0;
     uint32_t targetB_ = 0;
+    MatchCheck matchCheck_;
     PruneRules rules_;
     std::vector<TrailingInsertion> insertions_;
     DictionaryConstants dictionary_;
@@ -148,10 +162,8 @@ DictionaryOutcome ReferenceBackend::runDictionaryBatches(const std::vector<Dicti
             }
             if ((!basenameFirst || basenameMatches) && hashAMatches(hashFromScratch(filename, 0x100), dictionary_.targetHashA)) {
                 outcome.hits.push_back(filename);
-                if (!outcome.found && hashFromScratch(filename, 0x200) == dictionary_.targetHashB) {
-                    outcome.found = true;
-                    outcome.foundFilename = filename;
-                }
+                if (hashFromScratch(filename, 0x200) == dictionary_.targetHashB)
+                    addBothHashesMatch(filename, dictionary_.matchCheck, outcome);
             }
         }
     }
@@ -205,10 +217,8 @@ BatchOutcome ReferenceBackend::runBatch(int trailingLen, uint64_t start, uint64_
                 printf("WARNING: hashA mismatch for '%s' - incremental hash 0x%08X, full-filename hash 0x%08X\n", filename.c_str(), seed1,
                        verifyHashA);
             }
-            if (!outcome.found && hashFromScratch(filename, 0x200) == targetB_) {
-                outcome.found = true;
-                outcome.foundFilename = filename;
-            }
+            if (hashFromScratch(filename, 0x200) == targetB_)
+                addBothHashesMatch(filename, matchCheck_, outcome);
             outcome.hits.push_back(filename);
         }
 

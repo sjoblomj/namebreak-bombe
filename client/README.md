@@ -176,6 +176,21 @@ mode](#meet-in-the-middle-mode)), and `coordinator` mode one
 basenames not sent yet and the word lists it downloaded (see [Dictionary
 targets in coordinator mode](#dictionary-targets-in-coordinator-mode)).
 
+Two 32-bit hashes match by chance about once in 2^64 names, and a long
+search hashes that many - `REZ\SFZSSP050WSRL.WAV` matched both hashes of a
+file in the Brazilian Brood War installer and was nothing like its name. So
+in coordinator mode, a match of both hashes is also checked against what the
+coordinator says is known about the file (protocol 1.7 and later): its
+encryption key, which the name's basename must hash to (hash type 3), and
+where its entry is in the archive's hash table, which the name's lookup
+(hash type 0 modulo the table's size) must start close enough to for Storm
+to reach. A name that fails is a *false match*: printed as `FALSE MATCH`,
+with why, appended to `false_matches.txt` beside the matches files (the
+name, a tab, and why), and reported to the coordinator, which lists it on
+the target's dashboard card - and the search goes on past it as if it were
+any other Hash-A match. Only these checks run on a match of both hashes, so
+they cost nothing.
+
 ## Dictionary mode
 
 Instead of every string of an alphabet, `mode = dictionary` searches

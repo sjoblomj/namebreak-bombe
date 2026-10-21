@@ -135,12 +135,12 @@ fn claimed(claim: &ClaimResponse) -> (i64, i64, i64) {
 }
 
 async fn heartbeat(state: &AppState, user: &User, range_id: i64, next_tail_index: Option<i64>) -> Result<bool, AppError> {
-    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index, basenames: Vec::new() };
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index, basenames: Vec::new(), false_matches: Vec::new() };
     handlers::heartbeat(State(state.clone()), AuthedUser(user.clone()), Path(range_id), Json(req)).await.map(|json| json.0.range_released)
 }
 
 async fn quit(state: &AppState, user: &User, range_id: i64, next_tail_index: Option<i64>) -> Result<StatusCode, AppError> {
-    let req = QuitRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index, basenames: Vec::new() };
+    let req = QuitRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index, basenames: Vec::new(), false_matches: Vec::new() };
     handlers::quit(State(state.clone()), AuthedUser(user.clone()), Path(range_id), Json(req)).await
 }
 
@@ -151,6 +151,7 @@ async fn complete(state: &AppState, user: &User, range_id: i64, found: Option<&s
         elapsed_seconds: elapsed,
         candidates_processed: tails,
         basenames: Vec::new(),
+        false_matches: Vec::new(),
     };
     handlers::complete(State(state.clone()), AuthedUser(user.clone()), Path(range_id), Json(req)).await
 }

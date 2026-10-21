@@ -36,7 +36,12 @@
 // fields after it), how much memory this client will give such a search's
 // table (RegisterRequest::meetInTheMiddleTableBytes - without it the server
 // hands out none of that work), and progress reported by tail index.
-constexpr const char* kProtocolVersion = "1.6.0";
+// 1.7.0: what's known about a target's file beyond its hashes - its
+// encryption key and hash table position (ClaimResponse::encryptionKeyHex
+// and hashTableSize and so on), whatever kind of target it is - which a
+// match of both hashes is checked against, and the false matches that fail
+// it, sent with every report (HeartbeatRequest::falseMatches).
+constexpr const char* kProtocolVersion = "1.7.0";
 
 // The most basenames one heartbeat, quit or completion carries - the
 // server's MAX_BASENAMES_PER_REPORT. Any more wait for the next report (see
@@ -142,10 +147,21 @@ struct ClaimResponse {
     // Send every candidate's basename that matches encryptionKeyHex
     // (HeartbeatRequest::basenames).
     bool sendBasenames = false;
-    // A dictionary target's encryption key, if it has one - empty if not:
-    // only the candidates whose basename matches it are compared to the
-    // hashes. Older servers send it only with sendBasenames.
+
+    // The target's encryption key, if it has one - empty if not. A match of
+    // both hashes whose basename doesn't have it is a false match (see
+    // MatchCheck, engine/match_check.h), and in a dictionary target's range,
+    // only the candidates whose basename has it are compared to the hashes
+    // at all. Servers before protocol 1.7 send it only with a dictionary
+    // target's claim (older ones only with sendBasenames).
     std::string encryptionKeyHex;
+    // Where the file's entry is in its archive's hash table, if that's known
+    // - all three or none: a match of both hashes has to start its lookup at
+    // a slot from hashTableFirstStartSlot to hashTableLastStartSlot of the
+    // table's hashTableSize (see MatchCheck::checkSlot). From protocol 1.7.
+    std::optional<int64_t> hashTableSize;
+    std::optional<int64_t> hashTableFirstStartSlot;
+    std::optional<int64_t> hashTableLastStartSlot;
 
     // A meet-in-the-middle target's range (all optional in the response, and
     // only ever in a meet-in-the-middle target's claim): the unknown part of
@@ -193,6 +209,11 @@ struct HeartbeatRequest {
     // else it answers, a 409 included; only a report that gets no answer, or
     // another error, needs to send them again.
     std::vector<std::string> basenames;
+    // Filenames that matched both hashes but not what else is known about
+    // the file (see ClaimResponse::encryptionKeyHex) since the last report
+    // that got an answer - kept by the server, which shows them, as the
+    // basenames are. Rare enough that a report carries all of them.
+    std::vector<std::string> falseMatches;
 };
 
 struct HeartbeatResponse {
@@ -219,6 +240,7 @@ struct QuitRequest {
     std::optional<int64_t> nextCandidateNumber;
     std::optional<int64_t> nextTailIndex;
     std::vector<std::string> basenames;
+    std::vector<std::string> falseMatches;
 };
 
 struct CompleteRequest {
@@ -228,6 +250,7 @@ struct CompleteRequest {
     int64_t candidatesProcessed = 0;
     // As HeartbeatRequest's.
     std::vector<std::string> basenames;
+    std::vector<std::string> falseMatches;
 };
 
 std::string toJson(const RegisterRequest&  req);

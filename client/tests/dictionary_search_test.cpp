@@ -36,6 +36,7 @@
 
 #include "backends/backends.h"
 #include "engine/dictionary_search.h"
+#include "engine/match_writer.h"
 #include "engine/hash_match.h"
 #include "engine/mpq_hash.h"
 #include "engine/wordlist.h"
@@ -909,6 +910,64 @@ static void testRangesAndHooks(SearchBackend& backend) {
     check(r.ok && r.candidatesSearched == 0 && r.nextNumber == 3, "an empty range: nothing");
 }
 
+// Searches whose match of both hashes fails a MatchCheck - the hash table
+// slot it starts its lookup at isn't the file's: a false match. Each one is
+// reported, with why, and the search goes on to the end, reporting every hit
+// before and after it, as if there were no match at all.
+static void testFalseMatches(SearchBackend& backend) {
+    printf("--- false matches ---\n");
+    std::mt19937 rng(20261021);
+    int withFalseMatch = 0, mismatches = 0;
+    for (int round = 0; round < 90; ++round) {
+        DictionaryRequest req = randomRequest(rng, round);
+        req.basenamesFilePath.clear();
+        req.progressFilePath.clear();
+        Expected e = expectedOf(req);
+        if (e.firstFound.empty())
+            continue;
+        ++withFalseMatch;
+        // Every slot but the one the match's lookup starts at.
+        req.matchCheck.checkSlot = true;
+        req.matchCheck.hashTableSize = 1u << (1 + rng() % 16);
+        const uint32_t slot = hashOf(e.firstFound, 0x000) & (req.matchCheck.hashTableSize - 1);
+        req.matchCheck.firstStartSlot = (slot + 1) & (req.matchCheck.hashTableSize - 1);
+        req.matchCheck.lastStartSlot = (slot - 1) & (req.matchCheck.hashTableSize - 1);
+
+        // Every hit matching hashB is a false match: the same filename can be
+        // more than one candidate (words "A", "B" and "AB", written together).
+        std::vector<std::string> expectedFalse;
+        for (const std::string& hit : e.hits)
+            if (hashOf(hit, 0x200) == req.targetHashB)
+                expectedFalse.push_back(hit);
+        std::vector<std::string> hits, falseMatches;
+        DictionarySearchHooks hooks;
+        hooks.onPartialMatch = [&](const std::string& hit) { hits.push_back(hit); };
+        bool reasons = true;
+        hooks.onFalseMatch = [&](const FalseMatch& f) {
+            falseMatches.push_back(f.filename);
+            reasons = reasons && f.reason.rfind("its lookup starts at hash table slot", 0) == 0;
+        };
+        const DictionaryResult r = runDictionarySearch(backend, req, nullptr, hooks);
+        std::sort(hits.begin(), hits.end());
+        std::sort(e.hits.begin(), e.hits.end());
+        std::sort(falseMatches.begin(), falseMatches.end());
+        std::sort(expectedFalse.begin(), expectedFalse.end());
+        const std::vector<std::string> written = readLines(falseMatchesFilePath(req.outputFilePath));
+        bool fileOk = written.size() == expectedFalse.size();
+        for (size_t i = 0; fileOk && i < written.size(); ++i)
+            fileOk = written[i].find('\t') != std::string::npos;
+        if (!r.ok || r.found || r.aborted || hits != e.hits || falseMatches != expectedFalse || !reasons || !fileOk ||
+            r.nextNumber != std::min<uint64_t>(e.total, req.endNumber)) {
+            if (mismatches++ < 3)
+                fprintf(stderr, "  round %d: found %d, %zu hits of %zu, %zu false matches of %zu, %zu in the file, next %llu\n", round, (int) r.found,
+                        hits.size(), e.hits.size(), falseMatches.size(), expectedFalse.size(), written.size(), (unsigned long long) r.nextNumber);
+        }
+        std::filesystem::remove(falseMatchesFilePath(req.outputFilePath));
+    }
+    check(withFalseMatch >= 10, "rounds with a false match: " + std::to_string(withFalseMatch));
+    check(mismatches == 0, "each false match reported and written, with why, and every hit before and after it, to the end");
+}
+
 int main(int argc, char* argv[]) {
     std::string backendName;
     for (int i = 1; i < argc; ++i) {
@@ -938,6 +997,7 @@ int main(int argc, char* argv[]) {
     testEdges(*backend);
     testStopAndResume(*backend);
     testRangesAndHooks(*backend);
+    testFalseMatches(*backend);
 
     std::filesystem::remove_all(kDir);
     if (g_failures) {

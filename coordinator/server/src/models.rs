@@ -125,6 +125,11 @@ pub struct Target {
     pub meet_in_the_middle_table_length: Option<i64>,
     /// How many basenames clients have sent for it - see `ranges::record_basenames`.
     pub basename_count: i64,
+    /// Where the file's entry is in its archive's hash table - see
+    /// `AdminCreateTargetRequest::hash_table_position`. All three or none.
+    pub hash_table_size: Option<i64>,
+    pub hash_table_first_start_slot: Option<i64>,
+    pub hash_table_last_start_slot: Option<i64>,
 }
 
 /// What a dictionary target's ranges (and carving cursor) have as their
@@ -149,6 +154,16 @@ impl Target {
     /// see `meet_in_the_middle.rs`.
     pub fn is_meet_in_the_middle(&self) -> bool {
         self.kind == "meet-in-the-middle"
+    }
+
+    /// Where the file is in its archive's hash table, if that's known - see
+    /// `AdminCreateTargetRequest::hash_table_position`.
+    pub fn hash_table_position(&self) -> Option<namebreak_protocol::HashTablePosition> {
+        Some(namebreak_protocol::HashTablePosition {
+            table_size: self.hash_table_size?,
+            first_start_slot: self.hash_table_first_start_slot?,
+            last_start_slot: self.hash_table_last_start_slot?,
+        })
     }
 }
 
@@ -216,6 +231,10 @@ pub struct Range {
     pub start_block: i64,
     pub end_block: i64,
     pub progress_block: i64,
+    /// 1 if a client older than protocol 1.7 stopped in this range at a
+    /// false match it took for the file, so that only newer clients are
+    /// handed what's left of it - see `ranges::complete_range`.
+    pub false_match_inside: i64,
 }
 
 impl Range {

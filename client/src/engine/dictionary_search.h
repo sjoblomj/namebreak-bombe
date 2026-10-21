@@ -49,6 +49,11 @@ struct DictionaryRequest {
     FilenameBounds bounds;
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
+    // As SearchRequest::matchCheck: a candidate matching both hashes but not
+    // this is a false match (DictionarySearchHooks::onFalseMatch), and the
+    // search goes on. It doesn't change which candidates are searched, so a
+    // progress file holds whatever it is.
+    MatchCheck matchCheck;
     // The file's encryption key is known: compare each candidate's basename
     // to basenameKey (see continueBasenameHash). Unless the suffix has a
     // '\', only the candidates whose basename matches are then compared to
@@ -112,6 +117,10 @@ struct DictionarySearchHooks {
     // With every basename that matched the key, the first time it does in
     // this search - and the filename it matched in.
     std::function<void(const std::string& basename, const std::string& filename)> onBasenameMatch;
+    // With every candidate that matches both hashes but not
+    // DictionaryRequest::matchCheck - a hashA match too, and appended to
+    // false_matches.txt (see MatchWriter::falseMatch).
+    std::function<void(const FalseMatch& falseMatch)> onFalseMatch;
     // After every call to the backend, and at the end, with the search's
     // DictionaryResult::nextNumber so far: every candidate numbered below it
     // has been searched.

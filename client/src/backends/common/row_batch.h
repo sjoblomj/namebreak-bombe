@@ -117,6 +117,7 @@ private:
     std::vector<uint32_t> cryptTable_;
     uint32_t targetA_ = 0;
     uint32_t targetB_ = 0;
+    MatchCheck matchCheck_;
 };
 
 #endif // NAMEBREAK_BACKENDS_COMMON_ROW_BATCH_H

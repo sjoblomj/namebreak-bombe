@@ -295,8 +295,40 @@ bool getDictionaryClaim(const std::map<std::string, JsonValue>& obj, ClaimRespon
            getOptionalString(obj, "filename_lower_bound", out.filenameLowerBound) &&
            getOptionalString(obj, "filename_upper_bound", out.filenameUpperBound) &&
            getOptionalBool(obj, "send_basenames", out.sendBasenames) &&
-           getOptionalString(obj, "encryption_key_hex", out.encryptionKeyHex) &&
            (!out.sendBasenames || !out.encryptionKeyHex.empty());
+}
+
+// Like getOptionalInt64, into an optional: empty if missing or null.
+bool getOptionalInt64(const std::map<std::string, JsonValue>& obj, const std::string& key, std::optional<int64_t>& out) {
+    out.reset();
+    auto it = obj.find(key);
+    if (it == obj.end() || it->second.isNull())
+        return true;
+    int64_t value = 0;
+    if (!getInt64(obj, key, value))
+        return false;
+    out = value;
+    return true;
+}
+
+// What's known about the file beyond its hashes (see
+// ClaimResponse::encryptionKeyHex): the key, and the hash table position -
+// all three of its numbers, or none, and slots within a table whose size is
+// a power of two.
+bool getMatchCheckFields(const std::map<std::string, JsonValue>& obj, ClaimResponse& out) {
+    if (!getOptionalString(obj, "encryption_key_hex", out.encryptionKeyHex) ||
+        !getOptionalInt64(obj, "hash_table_size", out.hashTableSize) ||
+        !getOptionalInt64(obj, "hash_table_first_start_slot", out.hashTableFirstStartSlot) ||
+        !getOptionalInt64(obj, "hash_table_last_start_slot", out.hashTableLastStartSlot))
+        return false;
+    const bool size = out.hashTableSize.has_value();
+    if (size != out.hashTableFirstStartSlot.has_value() || size != out.hashTableLastStartSlot.has_value())
+        return false;
+    if (!size)
+        return true;
+    const int64_t n = *out.hashTableSize;
+    return n > 0 && n <= ((int64_t) 1 << 31) && (n & (n - 1)) == 0 && *out.hashTableFirstStartSlot >= 0 &&
+           *out.hashTableFirstStartSlot < n && *out.hashTableLastStartSlot >= 0 && *out.hashTableLastStartSlot < n;
 }
 
 // A JSON array of `items`.
@@ -310,10 +342,11 @@ std::string jsonStringArray(const std::vector<std::string>& items) {
 }
 
 // The fields a heartbeat, quit and completion share beyond the first:
-// `next_candidate_number` if there is one, and `basenames` if any - left out
-// otherwise, so that a report is what it was before protocol 1.5.
+// `next_candidate_number` if there is one, and `basenames` and
+// `false_matches` if any - left out otherwise, so that a report is what it
+// was before protocol 1.5.
 std::string progressAndBasenames(const std::optional<int64_t>& nextCandidateNumber, const std::optional<int64_t>& nextTailIndex,
-                                 const std::vector<std::string>& basenames) {
+                                 const std::vector<std::string>& basenames, const std::vector<std::string>& falseMatches) {
     std::string out;
     if (nextCandidateNumber)
         out += ",\"next_candidate_number\":" + std::to_string(*nextCandidateNumber);
@@ -321,6 +354,8 @@ std::string progressAndBasenames(const std::optional<int64_t>& nextCandidateNumb
         out += ",\"next_tail_index\":" + std::to_string(*nextTailIndex);
     if (!basenames.empty())
         out += ",\"basenames\":" + jsonStringArray(basenames);
+    if (!falseMatches.empty())
+        out += ",\"false_matches\":" + jsonStringArray(falseMatches);
     return out;
 }
 
@@ -350,7 +385,7 @@ std::string toJson(const RegisterRequest& req) {
 std::string toJson(const HeartbeatRequest& req) {
     std::string out = "{\"last_hash_a_match_filename\":";
     out += req.lastHashAMatchFilename ? escapeJsonString(*req.lastHashAMatchFilename) : "null";
-    out += progressAndBasenames(req.nextCandidateNumber, req.nextTailIndex, req.basenames);
+    out += progressAndBasenames(req.nextCandidateNumber, req.nextTailIndex, req.basenames, req.falseMatches);
     out += "}";
     return out;
 }
@@ -358,7 +393,7 @@ std::string toJson(const HeartbeatRequest& req) {
 std::string toJson(const QuitRequest& req) {
     std::string out = "{\"last_hash_a_match_filename\":";
     out += req.lastHashAMatchFilename ? escapeJsonString(*req.lastHashAMatchFilename) : "null";
-    out += progressAndBasenames(req.nextCandidateNumber, req.nextTailIndex, req.basenames);
+    out += progressAndBasenames(req.nextCandidateNumber, req.nextTailIndex, req.basenames, req.falseMatches);
     out += "}";
     return out;
 }
@@ -371,7 +406,7 @@ std::string toJson(const CompleteRequest& req) {
     out += req.filename ? escapeJsonString(*req.filename) : "null";
     out += ",\"elapsed_seconds\":" + std::to_string(req.elapsedSeconds);
     out += ",\"candidates_processed\":" + std::to_string(req.candidatesProcessed);
-    out += progressAndBasenames(std::nullopt, std::nullopt, req.basenames);
+    out += progressAndBasenames(std::nullopt, std::nullopt, req.basenames, req.falseMatches);
     out += "}";
     return out;
 }
@@ -406,6 +441,7 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getString(obj, "alphabet", out.alphabet) &&
            getInt64( obj, "candidate_count", out.candidateCount) &&
            getInt64( obj, "lease_seconds", out.leaseSeconds) &&
+           getMatchCheckFields(obj, out) &&
            getDictionaryClaim(obj, out) &&
            getMeetInTheMiddleClaim(obj, out);
 }

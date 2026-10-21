@@ -45,6 +45,7 @@ void HitVerifier::begin(const SearchConstants& constants) {
     cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
     targetA_ = constants.targetHashA;
     targetB_ = constants.targetHashB;
+    matchCheck_ = constants.matchCheck;
 }
 
 uint32_t HitVerifier::hashFromScratch(const std::string& filename, int tableOffset) const {
@@ -66,9 +67,16 @@ void HitVerifier::addHits(const std::vector<uint64_t>& trailingIndices, int trai
             printf("WARNING: the backend reported a hashA hit for '%s' but hashing it from scratch gives 0x%08X, not the target 0x%08X\n",
                    filename.c_str(), hashA, targetA_);
         }
-        if (!outcome.found && hashFromScratch(filename, 0x200) == targetB_) {
-            outcome.found = true;
-            outcome.foundFilename = filename;
+        if (hashFromScratch(filename, 0x200) == targetB_) {
+            // Every one that matches hashB is checked, not only the first:
+            // a false match before the file's own name mustn't hide it.
+            std::string reason = falseMatchReason(matchCheck_, filename, cryptTable_.data());
+            if (!reason.empty()) {
+                outcome.falseMatches.push_back({filename, std::move(reason)});
+            } else if (!outcome.found) {
+                outcome.found = true;
+                outcome.foundFilename = filename;
+            }
         }
         outcome.hits.push_back(filename);
     }

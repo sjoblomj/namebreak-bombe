@@ -119,6 +119,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # which code paths a search exercises.
 set(SEARCH_SOURCES
     src/engine/search.cpp
+    src/engine/match_check.cpp
     src/engine/match_writer.cpp
     src/engine/mpq_hash.cpp
     src/engine/candidate.cpp
@@ -316,6 +317,12 @@ endfunction()
 # Pure-CPU correctness check for IncrementalPrefixHasher (src/engine/mpq_hash.h).
 namebreak_test_executable(prefix_hasher_test tests/prefix_hasher_test.cpp namebreak_search)
 namebreak_test(prefix_hasher_test prefix_hasher_test)
+
+# What a match of both hashes is checked against before it's taken for the
+# file - its key and hash table position (src/engine/match_check.h) - and the
+# false_matches.txt one that fails is appended to. CPU only.
+namebreak_test_executable(match_check_test tests/match_check_test.cpp namebreak_search)
+namebreak_test(match_check_test match_check_test)
 
 # Pure-CPU correctness check for the lookup filter the CUDA and OpenCL backends search
 # with (src/backends/common/lowbits_filter.h): the property it rests on, every
@@ -585,6 +592,12 @@ if(NAMEBREAK_NETWORK)
             --client-one-basename $<TARGET_FILE:namebreak_one_basename_per_report>
             --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
         set_tests_properties(coordinator-dictionary PROPERTIES TIMEOUT 900)
+        # False matches end to end: an older client's, which the server
+        # catches, and this client's, which it reports and searches on past
+        # - see the script.
+        namebreak_test(coordinator-false-match ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_false_match_test.py
+            --client $<TARGET_FILE:namebreak> --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
+        set_tests_properties(coordinator-false-match PROPERTIES TIMEOUT 600)
     endif()
 endif()
 

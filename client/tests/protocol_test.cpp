@@ -55,7 +55,7 @@ static void testReports() {
     reg.hostname = "laptop";
     reg.backend = "cuda";
     reg.clientRelease = "dev";
-    check(toJson(reg) == R"({"username":"ojan","hostname":"laptop","backend":"cuda","protocol_version":"1.6.0",)"
+    check(toJson(reg) == R"({"username":"ojan","hostname":"laptop","backend":"cuda","protocol_version":"1.7.0",)"
                          R"("client_release":"dev","meet_in_the_middle_table_bytes":null})",
           "a registration without meet_in_the_middle_table_memory: no memory for a meet-in-the-middle table");
     reg.meetInTheMiddleTableBytes = 1073741824;
@@ -75,6 +75,28 @@ static void testReports() {
     check(toJson(complete) == before, "a completion without basenames: as before protocol 1.5");
     complete.basenames = {"Y.WAV", "Z.WAV"};
     check(toJson(complete) == before.substr(0, before.size() - 1) + R"(,"basenames":["Y.WAV","Z.WAV"]})", "... and with them");
+
+    // False matches, from protocol 1.7: with any kind of report, left out
+    // when there are none - as every report above has none.
+    complete.basenames.clear();
+    complete.falseMatches = {"REZ\\SFZSSP050WSRL.WAV"};
+    check(toJson(complete) == before.substr(0, before.size() - 1) + R"(,"false_matches":["REZ\\SFZSSP050WSRL.WAV"]})",
+          "a completion with a false match");
+    hb = HeartbeatRequest();
+    hb.lastHashAMatchFilename = "REZ\\B.WAV";
+    hb.falseMatches = {"REZ\\A.WAV", "REZ\\B.WAV"};
+    check(toJson(hb) == R"({"last_hash_a_match_filename":"REZ\\B.WAV","false_matches":["REZ\\A.WAV","REZ\\B.WAV"]})",
+          "an alphabet range's heartbeat with false matches");
+    hb = HeartbeatRequest();
+    hb.nextCandidateNumber = 3;
+    hb.basenames = {"A.WAV"};
+    hb.falseMatches = {"MUSIC\\A.WAV"};
+    check(toJson(hb) == R"({"last_hash_a_match_filename":null,"next_candidate_number":3,"basenames":["A.WAV"],"false_matches":["MUSIC\\A.WAV"]})",
+          "a dictionary range's heartbeat with basenames and a false match");
+    quit = QuitRequest();
+    quit.nextTailIndex = 2;
+    quit.falseMatches = {"X\\Y.PIF"};
+    check(toJson(quit) == R"({"last_hash_a_match_filename":null,"next_tail_index":2,"false_matches":["X\\Y.PIF"]})", "a quit with a false match");
 }
 
 // An alphabet target's claim, as the server writes it.
@@ -210,6 +232,55 @@ static void testMeetInTheMiddleClaims() {
     }
 }
 
+// What's known about a target's file beyond its hashes, from protocol 1.7 -
+// in any kind of target's claim.
+static void testMatchChecks() {
+    printf("--- the key and the hash table position ---\n");
+    auto withFields = [](const std::string& fields) {
+        std::string claim = kAlphabetClaim;
+        claim.insert(claim.size() - 1, fields);
+        return claim;
+    };
+    ClaimResponse c;
+    check(parseClaimResponse(kAlphabetClaim, c) && c.encryptionKeyHex.empty() && !c.hashTableSize && !c.hashTableFirstStartSlot &&
+              !c.hashTableLastStartSlot,
+          "an alphabet claim without them: nothing known");
+    c = ClaimResponse();
+    check(parseClaimResponse(withFields(R"(,"encryption_key_hex":"0x4A8FA566","hash_table_size":2048,"hash_table_first_start_slot":849,)"
+                                        R"("hash_table_last_start_slot":851)"),
+                             c) &&
+              c.encryptionKeyHex == "0x4A8FA566" && c.hashTableSize == std::optional<int64_t>(2048) &&
+              c.hashTableFirstStartSlot == std::optional<int64_t>(849) && c.hashTableLastStartSlot == std::optional<int64_t>(851),
+          "an alphabet claim with the key and the hash table position");
+    c = ClaimResponse();
+    check(parseClaimResponse(withFields(R"(,"hash_table_size":16,"hash_table_first_start_slot":14,"hash_table_last_start_slot":1)"), c) &&
+              c.hashTableFirstStartSlot == std::optional<int64_t>(14) && c.hashTableLastStartSlot == std::optional<int64_t>(1),
+          "slots wrapping past the table's end");
+    c = ClaimResponse();
+    check(parseClaimResponse(withFields(R"(,"hash_table_size":null,"hash_table_first_start_slot":null,"hash_table_last_start_slot":null)"), c) &&
+              !c.hashTableSize,
+          "all three null: none");
+    c = ClaimResponse();
+    check(parseClaimResponse(meetInTheMiddleClaim(meetInTheMiddleFieldsJson() + R"(,"hash_table_size":1,"hash_table_first_start_slot":0,)"
+                                                                                R"("hash_table_last_start_slot":0)"),
+                             c) &&
+              c.meetInTheMiddle && c.hashTableSize == std::optional<int64_t>(1),
+          "in a meet-in-the-middle claim too");
+    for (const char* bad : {R"(,"hash_table_size":2048,"hash_table_first_start_slot":849)",
+                            R"(,"hash_table_size":2048,"hash_table_last_start_slot":851)",
+                            R"(,"hash_table_first_start_slot":849,"hash_table_last_start_slot":851)",
+                            R"(,"hash_table_size":2000,"hash_table_first_start_slot":1,"hash_table_last_start_slot":2)",
+                            R"(,"hash_table_size":0,"hash_table_first_start_slot":0,"hash_table_last_start_slot":0)",
+                            R"(,"hash_table_size":2048,"hash_table_first_start_slot":2048,"hash_table_last_start_slot":2)",
+                            R"(,"hash_table_size":2048,"hash_table_first_start_slot":1,"hash_table_last_start_slot":-1)",
+                            R"(,"hash_table_size":4294967296,"hash_table_first_start_slot":1,"hash_table_last_start_slot":2)",
+                            R"(,"hash_table_size":"2048","hash_table_first_start_slot":1,"hash_table_last_start_slot":2)",
+                            R"(,"encryption_key_hex":12345)"}) {
+        ClaimResponse refused;
+        check(!parseClaimResponse(withFields(bad), refused), std::string("refused: ") + bad);
+    }
+}
+
 static void testClaims() {
     printf("--- claims ---\n");
     ClaimResponse c;
@@ -282,6 +353,7 @@ int main() {
     testReports();
     testClaims();
     testMeetInTheMiddleClaims();
+    testMatchChecks();
     if (g_failures) {
         fprintf(stderr, "%d of %d check(s) FAILED\n", g_failures, g_checks);
         return 1;
