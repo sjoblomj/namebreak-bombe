@@ -33,6 +33,11 @@
 // A quarter of the cases make one of the hits match hashB too - one among
 // hundreds, so it's reported along with others, some after it: the search
 // must end at it, and leave it, and nothing after it, in the matches file.
+// In half of those, it fails the search's MatchCheck - the file's key, or
+// its hash table slots, aren't the hit's: a false match. The search must
+// report it as one, append it to false_matches.txt, and go on to the end of
+// the range as if it were any other hit - every hit around it, in its batch
+// and after, reported.
 //
 // Calls the real runSearch(), which writes a matches file (and, on a find,
 // found.txt) in the current directory - ctest runs this in its own directory
@@ -173,6 +178,8 @@ struct Case {
     int leadingLen = 0;
     // One of the hits matches hashB too, if there are any.
     bool foundCase = false;
+    // ... and fails the MatchCheck: a false match.
+    bool falseMatchCase = false;
     // How many of a candidate's first characters the rules look at.
     int checkedLen() const { return pruneWholeCandidate ? len - 1 : leadingLen; }
 };
@@ -402,8 +409,31 @@ static long runCase(Case c, std::mt19937_64& rng) {
         }
     }
 
+    // A false match: the check that hit fails - its basename's key, or its
+    // hash table slot, but one off - worked out here, not by the code under
+    // test.
+    MatchCheck matchCheck;
+    if (c.falseMatchCase && !foundHit.empty()) {
+        if (rng() % 2 == 0) {
+            const size_t slash = foundHit.rfind('\\');
+            matchCheck.checkKey = true;
+            matchCheck.key = hashFromScratch(slash == std::string::npos ? foundHit : foundHit.substr(slash + 1), 0x300) + 1;
+        } else {
+            matchCheck.checkSlot = true;
+            matchCheck.hashTableSize = 1u << (1 + rng() % 20);
+            const uint32_t slot = hashFromScratch(foundHit, 0x000) & (matchCheck.hashTableSize - 1);
+            // Every slot but its own: from the one after it round to the one before.
+            matchCheck.firstStartSlot = (slot + 1) & (matchCheck.hashTableSize - 1);
+            matchCheck.lastStartSlot = (slot - 1) & (matchCheck.hashTableSize - 1);
+        }
+    }
+    const std::string falseHit = matchCheck.any() ? foundHit : "";
+    if (!falseHit.empty())
+        foundHit.clear();
+
     SearchRequest req;
     req.alphabet = c.alphabet;
+    req.matchCheck = matchCheck;
     req.prefix = c.prefix;
     req.suffix = c.suffix;
     req.lowerBound = candidateAt(c.first, c.len, c.alphabet);
@@ -423,13 +453,18 @@ static long runCase(Case c, std::mt19937_64& rng) {
     req.pruneWholeCandidate = c.pruneWholeCandidate;
 
     std::vector<std::string> reported;
+    std::vector<FalseMatch> falseMatches;
     OutputCapture capture;
     capture.start();
-    SearchResult result = runSearch(*g_backend, req, nullptr, [&](const std::string& f) { reported.push_back(f); });
+    SearchResult result = runSearch(
+        *g_backend, req, nullptr, [&](const std::string& f) { reported.push_back(f); }, nullptr,
+        [&](const FalseMatch& f) { falseMatches.push_back(f); });
     const std::string log = capture.stop();
     const std::string matchesFile = readFile(kMatchesFile), foundFile = readFile(foundFilePath(kMatchesFile));
+    const std::string falseMatchesFile = readFile(falseMatchesFilePath(kMatchesFile));
     std::remove(kMatchesFile);
     std::remove(foundFilePath(kMatchesFile).c_str());
+    std::remove(falseMatchesFilePath(kMatchesFile).c_str());
 
     bool ok = true;
     auto fail = [&](const std::string& what) {
@@ -453,6 +488,14 @@ static long runCase(Case c, std::mt19937_64& rng) {
         fail("the matches file holds '" + matchesFile + "', not just '" + lastLine + "'");
     if (foundFile != (foundHit.empty() ? "" : asWritten(foundHit + "\n")))
         fail("found.txt holds '" + foundFile + "'" + (foundHit.empty() ? ", though nothing was found" : ", not just '" + foundHit + "'"));
+    // The false match, once - reported, and in false_matches.txt.
+    if (falseHit.empty() && !falseMatches.empty())
+        fail("runSearch() reported a false match ('" + falseMatches[0].filename + "'), but the case has none");
+    if (!falseHit.empty() && (falseMatches.size() != 1 || falseMatches[0].filename != falseHit || falseMatches[0].reason.empty()))
+        fail("runSearch() didn't report '" + falseHit + "' as a false match, with why, exactly once (it reported " + std::to_string(falseMatches.size()) +
+             ")");
+    if (falseHit.empty() ? !falseMatchesFile.empty() : falseMatchesFile.rfind(falseHit + "\t", 0) != 0)
+        fail("false_matches.txt holds '" + falseMatchesFile + "'" + (falseHit.empty() ? ", though there's no false match" : ", not '" + falseHit + "'"));
     std::sort(reported.begin(), reported.end());
     if (std::adjacent_find(reported.begin(), reported.end()) != reported.end())
         fail("a hit was reported more than once");
@@ -606,6 +649,7 @@ int main(int argc, char** argv) {
 
         plantAtEdge(c, window, g_backend->batchSize(as), space, rng);
         c.foundCase = cases % 4 == 3;
+        c.falseMatchCase = cases % 8 == 7;
         const long verified = runCase(c, rng);
         ++cases;
         candidates += c.last - c.first + 1;

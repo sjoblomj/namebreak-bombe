@@ -24,6 +24,10 @@ struct SearchRequest {
     std::string upperBound;
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
+    // What else a candidate matching both hashes must have to be the file's
+    // name (see MatchCheck, match_check.h). One that hasn't is a false
+    // match: reported (see runSearch's onFalseMatch), and the search goes on.
+    MatchCheck matchCheck;
     bool pruneSymbolRuns = false;
     // Skip candidates that close a bracket nobody opened - see
     // hasUnopenedBracket_CPU (candidate.h). Brackets opened in `prefix`
@@ -91,6 +95,9 @@ struct SearchResult {
 // interrupt a long-running search (e.g. once a coordinator learns the target
 // was solved elsewhere); `onPartialMatch`, if given, is invoked with the
 // full filename of every Hash-A match as soon as it's known.
+// `onFalseMatch`, if given, with every candidate that matches both hashes
+// but not req.matchCheck - which is also a Hash-A match, and is appended to
+// false_matches.txt next to the matches file (see MatchWriter::falseMatch).
 // `pauseRequested`, if given, is polled the same way abortRequested is - but
 // instead of ending the search, blocks (still letting a caller's own
 // heartbeat/etc. threads run) until it's cleared again, so the batch already
@@ -103,6 +110,7 @@ struct SearchResult {
 SearchResult runSearch(SearchBackend& backend, const SearchRequest& req,
                        std::atomic<bool>* abortRequested = nullptr,
                        std::function<void(const std::string&)> onPartialMatch = nullptr,
-                       const std::atomic<bool>* pauseRequested = nullptr);
+                       const std::atomic<bool>* pauseRequested = nullptr,
+                       std::function<void(const FalseMatch&)> onFalseMatch = nullptr);
 
 #endif // NAMEBREAK_ENGINE_SEARCH_H

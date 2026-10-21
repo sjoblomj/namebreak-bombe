@@ -171,6 +171,28 @@ void resolveMissingIdentity(CoordinatorArgs& args) {
 
 namespace {
 
+// What a claim says is known about its target's file beyond its hashes (see
+// ClaimResponse::encryptionKeyHex) - what a match of both hashes is checked
+// against. False, with `error` set, if the key isn't hex.
+bool toMatchCheck(const ClaimResponse& claim, MatchCheck& check, std::string& error) {
+    check = MatchCheck();
+    if (!claim.encryptionKeyHex.empty()) {
+        if (!hexToU32(claim.encryptionKeyHex, check.key)) {
+            error = "malformed encryption key in claim response (" + claim.encryptionKeyHex + ")";
+            return false;
+        }
+        check.checkKey = true;
+    }
+    // parseClaimResponse has made sure they're all there or none, and fit.
+    if (claim.hashTableSize) {
+        check.checkSlot = true;
+        check.hashTableSize = (uint32_t) *claim.hashTableSize;
+        check.firstStartSlot = (uint32_t) *claim.hashTableFirstStartSlot;
+        check.lastStartSlot = (uint32_t) *claim.hashTableLastStartSlot;
+    }
+    return true;
+}
+
 SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& matchesDir, std::string& error) {
     SearchRequest req;
     req.alphabet = claim.alphabet;
@@ -194,6 +216,8 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& mat
     if (!hexToU32(claim.hashAHex, req.targetHashA) || !hexToU32(claim.hashBHex, req.targetHashB)) {
         error = "malformed target hash in claim response (hashA=" + claim.hashAHex + " hashB=" + claim.hashBHex + ")";
     }
+    if (error.empty())
+        toMatchCheck(claim, req.matchCheck, error);
     return req;
 }
 
@@ -258,6 +282,32 @@ private:
     SearchBackend* chosen_ = nullptr;
 };
 
+// The false matches a range's search has found that the server hasn't said
+// it has (see HeartbeatRequest::falseMatches) - added to from the search's
+// thread, and sent and removed from the heartbeat thread's.
+class FalseMatchOutbox {
+public:
+    void add(const std::string& filename) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        filenames_.push_back(filename);
+    }
+    // Every one waiting - a report carries them all.
+    std::vector<std::string> peek() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return filenames_;
+    }
+    // The first `count`, which a report (from peek) carried and got an
+    // answer to - any found since come after them.
+    void remove(size_t count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        filenames_.erase(filenames_.begin(), filenames_.begin() + (ptrdiff_t) std::min(count, filenames_.size()));
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<std::string> filenames_;
+};
+
 // How a range's search went, whichever kind of target it's of.
 struct RangeResult {
     bool ok = true;
@@ -285,6 +335,9 @@ struct RangeSearch {
     std::function<std::optional<int64_t>()> nextTailIndex;
     // Where a match it finds is recorded (see MatchWriter).
     std::string outputFilePath;
+    // Whatever kind of range it is, the false matches it found and hasn't
+    // had delivered yet - every report carries them.
+    FalseMatchOutbox falseMatches;
 };
 
 // What a report (a HeartbeatRequest or QuitRequest) of `search` says: a
@@ -293,6 +346,7 @@ struct RangeSearch {
 // alphabet range's latest Hash A match.
 template <class Report>
 void fillReport(const RangeSearch& search, Report& req) {
+    req.falseMatches = search.falseMatches.peek();
     if (search.nextTailIndex) {
         req.nextTailIndex = search.nextTailIndex();
     } else if (search.outbox) {
@@ -307,6 +361,13 @@ void fillReport(const RangeSearch& search, Report& req) {
 // After a report that carried `sent` got an answer that means the server
 // has them - see HeartbeatRequest::basenames.
 void basenamesDelivered(BasenameOutbox* outbox, const std::vector<std::string>& sent) {
+    if (outbox && !sent.empty())
+        outbox->remove(sent.size());
+}
+
+// The same for the false matches a report carried - the server keeps them
+// whatever else it answers, as it does the basenames.
+void falseMatchesDelivered(FalseMatchOutbox* outbox, const std::vector<std::string>& sent) {
     if (outbox && !sent.empty())
         outbox->remove(sent.size());
 }
@@ -327,8 +388,11 @@ std::string describeProgress(const QuitRequest& req) {
 // it got anywhere, and carries the basenames waiting in `outbox` (see
 // fillReport). One attempt only: the user asked to quit, and if the server
 // can't be reached the lease still runs out as before. Either way, any
-// basename it didn't get is in what's handed out again.
-void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t rangeId, const QuitRequest& req, BasenameOutbox* outbox) {
+// basename it didn't get is in what's handed out again. So are the false
+// matches in `falseMatches` it carries - found again when that part is
+// searched again, if they're past how far it says the search got.
+void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t rangeId, const QuitRequest& req, BasenameOutbox* outbox,
+                FalseMatchOutbox* falseMatches) {
     CoordinatorClient quitClient(args.serverUrl);
     quitClient.setToken(token);
     const bool progressed = req.lastHashAMatchFilename || req.nextCandidateNumber || req.nextTailIndex;
@@ -336,6 +400,7 @@ void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t r
     switch (quitClient.quit(rangeId, req, err)) {
         case CoordinatorClient::QuitOutcome::Ok:
             basenamesDelivered(outbox, req.basenames);
+            falseMatchesDelivered(falseMatches, req.falseMatches);
             if (progressed)
                 printf("[coordinator] range %lld: told the coordinator it's %s - the rest goes back to be handed out\n", (long long) rangeId,
                        describeProgress(req).c_str());
@@ -345,6 +410,7 @@ void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t r
             break;
         case CoordinatorClient::QuitOutcome::Conflict:
             basenamesDelivered(outbox, req.basenames);
+            falseMatchesDelivered(falseMatches, req.falseMatches);
             printf("[coordinator] range %lld: no longer assigned to us - nothing to report\n", (long long) rangeId);
             break;
         case CoordinatorClient::QuitOutcome::Error:
@@ -479,6 +545,7 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
             switch (hbClient.heartbeat(claim.rangeId, req, resp, err)) {
                 case CoordinatorClient::HeartbeatOutcome::Ok:
                     basenamesDelivered(search.outbox, req.basenames);
+                    falseMatchesDelivered(&search.falseMatches, req.falseMatches);
                     sendAgainNow = req.basenames.size() == kMaxBasenamesPerReport && search.outbox->size() > 0;
                     if (resp.rangeReleased) {
                         // The server doesn't say why (target solved elsewhere, or
@@ -503,6 +570,7 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
                 case CoordinatorClient::HeartbeatOutcome::Conflict:
                     // The server kept the basenames all the same.
                     basenamesDelivered(search.outbox, req.basenames);
+                    falseMatchesDelivered(&search.falseMatches, req.falseMatches);
                     // Not a failure, and not something retrying will ever fix: by
                     // the time this heartbeat reached the server, it had already
                     // stopped considering this range ours - almost always because
@@ -576,7 +644,7 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
             printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
             QuitRequest req;
             fillReport(search, req);
-            reportQuit(args, token, claim.rangeId, req, search.outbox);
+            reportQuit(args, token, claim.rangeId, req, search.outbox, &search.falseMatches);
         } else if (externallyQuit) {
             printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
         } else if (lostOwnership) {
@@ -620,6 +688,7 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
     completeReq.candidatesProcessed = claim.candidateCount;
     if (search.outbox)
         completeReq.basenames = search.outbox->peek(kMaxBasenamesPerReport).basenames;
+    completeReq.falseMatches = search.falseMatches.peek();
 
     // Retried until it gets a real answer: a lost report either leaves the
     // range to wait out its whole lease before being redone, or - worse -
@@ -647,9 +716,11 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
     switch (outcome) {
         case CoordinatorClient::CompleteOutcome::Ok:
             basenamesDelivered(search.outbox, completeReq.basenames);
+            falseMatchesDelivered(&search.falseMatches, completeReq.falseMatches);
             break;
         case CoordinatorClient::CompleteOutcome::Conflict:
             basenamesDelivered(search.outbox, completeReq.basenames);
+            falseMatchesDelivered(&search.falseMatches, completeReq.falseMatches);
             // This range's ownership moved on before we could report in -
             // almost certainly a network outage during heartbeating that
             // outlasted the lease, so the server already reassigned it.
@@ -691,10 +762,13 @@ void runAlphabetRange(SearchBackend& backend, const CoordinatorArgs& args, const
     RangeSearch search;
     search.outputFilePath = req.outputFilePath;
     search.run = [&](std::atomic<bool>& abort) {
-        SearchResult found = runSearch(backend, req, &abort, [&](const std::string& filename) {
-            std::lock_guard<std::mutex> lock(lastMatchMutex);
-            lastHashAMatch = filename;
-        }, pauseRequested);
+        SearchResult found = runSearch(
+            backend, req, &abort,
+            [&](const std::string& filename) {
+                std::lock_guard<std::mutex> lock(lastMatchMutex);
+                lastHashAMatch = filename;
+            },
+            pauseRequested, [&](const FalseMatch& falseMatch) { search.falseMatches.add(falseMatch.filename); });
         return RangeResult{found.ok, found.error, found.found, found.filename, found.aborted};
     };
     search.progress = [&](std::optional<std::string>& last) {
@@ -754,12 +828,13 @@ bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::stri
     // The key, whenever the target has one: only the candidates whose
     // basename matches it are compared to the hashes - and with
     // send_basenames, those basenames are sent.
-    req.checkBasename = !claim.encryptionKeyHex.empty();
-    req.recordBasenames = claim.sendBasenames;
-    if (req.checkBasename && !hexToU32(claim.encryptionKeyHex, req.basenameKey)) {
-        error = "malformed encryption key in claim response (" + claim.encryptionKeyHex + ")";
+    // It's also part of what a match of both hashes is checked against -
+    // with the hash table position, if that's known too.
+    if (!toMatchCheck(claim, req.matchCheck, error))
         return false;
-    }
+    req.checkBasename = req.matchCheck.checkKey;
+    req.basenameKey = req.matchCheck.key;
+    req.recordBasenames = claim.sendBasenames;
     req.startNumber = (uint64_t) claim.firstCandidateNumber;
     req.endNumber = (uint64_t) claim.endCandidateNumber;
     req.wordSource.clear();
@@ -799,7 +874,7 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
                        toDictionaryRequest(claim, words, args.matchesDir, req, error) && (backend = backends.get(error)) != nullptr;
     if (!ready) {
         fprintf(stderr, "[coordinator] range %lld: can't search it (%s) - handing it back\n", (long long) claim.rangeId, error.c_str());
-        reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr);
+        reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr, nullptr);
         return false;
     }
     for (const std::string& name : downloaded)
@@ -830,6 +905,7 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
                 callbacks->onDictionaryBasename(basename);
         };
         hooks.onProgress = [&](uint64_t next) { outbox.setProgress(next); };
+        hooks.onFalseMatch = [&](const FalseMatch& falseMatch) { search.falseMatches.add(falseMatch.filename); };
         if (callbacks) {
             hooks.onCount = callbacks->onDictionaryCount;
             hooks.onStatus = callbacks->onDictionaryStatus;
@@ -874,6 +950,8 @@ bool toMeetInTheMiddleRequest(const ClaimResponse& claim, const CoordinatorArgs&
     }
     req.meetingPointA = {seeds[0], seeds[1]};
     req.meetingPointB = {seeds[2], seeds[3]};
+    if (!toMatchCheck(claim, req.matchCheck, error))
+        return false;
     // The memory this range's table would take - never more than this client
     // said it would give (RegisterRequest::meetInTheMiddleTableBytes). The
     // server doesn't hand out more, so this only catches a server that got it
@@ -918,7 +996,7 @@ bool runMeetInTheMiddleRange(MeetInTheMiddleBackend& backends, const Coordinator
     SearchBackend* backend = nullptr;
     if (!toMeetInTheMiddleRequest(claim, args, req, base, error) || (backend = backends.get(error)) == nullptr) {
         fprintf(stderr, "[coordinator] range %lld: can't search it (%s) - handing it back\n", (long long) claim.rangeId, error.c_str());
-        reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr);
+        reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr, nullptr);
         return false;
     }
 
@@ -951,6 +1029,7 @@ bool runMeetInTheMiddleRange(MeetInTheMiddleBackend& backends, const Coordinator
             std::lock_guard<std::mutex> lock(progressMutex);
             reached = (int64_t) (next - base);
         };
+        hooks.onFalseMatch = [&](const FalseMatch& falseMatch) { search.falseMatches.add(falseMatch.filename); };
         if (callbacks) {
             hooks.onCount = callbacks->onMeetInTheMiddleCount;
             hooks.onStatus = callbacks->onMeetInTheMiddleStatus;

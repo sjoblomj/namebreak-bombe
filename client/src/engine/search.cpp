@@ -25,9 +25,11 @@ BatchOutcome SearchBackend::runBatches(int trailingLen, const std::vector<BatchR
             total.hits.clear();
             total.found = false;
             total.foundFilename.clear();
+            total.falseMatches.clear();
             return total;
         }
         total.hits.insert(total.hits.end(), outcome.hits.begin(), outcome.hits.end());
+        total.falseMatches.insert(total.falseMatches.end(), outcome.falseMatches.begin(), outcome.falseMatches.end());
         if (outcome.found) {
             total.found = true;
             total.foundFilename = outcome.foundFilename;
@@ -81,14 +83,22 @@ bool waitUnlessAborted(const std::atomic<bool>* abortRequested, const std::atomi
 }
 
 // Writes out the hits of an outcome that has them all (hitCount <=
-// MAX_MATCHES). Returns 1 if one matched both hashes (outFoundFilename is
-// filled), 0 otherwise.
+// MAX_MATCHES), and its false matches. Returns 1 if one matched both hashes
+// (outFoundFilename is filled), 0 otherwise - a false match is a hit like
+// any other, and the search goes on.
 int reportOutcome(const BatchOutcome& outcome, MatchWriter& matches, const std::function<void(const std::string&)>& onPartialMatch,
-                  std::string& outFoundFilename) {
+                  const std::function<void(const FalseMatch&)>& onFalseMatch, std::string& outFoundFilename) {
     for (const std::string& hit : outcome.hits) {
         printf("%s\n", hit.c_str());
         if (onPartialMatch)
             onPartialMatch(hit);
+    }
+    for (const FalseMatch& falseMatch : outcome.falseMatches) {
+        printf("FALSE MATCH (both hashes, but %s): %s\n", falseMatch.reason.c_str(), falseMatch.filename.c_str());
+        fflush(stdout);
+        matches.falseMatch(falseMatch);
+        if (onFalseMatch)
+            onFalseMatch(falseMatch);
     }
     if (outcome.found) {
         // The matches file's line from now on, whichever hits come after it
@@ -107,7 +117,8 @@ int reportOutcome(const BatchOutcome& outcome, MatchWriter& matches, const std::
 
 int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint64_t count, const BatchParams& params, MatchWriter& matches,
                 const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
-                std::string& outFoundFilename, const std::atomic<bool>* pauseRequested) {
+                const std::function<void(const FalseMatch&)>& onFalseMatch, std::string& outFoundFilename,
+                const std::atomic<bool>* pauseRequested) {
     if (!waitUnlessAborted(abortRequested, pauseRequested))
         return -1;
 
@@ -125,14 +136,14 @@ int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint
         fprintf(stderr, "note: %d hashA hits in one batch, more than the %d that can be recorded - searching its two halves separately\n",
                 outcome.hitCount, MAX_MATCHES);
         const uint64_t half = count / 2;
-        int r = searchChunk(backend, trailingLen, startIdx, half, params, matches, abortRequested, onPartialMatch, outFoundFilename,
-                            pauseRequested);
+        int r = searchChunk(backend, trailingLen, startIdx, half, params, matches, abortRequested, onPartialMatch, onFalseMatch,
+                            outFoundFilename, pauseRequested);
         if (r != 0)
             return r;
         return searchChunk(backend, trailingLen, startIdx + half, count - half, params, matches, abortRequested, onPartialMatch,
-                           outFoundFilename, pauseRequested);
+                           onFalseMatch, outFoundFilename, pauseRequested);
     }
-    return reportOutcome(outcome, matches, onPartialMatch, outFoundFilename);
+    return reportOutcome(outcome, matches, onPartialMatch, onFalseMatch, outFoundFilename);
 }
 
 // searchChunk for several batches at once, in one backend.runBatches() call
@@ -142,10 +153,11 @@ int searchChunk(SearchBackend& backend, int trailingLen, uint64_t startIdx, uint
 // splits it further if it has to).
 int searchBatches(SearchBackend& backend, int trailingLen, const std::vector<BatchRequest>& batches, MatchWriter& matches,
                   const std::atomic<bool>* abortRequested, const std::function<void(const std::string&)>& onPartialMatch,
-                  std::string& outFoundFilename, const std::atomic<bool>* pauseRequested) {
+                  const std::function<void(const FalseMatch&)>& onFalseMatch, std::string& outFoundFilename,
+                  const std::atomic<bool>* pauseRequested) {
     if (batches.size() == 1)
         return searchChunk(backend, trailingLen, batches[0].start, batches[0].count, batches[0].params, matches, abortRequested,
-                           onPartialMatch, outFoundFilename, pauseRequested);
+                           onPartialMatch, onFalseMatch, outFoundFilename, pauseRequested);
     if (!waitUnlessAborted(abortRequested, pauseRequested))
         return -1;
 
@@ -156,19 +168,20 @@ int searchBatches(SearchBackend& backend, int trailingLen, const std::vector<Bat
                 outcome.hitCount, batches.size(), MAX_MATCHES);
         for (const BatchRequest& batch : batches) {
             int r = searchChunk(backend, trailingLen, batch.start, batch.count, batch.params, matches, abortRequested, onPartialMatch,
-                                outFoundFilename, pauseRequested);
+                                onFalseMatch, outFoundFilename, pauseRequested);
             if (r != 0)
                 return r;
         }
         return 0;
     }
-    return reportOutcome(outcome, matches, onPartialMatch, outFoundFilename);
+    return reportOutcome(outcome, matches, onPartialMatch, onFalseMatch, outFoundFilename);
 }
 
 } // namespace
 
 SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::atomic<bool>* abortRequested,
-                       std::function<void(const std::string&)> onPartialMatch, const std::atomic<bool>* pauseRequested) {
+                       std::function<void(const std::string&)> onPartialMatch, const std::atomic<bool>* pauseRequested,
+                       std::function<void(const FalseMatch&)> onFalseMatch) {
     SearchResult result;
 
     if (req.alphabet.empty() || req.alphabet.size() > MAX_ALPHABET_SIZE) {
@@ -301,6 +314,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     printf("upperBoundLimit: '%s'\n", upperBoundLimit.c_str());
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
+    printMatchCheck(req.matchCheck);
     const char* pruneScope = req.pruneWholeCandidate ? "every character but the last" : "leading characters only";
     printf("pruneSymbolRuns: %s (%s)\n", req.pruneSymbolRuns ? "true" : "false", pruneScope);
     printf("pruneUnopenedBrackets: %s (%s)\n", req.pruneUnopenedBrackets ? "true" : "false", pruneScope);
@@ -347,6 +361,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     constants.cryptTable = h_cryptTable;
     constants.targetHashA = req.targetHashA;
     constants.targetHashB = req.targetHashB;
+    constants.matchCheck = req.matchCheck;
     if (req.pruneWholeCandidate)
         constants.trailingRules = rules;
     // The backend's search begins with the first candidate length's
@@ -519,7 +534,8 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
         // next one, whose trailingLen may differ.
         std::vector<BatchRequest> pending;
         auto searchPending = [&]() {
-            int r = searchBatches(backend, trailingLen, pending, matches, abortRequested, onPartialMatch, foundFilename, pauseRequested);
+            int r = searchBatches(backend, trailingLen, pending, matches, abortRequested, onPartialMatch, onFalseMatch, foundFilename,
+                                  pauseRequested);
             pending.clear();
             return r;
         };

@@ -48,6 +48,10 @@ struct MeetInTheMiddleRequest {
     bool hasMeetingPointB = true;
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
+    // As SearchRequest::matchCheck: a directory whose filename matches both
+    // hashes but not this is a false match (MeetInTheMiddleSearchHooks::
+    // onFalseMatch), and the search goes on.
+    MatchCheck matchCheck;
     // How long the directory may be, in characters.
     int minLength = 1;
     int maxLength = 1;
@@ -109,6 +113,10 @@ struct MeetInTheMiddleResult {
 struct MeetInTheMiddleSearchHooks {
     // With the filename of every directory that matched the meeting point.
     std::function<void(const std::string& filename)> onPartialMatch;
+    // With every filename that matches both hashes but not
+    // MeetInTheMiddleRequest::matchCheck - appended to false_matches.txt too
+    // (see MatchWriter::falseMatch).
+    std::function<void(const FalseMatch& falseMatch)> onFalseMatch;
     // After every call to the backend, and at the end, with the search's
     // MeetInTheMiddleResult::nextNumber so far.
     std::function<void(uint64_t nextNumber)> onProgress;

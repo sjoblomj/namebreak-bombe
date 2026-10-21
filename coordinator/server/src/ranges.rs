@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, MEET_IN_THE_MIDDLE_SINCE, MAX_BASENAMES_PER_REPORT};
+use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, FALSE_MATCHES_SINCE, MAX_BASENAMES_PER_REPORT, MEET_IN_THE_MIDDLE_SINCE};
 use sqlx::SqlitePool;
 
 use crate::alphabet::{
@@ -131,6 +131,9 @@ pub(crate) fn to_claim_response(
         filename_upper_bound: None,
         send_basenames: false,
         encryption_key_hex: None,
+        hash_table_size: None,
+        hash_table_first_start_slot: None,
+        hash_table_last_start_slot: None,
         meet_in_the_middle: false,
         meeting_point_a_seed1_hex: None,
         meeting_point_a_seed2_hex: None,
@@ -187,6 +190,9 @@ pub(crate) fn to_dictionary_claim_response(target: &Target, dictionary: &Diction
         filename_upper_bound: dictionary.bounds.upper.clone(),
         send_basenames,
         encryption_key_hex,
+        hash_table_size: None,
+        hash_table_first_start_slot: None,
+        hash_table_last_start_slot: None,
         meet_in_the_middle: false,
         meeting_point_a_seed1_hex: None,
         meeting_point_a_seed2_hex: None,
@@ -256,6 +262,9 @@ pub(crate) fn to_meet_in_the_middle_claim_response(
         filename_upper_bound: None,
         send_basenames: false,
         encryption_key_hex: None,
+        hash_table_size: None,
+        hash_table_first_start_slot: None,
+        hash_table_last_start_slot: None,
         meet_in_the_middle: true,
         meeting_point_a_seed1_hex: Some(hex(meet_in_the_middle.meeting_point_a.0)),
         meeting_point_a_seed2_hex: Some(hex(meet_in_the_middle.meeting_point_a.1)),
@@ -362,14 +371,15 @@ async fn insert_pending_range(
     alphabet_name: &str,
     alphabet: &str,
     priority_range_id: Option<i64>,
+    false_match_inside: i64,
     created_at: i64,
 ) -> Result<(), sqlx::Error> {
     let (start_block, start_index) = split_pos(alphabet, candidate_len, start_index);
     let (end_block, end_index) = split_end(alphabet, candidate_len, end_index);
     sqlx::query(
         "INSERT INTO ranges (target_id, candidate_len, start_block, start_index, end_block, end_index, status, created_at, alphabet_name, alphabet, \
-         priority_range_id) \
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+         priority_range_id, false_match_inside) \
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
     )
     .bind(target_id)
     .bind(candidate_len)
@@ -381,6 +391,7 @@ async fn insert_pending_range(
     .bind(alphabet_name)
     .bind(alphabet)
     .bind(priority_range_id)
+    .bind(false_match_inside)
     .execute(tx)
     .await?;
     Ok(())
@@ -983,7 +994,20 @@ async fn create_next_auto_priority_range(tx: &mut sqlx::SqliteConnection, config
 /// has either, even if the higher-priority target's own claimable work is
 /// just a leftover pending range rather than fresh space; it can starve
 /// completely while a higher-priority target is still being worked.
+/// The work `user` is to search next - see `claim_work` - with what's known
+/// about its target's file beyond its hashes, if `user` is a client that
+/// checks a match of both hashes against it (see `false_matches.rs`).
 pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -> Result<Option<ClaimResponse>, AppError> {
+    let Some(mut claim) = claim_work(pool, config, user).await? else {
+        return Ok(None);
+    };
+    let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(claim.target_id).fetch_one(pool).await?;
+    let client_version: Version = user.protocol_version.parse().unwrap_or(Version::new(1, 0, 0));
+    crate::false_matches::add_match_checks(&mut claim, &target, client_version);
+    Ok(Some(claim))
+}
+
+async fn claim_work(pool: &SqlitePool, config: &RangeConfig, user: &User) -> Result<Option<ClaimResponse>, AppError> {
     let mut tx = pool.begin().await?;
     let now = now_unix();
     let rate = effective_rate(config, user);
@@ -1011,7 +1035,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             if client_version < DICTIONARY_SINCE {
                 continue;
             }
-            if let Some(claim) = claim_dictionary_range(&mut tx, config, &target, user, now).await? {
+            if let Some(claim) = claim_dictionary_range(&mut tx, config, &target, user, client_version, now).await? {
                 tx.commit().await?;
                 return Ok(Some(claim));
             }
@@ -1028,7 +1052,7 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             if client_version < MEET_IN_THE_MIDDLE_SINCE || !meet_in_the_middle_table_fits(&target, user)? {
                 continue;
             }
-            if let Some(claim) = claim_meet_in_the_middle_range(&mut tx, config, &target, user, now).await? {
+            if let Some(claim) = claim_meet_in_the_middle_range(&mut tx, config, &target, user, client_version, now).await? {
                 tx.commit().await?;
                 return Ok(Some(claim));
             }
@@ -1059,12 +1083,15 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
         // previous claimant can still re-adopt it as-is - only now that it's
         // actually being handed out is its already-searched portion split
         // off as its own completed row, leaving just the unsearched
-        // remainder to assign here.
+        // remainder to assign here. Not one an older client stopped in at a
+        // false match, though, unless this client knows one when it sees one
+        // (see `models::Range::false_match_inside`).
         let pending = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC")
             .bind(target.id)
             .fetch_all(&mut *tx)
             .await?
             .into_iter()
+            .filter(|range| range.false_match_inside == 0 || client_version >= FALSE_MATCHES_SINCE)
             .find_map(|range| client_alphabet_for(&range.alphabet_name, &range.alphabet, client_version).map(str::to_string).map(|a| (range, a)));
 
         if let Some((range, client_alphabet)) = pending {
@@ -1299,17 +1326,21 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
 /// gaps between them. A range never spans two windows, so its candidates
 /// all have the same number of words, which is its `candidate_len`. `None`
 /// once everything has been handed out.
-async fn claim_dictionary_range(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, target: &Target, user: &User, now: i64) -> Result<Option<ClaimResponse>, AppError> {
+async fn claim_dictionary_range(
+    tx: &mut sqlx::SqliteConnection,
+    config: &RangeConfig,
+    target: &Target,
+    user: &User,
+    client_version: Version,
+    now: i64,
+) -> Result<Option<ClaimResponse>, AppError> {
     let dictionary = config.dictionaries.get(&mut *tx, target).await?;
     let chunk = dictionary_chunk_size(config, effective_dictionary_rate(config, user));
     let lease_seconds = config.lease_seconds;
 
     // As for an alphabet target: the unsearched rest of a released range, or
-    // one a split left - first.
-    let pending = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1")
-        .bind(target.id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    // one a split left - first, false matches inside and all.
+    let pending = pending_range_for(&mut *tx, target, client_version).await?;
     if let Some(range) = pending {
         let range = split_off_searched_portion(&mut *tx, range, now).await?;
         let range = split_off_chunk(&mut *tx, range, chunk as Pos).await?;
@@ -1342,6 +1373,20 @@ async fn claim_dictionary_range(tx: &mut sqlx::SqliteConnection, config: &RangeC
     Ok(Some(to_dictionary_claim_response(target, &dictionary, range_id, start, end, lease_seconds)))
 }
 
+/// A dictionary or meet-in-the-middle target's oldest pending range a client
+/// of `client_version` is to have: not one an older client stopped in at a
+/// false match, unless this one knows one when it sees one (see
+/// `models::Range::false_match_inside`).
+async fn pending_range_for(tx: &mut sqlx::SqliteConnection, target: &Target, client_version: Version) -> Result<Option<Range>, AppError> {
+    Ok(sqlx::query_as::<_, Range>(
+        "SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' AND (false_match_inside = 0 OR ?) ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(target.id)
+    .bind(client_version >= FALSE_MATCHES_SINCE)
+    .fetch_optional(&mut *tx)
+    .await?)
+}
+
 /// Whether `user` will give a table as big as meet-in-the-middle target
 /// `target`'s - what it said at `/register`
 /// (`namebreak_protocol::RegisterRequest::meet_in_the_middle_table_bytes`). A
@@ -1359,15 +1404,19 @@ pub(crate) fn meet_in_the_middle_table_fits(target: &Target, user: &User) -> Res
 /// fresh chunk of the length the cursor is on. One length a range - a tail is
 /// the directory minus the table's characters, so the tails of two lengths
 /// aren't the same thing.
-async fn claim_meet_in_the_middle_range(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, target: &Target, user: &User, now: i64) -> Result<Option<ClaimResponse>, AppError> {
+async fn claim_meet_in_the_middle_range(
+    tx: &mut sqlx::SqliteConnection,
+    config: &RangeConfig,
+    target: &Target,
+    user: &User,
+    client_version: Version,
+    now: i64,
+) -> Result<Option<ClaimResponse>, AppError> {
     let meet_in_the_middle = crate::meet_in_the_middle::of_target(target)?;
     let chunk = meet_in_the_middle_chunk_size(config, effective_meet_in_the_middle_rate(config, user));
     let lease_seconds = config.lease_seconds;
 
-    let pending = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1")
-        .bind(target.id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let pending = pending_range_for(&mut *tx, target, client_version).await?;
     if let Some(range) = pending {
         let range = split_off_searched_portion(&mut *tx, range, now).await?;
         let range = split_off_chunk(&mut *tx, range, chunk as Pos).await?;
@@ -1717,6 +1766,26 @@ pub async fn complete_range(
         tx.commit().await?;
         return Ok(CompleteOutcome { target_solved: false });
     }
+
+    // A find is checked against what's known about the file beyond its
+    // hashes (see false_matches.rs): a client older than protocol 1.7
+    // doesn't, and stops at the first match of both hashes - as does a newer
+    // one told less than the target has now. One that fails is a false
+    // match, kept as one; the target stays unsolved, and the range wasn't
+    // searched past it.
+    if found {
+        let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(range.target_id).fetch_one(&mut *tx).await?;
+        if let Some((filename, reason)) = filename.as_deref().and_then(|f| crate::false_matches::false_match_reason(&target, f).map(|reason| (f, reason))) {
+            crate::false_matches::store(&mut tx, target.id, filename, &reason, user.id, Some(range_id), now).await?;
+            tracing::warn!(range_id, user_id = user.id, target_id = target.id, filename, reason, "a find that's a false match - the target stays unsolved");
+            if owns_range && target.is_virtual == 0 {
+                hand_back_after_false_match(&mut tx, range, filename, now).await?;
+            }
+            tx.commit().await?;
+            return Ok(CompleteOutcome { target_solved: false });
+        }
+    }
+
     if owns_range {
         // assigned_user_id is only for the pending case, where it was cleared
         // on release - for an in_progress range it's already this user.
@@ -1760,24 +1829,61 @@ pub async fn complete_range(
     // sibling ranges already are - see heartbeat_range's `target_solved` check.
     let mut target_solved = false;
     if found {
-        let result = sqlx::query(
-            "UPDATE targets SET status = 'solved', found_filename = ?, found_by_user_id = ?, found_at = ? \
-             WHERE status = 'active' AND is_virtual = 0 \
-             AND hash_a = (SELECT hash_a FROM targets WHERE id = ?) \
-             AND hash_b = (SELECT hash_b FROM targets WHERE id = ?)",
-        )
-        .bind(&filename)
-        .bind(user.id)
-        .bind(now)
-        .bind(range.target_id)
-        .bind(range.target_id)
-        .execute(&mut *tx)
-        .await?;
-        target_solved = result.rows_affected() > 0;
+        target_solved = solve_target_as(&mut tx, range.target_id, filename.as_deref(), user.id, now).await?;
     }
 
     tx.commit().await?;
     Ok(CompleteOutcome { target_solved })
+}
+
+/// Solves target `target_id` with `filename`, found by `user_id` - and every
+/// other active target with the same hashes (see `complete_range`). Returns
+/// whether any was still active.
+pub async fn solve_target(tx: &mut sqlx::SqliteConnection, target_id: i64, filename: &str, user_id: i64, now: i64) -> Result<bool, AppError> {
+    solve_target_as(tx, target_id, Some(filename), user_id, now).await
+}
+
+async fn solve_target_as(tx: &mut sqlx::SqliteConnection, target_id: i64, filename: Option<&str>, user_id: i64, now: i64) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        "UPDATE targets SET status = 'solved', found_filename = ?, found_by_user_id = ?, found_at = ? \
+         WHERE status = 'active' AND is_virtual = 0 \
+         AND hash_a = (SELECT hash_a FROM targets WHERE id = ?) \
+         AND hash_b = (SELECT hash_b FROM targets WHERE id = ?)",
+    )
+    .bind(filename)
+    .bind(user_id)
+    .bind(now)
+    .bind(target_id)
+    .bind(target_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// A range whose client stopped at `filename`, a false match it took for the
+/// file (see `complete_range`): everything up to and including it was
+/// searched (a client reports a match only once the batch it's in is done,
+/// as it does a Hash A match - see `HeartbeatRequest::last_hash_a_match_filename`),
+/// and the rest is handed out again, as a quit's is (see `quit_range`).
+/// For an alphabet range, that's past the match. A dictionary or
+/// meet-in-the-middle range's progress is a number a completion doesn't
+/// carry, so its rest still has the match in it - and is then only for
+/// clients that know a false match when they see one
+/// (`models::Range::false_match_inside`): an older one would stop at it
+/// again, over and over.
+async fn hand_back_after_false_match(tx: &mut sqlx::SqliteConnection, mut range: Range, filename: &str, now: i64) -> Result<(), AppError> {
+    record_progress(&mut *tx, &mut range, Some(filename), None, None).await?;
+    let past_it = !range.is_dictionary() && !range.is_meet_in_the_middle() && resolve_progress_index(&mut *tx, &range, filename).await?.is_some();
+    if !past_it {
+        sqlx::query("UPDATE ranges SET false_match_inside = 1 WHERE id = ?").bind(range.id).execute(&mut *tx).await?;
+        range.false_match_inside = 1;
+    }
+    release_range(&mut *tx, &range, now).await?;
+    let released = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE id = ?").bind(range.id).fetch_one(&mut *tx).await?;
+    if released.status == "pending" {
+        split_off_searched_portion(&mut *tx, released, now).await?;
+    }
+    Ok(())
 }
 
 /// Keeps the basenames a client reported with a heartbeat, quit or
@@ -1938,11 +2044,14 @@ async fn split_off_searched_portion(tx: &mut sqlx::SqliteConnection, range: Rang
     // have been patched since this range was originally carved (see
     // `models::Range::alphabet`), and this remainder is still the same
     // priority range's work if the original was (see
-    // `models::Range::priority_range_id`).
+    // `models::Range::priority_range_id`) - and, if a false match stopped
+    // an older client in it, that only newer ones are to have it (see
+    // `models::Range::false_match_inside`).
     let remainder = sqlx::query_as::<_, Range>(
         "INSERT INTO ranges (target_id, candidate_len, start_block, start_index, end_block, end_index, status, \
-         assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id) \
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?) RETURNING *",
+         assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id, \
+         false_match_inside) \
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?) RETURNING *",
     )
     .bind(range.target_id)
     .bind(range.candidate_len)
@@ -1954,6 +2063,7 @@ async fn split_off_searched_portion(tx: &mut sqlx::SqliteConnection, range: Rang
     .bind(&range.alphabet_name)
     .bind(&range.alphabet)
     .bind(range.priority_range_id)
+    .bind(range.false_match_inside)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1971,8 +2081,19 @@ async fn split_off_chunk(tx: &mut sqlx::SqliteConnection, mut range: Range, chun
     if split >= range.end() {
         return Ok(range);
     }
-    insert_pending_range(&mut *tx, range.target_id, range.candidate_len, split, range.end(), &range.alphabet_name, &range.alphabet, range.priority_range_id, range.created_at)
-        .await?;
+    insert_pending_range(
+        &mut *tx,
+        range.target_id,
+        range.candidate_len,
+        split,
+        range.end(),
+        &range.alphabet_name,
+        &range.alphabet,
+        range.priority_range_id,
+        range.false_match_inside,
+        range.created_at,
+    )
+    .await?;
     let (end_block, end_index) = split_end(&range.alphabet, range.candidate_len, split);
     sqlx::query("UPDATE ranges SET end_block = ?, end_index = ? WHERE id = ?").bind(end_block).bind(end_index).bind(range.id).execute(&mut *tx).await?;
     range.end_block = end_block;
@@ -1991,6 +2112,7 @@ pub async fn delete_target(pool: &SqlitePool, target_id: i64) -> Result<bool, Ap
     sqlx::query("DELETE FROM target_progress WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM basename_reports WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM basename_hashes WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM false_matches WHERE target_id = ?").bind(target_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM priority_range_segments WHERE priority_range_id IN (SELECT id FROM priority_ranges WHERE target_id = ?)")
         .bind(target_id)
         .execute(&mut *tx)
@@ -2414,7 +2536,7 @@ pub async fn remove_skip_range(pool: &SqlitePool, skip_range_id: i64) -> Result<
         }
         let reached = still_to_be_reached(&mut tx, &target, row.candidate_len, &row.alphabet_name, &row.alphabet, &freed).await?;
         for (start, end) in subtract_spans(&freed, &reached) {
-            insert_pending_range(&mut tx, target.id, row.candidate_len, start, end, &row.alphabet_name, &row.alphabet, row.priority_range_id, now).await?;
+            insert_pending_range(&mut tx, target.id, row.candidate_len, start, end, &row.alphabet_name, &row.alphabet, row.priority_range_id, 0, now).await?;
             requeued += end - start;
         }
     }

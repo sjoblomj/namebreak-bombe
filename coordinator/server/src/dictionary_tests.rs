@@ -100,7 +100,7 @@ async fn claim(state: &AppState, user: &User) -> Option<ClaimResponse> {
 }
 
 fn report(next: Option<i64>, basenames: &[&str]) -> HeartbeatRequest {
-    HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: next, next_tail_index: None, basenames: basenames.iter().map(|b| b.to_string()).collect() }
+    HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: next, next_tail_index: None, basenames: basenames.iter().map(|b| b.to_string()).collect(), false_matches: Vec::new() }
 }
 
 async fn heartbeat(state: &AppState, user: &User, range_id: i64, req: HeartbeatRequest) -> Result<bool, AppError> {
@@ -108,7 +108,7 @@ async fn heartbeat(state: &AppState, user: &User, range_id: i64, req: HeartbeatR
 }
 
 async fn quit(state: &AppState, user: &User, range_id: i64, next: Option<i64>, basenames: &[&str]) -> Result<StatusCode, AppError> {
-    let req = QuitRequest { last_hash_a_match_filename: None, next_candidate_number: next, next_tail_index: None, basenames: basenames.iter().map(|b| b.to_string()).collect() };
+    let req = QuitRequest { last_hash_a_match_filename: None, next_candidate_number: next, next_tail_index: None, basenames: basenames.iter().map(|b| b.to_string()).collect(), false_matches: Vec::new() };
     handlers::quit(State(state.clone()), AuthedUser(user.clone()), Path(range_id), Json(req)).await
 }
 
@@ -119,6 +119,7 @@ async fn complete(state: &AppState, user: &User, range_id: i64, found: Option<&s
         elapsed_seconds: elapsed,
         candidates_processed: candidates,
         basenames: basenames.iter().map(|b| b.to_string()).collect(),
+        false_matches: Vec::new(),
     };
     handlers::complete(State(state.clone()), AuthedUser(user.clone()), Path(range_id), Json(req)).await
 }
@@ -471,7 +472,7 @@ async fn heartbeats_checkpoint_by_candidate_number() {
     assert_eq!(progress(range(&state, c.range_id).await), Some(6), "never backwards");
     heartbeat(&state, &client, c.range_id, report(Some(21), &[])).await.unwrap();
     assert_eq!(progress(range(&state, c.range_id).await), Some(6), "past the end: ignored");
-    let filename_only = HeartbeatRequest { last_hash_a_match_filename: Some("MUSIC\\ECHO_ECHO.WAV".into()), next_candidate_number: None, next_tail_index: None, basenames: vec![] };
+    let filename_only = HeartbeatRequest { last_hash_a_match_filename: Some("MUSIC\\ECHO_ECHO.WAV".into()), next_candidate_number: None, next_tail_index: None, basenames: vec![], false_matches: Vec::new() };
     heartbeat(&state, &client, c.range_id, filename_only).await.unwrap();
     assert_eq!(progress(range(&state, c.range_id).await), Some(6), "a dictionary range goes by numbers only");
     heartbeat(&state, &client, c.range_id, report(Some(20), &[])).await.unwrap();
@@ -690,7 +691,7 @@ async fn basenames_are_stored_compressed() {
     let words: Vec<String> = (0..3000).map(|i| format!("W{}{}", ["ALPHA", "BRAVO", "ECHO", "TANGO"][i % 4], i * 7)).collect();
     let many: Vec<String> =
         (0..MAX_BASENAMES_PER_REPORT).map(|i| format!("{}_{}-{}.WAV", words[i % 3000], words[(i * 7 + i / 3000) % 3000], words[i * 13 % 3000])).collect();
-    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone() };
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone(), false_matches: Vec::new() };
     heartbeat(&state, &client, c.range_id, req).await.unwrap();
     let (stored, count): (i64, i64) =
         sqlx::query_as("SELECT SUM(LENGTH(names)), SUM(count) FROM basename_reports WHERE target_id = ?").bind(id).fetch_one(&state.pool).await.unwrap();
@@ -737,7 +738,7 @@ async fn big_answers_are_gzipped_for_whoever_takes_gzip() {
     let client = user(&state, "u", "1.5.0").await;
     let c = claim(&state, &client).await.unwrap();
     let many: Vec<String> = (0..2000).map(|i| format!("SOME_LONGER_NAME_{i:05}.WAV")).collect();
-    heartbeat(&state, &client, c.range_id, HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone() })
+    heartbeat(&state, &client, c.range_id, HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone(), false_matches: Vec::new() })
         .await
         .unwrap();
     let all: String = many.iter().map(|n| format!("{n}\n")).collect();
@@ -768,10 +769,10 @@ async fn too_many_basenames_at_once_are_refused() {
     let client = user(&state, "u", "1.5.0").await;
     let c = claim(&state, &client).await.unwrap();
     let many: Vec<String> = (0..=MAX_BASENAMES_PER_REPORT).map(|i| format!("N{i}.WAV")).collect();
-    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone() };
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many.clone(), false_matches: Vec::new() };
     assert!(matches!(heartbeat(&state, &client, c.range_id, req).await, Err(AppError::BadRequest(_))));
     assert!(basenames(&state, id).await.is_empty());
-    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many[1..].to_vec() };
+    let req = HeartbeatRequest { last_hash_a_match_filename: None, next_candidate_number: None, next_tail_index: None, basenames: many[1..].to_vec(), false_matches: Vec::new() };
     heartbeat(&state, &client, c.range_id, req).await.unwrap();
     assert_eq!(basenames(&state, id).await.len(), MAX_BASENAMES_PER_REPORT, "as many as are allowed");
 }

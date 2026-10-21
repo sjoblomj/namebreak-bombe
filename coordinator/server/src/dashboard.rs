@@ -23,6 +23,7 @@ use crate::alphabet::{bound_indices_at_len, ceil_index, floor_index, index_to_ca
 use crate::dictionary::DictionaryTarget;
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Segment, SkipRange, Target};
+use namebreak_protocol::HashTablePosition;
 use crate::ranges::{count_within, owned_spans};
 use crate::state::AppState;
 
@@ -163,6 +164,12 @@ pub struct DashboardTarget {
     /// and `base_file_name`.
     pub encryption_key_hex: Option<String>,
     pub base_file_name: Option<String>,
+    /// Shown with them, when known - see `models::Target::hash_table_position`.
+    pub hash_table_position: Option<HashTablePosition>,
+    /// The names clients found that match both hashes but not the rest of
+    /// what's known about the file (see `false_matches.rs`), first reported
+    /// first. The dashboard gives a target with any a tab listing them.
+    pub false_matches: Vec<DashboardFalseMatch>,
     /// Shown below the hashes, with the settings below.
     pub prefix: String,
     pub suffix: String,
@@ -299,6 +306,19 @@ pub struct DashboardDictionary {
     /// `GET /api/v1/targets/{id}/basenames`.
     pub basename_count: i64,
     pub basenames: Vec<DashboardBasename>,
+}
+
+/// A false match - see `DashboardTarget::false_matches`.
+#[derive(Serialize)]
+pub struct DashboardFalseMatch {
+    pub filename: String,
+    /// What it failed, worked out when it was reported.
+    pub reason: String,
+    /// "username@hostname" of whoever reported it, and its backend - see
+    /// `DashboardRange::worker`.
+    pub reported_by: Option<String>,
+    pub reported_by_backend: Option<String>,
+    pub reported_at: i64,
 }
 
 /// How many of a target's basenames the dashboard lists.
@@ -821,6 +841,8 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             hash_a_hex: format!("0x{:08X}", i64_to_u32(hash_a)),
             hash_b_hex: format!("0x{:08X}", i64_to_u32(hash_b)),
             encryption_key_hex: settings.encryption_key.map(|key| format!("0x{:08X}", i64_to_u32(key))),
+            hash_table_position: settings.hash_table_position(),
+            false_matches: Vec::new(),
             base_file_name: settings.base_file_name,
             prefix: settings.prefix,
             suffix: settings.suffix,
@@ -853,6 +875,23 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             dictionary: None,
             meet_in_the_middle: None,
         });
+    }
+
+    // Every target's false matches, which are few - a target has none, all
+    // but always.
+    #[allow(clippy::type_complexity)]
+    let false_match_rows: Vec<(i64, String, String, Option<String>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT f.target_id, f.filename, f.reason, u.username || '@' || u.hostname, NULLIF(u.backend, ''), f.reported_at \
+         FROM false_matches f LEFT JOIN users u ON u.id = f.user_id ORDER BY f.id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let mut false_matches_by_target: HashMap<i64, Vec<DashboardFalseMatch>> = HashMap::new();
+    for (target_id, filename, reason, reported_by, reported_by_backend, reported_at) in false_match_rows {
+        false_matches_by_target.entry(target_id).or_default().push(DashboardFalseMatch { filename, reason, reported_by, reported_by_backend, reported_at });
+    }
+    for target in &mut targets {
+        target.false_matches = false_matches_by_target.remove(&target.id).unwrap_or_default();
     }
 
     let active_ranges: i64 = sqlx::query_scalar(
@@ -946,6 +985,7 @@ fn meet_in_the_middle_target(
     };
     let sweep_after_range_id = next.and_then(|(length, index)| ranges.iter().filter(|r| r.0 == length).take_while(|r| r.1 < index).last().map(|r| r.3.id));
     let table_directories = (space.alphabet_size() as u64).pow(space.table_length() as u32);
+    let hash_table_position = target.hash_table_position();
 
     DashboardTarget {
         id: target.id,
@@ -955,7 +995,9 @@ fn meet_in_the_middle_target(
         upper_bound: String::new(),
         hash_a_hex: format!("0x{:08X}", i64_to_u32(target.hash_a)),
         hash_b_hex: format!("0x{:08X}", i64_to_u32(target.hash_b)),
-        encryption_key_hex: None,
+        encryption_key_hex: target.encryption_key.map(|key| format!("0x{:08X}", i64_to_u32(key))),
+        hash_table_position,
+        false_matches: Vec::new(),
         base_file_name: target.base_file_name,
         prefix: target.prefix,
         suffix: target.suffix,
@@ -1080,6 +1122,7 @@ fn dictionary_target(
     };
     let cursor = next.map_or(i64::MAX, |(_, number)| number);
     let sweep_after_range_id = ranges.iter().take_while(|r| r.0 < cursor).last().map(|r| r.2.id);
+    let hash_table_position = target.hash_table_position();
 
     DashboardTarget {
         id: target.id,
@@ -1090,6 +1133,8 @@ fn dictionary_target(
         hash_a_hex: format!("0x{:08X}", i64_to_u32(target.hash_a)),
         hash_b_hex: format!("0x{:08X}", i64_to_u32(target.hash_b)),
         encryption_key_hex: target.encryption_key.map(|key| format!("0x{:08X}", i64_to_u32(key))),
+        hash_table_position,
+        false_matches: Vec::new(),
         base_file_name: target.base_file_name,
         prefix: target.prefix,
         suffix: target.suffix,

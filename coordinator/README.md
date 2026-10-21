@@ -57,8 +57,8 @@ See the top-level plan/design notes for the full rationale; the short version:
   hands back an opaque bearer token. Every other endpoint requires it - this
   is the only thing standing between a real client and a generic bot scraping
   the API, so it's intentionally simple rather than absent.
-- **Protocol versioning** (now 1.6.0 - dictionary targets came with 1.5,
-  meet-in-the-middle targets with 1.6): every client declares its own `protocol_version`
+- **Protocol versioning** (now 1.7.0 - dictionary targets came with 1.5,
+  meet-in-the-middle targets with 1.6, false matches with 1.7): every client declares its own `protocol_version`
   (`X.Y.Z`) at `/register`; the server rejects registration outright on a
   MAJOR version mismatch against its own `PROTOCOL_VERSION`
   (`coordinator/protocol/src/lib.rs`), asking for an upgrade. A client's
@@ -391,8 +391,10 @@ since it's never sanitized.
 
 `encryption_key_hex` and `base_file_name` (both optional) record what's known
 about an encrypted target file beyond its two hashes. They're shown on the
-target's dashboard card; an alphabet search doesn't use them (a dictionary
-search does use the key - see `send_basenames` below). `encryption_key_hex` is
+target's dashboard card, and the key is what a match of both hashes is
+checked against before it's taken for the file (see "False matches" below) -
+a dictionary search also uses it to pick which candidates to hash at all
+(see `send_basenames` below). `encryption_key_hex` is
 the file's encryption key, in hex like the hashes, without the adjustment
 some files' keys get for their position and size in the archive - mpqcli's
 `encryption-key-raw`. That key is made from the file's name without its
@@ -400,6 +402,45 @@ directory, so it's the same for every file of that name, in any directory.
 `base_file_name` is that name without the directory, when it's known but the
 directory isn't - e.g. because the key is that of a known name. It can't
 have a `\` or `/`.
+
+`hash_table_position` (optional, any kind of target) says where the file's
+entry is in its archive's hash table:
+`{"table_size": 2048, "first_start_slot": 849, "last_start_slot": 851}`.
+Storm looks a name up from slot hash type 0 % `table_size` onwards, slot by
+slot (wrapping past the end), and gives up at the first slot that has never
+been used - so the file's name has to start its lookup somewhere from the
+slot just after the nearest never-used slot before the entry
+(`first_start_slot`) up to the entry's own slot (`last_start_slot`). The
+first is the greater if they wrap past the table's end. `table_size` is a
+power of two, as an archive's hash table's is. Shown on the dashboard card,
+and checked like the key.
+
+### False matches
+
+Two 32-bit hashes match by chance about once in 2^64 names, and a long
+search hashes that many: `REZ\SFZSSP050WSRL.WAV` matched a file's Hash A and
+Hash B and was nothing like its name. So a match of both hashes is checked
+against `encryption_key_hex` (hash type 3 of the name's basename must be
+it) and `hash_table_position`, whichever the target has. A name that fails
+either is a *false match*, not the file.
+
+Clients of protocol 1.7 and later are given both with every claim, whatever
+kind of target it's of, check every match of both hashes against them, and
+search on past one that fails - reporting it with their next heartbeat,
+quit or completion (`false_matches`). The server keeps each one once per
+target; should one pass the target's checks as they are when it's reported
+(they were patched since the range was claimed), it's the find, and solves
+the target. Older clients are given neither - their claims are as they were
+- and take the first match of both hashes for the file, so the server checks
+every find itself, whoever reports it. One that fails is kept as a false
+match, the target stays unsolved, and the range wasn't searched past it: an
+alphabet range's rest, after the name, is handed out again; a dictionary or
+meet-in-the-middle range's progress is a number a completion doesn't carry,
+so all of its unsearched part goes back - to clients of 1.7 and later only,
+as an older one would stop at the same name again.
+
+A target with false matches gets a "False matches" tab on its dashboard
+card, listing each one, why it isn't the file, and who reported it when.
 
 ### Dictionary targets
 
@@ -595,7 +636,7 @@ Pause/resume a target, and/or change its name, priority, description,
 alphabet_name (or a custom alphabet), prune_symbol_runs, prune_unopened_brackets,
 prune_whole_candidate, max_backslash_count, min_backslash_count,
 prune_adjacent_backslashes, insert_from_start, insert_from_end, start_len,
-auto_priority, encryption_key_hex or base_file_name:
+auto_priority, encryption_key_hex, base_file_name or hash_table_position:
 
 ```sh
 curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
@@ -605,7 +646,7 @@ curl -X PATCH localhost:8080/api/v1/admin/targets/1 \
 
 Any field can be omitted to leave it unchanged (pass `"description": ""` to
 clear an existing one, and `null` to remove `insert_from_start`,
-`insert_from_end`, `encryption_key_hex` or `base_file_name`), but at least one
+`insert_from_end`, `encryption_key_hex`, `base_file_name` or `hash_table_position`), but at least one
 must be given. A changed
 `prune_symbol_runs`/`prune_unopened_brackets`/`prune_whole_candidate`/`max_backslash_count`/`min_backslash_count`/`prune_adjacent_backslashes` affects every range claimed
 after the patch (including already-carved pending ones); ranges already in

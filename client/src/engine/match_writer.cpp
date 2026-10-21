@@ -83,6 +83,10 @@ std::string foundFilePath(const std::string& matchesPath) {
     return (std::filesystem::path(matchesPath).parent_path() / "found.txt").string();
 }
 
+std::string falseMatchesFilePath(const std::string& matchesPath) {
+    return (std::filesystem::path(matchesPath).parent_path() / "false_matches.txt").string();
+}
+
 bool MatchWriter::open(const std::string& path, std::string& error) {
     path_ = path;
     std::filesystem::path dir = std::filesystem::path(path).parent_path();
@@ -149,4 +153,11 @@ bool MatchWriter::found(const std::string& filename) {
         ok = false;
     }
     return ok;
+}
+
+void MatchWriter::falseMatch(const FalseMatch& falseMatch) {
+    std::string error;
+    const std::string path = falseMatchesFilePath(path_);
+    if (!writeLine(path, "a", falseMatch.filename + "\t" + falseMatch.reason, error))
+        fprintf(stderr, "warning: cannot record the false match %s in %s: %s\n", falseMatch.filename.c_str(), path.c_str(), error.c_str());
 }

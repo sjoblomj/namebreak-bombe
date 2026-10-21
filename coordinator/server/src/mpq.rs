@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 /// The crypt-table offsets of the hashes this server works with: hashA
 /// (Storm's hash type 1), hashB (2), and the one an encryption key is made
 /// with (3) - the client's `kHashAOffset` and friends.
+/// And hash type 0, which an archive's hash table is indexed by - see
+/// `false_matches.rs`.
+pub const TABLE_INDEX_OFFSET: usize = 0x000;
 pub const HASH_A_OFFSET: usize = 0x100;
 pub const HASH_B_OFFSET: usize = 0x200;
 pub const FILE_KEY_OFFSET: usize = 0x300;

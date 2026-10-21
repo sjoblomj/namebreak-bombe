@@ -188,6 +188,12 @@
   /* A found name on one line, however narrow the screen - the table
      scrolls within its .table-scroll instead. */
   .matches-table .candidate { white-space: pre; overflow-wrap: normal; }
+  /* A target's False matches tab - see falseMatchesPanel. Why one isn't the
+     file can be long; it wraps, while the name stays on one line. */
+  .false-matches-intro { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+  .false-matches-intro + .table-scroll { margin-top: 8px; }
+  .false-matches-table td.reason { white-space: normal; min-width: 240px; }
+  .false-matches-table .candidate { white-space: pre; overflow-wrap: normal; }
   .volunteers-table td.canary-missed { color: var(--b-hip); font-weight: 600; }
   .target-card {
     background: var(--card-bg);
@@ -1953,6 +1959,50 @@
     return { panel, load: lines.load };
   }
 
+  // The names clients found that match both of a target's hashes but not
+  // the rest of what's known about its file - its encryption key, or where
+  // it is in the archive's hash table (see dashboard.rs's
+  // DashboardFalseMatch). The search went on past each of them.
+  function falseMatchesPanel(t) {
+    const panel = document.createElement('div');
+    const intro = document.createElement('p');
+    intro.className = 'false-matches-intro';
+    intro.textContent = 'Names that match both Hash A and Hash B by chance, but not the rest of what is known about the file, so ' +
+      'they can\'t be its name. The search went on past them.';
+    panel.appendChild(intro);
+    const table = document.createElement('table');
+    table.className = 'false-matches-table';
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th>Name</th><th>Why it isn\'t the file</th><th>Reported by</th><th>Reported at</th></tr>';
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    for (const f of t.false_matches) {
+      const tr = document.createElement('tr');
+      const name = document.createElement('td');
+      name.appendChild(candidateChip(f.filename));
+      tr.appendChild(name);
+      const reason = document.createElement('td');
+      reason.className = 'reason';
+      reason.textContent = f.reason;
+      tr.appendChild(reason);
+      const by = document.createElement('td');
+      by.className = 'worker' + (f.reported_by ? '' : ' none');
+      by.appendChild(workerFragment(f.reported_by, f.reported_by_backend));
+      tr.appendChild(by);
+      const at = document.createElement('td');
+      at.className = 'mono';
+      setTimeCell(at, f.reported_at);
+      tr.appendChild(at);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    const tableScroll = document.createElement('div');
+    tableScroll.className = 'table-scroll';
+    tableScroll.appendChild(table);
+    panel.appendChild(tableScroll);
+    return panel;
+  }
+
   // The word lists a dictionary target's candidates are made of, each
   // loaded when the tab is first opened - but not english-1, the dictionary
   // built into the client and the server, which is only mentioned.
@@ -2036,6 +2086,11 @@
     const fileInfo = [];
     if (t.base_file_name) fileInfo.push(`Base file name: ${t.base_file_name}`);
     if (t.encryption_key_hex) fileInfo.push(`Encryption key: ${t.encryption_key_hex}`);
+    if (t.hash_table_position) {
+      const p = t.hash_table_position;
+      const slots = p.first_start_slot === p.last_start_slot ? `slot ${p.first_start_slot}` : `slots ${p.first_start_slot}–${p.last_start_slot}`;
+      fileInfo.push(`Hash table: ${slots} of ${p.table_size}`);
+    }
     if (fileInfo.length) {
       const info = document.createElement('div');
       info.className = 'target-hashes mono';
@@ -2117,11 +2172,11 @@
       card.appendChild(banner);
     }
 
-    // A target with priority ranges gets a Priority ranges tab, and a
+    // A target with priority ranges gets a Priority ranges tab, a
     // dictionary target Basenames (if it collects them, or did) and
-    // Dictionary tabs, next to its Progress; one with none of those goes
-    // straight to the range table - no tabs shown when there's nothing to
-    // tab against.
+    // Dictionary tabs, and one with false matches a False matches tab, next
+    // to its Progress; one with none of those goes straight to the range
+    // table - no tabs shown when there's nothing to tab against.
     const tabs = [{ label: 'Progress', panel: rangesContent(t) }];
     const prioritySection = priorityRangeSection(t);
     if (prioritySection) tabs.push({ label: 'Priority ranges', panel: prioritySection });
@@ -2133,6 +2188,8 @@
       const dictionary = dictionaryPanel(t);
       tabs.push({ label: 'Dictionary', panel: dictionary.panel, onOpen: dictionary.load });
     }
+    if (t.false_matches && t.false_matches.length > 0)
+      tabs.push({ label: `False matches (${fmtNum(t.false_matches.length)})`, panel: falseMatchesPanel(t) });
     card.appendChild(tabs.length > 1 ? targetTabs(tabs) : tabs[0].panel);
     return card;
   }

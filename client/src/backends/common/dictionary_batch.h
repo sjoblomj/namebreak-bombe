@@ -209,6 +209,7 @@ private:
     std::vector<uint32_t> cryptTable_;
     uint32_t targetA_ = 0;
     uint32_t targetB_ = 0;
+    MatchCheck matchCheck_;
     bool checkBasename_ = false;
     uint32_t basenameKey_ = 0;
     bool recordBasenames_ = false;

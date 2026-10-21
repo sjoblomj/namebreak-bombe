@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
     AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
-    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, DictionarySettings, HeartbeatRequest, HeartbeatResponse, MeetInTheMiddleSettings,
+    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, DictionarySettings, HashTablePosition, HeartbeatRequest, HeartbeatResponse, MeetInTheMiddleSettings,
     QuitRequest, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus, Version, WordListInfo, PROTOCOL_VERSION,
 };
 
@@ -20,6 +20,7 @@ use crate::client_release;
 use crate::dictionary::{self, FilenameBounds};
 use crate::meet_in_the_middle;
 use crate::error::AppError;
+use crate::false_matches;
 use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME, MEET_IN_THE_MIDDLE_ALPHABET_NAME};
 use crate::ranges::{self, SegmentOwner};
 use crate::state::{generate_token, now_unix, AppState};
@@ -123,6 +124,7 @@ pub async fn heartbeat(
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
     ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
+    false_matches::record_reported(&state.pool, &user, range_id, &req.false_matches).await?;
     let outcome = ranges::heartbeat_range(&state.pool, &state.config, &user, range_id, req.last_hash_a_match_filename, req.next_candidate_number, req.next_tail_index).await?;
     Ok(Json(HeartbeatResponse { lease_seconds: outcome.lease_seconds, range_released: outcome.range_released }))
 }
@@ -134,6 +136,7 @@ pub async fn quit(
     Json(req): Json<QuitRequest>,
 ) -> Result<StatusCode, AppError> {
     ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
+    false_matches::record_reported(&state.pool, &user, range_id, &req.false_matches).await?;
     ranges::quit_range(&state.pool, &user, range_id, req.last_hash_a_match_filename.as_deref(), req.next_candidate_number, req.next_tail_index).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -160,6 +163,7 @@ pub async fn complete(
     Json(req): Json<CompleteRequest>,
 ) -> Result<StatusCode, AppError> {
     ranges::record_basenames(&state.pool, &state.disk, &user, range_id, &req.basenames).await?;
+    false_matches::record_reported(&state.pool, &user, range_id, &req.false_matches).await?;
     let outcome = ranges::complete_range(
         &state.pool,
         &state.config,
@@ -270,6 +274,19 @@ fn parse_encryption_key(hex: &str) -> Result<u32, AppError> {
     parse_hash_hex(hex).map_err(|_| AppError::BadRequest("invalid encryption_key_hex".into()))
 }
 
+/// Stores (or, with None, removes) where target `target_id`'s file is in its
+/// archive's hash table - see `AdminCreateTargetRequest::hash_table_position`.
+async fn set_hash_table_position(tx: &mut sqlx::SqliteConnection, target_id: i64, position: Option<&HashTablePosition>) -> Result<(), AppError> {
+    sqlx::query("UPDATE targets SET hash_table_size = ?, hash_table_first_start_slot = ?, hash_table_last_start_slot = ? WHERE id = ?")
+        .bind(position.map(|p| p.table_size))
+        .bind(position.map(|p| p.first_start_slot))
+        .bind(position.map(|p| p.last_start_slot))
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
 /// Rejects a `base_file_name` that can't be a file's name without its
 /// directory - see `AdminCreateTargetRequest::base_file_name`.
 fn validate_base_file_name(name: &str) -> Result<(), AppError> {
@@ -305,6 +322,9 @@ pub async fn admin_create_target(
     let encryption_key = req.encryption_key_hex.as_deref().map(parse_encryption_key).transpose()?;
     if let Some(name) = &req.base_file_name {
         validate_base_file_name(name)?;
+    }
+    if let Some(position) = &req.hash_table_position {
+        false_matches::validate_hash_table_position(position)?;
     }
     validate_backslash_counts(req.max_backslash_count, req.min_backslash_count)?;
     validate_insertions(&req.prefix, &req.suffix, &req.insert_from_start, &req.insert_from_end)?;
@@ -383,6 +403,7 @@ pub async fn admin_create_target(
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
+    set_hash_table_position(&mut tx, target_id, req.hash_table_position.as_ref()).await?;
 
     // Start at the operator's start_len (1 unless set) - a bound doesn't get to skip
     // short lengths just because it's itself longer (see the comment above: at length
@@ -459,6 +480,9 @@ async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetReque
     if req.send_basenames && encryption_key.is_none() {
         return Err(AppError::BadRequest("send_basenames needs an encryption_key_hex to compare the basenames to".into()));
     }
+    if let Some(position) = &req.hash_table_position {
+        false_matches::validate_hash_table_position(position)?;
+    }
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
     for (what, text) in [("prefix", &req.prefix), ("suffix", &req.suffix), ("lower_bound", &req.lower_bound), ("upper_bound", &req.upper_bound)] {
@@ -511,6 +535,7 @@ async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetReque
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
+    set_hash_table_position(&mut tx, target_id, req.hash_table_position.as_ref()).await?;
     sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, 0, ?, ?, '')")
         .bind(target_id)
         .bind(first.words)
@@ -563,6 +588,9 @@ async fn create_meet_in_the_middle_target(state: &AppState, req: &AdminCreateTar
     if let Some(name) = &req.base_file_name {
         validate_base_file_name(name)?;
     }
+    if let Some(position) = &req.hash_table_position {
+        false_matches::validate_hash_table_position(position)?;
+    }
     validate_backslash_counts(req.max_backslash_count, req.min_backslash_count)?;
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
@@ -614,6 +642,7 @@ async fn create_meet_in_the_middle_target(state: &AppState, req: &AdminCreateTar
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
+    set_hash_table_position(&mut tx, target_id, req.hash_table_position.as_ref()).await?;
     sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, 0, 0, ?, '')")
         .bind(target_id)
         .bind(space.min_length())
@@ -890,11 +919,12 @@ pub async fn admin_patch_target(
         && req.encryption_key_hex.is_none()
         && req.base_file_name.is_none()
         && req.send_basenames.is_none()
+        && req.hash_table_position.is_none()
     {
         return Err(AppError::BadRequest(
             "at least one of name, status, priority, description, alphabet_name, alphabet, prune_symbol_runs, prune_unopened_brackets, \
              prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, insert_from_start, \
-             insert_from_end, start_len, auto_priority, encryption_key_hex, base_file_name or send_basenames must be provided"
+             insert_from_end, start_len, auto_priority, encryption_key_hex, base_file_name, send_basenames or hash_table_position must be provided"
                 .into(),
         ));
     }
@@ -902,6 +932,9 @@ pub async fn admin_patch_target(
     let encryption_key = req.encryption_key_hex.as_ref().map(|hex| hex.as_deref().map(parse_encryption_key).transpose()).transpose()?;
     if let Some(Some(name)) = &req.base_file_name {
         validate_base_file_name(name)?;
+    }
+    if let Some(Some(position)) = &req.hash_table_position {
+        false_matches::validate_hash_table_position(position)?;
     }
 
     // A dictionary target has none of an alphabet target's search settings,
@@ -1054,6 +1087,9 @@ pub async fn admin_patch_target(
     }
     if let Some(base_file_name) = &req.base_file_name {
         sqlx::query("UPDATE targets SET base_file_name = ? WHERE id = ?").bind(base_file_name).bind(target_id).execute(&mut *tx).await?;
+    }
+    if let Some(position) = &req.hash_table_position {
+        set_hash_table_position(&mut tx, target_id, position.as_ref()).await?;
     }
 
     // Turned on again, or in an alphabet that can spell other prefixes: look

@@ -11,7 +11,10 @@ mod disk;
 mod dictionary_tests;
 #[cfg(test)]
 mod meet_in_the_middle_tests;
+#[cfg(test)]
+mod false_matches_tests;
 mod error;
+mod false_matches;
 mod handlers;
 mod likely_prefixes;
 mod meet_in_the_middle;

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "engine/candidate.h"
+#include "engine/match_check.h"
 #include "engine/meet_in_the_middle.h"
 #include "engine/limits.h"
 
@@ -64,6 +65,9 @@ struct SearchConstants {
     const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
+    // What a candidate matching both hashes must have as well to be the
+    // file's name (see MatchCheck) - one that hasn't is a false match.
+    MatchCheck matchCheck;
     // The rules every trailing character but the last must pass
     // (SearchRequest::pruneWholeCandidate), starting from each batch's
     // BatchParams::pruneEntry - or none, and every candidate of a batch is
@@ -99,9 +103,13 @@ struct BatchOutcome {
     int hitCount = 0;
     // The complete filename of every hashA hit, in no particular order.
     std::vector<std::string> hits;
-    // Set once one of the hits also matches hashB.
+    // Set once one of the hits also matches hashB - and passes
+    // SearchConstants::matchCheck.
     bool found = false;
     std::string foundFilename;
+    // The hits that match hashB but not the MatchCheck - every one, found
+    // or not: a false match is no reason to stop.
+    std::vector<FalseMatch> falseMatches;
 };
 
 // Everything that stays the same for a whole dictionary search
@@ -118,6 +126,8 @@ struct DictionaryConstants {
     const uint32_t* cryptTable = nullptr; // 0x500 entries, see prepareCryptTable
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
+    // As SearchConstants::matchCheck.
+    MatchCheck matchCheck;
     // The file's encryption key is known: compare each candidate's basename -
     // its filename after the last '\' - hashed as Storm makes the key (hash
     // type 3), to basenameKey. The file's name has that basename, so only a
@@ -198,9 +208,12 @@ struct DictionaryOutcome {
     // The filename of every hashA hit - of the candidates compared to the
     // targets at all (see dictionaryHashes).
     std::vector<std::string> hits;
-    // Set once one of them also matches hashB.
+    // Set once one of them also matches hashB - and passes
+    // DictionaryConstants::matchCheck.
     bool found = false;
     std::string foundFilename;
+    // As BatchOutcome's.
+    std::vector<FalseMatch> falseMatches;
     // With recordBasenames, the filename of every candidate whose basename
     // matched basenameKey - or, if the suffix has a '\', and so every
     // candidate has the same basename, of at least one of the call's

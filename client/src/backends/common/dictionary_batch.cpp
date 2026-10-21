@@ -184,6 +184,7 @@ void DictionaryHitVerifier::begin(const DictionaryConstants& constants) {
     cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
     targetA_ = constants.targetHashA;
     targetB_ = constants.targetHashB;
+    matchCheck_ = constants.matchCheck;
     checkBasename_ = constants.checkBasename;
     basenameKey_ = constants.basenameKey;
     recordBasenames_ = constants.checkBasename && constants.recordBasenames;
@@ -205,10 +206,15 @@ void DictionaryHitVerifier::addHits(const std::vector<DictionaryBatch>& batches,
     const uint32_t* table = cryptTable_.data();
     auto nameOf = [&](const DictionaryHit& hit) { return filenameOf(batches[hit.batch], hit.word, hit.tail, hit.pair); };
     // A candidate whose hashA matches: a hashA hit, and the match if its
-    // hashB does too.
+    // hashB does too and it passes the MatchCheck - or else a false match.
     auto addHashAHit = [&](const std::string& filename) {
         outcome.hits.push_back(filename);
-        if (!outcome.found && continueHash(kInitialHashState, filename, kHashBOffset, table).first == targetB_) {
+        if (continueHash(kInitialHashState, filename, kHashBOffset, table).first != targetB_)
+            return;
+        std::string reason = falseMatchReason(matchCheck_, filename, table);
+        if (!reason.empty()) {
+            outcome.falseMatches.push_back({filename, std::move(reason)});
+        } else if (!outcome.found) {
             outcome.found = true;
             outcome.foundFilename = filename;
         }

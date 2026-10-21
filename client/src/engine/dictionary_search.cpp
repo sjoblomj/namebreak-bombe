@@ -495,6 +495,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     printf("upper: %s\n", req.bounds.hasUpper ? ("'" + req.bounds.upper + "'").c_str() : "(none)");
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
+    printMatchCheck(req.matchCheck);
     DictionaryConstants constants;
     constants.words = space.words();
     constants.tails = space.tails();
@@ -503,6 +504,7 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
     constants.cryptTable = cryptTable;
     constants.targetHashA = req.targetHashA;
     constants.targetHashB = req.targetHashB;
+    constants.matchCheck = req.matchCheck;
     constants.checkBasename = req.checkBasename;
     constants.basenameKey = req.basenameKey;
     constants.recordBasenames = req.recordBasenames;
@@ -603,6 +605,13 @@ DictionaryResult runDictionarySearch(SearchBackend& backend, const DictionaryReq
             printf("%s\n", hit.c_str());
             if (hooks.onPartialMatch)
                 hooks.onPartialMatch(hit);
+        }
+        for (const FalseMatch& falseMatch : outcome.falseMatches) {
+            printf("FALSE MATCH (both hashes, but %s): %s\n", falseMatch.reason.c_str(), falseMatch.filename.c_str());
+            fflush(stdout);
+            matches.falseMatch(falseMatch);
+            if (hooks.onFalseMatch)
+                hooks.onFalseMatch(falseMatch);
         }
         for (const std::string& hit : outcome.basenameHits) {
             const std::string basename = basenameOf(hit);
