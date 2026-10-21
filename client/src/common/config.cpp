@@ -85,6 +85,81 @@ bool parseBytesImpl(const std::string& s, uint64_t& out) {
     return true;
 }
 
+// What a section says is known about the file beyond its hashes, as written
+// - see readMatchCheckKeys.
+struct MatchCheckKeys {
+    std::string key;
+    std::string tableSize, firstStartSlot, lastStartSlot;
+};
+
+// The keys a match of both hashes is checked against (see MatchCheck,
+// engine/match_check.h): `encryption_key`, unless `withKey` is false (the
+// [dictionary] section reads its own), and `hash_table_size`,
+// `hash_table_first_start_slot` and `hash_table_last_start_slot`. Read here,
+// before the section's unknown keys are looked for; parsed by
+// parseMatchCheck once they have been. `quoted`: the section keeps its
+// values as written (see ConfigFile::dictionary).
+MatchCheckKeys readMatchCheckKeys(ConfigSectionReader& r, bool withKey, bool quoted) {
+    auto get = [&](const char* name) {
+        const std::string value = r.getOptional(name, "");
+        return quoted ? unquote(value) : value;
+    };
+    MatchCheckKeys keys;
+    if (withKey)
+        keys.key = get("encryption_key");
+    keys.tableSize = get("hash_table_size");
+    keys.firstStartSlot = get("hash_table_first_start_slot");
+    keys.lastStartSlot = get("hash_table_last_start_slot");
+    return keys;
+}
+
+// `keys` into `check`: the key in hex like the hashes, and the hash table
+// position all three or none - a table size that's a power of two, up to
+// 2^31, as an archive's is, and slots of it. False, with `error` set, on
+// anything else.
+bool parseMatchCheck(const MatchCheckKeys& keys, MatchCheck& check, std::string& error) {
+    check = MatchCheck();
+    if (!keys.key.empty()) {
+        if (!hexToU32(keys.key, check.key)) {
+            error = "invalid encryption_key: " + keys.key;
+            return false;
+        }
+        check.checkKey = true;
+    }
+    const bool any = !keys.tableSize.empty() || !keys.firstStartSlot.empty() || !keys.lastStartSlot.empty();
+    if (!any)
+        return true;
+    if (keys.tableSize.empty() || keys.firstStartSlot.empty() || keys.lastStartSlot.empty()) {
+        error = "hash_table_size, hash_table_first_start_slot and hash_table_last_start_slot go together: give all three, or none";
+        return false;
+    }
+    auto number = [&](const char* name, const std::string& text, uint64_t& out) {
+        if (text.size() > 10 || text.find_first_not_of("0123456789") != std::string::npos) {
+            error = std::string("invalid ") + name + ": '" + text + "' (expected a number)";
+            return false;
+        }
+        out = std::stoull(text);
+        return true;
+    };
+    uint64_t size = 0, first = 0, last = 0;
+    if (!number("hash_table_size", keys.tableSize, size) || !number("hash_table_first_start_slot", keys.firstStartSlot, first) ||
+        !number("hash_table_last_start_slot", keys.lastStartSlot, last))
+        return false;
+    if (size == 0 || size > (1ull << 31) || (size & (size - 1)) != 0) {
+        error = "invalid hash_table_size: " + keys.tableSize + " (an archive's hash table's size is a power of two, up to 2^31)";
+        return false;
+    }
+    if (first >= size || last >= size) {
+        error = "hash_table_first_start_slot and hash_table_last_start_slot must be slots of the table, 0 to " + std::to_string(size - 1);
+        return false;
+    }
+    check.checkSlot = true;
+    check.hashTableSize = (uint32_t) size;
+    check.firstStartSlot = (uint32_t) first;
+    check.lastStartSlot = (uint32_t) last;
+    return true;
+}
+
 // Inverse of unquote() above: wraps `s` in "..." only if writing it plain
 // would lose meaningful leading/trailing whitespace when re-read.
 std::string quoteIfNeeded(const std::string& s) {
@@ -330,12 +405,15 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     std::string insertFromEndStr = r.getOptional("insert_from_end", "");
     std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
     std::string matchesName = r.getOptional("matches_name", "");
+    const MatchCheckKeys matchCheckKeys = readMatchCheckKeys(r, true, false);
 
     std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
         error = "unknown key '" + unknown + "' in [search] section";
         return false;
     }
+    if (!parseMatchCheck(matchCheckKeys, out.matchCheck, error))
+        return false;
 
     try {
         out.maxBackslashCount = std::stoi(maxBackslashStr);
@@ -455,12 +533,15 @@ bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleReques
     const std::string minBackslashStr = r.getOptional("min_backslash_count", "0");
     const std::string matchesName = r.getOptional("matches_name", "");
     const std::string resumeStr = r.getOptional("resume_from_last_candidate", "false");
+    const MatchCheckKeys matchCheckKeys = readMatchCheckKeys(r, true, false);
 
     const std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
         error = "unknown key '" + unknown + "' in [meet-in-the-middle] section";
         return false;
     }
+    if (!parseMatchCheck(matchCheckKeys, out.matchCheck, error))
+        return false;
 
     uint32_t seeds[4] = {0, 0, 0, 0};
     for (int i = 0; i < (out.hasMeetingPointB ? 4 : 2); ++i) {
@@ -616,12 +697,18 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
     std::string recordHashAStr = unquote(r.getOptional("record_hasha_matches", "false"));
     std::string matchesName = unquote(r.getOptional("matches_name", ""));
     std::string resumeStr = unquote(r.getOptional("resume_from_last_candidate", "false"));
+    // Its encryption_key is read above: it picks the candidates to hash, and
+    // isn't checked again - with record_hasha_matches, so that a wrong key
+    // can't hide the file.
+    const MatchCheckKeys matchCheckKeys = readMatchCheckKeys(r, false, true);
 
     std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
         error = "unknown key '" + unknown + "' in [dictionary] section";
         return false;
     }
+    if (!parseMatchCheck(matchCheckKeys, out.matchCheck, error))
+        return false;
     maxWordsStr = unquote(maxWordsStr);
     prefix = unquote(prefix);
     suffix = unquote(suffix);

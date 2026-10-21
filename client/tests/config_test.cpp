@@ -585,6 +585,69 @@ static void testMeetInTheMiddleResume() {
     std::filesystem::remove(progressPath);
 }
 
+// What a match of both hashes is checked against (see MatchCheck,
+// engine/match_check.h): encryption_key and the hash table position in
+// [search] and [meet-in-the-middle], the position alone in [dictionary] -
+// whose encryption_key picks the candidates to hash instead.
+static void testMatchChecks() {
+    printf("--- the key and the hash table position ---\n");
+    SearchRequest req;
+    std::string error;
+    ConfigFile config = makeConfig("", "");
+    check(buildSearchRequest(config, true, req, error) && !req.matchCheck.any(), "[search] without them: nothing to check");
+    config.search["encryption_key"] = "0x4A8FA566";
+    config.search["hash_table_size"] = "2048";
+    config.search["hash_table_first_start_slot"] = "849";
+    config.search["hash_table_last_start_slot"] = "851";
+    check(buildSearchRequest(config, true, req, error) && req.matchCheck.checkKey && req.matchCheck.key == 0x4A8FA566 &&
+              req.matchCheck.checkSlot && req.matchCheck.hashTableSize == 2048 && req.matchCheck.firstStartSlot == 849 &&
+              req.matchCheck.lastStartSlot == 851,
+          "[search] with both (" + error + ")");
+    config.search["hash_table_first_start_slot"] = "2040";
+    config.search["hash_table_last_start_slot"] = "3";
+    check(buildSearchRequest(config, true, req, error) && req.matchCheck.firstStartSlot == 2040 && req.matchCheck.lastStartSlot == 3,
+          "slots wrapping past the table's end");
+    config.search.erase("hash_table_first_start_slot");
+    check(!buildSearchRequest(config, true, req, error) && error.find("go together") != std::string::npos, "two of the three: refused");
+    config.search.erase("hash_table_size");
+    config.search.erase("hash_table_last_start_slot");
+    check(buildSearchRequest(config, true, req, error) && req.matchCheck.checkKey && !req.matchCheck.checkSlot, "the key alone");
+    for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{{"encryption_key", "xyz"},
+                                                                                  {"hash_table_size", "2000"},
+                                                                                  {"hash_table_size", "0"},
+                                                                                  {"hash_table_size", "4294967296"},
+                                                                                  {"hash_table_first_start_slot", "2048"},
+                                                                                  {"hash_table_last_start_slot", "-1"}}) {
+        ConfigFile bad = makeConfig("", "");
+        bad.search["hash_table_size"] = "2048";
+        bad.search["hash_table_first_start_slot"] = "1";
+        bad.search["hash_table_last_start_slot"] = "2";
+        bad.search[key] = value;
+        check(!buildSearchRequest(bad, true, req, error), key + " = " + value + ": refused (" + error + ")");
+    }
+
+    ConfigFile dictionary = makeDictionaryConfig();
+    dictionary.dictionary["encryption_key"] = "0x1234";
+    dictionary.dictionary["hash_table_size"] = "\"16\"";
+    dictionary.dictionary["hash_table_first_start_slot"] = "14";
+    dictionary.dictionary["hash_table_last_start_slot"] = "1";
+    DictionaryRequest dict;
+    check(buildDict(dictionary, dict, error) && dict.checkBasename && dict.basenameKey == 0x1234 && !dict.matchCheck.checkKey &&
+              dict.matchCheck.checkSlot && dict.matchCheck.hashTableSize == 16 && dict.matchCheck.firstStartSlot == 14 &&
+              dict.matchCheck.lastStartSlot == 1,
+          "[dictionary]: the position, quoted or not - and its key picks the candidates, not checked again (" + error + ")");
+
+    ConfigFile meet = makeMeetInTheMiddleConfig();
+    meet.meetInTheMiddle["encryption_key"] = "0xABCD";
+    meet.meetInTheMiddle["hash_table_size"] = "1";
+    meet.meetInTheMiddle["hash_table_first_start_slot"] = "0";
+    meet.meetInTheMiddle["hash_table_last_start_slot"] = "0";
+    MeetInTheMiddleRequest mitm;
+    check(buildMeetInTheMiddle(meet, mitm, error) && mitm.matchCheck.checkKey && mitm.matchCheck.key == 0xABCD && mitm.matchCheck.checkSlot &&
+              mitm.matchCheck.hashTableSize == 1,
+          "[meet-in-the-middle] with both (" + error + ")");
+}
+
 int main() {
     printf("--- without resume_from_last_candidate ---\n");
     writeMatches("REZ\\QQQ.WAV"); // must be ignored
@@ -709,6 +772,7 @@ int main() {
     }
 
     testMatchesName();
+    testMatchChecks();
     testConfigList();
     testLoadDictionarySection();
     testDictionaryRequest();

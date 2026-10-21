@@ -68,6 +68,11 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
 
 // Builds a SearchRequest from `config`'s [search] section (and matches_dir) -
 // shared by both bounded and continuous mode (`continuous` selects which).
+// Besides the search's own keys, `encryption_key` (the raw key, hex) and
+// `hash_table_size`, `hash_table_first_start_slot` and
+// `hash_table_last_start_slot` (all three or none) say what a match of both
+// hashes must have too to be the file (see MatchCheck,
+// engine/match_check.h) - all optional.
 // Returns false with `error` set if a required key is missing or a value
 // doesn't parse.
 bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest& out, std::string& error);
@@ -92,6 +97,10 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
 //   encryption_key      optional, the raw key: hash type 3 of the basename
 //   record_basenames    default true with an encryption_key, else false
 //   record_hasha_matches   default false
+//   hash_table_size, hash_table_first_start_slot, hash_table_last_start_slot
+//                       optional, all three or none: where the file is in
+//                       its archive's hash table (see MatchCheck,
+//                       engine/match_check.h)
 //   matches_name        names the files: matches-<name>.txt, ...
 //   resume_from_last_candidate   default false
 // A list is items separated by commas, each either "quoted" - kept as it
@@ -123,6 +132,8 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 //   prune_adjacent_backslashes, max_backslash_count,
 //   min_backslash_count                 optional, as in [search] - but
 //                       applied to every character of the directory
+//   encryption_key, hash_table_size, hash_table_first_start_slot,
+//   hash_table_last_start_slot          optional, as in [search]
 //   matches_name        names the files: matches-<name>.txt, ...
 //   resume_from_last_candidate          default false
 //

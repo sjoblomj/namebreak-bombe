@@ -152,6 +152,8 @@ resume_from_last_candidate = true
 | `insert_from_start` / `insert_from_end` | no | Text inserted into every candidate, as `text, position` (e.g. `\, 3`; quote the text if it has leading or trailing spaces, `" A ", 3`; at most 16 characters): after the candidate's first `position` characters, or before its last `position`. A candidate shorter than the position gets nothing inserted; both are placed on the candidate's own characters, and where they meet `insert_from_start` comes first. `lower_bound`, `upper_bound` and the length a search covers are without them; the filenames it reports, `start_candidate` and the matches file it resumes from are with them. The pruning rules check inserted text like the candidate's own characters, except text inserted after its last character, which is part of the suffix. See [Inserted text](#inserted-text) for what it costs. |
 | `prune_whole_candidate` | no (default `false`) | Apply `prune_symbol_runs`, `prune_unopened_brackets`, `max_backslash_count`, `min_backslash_count` and `prune_adjacent_backslashes` to every character of a candidate but the last, instead of only to its leading characters (all but the last five or so). About a fifth fewer candidates are searched, and a search is about 10% faster on a GPU - see [Design decisions](#design-decisions). |
 | `matches_name` | no | Names the matches file: `matches-<matches_name>.txt` instead of `matches.txt`, so that searches for different files don't share one. Characters other than letters, digits, `.`, `-` and `_` become `_`. |
+| `encryption_key` | no | The file's raw encryption key, hex (mpqcli's `encryption-key-raw`): a match of both hashes whose basename doesn't hash to it is a false match (see below). |
+| `hash_table_size`, `hash_table_first_start_slot`, `hash_table_last_start_slot` | no (all three or none) | Where the file's entry is in its archive's hash table: a match of both hashes whose lookup doesn't start at a slot from the first to the last is a false match (see below). The size is a power of two. |
 
 `[coordinator]` keys (`coordinator` mode only) are `server_url` (required),
 plus optional `username`, `hostname` (auto-detected and interactively
@@ -179,17 +181,22 @@ targets in coordinator mode](#dictionary-targets-in-coordinator-mode)).
 Two 32-bit hashes match by chance about once in 2^64 names, and a long
 search hashes that many - `REZ\SFZSSP050WSRL.WAV` matched both hashes of a
 file in the Brazilian Brood War installer and was nothing like its name. So
-in coordinator mode, a match of both hashes is also checked against what the
-coordinator says is known about the file (protocol 1.7 and later): its
-encryption key, which the name's basename must hash to (hash type 3), and
-where its entry is in the archive's hash table, which the name's lookup
-(hash type 0 modulo the table's size) must start close enough to for Storm
-to reach. A name that fails is a *false match*: printed as `FALSE MATCH`,
-with why, appended to `false_matches.txt` beside the matches files (the
-name, a tab, and why), and reported to the coordinator, which lists it on
-the target's dashboard card - and the search goes on past it as if it were
-any other Hash-A match. Only these checks run on a match of both hashes, so
-they cost nothing.
+a match of both hashes is also checked against what's known about the file,
+if anything: its encryption key, which the name's basename must hash to
+(hash type 3), and where its entry is in the archive's hash table, which
+the name's lookup (hash type 0 modulo the table's size) must start close
+enough to for Storm to reach. A section of the config gives them as
+`encryption_key` and as `hash_table_size`, `hash_table_first_start_slot`
+and `hash_table_last_start_slot` (see the tables of keys; in coordinator
+mode, protocol 1.7 and later, the coordinator gives them). `first` is the
+slot just after the nearest never-used slot before the file's entry, `last`
+the entry's own, and the first is the greater if they wrap past the table's
+end. A name that fails is a *false match*: printed as `FALSE MATCH`, with why,
+appended to `false_matches.txt` beside the matches files (the name, a tab,
+and why) - and, in coordinator mode, reported to the coordinator, which
+lists it on the target's dashboard card - and the search goes on past it as
+if it were any other Hash-A match. Only these checks run on a match of both
+hashes, so they cost nothing.
 
 ## Dictionary mode
 
@@ -234,6 +241,7 @@ resume_from_last_candidate = true
 | `encryption_key` | no | The file's raw encryption key, hex: hash type 3 of its basename, before the adjustment for its position and size in the archive (mpqcli's `encryption-key-raw`, the coordinator's `encryption_key_hex`). Every candidate whose basename - what follows the filename's last `\` - hashes to it is recorded (see `record_basenames`), and, unless the suffix has a `\`, only those candidates are compared to `hash_a` and `hash_b` at all: the file's name has that basename, so no other can be it. That makes the search about a third faster (see [Dictionary searches on the GPU](#dictionary-searches-on-the-gpu)) - and a wrong key hides the file (see `record_hasha_matches`). |
 | `record_basenames` | no (default `true` with an `encryption_key`, else `false`) | Whether to record the basenames that match the key. `true` needs an `encryption_key`; `false` still uses the key. |
 | `record_hasha_matches` | no (default `false`) | With an `encryption_key`, compare every candidate to `hash_a` and `hash_b` all the same, as if the key weren't known: every Hash-A match is recorded in `matches.txt`, and a wrong key can't hide the file - but the search is about a third slower, as before the key was used for that. Without an `encryption_key`, every candidate is compared anyway. |
+| `hash_table_size`, `hash_table_first_start_slot`, `hash_table_last_start_slot` | no (all three or none) | As in `[search]`. The `encryption_key` above isn't checked again: it already decides which candidates are compared to the hashes, and with `record_hasha_matches` a match of both hashes is the find whatever its basename. |
 | `matches_name` | no | Names the files the search writes, as in `[search]`. |
 | `resume_from_last_candidate` | no (default `false`) | Carry on from the progress file (see below). |
 
@@ -541,6 +549,7 @@ about eight seconds of this GPU's own time.
 | `table_length` | no | How many of a directory's first characters the table holds. Left out, the longest that fits in `table_memory`. |
 | `table_memory` | no (default `1G`) | How much memory the table may take: bytes, or with a `K`, `M` or `G` after it. |
 | `prune_symbol_runs`, `prune_unopened_brackets`, `prune_adjacent_backslashes`, `max_backslash_count`, `min_backslash_count` | no | The same cheap rules as `[search]` - but applied to *every* character of the directory, not only its leading ones, and `prune_adjacent_backslashes` also counts a `\` the suffix begins with next to one the directory ends with. |
+| `encryption_key`, `hash_table_size`, `hash_table_first_start_slot`, `hash_table_last_start_slot` | no | As in `[search]`. |
 | `matches_name` | no | Names the files it writes: `matches-<name>.txt` and `meet-in-the-middle-<name>.txt` instead of `matches.txt` and `meet-in-the-middle.txt`. |
 | `resume_from_last_candidate` | no (default false) | Carry on from the progress file - unless that was written by a search with other settings, which it refuses to resume. |
 
