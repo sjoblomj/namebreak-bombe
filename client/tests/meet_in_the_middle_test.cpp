@@ -459,6 +459,17 @@ static void testTableSize() {
     check(withinBudget, "the table length chosen for a budget fits in it");
     check(largest, "and is the largest that does");
     check(meetInTheMiddleTableLengthForBytes(alphabetSize, 3, (uint64_t) 8 << 30) == 3, "never longer than the longest directory");
+
+    // What the table buys, in the other direction: how much is left to walk.
+    MeetInTheMiddleSpace space;
+    std::string error;
+    check(MeetInTheMiddleSpace::create("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 1, 8, 5, space, error) &&
+              meetInTheMiddleTailsToWalk(26, 8, 5) == space.size() && space.size() == 1 + 26 + 26 * 26 + 26 * 26 * 26,
+          "the tails left to walk: every tail of every length, as a real alphabet's own space counts them");
+    check(meetInTheMiddleTailsToWalk(43, 16, 5) < UINT64_MAX && meetInTheMiddleTailsToWalk(43, 16, 4) == UINT64_MAX,
+          "one character more of tail than fits in 64 bits: UINT64_MAX");
+    check(meetInTheMiddleTailsToWalk(MAX_ALPHABET_SIZE, 2, 1) == 1 + MAX_ALPHABET_SIZE && meetInTheMiddleTailsToWalk(0, 2, 1) == UINT64_MAX,
+          "the largest alphabet there can be is still counted; an empty one isn't");
 }
 
 // --- The meeting point's own consistency ------------------------------------------
