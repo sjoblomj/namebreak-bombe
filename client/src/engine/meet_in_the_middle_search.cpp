@@ -79,9 +79,22 @@ bool meetingPointFitsHashes(const MeetInTheMiddleRequest& req, const uint32_t* c
 }
 
 uint64_t meetInTheMiddleTailsToWalk(int alphabetSize, int maxLength, int tableLength) {
+    // How many tails there are depends on how many characters the alphabet
+    // has, never on which ones, so a made-up alphabet of the right size
+    // gives the right answer. It still has to be one
+    // MeetInTheMiddleSpace::create would accept from a real search, and
+    // that means no character twice - so the characters come from this
+    // string, which has none repeated. It is 64 long, one more than the
+    // most a real alphabet may have (MAX_ALPHABET_SIZE), so every size the
+    // engine accepts can be served out of it; a size it can't is refused
+    // here rather than running off the end.
+    static const std::string kDistinctCharacters =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    if (alphabetSize < 1 || alphabetSize > (int) kDistinctCharacters.size())
+        return UINT64_MAX;
     MeetInTheMiddleSpace space;
     std::string error;
-    if (!MeetInTheMiddleSpace::create(std::string(alphabetSize, 'x'), 1, maxLength, tableLength, space, error))
+    if (!MeetInTheMiddleSpace::create(kDistinctCharacters.substr(0, alphabetSize), 1, maxLength, tableLength, space, error))
         return UINT64_MAX;
     return space.size();
 }
