@@ -981,21 +981,24 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
 
     // A seed in each column, rather than both of them in the left one -
     // seed1 above seed1, seed2 above seed2.
-    makeLabel(pm, "Meeting point A:", kL1, rowM(2) + 3, 104);
+    makeLabel(pm, "Hash A, seed 1:", kL1, rowM(2) + 3, 104);
     state.hwndMitmASeed1 = makeEdit(pm, mitm.meetingPointASeed1, kE1, rowM(2), kMitmEdit1);
     addHelp(pm, kH1, rowM(2) + 2,
-            "Hash A's first seed (seed1) right after the directory, in hex (a 0x prefix is optional). The two seeds together are what "
-            "the search looks for - a directory that takes the hash from the prefix's state to them.");
-    makeLabel(pm, "A, seed 2:", kL2, rowM(2) + 3, 110);
+            "The meeting point: hashA's first seed (seed1) right after the directory, in hex (a 0x prefix is optional). These four "
+            "seeds together are what the search looks for - a directory that takes the hash from the prefix's state to them. Not the "
+            "file's own hash, which is Hash A (hex) below.");
+    makeLabel(pm, "Hash A, seed 2:", kL2, rowM(2) + 3, 110);
     state.hwndMitmASeed2 = makeEdit(pm, mitm.meetingPointASeed2, kE2, rowM(2), kMitmEdit2);
-    addHelp(pm, kH2, rowM(2) + 2, "Hash A's second seed (seed2) right after the directory, in hex.");
+    addHelp(pm, kH2, rowM(2) + 2, "The meeting point: hashA's second seed (seed2) right after the directory, in hex.");
 
-    makeLabel(pm, "Meeting point B:", kL1, rowM(3) + 3, 104);
+    makeLabel(pm, "Hash B, seed 1:", kL1, rowM(3) + 3, 104);
     state.hwndMitmBSeed1 = makeEdit(pm, mitm.meetingPointBSeed1, kE1, rowM(3), kMitmEdit1);
-    addHelp(pm, kH1, rowM(3) + 2, "Hash B's first seed right after the directory, in hex.");
-    makeLabel(pm, "B, seed 2:", kL2, rowM(3) + 3, 110);
+    addHelp(pm, kH1, rowM(3) + 2,
+            "The meeting point: hashB's first seed right after the directory, in hex. The search itself only walks hashA's state; "
+            "these two are what it checks that meeting point against before it starts (see Hash B (hex)).");
+    makeLabel(pm, "Hash B, seed 2:", kL2, rowM(3) + 3, 110);
     state.hwndMitmBSeed2 = makeEdit(pm, mitm.meetingPointBSeed2, kE2, rowM(3), kMitmEdit2);
-    addHelp(pm, kH2, rowM(3) + 2, "Hash B's second seed, in hex.");
+    addHelp(pm, kH2, rowM(3) + 2, "The meeting point: hashB's second seed right after the directory, in hex.");
 
     makeLabel(pm, "Hash A (hex):", kL1, rowM(4) + 3, 100);
     state.hwndMitmHashA = makeEdit(pm, mitm.hashA, kE1, rowM(4), kMitmEdit1);
