@@ -522,12 +522,25 @@ static void testMeetInTheMiddleRequest() {
           "matches_name names both files");
     config.meetInTheMiddle.erase("matches_name");
 
-    for (const char* key : {"alphabet", "suffix", "hash_a", "hash_b", "max_length", "meeting_point_a_seed1", "meeting_point_b_seed2"}) {
+    for (const char* key : {"alphabet", "suffix", "hash_a", "hash_b", "max_length", "meeting_point_a_seed1", "meeting_point_a_seed2"}) {
         ConfigFile missing = makeMeetInTheMiddleConfig();
         missing.meetInTheMiddle.erase(key);
         check(meetInTheMiddleErrorOf(missing).find(std::string("missing required key '") + key + "'") != std::string::npos,
               std::string("without ") + key + ": an error");
     }
+    // hashB's meeting point is the one optional half of it: the search
+    // never walks it, it only checks the meeting point against hash_b.
+    config = makeMeetInTheMiddleConfig();
+    config.meetInTheMiddle.erase("meeting_point_b_seed1");
+    config.meetInTheMiddle.erase("meeting_point_b_seed2");
+    check(buildMeetInTheMiddle(config, req, error) && !req.hasMeetingPointB && req.meetingPointA == HashState{0x92F62345, 0xB9F61953},
+          "without hashB's two seeds: a search on hashA's meeting point alone");
+    const std::string withoutB = meetInTheMiddleFingerprint(req);
+    check(buildMeetInTheMiddle(makeMeetInTheMiddleConfig(), req, error) && meetInTheMiddleFingerprint(req) != withoutB,
+          "... whose progress is not the same search's as one that has them");
+    config.meetInTheMiddle["meeting_point_b_seed1"] = "0xB95115E6";
+    check(meetInTheMiddleErrorOf(config).find("go together") != std::string::npos, "one of hashB's two seeds without the other: an error");
+    config = makeMeetInTheMiddleConfig();
     config.meetInTheMiddle["meeting_point_a_seed1"] = "not hex";
     check(meetInTheMiddleErrorOf(config).find("meeting_point_a_seed1") != std::string::npos, "a seed that isn't hex: an error");
     config = makeMeetInTheMiddleConfig();

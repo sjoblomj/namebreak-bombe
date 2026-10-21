@@ -446,12 +446,14 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         m.matchesName = getField(state->hwndMitmMatchesName);
                         m.resume = isChecked(state->hwndMitmResume);
                         // The same required-key list as
-                        // buildMeetInTheMiddleRequest (config.cpp).
+                        // buildMeetInTheMiddleRequest (config.cpp) - hashB's
+                        // two seeds aren't in it, and the probe below is
+                        // what says so if only one of them is filled in.
                         if (m.alphabet.empty() || m.suffix.empty() || m.maxLength.empty() || m.hashA.empty() || m.hashB.empty() ||
-                            m.meetingPointASeed1.empty() || m.meetingPointASeed2.empty() || m.meetingPointBSeed1.empty() ||
-                            m.meetingPointBSeed2.empty()) {
+                            m.meetingPointASeed1.empty() || m.meetingPointASeed2.empty()) {
                             MessageBoxA(hwnd,
-                                        "Alphabet, Suffix, Max length, both hashes and all four meeting point seeds are required.",
+                                        "Alphabet, Suffix, Max length, both hashes and both of Hash A's meeting point seeds are "
+                                        "required.",
                                         "namebreak setup", MB_OK | MB_ICONWARNING);
                             return 0;
                         }
@@ -994,11 +996,12 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     makeLabel(pm, "Hash B, seed 1:", kL1, rowM(3) + 3, 104);
     state.hwndMitmBSeed1 = makeEdit(pm, mitm.meetingPointBSeed1, kE1, rowM(3), kMitmEdit1);
     addHelp(pm, kH1, rowM(3) + 2,
-            "The meeting point: hashB's first seed right after the directory, in hex. The search itself only walks hashA's state; "
-            "these two are what it checks that meeting point against before it starts (see Hash B (hex)).");
+            "Optional, but give both of hashB's seeds or neither. The search itself only walks hashA's state - these two are what "
+            "it checks that meeting point against before it starts, which is what catches a meeting point taken for the wrong place "
+            "in the name. Without them the search runs on hashA alone, and such a mistake looks just like a file that isn't there.");
     makeLabel(pm, "Hash B, seed 2:", kL2, rowM(3) + 3, 110);
     state.hwndMitmBSeed2 = makeEdit(pm, mitm.meetingPointBSeed2, kE2, rowM(3), kMitmEdit2);
-    addHelp(pm, kH2, rowM(3) + 2, "The meeting point: hashB's second seed right after the directory, in hex.");
+    addHelp(pm, kH2, rowM(3) + 2, "Optional, with Hash B, seed 1: the meeting point's second seed for hashB, in hex.");
 
     makeLabel(pm, "Hash A (hex):", kL1, rowM(4) + 3, 100);
     state.hwndMitmHashA = makeEdit(pm, mitm.hashA, kE1, rowM(4), kMitmEdit1);

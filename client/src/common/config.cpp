@@ -426,10 +426,22 @@ bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleReques
     if (!r.getRequired("alphabet", out.alphabet, error)) return false;
     out.prefix = r.getOptional("prefix", "");
     if (!r.getRequired("suffix", suffix, error)) return false;
-    for (int i = 0; i < 4; ++i) {
+    // hashA's meeting point is the search itself; hashB's only checks it
+    // against hash_b before the search starts, so it may be left out - but
+    // half of a state means nothing, so it's both seeds or neither.
+    for (int i = 0; i < 2; ++i) {
         if (!r.getRequired(kMeetInTheMiddleKeys[i], meetingPointHex[i], error))
             return false;
     }
+    for (int i = 2; i < 4; ++i)
+        meetingPointHex[i] = r.getOptional(kMeetInTheMiddleKeys[i], "");
+    if (meetingPointHex[2].empty() != meetingPointHex[3].empty()) {
+        error = "meeting_point_b_seed1 and meeting_point_b_seed2 go together: give both, or neither (hashB's meeting point is "
+                "optional - the search walks hashA's state, and hashB's is only used to check that the meeting point really is the "
+                "state where the suffix begins)";
+        return false;
+    }
+    out.hasMeetingPointB = !meetingPointHex[2].empty();
     if (!r.getRequired("hash_a", hashAHex, error)) return false;
     if (!r.getRequired("hash_b", hashBHex, error)) return false;
     const std::string minLengthStr = r.getOptional("min_length", "1");
@@ -451,7 +463,7 @@ bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleReques
     }
 
     uint32_t seeds[4] = {0, 0, 0, 0};
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < (out.hasMeetingPointB ? 4 : 2); ++i) {
         if (!hexToU32(meetingPointHex[i], seeds[i])) {
             error = std::string("invalid ") + kMeetInTheMiddleKeys[i] + ": " + meetingPointHex[i];
             return false;

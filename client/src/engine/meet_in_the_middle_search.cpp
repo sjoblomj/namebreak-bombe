@@ -62,7 +62,10 @@ std::string stateText(HashState state) {
 
 bool meetingPointFitsHashes(const MeetInTheMiddleRequest& req, const uint32_t* cryptTable, std::string& error) {
     const uint32_t hashA = continueHash(req.meetingPointA, req.suffix, kHashAOffset, cryptTable).first;
-    const uint32_t hashB = continueHash(req.meetingPointB, req.suffix, kHashBOffset, cryptTable).first;
+    // Without hashB's meeting point there is only hashA's to check - see
+    // MeetInTheMiddleRequest::hasMeetingPointB.
+    const uint32_t hashB =
+        req.hasMeetingPointB ? continueHash(req.meetingPointB, req.suffix, kHashBOffset, cryptTable).first : req.targetHashB;
     if (hashA == req.targetHashA && hashB == req.targetHashB)
         return true;
     // Whichever of the two doesn't fit - hashA first, if both don't.
@@ -89,7 +92,7 @@ std::string meetInTheMiddleFingerprint(const MeetInTheMiddleRequest& req) {
     text += field("prefix", req.prefix);
     text += field("suffix", req.suffix);
     text += field("meeting_point_a", stateText(req.meetingPointA));
-    text += field("meeting_point_b", stateText(req.meetingPointB));
+    text += field("meeting_point_b", req.hasMeetingPointB ? stateText(req.meetingPointB) : "none");
     text += field("hashes", std::to_string(req.targetHashA) + " " + std::to_string(req.targetHashB));
     text += field("lengths", std::to_string(req.minLength) + "-" + std::to_string(req.maxLength));
     // The table's length is part of it: it decides where the walk's nodes
@@ -224,7 +227,11 @@ MeetInTheMiddleResult runMeetInTheMiddleSearch(SearchBackend& backend, const Mee
     printf("suffix: '%s'\n", req.suffix.c_str());
     printf("alphabet: '%s' (%zu characters)\n", req.alphabet.c_str(), req.alphabet.size());
     printf("directory: %d to %d characters\n", space.minLength(), space.maxLength());
-    printf("meeting point after the directory: hashA %s, hashB %s\n", stateText(req.meetingPointA).c_str(), stateText(req.meetingPointB).c_str());
+    printf("meeting point after the directory: hashA %s, hashB %s\n", stateText(req.meetingPointA).c_str(),
+           req.hasMeetingPointB ? stateText(req.meetingPointB).c_str() : "(not given)");
+    if (!req.hasMeetingPointB)
+        printf("no meeting point for hashB: the one for hashA is all that was checked against the file's hashes - if it is for the "
+               "wrong place in the name, this search will walk everything and find nothing\n");
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
     printf("table: the first %d characters of a directory, %llu of them at most, %llu MB\n", space.tableLength(),

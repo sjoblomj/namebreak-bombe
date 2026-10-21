@@ -107,10 +107,13 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 //   alphabet            required
 //   prefix              optional, default none
 //   suffix              required - what follows the unknown directory
-//   meeting_point_a_seed1, meeting_point_a_seed2,
-//   meeting_point_b_seed1, meeting_point_b_seed2
+//   meeting_point_a_seed1, meeting_point_a_seed2
 //                       required - the hash state after the directory, for
-//                       hashA and for hashB
+//                       hashA, which is what the search walks
+//   meeting_point_b_seed1, meeting_point_b_seed2
+//                       optional, both or neither - the same state for
+//                       hashB, which the search only uses to check the
+//                       meeting point against hash_b before it starts
 //   hash_a, hash_b      required - the file's own two hashes
 //   min_length          optional, default 1
 //   max_length          required

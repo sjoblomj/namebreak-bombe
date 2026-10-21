@@ -485,6 +485,14 @@ static void testFitsHashes() {
     MeetInTheMiddleRequest wrongB = req;
     wrongB.meetingPointB.first ^= 0x100;
     check(!meetingPointFitsHashes(wrongB, g_cryptTable, error) && error.find("hashB") != std::string::npos, "and so is hashB's");
+    MeetInTheMiddleRequest noB = wrongB;
+    noB.hasMeetingPointB = false;
+    check(meetingPointFitsHashes(noB, g_cryptTable, error),
+          "without hashB's meeting point, only hashA's is checked - a wrong hashB state isn't looked at");
+    MeetInTheMiddleRequest noBWrongA = wrongA;
+    noBWrongA.hasMeetingPointB = false;
+    check(!meetingPointFitsHashes(noBWrongA, g_cryptTable, error) && error.find("hashA") != std::string::npos,
+          "... and hashA's is still checked");
     MeetInTheMiddleRequest wrongSuffix = req;
     wrongSuffix.suffix = "\\BWUNIN.EXE";
     check(!meetingPointFitsHashes(wrongSuffix, g_cryptTable, error), "a meeting point at the wrong place in the name is caught");
@@ -545,6 +553,9 @@ static void testFingerprint() {
     r = base;
     r.meetingPointB.second ^= 1;
     with("another meeting point for hashB", r);
+    r = base;
+    r.hasMeetingPointB = false;
+    with("no meeting point for hashB at all", r);
     r = base;
     r.targetHashA ^= 1;
     with("another hashA", r);

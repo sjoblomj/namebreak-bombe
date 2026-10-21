@@ -43,11 +43,12 @@ bool isConfigReady(const ConfigFile& config) {
         }
         return true;
     }
-    // Likewise only its required keys - the meeting point among them, which
-    // is what the search is for (buildMeetInTheMiddleRequest, config.cpp).
+    // Likewise only its required keys - hashA's meeting point among them,
+    // which is what the search walks (buildMeetInTheMiddleRequest,
+    // config.cpp); hashB's is optional, so it isn't one.
     if (config.mode == "meet-in-the-middle") {
-        for (const char* key : {"alphabet", "suffix", "meeting_point_a_seed1", "meeting_point_a_seed2", "meeting_point_b_seed1",
-                                "meeting_point_b_seed2", "hash_a", "hash_b", "max_length"}) {
+        for (const char* key : {"alphabet", "suffix", "meeting_point_a_seed1", "meeting_point_a_seed2", "hash_a", "hash_b",
+                                "max_length"}) {
             auto it = config.meetInTheMiddle.find(key);
             if (it == config.meetInTheMiddle.end() || it->second.empty())
                 return false;

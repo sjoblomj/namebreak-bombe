@@ -518,8 +518,8 @@ about eight seconds of this GPU's own time.
 | `alphabet` | yes | The characters the unknown directory is made of (at most 63, each once). A `\` among them searches directories with subdirectories in them. |
 | `prefix` | no (default none) | Known text before the unknown directory. The meeting point must be the state after the prefix *and* the directory. |
 | `suffix` | yes | Known text after it - for a file in that directory, the `\` and the basename. |
-| `meeting_point_a_seed1`, `meeting_point_a_seed2` | yes | Hash A's state after the directory, hex. |
-| `meeting_point_b_seed1`, `meeting_point_b_seed2` | yes | Hash B's state after the directory, hex. |
+| `meeting_point_a_seed1`, `meeting_point_a_seed2` | yes | Hash A's state after the directory, hex - the state the search walks to. |
+| `meeting_point_b_seed1`, `meeting_point_b_seed2` | no (both or neither) | Hash B's state after the directory, hex. The search never walks it; it only checks the meeting point against `hash_b` before starting (see below). |
 | `hash_a`, `hash_b` | yes | The file's own two hashes, hex. Hashing `suffix` onto the meeting point must give them, or the search refuses to start - see below. |
 | `min_length` | no (default 1) | The shortest directory to report. |
 | `max_length` | yes | The longest to search, up to `MAX_CANDIDATE_LEN` (16). |
@@ -545,6 +545,18 @@ to Hash A, and the search reports it, then checks Hash B in full. Both
 together leave about one directory in 2^96 to match by chance - the search
 says how many it expects before it starts, which for a real search is 0.
 
+Only Hash A's half of the meeting point is actually searched for, so Hash
+B's is optional: leave `meeting_point_b_seed1`/`meeting_point_b_seed2` out
+(both, or neither - half a state means nothing) and the search runs on Hash
+A's state alone. Nothing about what it finds changes, since every directory
+that reaches the meeting point is hashed in full and compared to both of
+the file's hashes anyway. What is lost is the check above, for the half of
+it that catches the subtler mistake: a meeting point taken at the wrong
+place in the name still hashes to *something*, and without Hash B's state
+to compare it against, such a search walks everything and finds nothing -
+which looks exactly like a file that isn't there. The search says so on
+startup when they are missing.
+
 ### Pruning, and what it may skip
 
 The rules work on the two halves separately. A run of three symbols, two
@@ -567,7 +579,7 @@ directory of a small alphabet at every split between the two halves.
 
 The Windows GUI's setup has a Meet in the Middle tab with these keys, and
 checks them as a search would before it writes them - including that hashing
-the suffix onto the meeting point really gives the file's two hashes, which
+the suffix onto the meeting point really gives the file's hashes, which
 is the mistake worth catching before a search walks the whole space for
 nothing. While it searches, its progress bar is how many of the tails it has
 rewound, and a directory that matches the meeting point is listed with the

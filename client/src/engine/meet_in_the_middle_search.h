@@ -37,6 +37,15 @@ struct MeetInTheMiddleRequest {
     // file's two hashes, or the search refuses to start.
     HashState meetingPointA{0, 0};
     HashState meetingPointB{0, 0};
+    // Whether hashB's meeting point is known at all. The search never walks
+    // it: only hashA's state goes in the table and is rewound from
+    // (MeetInTheMiddleTable::build, MeetInTheMiddleWalk), and every
+    // directory that reaches it is hashed in full and checked against both
+    // of the file's hashes anyway. It is there to catch a meeting point for
+    // the wrong place in the name before a search that would otherwise find
+    // nothing (meetingPointFitsHashes) - so false means that check is left
+    // to hashA alone, and nothing else about the search changes.
+    bool hasMeetingPointB = true;
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
     // How long the directory may be, in characters.
