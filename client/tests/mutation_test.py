@@ -424,18 +424,25 @@ MEET_IN_THE_MIDDLE_CAUGHT = ("self-test", "meet-in-the-middle", "meet-in-the-mid
 # mutations are in CPU_MEET_IN_THE_MIDDLE_MUTATIONS, where they are reached.
 MEET_IN_THE_MIDDLE_ENGINE = "src/engine/meet_in_the_middle.cpp"
 MEET_IN_THE_MIDDLE_MUTATIONS = [
-    # The table's filter is indexed by the host and read by the kernels, each
-    # with its own copy of the mixing: this is what holds the two together.
-    Mutation("jfiltermix", "the table's filter indexed with another mixing than a kernel reads it with",
-             [("src/engine/meet_in_the_middle.h", "        return (key * 0x9E3779B97F4A7C15ull) >> filterShift_;",
-               "        return ((key + 1) * 0x9E3779B97F4A7C15ull) >> filterShift_;")],
-             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
     # The directories shorter than the table, which only its build sees - the
     # self-test doesn't look at them.
     Mutation("jshortdirs", "a directory of exactly the table's length reported by its build as well as by the walk",
              [(MEET_IN_THE_MIDDLE_ENGINE, "            if ((int) dir.size() < space.tableLength() && (int) dir.size() >= space.minLength()",
                "            if ((int) dir.size() <= space.tableLength() && (int) dir.size() >= space.minLength()")],
              caught_by=("meet-in-the-middle", "meet-in-the-middle-small")),
+]
+
+# The engine's half that only a kernel can disagree with: the table's filter
+# is indexed with MeetInTheMiddleTable::filterBit and read by the kernels,
+# each with its own copy of the mixing, and this is what holds the two
+# together. The CPU backends probe the filter through filterBit itself, so
+# another mixing there is the same mixing on both sides and changes nothing -
+# which is why this isn't in MEET_IN_THE_MIDDLE_MUTATIONS.
+MEET_IN_THE_MIDDLE_KERNEL_MUTATIONS = [
+    Mutation("jfiltermix", "the table's filter indexed with another mixing than a kernel reads it with",
+             [("src/engine/meet_in_the_middle.h", "        return (key * 0x9E3779B97F4A7C15ull) >> filterShift_;",
+               "        return ((key + 1) * 0x9E3779B97F4A7C15ull) >> filterShift_;")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
 ]
 
 # The CUDA/HIP meet-in-the-middle kernel (meetInTheMiddleKernel). Nothing here
@@ -680,7 +687,8 @@ CUDA_MUTATIONS = [
              edits=[(KERNEL, ">= groups * NAMEBREAK_LIST_MIN_PRUNED_PERCENT);", ">= 0);")]),
     Mutation("neverlisted", "no launch walking its lists", expect="harmless",
              edits=[(KERNEL, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
-] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS + CUDA_DICT_MUTATIONS + CUDA_MEET_IN_THE_MIDDLE_MUTATIONS + MEET_IN_THE_MIDDLE_MUTATIONS
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + ENGINE_PRUNING_MUTATIONS + CUDA_DICT_MUTATIONS + CUDA_MEET_IN_THE_MIDDLE_MUTATIONS \
+  + MEET_IN_THE_MIDDLE_KERNEL_MUTATIONS + MEET_IN_THE_MIDDLE_MUTATIONS
 
 OPENCL_DICT_MUTATIONS = [
     Mutation("dictlastcell", "the last cell of every segment of a pair cut into several skipped",
@@ -904,7 +912,8 @@ OPENCL_MUTATIONS = [
              edits=[(CL_HOST, ">= groups * kListMinPrunedPercent);", ">= 0);")]),
     Mutation("neverlisted", "no launch walking its lists", expect="harmless",
              edits=[(CL_HOST, "const bool listed = listed_ && listWalking_ != ListWalking::Never &&", "const bool listed = false &&")]),
-] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + OPENCL_DICT_MUTATIONS + OPENCL_MEET_IN_THE_MIDDLE_MUTATIONS + MEET_IN_THE_MIDDLE_MUTATIONS
+] + SURVIVES_MUTATIONS + ROW_PRUNING_MUTATIONS + OPENCL_DICT_MUTATIONS + OPENCL_MEET_IN_THE_MIDDLE_MUTATIONS \
+  + MEET_IN_THE_MIDDLE_KERNEL_MUTATIONS + MEET_IN_THE_MIDDLE_MUTATIONS
 
 # The Metal ones can only be run on a Mac (--backend metal).
 METAL_MUTATIONS = [
