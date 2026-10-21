@@ -4,11 +4,12 @@
 // main window/worker thread exist, so there's no other message loop running
 // concurrently to conflict with.
 //
-// One SysTabControl32 with three tabs - Coordinator; Local Search (which
+// One SysTabControl32 with four tabs - Coordinator; Local Search (which
 // covers both bounded and continuous, since they share the exact same
 // [search] config keys and differ only in that one mode value - a radio
-// pair inside the tab picks between them); and Local Dictionary, for the
-// [dictionary] section. Each tab's controls live on their
+// pair inside the tab picks between them); Local Dictionary, for the
+// [dictionary] section; and Meet in the Middle, for the
+// [meet-in-the-middle] one. Each tab's controls live on their
 // own plain page window laid over the tab control's body (see
 // SetupPageWndProc for why), created up front; only the active tab's page is
 // shown at a time (see showTabPage). Whichever tab is active when OK is
@@ -20,6 +21,9 @@
 
 #include <commdlg.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <vector>
@@ -28,6 +32,9 @@
 #include "common/config.h"
 #include "common/string_util.h"
 #include "engine/limits.h"
+#include "engine/meet_in_the_middle.h"
+#include "engine/meet_in_the_middle_search.h"
+#include "engine/mpq_hash.h"
 #include "gui/win32/about_dialog.h"
 #include "gui/win32/app_icons.h"
 
@@ -36,10 +43,12 @@
 namespace {
 
 using gui::DictionaryFields;
+using gui::MeetInTheMiddleFields;
 using gui::SetupDialogFields;
 using gui::kTabCoordinator;
 using gui::kTabDictionary;
 using gui::kTabLocalSearch;
+using gui::kTabMeetInTheMiddle;
 using gui::showAboutDialog;
 
 constexpr const char* kSetupClassName = "NamebreakSetupDialog";
@@ -55,6 +64,7 @@ constexpr int kIdSetupPruneWholeCheckbox = 308;
 constexpr int kIdSetupPruneAdjacentCheckbox = 309;
 constexpr int kIdSetupBrowseWordLists = 310;
 constexpr int kIdSetupEncryptionKey = 311;
+constexpr int kIdSetupTableMemory = 312;
 
 // Marker stored in a help "?" control's GWLP_USERDATA so SetupPageWndProc can
 // tell it apart from an ordinary label when coloring it.
@@ -69,7 +79,13 @@ struct SetupDialogState {
     HWND hwndPageCoordinator = nullptr;
     HWND hwndPageSearch = nullptr;
     HWND hwndPageDictionary = nullptr;
+    HWND hwndPageMeetInTheMiddle = nullptr;
     HWND hwndUsername = nullptr, hwndHostname = nullptr, hwndServerUrl = nullptr, hwndPollInterval = nullptr;
+    // The Coordinator tab's memory slider and the line under it that says
+    // what the stop it's at means - see tableMemoryLabel.
+    HWND hwndTableMemory = nullptr, hwndTableMemoryText = nullptr;
+    std::vector<uint64_t> tableMemoryStops;
+    uint64_t availablePhysicalBytes = 0;
     HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr, hwndPruneBrackets = nullptr,
          hwndPruneWhole = nullptr, hwndPruneAdjacent = nullptr;
     HWND hwndInsertFromStart = nullptr, hwndInsertFromEnd = nullptr;
@@ -81,6 +97,12 @@ struct SetupDialogState {
          hwndDictLowerBound = nullptr, hwndDictUpperBound = nullptr, hwndDictHashA = nullptr, hwndDictHashB = nullptr,
          hwndDictKey = nullptr, hwndDictMatchesName = nullptr, hwndDictRecordBasenames = nullptr, hwndDictRecordHashA = nullptr,
          hwndDictResume = nullptr;
+    // The Meet in the Middle tab's.
+    HWND hwndMitmAlphabet = nullptr, hwndMitmPrefix = nullptr, hwndMitmSuffix = nullptr, hwndMitmASeed1 = nullptr,
+         hwndMitmASeed2 = nullptr, hwndMitmBSeed1 = nullptr, hwndMitmBSeed2 = nullptr, hwndMitmHashA = nullptr, hwndMitmHashB = nullptr,
+         hwndMitmMinLength = nullptr, hwndMitmMaxLength = nullptr, hwndMitmTableLength = nullptr, hwndMitmTableMemory = nullptr,
+         hwndMitmMinBackslash = nullptr, hwndMitmMaxBackslash = nullptr, hwndMitmPrune = nullptr, hwndMitmPruneBrackets = nullptr,
+         hwndMitmPruneAdjacent = nullptr, hwndMitmMatchesName = nullptr, hwndMitmResume = nullptr;
     // Tooltip strings must outlive the tooltip (it keeps pointers, not
     // copies); a deque never moves existing elements as it grows.
     std::deque<std::string> helpTexts;
@@ -93,6 +115,7 @@ void showTabPage(SetupDialogState* state, int sel) {
     ShowWindow(state->hwndPageCoordinator, sel == kTabCoordinator ? SW_SHOW : SW_HIDE);
     ShowWindow(state->hwndPageSearch, sel == kTabLocalSearch ? SW_SHOW : SW_HIDE);
     ShowWindow(state->hwndPageDictionary, sel == kTabDictionary ? SW_SHOW : SW_HIDE);
+    ShowWindow(state->hwndPageMeetInTheMiddle, sel == kTabMeetInTheMiddle ? SW_SHOW : SW_HIDE);
 }
 
 bool isChecked(HWND h) {
@@ -103,6 +126,131 @@ std::string windowText(HWND h) {
     std::string text(GetWindowTextLengthA(h) + 1, '\0');
     text.resize(GetWindowTextA(h, &text[0], (int) text.size()));
     return text;
+}
+
+// --- The Coordinator tab's meet-in-the-middle memory slider ---------------
+//
+// How much memory this client will give a meet-in-the-middle target's table
+// is a coarse choice: a character more of the table needs about as many
+// times more memory as the alphabet has characters, so the useful values are
+// powers of two far apart, and a slider over them says more than a number
+// box would (what you are giving, out of what this machine has).
+
+// The sizes the slider stops at - none, then powers of two from 256 MB up.
+constexpr uint64_t kTableMemoryStops[] = {0,            256ull << 20, 512ull << 20, 1ull << 30,  2ull << 30,
+                                           4ull << 30,  8ull << 30,   16ull << 30,  32ull << 30, 64ull << 30};
+
+// Those of them a machine with `totalBytes` of memory could hold at all -
+// always at least None and the smallest size, so there is something to drag
+// even on a very small machine.
+std::vector<uint64_t> tableMemoryStopsFor(uint64_t totalBytes) {
+    std::vector<uint64_t> stops;
+    for (uint64_t stop : kTableMemoryStops)
+        if (stop <= totalBytes || stops.size() < 2)
+            stops.push_back(stop);
+    return stops;
+}
+
+// What to propose on a machine this size: an eighth of its memory at most,
+// and never more than 4 GB unasked - enough for five characters of a
+// 43-character alphabet, which is what the directories looked for in
+// practice need.
+uint64_t proposedTableMemory(const std::vector<uint64_t>& stops, uint64_t totalBytes) {
+    const uint64_t cap = (std::min) (totalBytes / 8, 4ull << 30);
+    uint64_t proposed = 0;
+    for (uint64_t stop : stops)
+        if (stop <= cap)
+            proposed = stop;
+    return proposed;
+}
+
+// The stop at or below `bytes` - which stop a value from config.conf sits
+// at, rounded down so that the slider never offers more than the file asked
+// for.
+int stopIndexFor(const std::vector<uint64_t>& stops, uint64_t bytes) {
+    int index = 0;
+    for (int i = 0; i < (int) stops.size(); ++i)
+        if (stops[i] <= bytes)
+            index = i;
+    return index;
+}
+
+// A size as config.conf writes it: 0, 256M, 4G.
+std::string bytesForConfig(uint64_t bytes) {
+    if (bytes == 0)
+        return "0";
+    if (bytes % (1ull << 30) == 0)
+        return std::to_string(bytes >> 30) + "G";
+    return std::to_string(bytes >> 20) + "M";
+}
+
+// A size as this dialog says it: None, 256 MB, 4 GB (every stop is a whole
+// number of its unit).
+std::string stopText(uint64_t bytes) {
+    if (bytes == 0)
+        return "None";
+    if (bytes < (1ull << 30))
+        return std::to_string(bytes >> 20) + " MB";
+    return std::to_string(bytes >> 30) + " GB";
+}
+
+// A machine's memory, as the line above the slider says it: 31.8 GB.
+std::string memoryText(uint64_t bytes) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%.1f GB", (double) bytes / (double) (1ull << 30));
+    return buf;
+}
+
+// What a stop means, for the line under the slider: the size, and how long a
+// table of it holds - which is the whole point of giving the memory. Two
+// alphabet sizes, because what one buys depends on the target's own alphabet
+// and the steps are wide: 2 GB and 32 GB are the same five characters of a
+// 43-character alphabet, but six and seven of a 26-character one.
+std::string tableMemoryLabel(uint64_t bytes, uint64_t availableBytes) {
+    if (bytes == 0)
+        return "None: the server hands this client no meet-in-the-middle work.";
+    std::string text = stopText(bytes) + " - a table of " +
+                       std::to_string(meetInTheMiddleTableLengthForBytes(43, MAX_CANDIDATE_LEN, bytes)) +
+                       " characters of a 43-character alphabet, " +
+                       std::to_string(meetInTheMiddleTableLengthForBytes(26, MAX_CANDIDATE_LEN, bytes)) + " of a 26-character one.";
+    if (bytes > availableBytes)
+        text += "\r\nThat is more than is free on this machine right now.";
+    return text;
+}
+
+void syncTableMemoryText(SetupDialogState* state) {
+    const int pos = (int) SendMessage(state->hwndTableMemory, TBM_GETPOS, 0, 0);
+    const uint64_t bytes = state->tableMemoryStops[(size_t) (pos < 0 ? 0 : pos)];
+    SetWindowTextA(state->hwndTableMemoryText, tableMemoryLabel(bytes, state->availablePhysicalBytes).c_str());
+}
+
+// Every [meet-in-the-middle] key for `fields`, with the values as a loaded
+// ConfigFile's own map holds them - unquoted. Empty for a key to leave out.
+// gui::meetInTheMiddleConfigKeys adds the quoting the file itself needs.
+std::vector<std::pair<std::string, std::string>> meetInTheMiddleValues(const MeetInTheMiddleFields& f) {
+    return {
+        {"alphabet", f.alphabet},
+        {"prefix", f.prefix},
+        {"suffix", f.suffix},
+        {"meeting_point_a_seed1", f.meetingPointASeed1},
+        {"meeting_point_a_seed2", f.meetingPointASeed2},
+        {"meeting_point_b_seed1", f.meetingPointBSeed1},
+        {"meeting_point_b_seed2", f.meetingPointBSeed2},
+        {"hash_a", f.hashA},
+        {"hash_b", f.hashB},
+        {"min_length", f.minLength},
+        {"max_length", f.maxLength},
+        // Left out, rather than empty, for a table as long as the memory allows.
+        {"table_length", f.tableLength},
+        {"table_memory", f.tableMemory},
+        {"max_backslash_count", f.maxBackslashCount},
+        {"min_backslash_count", f.minBackslashCount},
+        {"prune_symbol_runs", f.pruneSymbolRuns ? "true" : "false"},
+        {"prune_unopened_brackets", f.pruneUnopenedBrackets ? "true" : "false"},
+        {"prune_adjacent_backslashes", f.pruneAdjacentBackslashes ? "true" : "false"},
+        {"matches_name", f.matchesName},
+        {"resume_from_last_candidate", f.resume ? "true" : "false"},
+    };
 }
 
 // Recording basenames means something only with a key to compare them to.
@@ -163,7 +311,9 @@ void browseWordLists(HWND owner, SetupDialogState* state) {
 // visible gray box. All this adds over a stock window is coloring the help
 // "?" marks, and handing its controls' notifications on to the dialog.
 LRESULT CALLBACK SetupPageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_COMMAND)
+    // WM_HSCROLL is how a trackbar reports being dragged, and it goes to its
+    // parent - this page - the same way a button's WM_COMMAND does.
+    if (msg == WM_COMMAND || msg == WM_HSCROLL)
         return SendMessage(GetParent(hwnd), msg, wParam, lParam);
     if (msg == WM_CTLCOLORSTATIC && GetWindowLongPtr((HWND) lParam, GWLP_USERDATA) == kHelpMarker) {
         HDC hdc = (HDC) wParam;
@@ -177,6 +327,10 @@ LRESULT CALLBACK SetupPageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* state = reinterpret_cast<SetupDialogState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
     switch (msg) {
+        case WM_HSCROLL:
+            if (state && (HWND) lParam == state->hwndTableMemory)
+                syncTableMemoryText(state);
+            return 0;
         case WM_NOTIFY: {
             if (!state)
                 break;
@@ -216,6 +370,9 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         state->fields->hostname = getField(state->hwndHostname);
                         state->fields->serverUrl = serverUrl;
                         state->fields->pollIntervalSecs = getField(state->hwndPollInterval);
+                        const int memoryPos = (int) SendMessage(state->hwndTableMemory, TBM_GETPOS, 0, 0);
+                        state->fields->meetInTheMiddleTableMemory =
+                            bytesForConfig(state->tableMemoryStops[(size_t) (memoryPos < 0 ? 0 : memoryPos)]);
                         state->fields->mode = "coordinator";
                     } else if (sel == kTabDictionary) {
                         DictionaryFields d;
@@ -260,6 +417,66 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         }
                         state->fields->dictionary = d;
                         state->fields->mode = "dictionary";
+                    } else if (sel == kTabMeetInTheMiddle) {
+                        MeetInTheMiddleFields m;
+                        // The alphabet, prefix and suffix as typed, not
+                        // trimmed: a space is a character like any other in
+                        // them, and the usual alphabet has one.
+                        m.alphabet = windowText(state->hwndMitmAlphabet);
+                        m.prefix = windowText(state->hwndMitmPrefix);
+                        m.suffix = windowText(state->hwndMitmSuffix);
+                        m.meetingPointASeed1 = getField(state->hwndMitmASeed1);
+                        m.meetingPointASeed2 = getField(state->hwndMitmASeed2);
+                        m.meetingPointBSeed1 = getField(state->hwndMitmBSeed1);
+                        m.meetingPointBSeed2 = getField(state->hwndMitmBSeed2);
+                        m.hashA = getField(state->hwndMitmHashA);
+                        m.hashB = getField(state->hwndMitmHashB);
+                        m.minLength = getField(state->hwndMitmMinLength);
+                        m.maxLength = getField(state->hwndMitmMaxLength);
+                        m.tableLength = getField(state->hwndMitmTableLength);
+                        m.tableMemory = getField(state->hwndMitmTableMemory);
+                        m.maxBackslashCount = getField(state->hwndMitmMaxBackslash);
+                        m.minBackslashCount = getField(state->hwndMitmMinBackslash);
+                        m.pruneSymbolRuns = isChecked(state->hwndMitmPrune);
+                        m.pruneUnopenedBrackets = isChecked(state->hwndMitmPruneBrackets);
+                        m.pruneAdjacentBackslashes = isChecked(state->hwndMitmPruneAdjacent);
+                        m.matchesName = getField(state->hwndMitmMatchesName);
+                        m.resume = isChecked(state->hwndMitmResume);
+                        // The same required-key list as
+                        // buildMeetInTheMiddleRequest (config.cpp).
+                        if (m.alphabet.empty() || m.suffix.empty() || m.maxLength.empty() || m.hashA.empty() || m.hashB.empty() ||
+                            m.meetingPointASeed1.empty() || m.meetingPointASeed2.empty() || m.meetingPointBSeed1.empty() ||
+                            m.meetingPointBSeed2.empty()) {
+                            MessageBoxA(hwnd,
+                                        "Alphabet, Suffix, Max length, both hashes and all four meeting point seeds are required.",
+                                        "namebreak setup", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
+                        // Everything else the search checks before it starts,
+                        // checked here where it can still be put right - the
+                        // values themselves, and that hashing the suffix onto
+                        // the meeting point really gives the file's hashes,
+                        // which is the mistake worth catching early (the
+                        // seeds and the hashes come from different places).
+                        ConfigFile probe;
+                        probe.matchesDir = state->fields->matchesDir;
+                        for (const auto& kv : meetInTheMiddleValues(m))
+                            if (!kv.second.empty())
+                                probe.meetInTheMiddle[kv.first] = kv.second;
+                        MeetInTheMiddleRequest request;
+                        std::string error;
+                        if (!buildMeetInTheMiddleRequest(probe, request, error)) {
+                            MessageBoxA(hwnd, ("Meet in the Middle: " + error).c_str(), "namebreak setup", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
+                        std::vector<uint32_t> cryptTable(0x500);
+                        prepareCryptTable(cryptTable.data());
+                        if (!meetingPointFitsHashes(request, cryptTable.data(), error)) {
+                            MessageBoxA(hwnd, ("Meet in the Middle: " + error).c_str(), "namebreak setup", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
+                        state->fields->meetInTheMiddle = m;
+                        state->fields->mode = "meet-in-the-middle";
                     } else {
                         std::string alphabet = getField(state->hwndAlphabet);
                         std::string maxBackslash = getField(state->hwndMaxBackslash);
@@ -356,7 +573,7 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
 
     constexpr DWORD kStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     constexpr DWORD kExStyle = WS_EX_DLGMODALFRAME;
-    RECT rect = {0, 0, 620, 580}; // desired client area
+    RECT rect = {0, 0, 620, 640}; // desired client area
     AdjustWindowRectEx(&rect, kStyle, FALSE, kExStyle);
     HWND hwndDialog = CreateWindowExA(kExStyle, kSetupClassName, "namebreak - first-run setup", kStyle, CW_USEDEFAULT, CW_USEDEFAULT,
                                        rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, hInstance, nullptr);
@@ -375,7 +592,7 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
                      WS_CHILD | WS_VISIBLE, 150, 46, 455, 46, hwndDialog, nullptr, hInstance, nullptr);
 
     // --- Tabs, each with a page window over the tab body ---
-    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE, 10, 100, 600, 430, hwndDialog, nullptr, hInstance, nullptr);
+    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE, 10, 100, 600, 490, hwndDialog, nullptr, hInstance, nullptr);
     TCITEMA tie{};
     tie.mask = TCIF_TEXT;
     tie.pszText = (LPSTR) "Coordinator";
@@ -384,9 +601,17 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabLocalSearch, (LPARAM) &tie);
     tie.pszText = (LPSTR) "Local Dictionary";
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabDictionary, (LPARAM) &tie);
-    state.hwndPageCoordinator = CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, 592, 394, hwndDialog, nullptr, hInstance, nullptr);
-    state.hwndPageSearch = CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, 592, 394, hwndDialog, nullptr, hInstance, nullptr);
-    state.hwndPageDictionary = CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, 592, 394, hwndDialog, nullptr, hInstance, nullptr);
+    tie.pszText = (LPSTR) "Meet in the Middle";
+    SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabMeetInTheMiddle, (LPARAM) &tie);
+    constexpr int kPageWidth = 592, kPageHeight = 454;
+    state.hwndPageCoordinator =
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
+    state.hwndPageSearch =
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
+    state.hwndPageDictionary =
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
+    state.hwndPageMeetInTheMiddle =
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
 
     // One tooltip window serves every help "?" mark. Long delay before it
     // disappears (the texts are a few lines) and a max width so they wrap.
@@ -463,6 +688,45 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
     addHelp(pc, 200, kCoordRow0 + 3 * kRowStep + 2,
             "How many seconds to wait before asking the server for work again when none was available. It is also the starting delay "
             "after a failed request, which then backs off. Default: 30.");
+
+    // How much memory this client will give a meet-in-the-middle target's
+    // table. The server only hands out such a target if its table fits in
+    // this, so None is a plain "none of that work, thanks" - see the Meet in
+    // the Middle tab for what the table is for.
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof memory;
+    if (!GlobalMemoryStatusEx(&memory)) {
+        memory.ullTotalPhys = 4ull << 30; // modest, if Windows won't say
+        memory.ullAvailPhys = 1ull << 30;
+    }
+    state.tableMemoryStops = tableMemoryStopsFor(memory.ullTotalPhys);
+    state.availablePhysicalBytes = memory.ullAvailPhys;
+    uint64_t tableMemory = 0;
+    if (fields.meetInTheMiddleTableMemory.empty())
+        tableMemory = proposedTableMemory(state.tableMemoryStops, memory.ullTotalPhys);
+    else if (!parseConfigBytes(fields.meetInTheMiddleTableMemory, tableMemory))
+        tableMemory = 0;
+
+    constexpr int kMemoryY = 240;
+    makeLabel(pc, "Meet-in-the-middle work", 8, kMemoryY, 200);
+    const std::string machineMemory = "This machine has " + memoryText(memory.ullTotalPhys) + " of memory, " +
+                                      memoryText(memory.ullAvailPhys) + " of it free right now.";
+    makeLabel(pc, machineMemory.c_str(), 8, kMemoryY + 22, 560);
+    makeLabel(pc, "Give at most:", 8, kMemoryY + 56, 100);
+    state.hwndTableMemory =
+        CreateWindowExA(0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_AUTOTICKS | TBS_HORZ, 110, kMemoryY + 50, 330, 32,
+                         pc, (HMENU) (INT_PTR) kIdSetupTableMemory, hInstance, nullptr);
+    SendMessage(state.hwndTableMemory, TBM_SETRANGE, TRUE, MAKELONG(0, (int) state.tableMemoryStops.size() - 1));
+    SendMessage(state.hwndTableMemory, TBM_SETPAGESIZE, 0, 1);
+    SendMessage(state.hwndTableMemory, TBM_SETPOS, TRUE, stopIndexFor(state.tableMemoryStops, tableMemory));
+    addHelp(pc, 450, kMemoryY + 56,
+            "How much memory this client will give the table of a meet-in-the-middle target - a file whose directory is unknown, "
+            "searched from both ends at once (see the Meet in the Middle tab). The server hands out such a target only if its table "
+            "fits in this, so None means no work of that kind at all.\r\n"
+            "The table is only held while such a range is being searched, and on a GPU it is held in the card's own memory too - so "
+            "keep this under what your GPU has free if you search with one.");
+    state.hwndTableMemoryText = makeLabel(pc, "", 8, kMemoryY + 88, 560, 34);
+    syncTableMemoryText(&state);
 
     // --- Local Search page (two columns: label, field, help) ---
     HWND ps = state.hwndPageSearch;
@@ -651,13 +915,126 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields) {
             "and when you quit - instead of starting from the beginning.");
     syncRecordBasenames(&state);
 
+    // --- Meet in the Middle page (two columns, as Local Search) ---
+    HWND pm = state.hwndPageMeetInTheMiddle;
+    const MeetInTheMiddleFields& mitm = fields.meetInTheMiddle;
+    makeLabel(pm,
+              "Search on your own for a file whose directory is unknown, but where the hash state right after that directory - the "
+              "meeting point - is already known, for both hashes. (Two files of the same unknown directory whose basenames are known "
+              "pin it down.) The search then comes at the directory from both ends at once: forward from the prefix into a table of "
+              "every beginning, backward from the meeting point, meeting in the middle - so every character the table holds is one "
+              "character less to brute-force.",
+              8, 6, 570, 78);
+    makeLabel(pm,
+              "Mind the memory: that table can be large. With a 43-character alphabet it takes about 30 MB for 4 of the directory's "
+              "characters, 1.4 GB for 5 and 59 GB for 6 - Table memory below is the cap, and on a GPU the table has to fit in the "
+              "card's own memory as well.",
+              8, 88, 570, 46);
+    // Ten rows of fields, so this page's rows sit a little closer together
+    // than the other pages' (kRowStep).
+    constexpr int kMitmRow0 = 140, kMitmRowStep = 30;
+    auto rowM = [&](int n) { return kMitmRow0 + n * kMitmRowStep; };
+
+    makeLabel(pm, "Alphabet:", kL1, rowM(0) + 3, 100);
+    state.hwndMitmAlphabet = makeEdit(pm, mitm.alphabet, kE1, rowM(0), 150);
+    const std::string mitmAlphabetHelp = "Every character the unknown directory may be made of, typed out with no separators - at most " +
+                                         std::to_string(MAX_ALPHABET_SIZE) + " of them. A space is one of them if you type one, and "
+                                         "spaces at either end are kept, so type it exactly. A backslash searches directories with "
+                                         "subdirectories in them.";
+    addHelp(pm, kH1, rowM(0) + 2, mitmAlphabetHelp.c_str());
+    makeLabel(pm, "Matches name:", kL2, rowM(0) + 3, 110);
+    state.hwndMitmMatchesName = makeEdit(pm, mitm.matchesName, kE2, rowM(0), 120);
+    addHelp(pm, kH2, rowM(0) + 2,
+            "Optional. Names the files the search writes - matches-<name>.txt and meet-in-the-middle-<name>.txt (where its progress "
+            "is kept) - so searches for different files keep theirs apart. Blank: matches.txt and meet-in-the-middle.txt.");
+
+    makeLabel(pm, "Prefix:", kL1, rowM(1) + 3, 100);
+    state.hwndMitmPrefix = makeEdit(pm, mitm.prefix, kE1, rowM(1), 150);
+    addHelp(pm, kH1, rowM(1) + 2,
+            "Optional. Known text before the unknown directory. The meeting point must be the hash state after the prefix and the "
+            "directory together.");
+    makeLabel(pm, "Suffix:", kL2, rowM(1) + 3, 110);
+    state.hwndMitmSuffix = makeEdit(pm, mitm.suffix, kE2, rowM(1), 120);
+    addHelp(pm, kH2, rowM(1) + 2,
+            "What follows the directory - for a file inside it, the backslash and the basename, for example \\BWUNIN.PIF.");
+
+    makeLabel(pm, "Meeting point A:", kL1, rowM(2) + 3, 104);
+    state.hwndMitmASeed1 = makeEdit(pm, mitm.meetingPointASeed1, kE1, rowM(2), 150);
+    state.hwndMitmASeed2 = makeEdit(pm, mitm.meetingPointASeed2, kE1 + 158, rowM(2), 150);
+    addHelp(pm, kE1 + 316, rowM(2) + 2,
+            "Hash A's two seeds right after the directory, in hex (a 0x prefix is optional): seed1 on the left, seed2 on the right. "
+            "This is what the search looks for - a directory that takes the hash from the prefix's state to it.");
+    makeLabel(pm, "Meeting point B:", kL1, rowM(3) + 3, 104);
+    state.hwndMitmBSeed1 = makeEdit(pm, mitm.meetingPointBSeed1, kE1, rowM(3), 150);
+    state.hwndMitmBSeed2 = makeEdit(pm, mitm.meetingPointBSeed2, kE1 + 158, rowM(3), 150);
+    addHelp(pm, kE1 + 316, rowM(3) + 2, "The same two seeds for Hash B, in hex.");
+
+    makeLabel(pm, "Hash A (hex):", kL1, rowM(4) + 3, 100);
+    state.hwndMitmHashA = makeEdit(pm, mitm.hashA, kE1, rowM(4), 150);
+    addHelp(pm, kH1, rowM(4) + 2,
+            "The file's own first MPQ hash, in hex. Hashing the suffix onto the meeting point must give it, or the search refuses to "
+            "start - a meeting point for the wrong place in the name would otherwise search everything and find nothing.");
+    makeLabel(pm, "Hash B (hex):", kL2, rowM(4) + 3, 110);
+    state.hwndMitmHashB = makeEdit(pm, mitm.hashB, kE2, rowM(4), 120);
+    addHelp(pm, kH2, rowM(4) + 2, "The file's own second MPQ hash, in hex - checked against the meeting point the same way.");
+
+    makeLabel(pm, "Min length:", kL1, rowM(5) + 3, 100);
+    state.hwndMitmMinLength = makeEdit(pm, mitm.minLength, kE1, rowM(5), 60);
+    addHelp(pm, kE1 + 68, rowM(5) + 2, "The shortest the unknown directory may be, in characters. Default: 1.");
+    makeLabel(pm, "Max length:", kL2, rowM(5) + 3, 110);
+    state.hwndMitmMaxLength = makeEdit(pm, mitm.maxLength, kE2, rowM(5), 60);
+    const std::string mitmMaxLengthHelp = "Required. The longest the unknown directory may be - at most " +
+                                          std::to_string(MAX_CANDIDATE_LEN) +
+                                          " characters. Every length from the shortest up to it is searched, shortest first.";
+    addHelp(pm, kE2 + 68, rowM(5) + 2, mitmMaxLengthHelp.c_str());
+
+    makeLabel(pm, "Table length:", kL1, rowM(6) + 3, 100);
+    state.hwndMitmTableLength = makeEdit(pm, mitm.tableLength, kE1, rowM(6), 60);
+    addHelp(pm, kE1 + 68, rowM(6) + 2,
+            "Optional. How many of the directory's first characters the table holds; the rest are what the search walks backwards. "
+            "Blank: as many as Table memory allows, which is what you usually want.");
+    makeLabel(pm, "Table memory:", kL2, rowM(6) + 3, 110);
+    state.hwndMitmTableMemory = makeEdit(pm, mitm.tableMemory, kE2, rowM(6), 80);
+    addHelp(pm, kE2 + 88, rowM(6) + 2,
+            "The most memory the table may take - a plain number of bytes, or one with a K, M or G after it (1G by default). Each "
+            "character more needs about as many times more memory as the alphabet has characters, so this decides how far the search "
+            "reaches. On a GPU the table has to fit in the card's own memory too.");
+
+    makeLabel(pm, "Min backslash:", kL1, rowM(7) + 3, 100);
+    state.hwndMitmMinBackslash = makeEdit(pm, mitm.minBackslashCount, kE1, rowM(7), 60);
+    addHelp(pm, kE1 + 68, rowM(7) + 2,
+            "Optional. The fewest backslashes the directory may contain without being skipped. 0 (or blank) means none are needed.");
+    makeLabel(pm, "Max backslash:", kL2, rowM(7) + 3, 110);
+    state.hwndMitmMaxBackslash = makeEdit(pm, mitm.maxBackslashCount, kE2, rowM(7), 60);
+    addHelp(pm, kE2 + 68, rowM(7) + 2,
+            "The most backslashes the directory may contain before it is skipped. 0 means no limit (to forbid them entirely, leave "
+            "the backslash out of the alphabet instead).");
+
+    state.hwndMitmPrune = makeCheckbox(pm, "Prune symbol runs", kL1, rowM(8) + 1, 150, 0, mitm.pruneSymbolRuns);
+    addHelp(pm, kH1, rowM(8) + 2,
+            "Skip directories containing three or more symbols in a row that are neither letters, digits nor spaces - real names "
+            "practically never have those. Applies to every character of the directory, and makes the search faster.");
+    state.hwndMitmPruneBrackets = makeCheckbox(pm, "Prune unopened brackets", kL2, rowM(8) + 1, 170, 0, mitm.pruneUnopenedBrackets);
+    addHelp(pm, kH2, rowM(8) + 2,
+            "Skip directories that close a bracket that was never opened - a ) with no ( before it, or a ] with no [ (brackets "
+            "opened in the prefix count).");
+    state.hwndMitmPruneAdjacent = makeCheckbox(pm, "Prune adjacent backslashes", kL1, rowM(9) + 1, 190, 0, mitm.pruneAdjacentBackslashes);
+    addHelp(pm, kH1, rowM(9) + 2,
+            "Skip directories with two backslashes next to each other - counting one the prefix ends with, and one the suffix begins "
+            "with. Real names never have those.");
+    state.hwndMitmResume = makeCheckbox(pm, "Resume from last candidate", kL2, rowM(9) + 1, 190, 0, mitm.resume);
+    addHelp(pm, kH2, rowM(9) + 2,
+            "Carry on where the last search with these settings stopped - its progress is saved in meet-in-the-middle.txt every 30 "
+            "seconds and when you quit - instead of starting from the beginning.");
+
     // --- Buttons ---
-    CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 542, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout, hInstance,
-                     nullptr);
-    CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, 542, 80, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupOk,
+    constexpr int kButtonY = 602;
+    CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, kButtonY, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout,
                      hInstance, nullptr);
-    CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 520, 542, 80, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupCancel, hInstance,
-                     nullptr);
+    CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, kButtonY, 80, 26, hwndDialog,
+                     (HMENU) (INT_PTR) kIdSetupOk, hInstance, nullptr);
+    CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 520, kButtonY, 80, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupCancel,
+                     hInstance, nullptr);
 
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
     HFONT titleFont = CreateFontA(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -708,6 +1085,16 @@ std::vector<std::pair<std::string, std::string>> dictionaryConfigKeys(const Dict
         {"matches_name", optional(fields.matchesName)},
         {"resume_from_last_candidate", fields.resume ? "true" : "false"},
     };
+}
+
+std::vector<std::pair<std::string, std::string>> meetInTheMiddleConfigKeys(const MeetInTheMiddleFields& fields) {
+    std::vector<std::pair<std::string, std::string>> keys = meetInTheMiddleValues(fields);
+    // The three values a space can be part of - and the file keeps a
+    // leading or trailing one only inside quotes.
+    for (auto& kv : keys)
+        if ((kv.first == "alphabet" || kv.first == "prefix" || kv.first == "suffix" || kv.first == "matches_name") && !kv.second.empty())
+            kv.second = quoteDictionaryValue(kv.second);
+    return keys;
 }
 
 } // namespace gui

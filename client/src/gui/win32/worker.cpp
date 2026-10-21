@@ -49,23 +49,31 @@ std::string compactCount(uint64_t n) {
     return buf;
 }
 
-// A dictionary search's progress, as the status line and the matches box
-// show it - a local one's, or each of a coordinator's dictionary ranges'. The
-// status line is the CLI's progress line, shortened. Worker thread only, but
-// for what it writes to g_status.
-class DictionaryProgressText {
+// The progress of a search that counts its own work, as the status line and
+// the matches box show it: a dictionary search (a local one, or each of a
+// coordinator's dictionary ranges) counting candidates, or a
+// meet-in-the-middle one counting tails. The status line is the CLI's
+// progress line, shortened. Worker thread only, but for what it writes to
+// g_status.
+class CountedProgressText {
 public:
-    // Before every search, for only its own candidates to count towards the
-    // rate - not those a resumed search had searched before.
+    // `unit` is what this kind of search counts and `hit`/`hits` what it
+    // finds along the way, for the status line; `found` is the list in
+    // g_status those go to, for the matches box.
+    CountedProgressText(const char* unit, const char* hit, const char* hits, std::vector<std::string>* found)
+        : unit_(unit), hit_(hit), hits_(hits), found_(found) {}
+
+    // Before every search, for only its own work to count towards the rate -
+    // not what a resumed search had searched before.
     void start() {
         startTime_ = std::chrono::steady_clock::now();
-        basenameHits_ = 0;
+        hitCount_ = 0;
     }
 
-    void basename(const std::string& basename) {
-        ++basenameHits_;
+    void hit(const std::string& text) {
+        ++hitCount_;
         std::lock_guard<std::mutex> lock(g_status.mutex);
-        g_status.newBasenames.push_back(basename);
+        found_->push_back(text);
     }
 
     void count(uint64_t searched, uint64_t toSearch) {
@@ -74,10 +82,10 @@ public:
         const double fraction = toSearch ? (double) searched / (double) toSearch : 1.0;
         char percent[16];
         snprintf(percent, sizeof percent, "%.2f%%", 100.0 * fraction);
-        std::string text = std::string(percent) + " of " + compactCount(toSearch) + " candidates, about " +
+        std::string text = std::string(percent) + " of " + compactCount(toSearch) + " " + unit_ + ", about " +
                            (rate > 0 ? formatDuration((double) (toSearch - searched) / rate) : "?") + " left";
-        if (basenameHits_)
-            text += " - " + withCommas(basenameHits_) + (basenameHits_ == 1 ? " basename" : " basenames");
+        if (hitCount_)
+            text += " - " + withCommas(hitCount_) + " " + (hitCount_ == 1 ? hit_ : hits_);
         std::lock_guard<std::mutex> lock(g_status.mutex);
         g_status.progressFraction = fraction;
         g_status.statusText = text;
@@ -91,11 +99,16 @@ public:
     }
 
 private:
+    const char* unit_;
+    const char* hit_;
+    const char* hits_;
+    std::vector<std::string>* found_;
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
-    uint64_t basenameHits_ = 0;
+    uint64_t hitCount_ = 0;
 };
 
-DictionaryProgressText g_dictionaryProgress;
+CountedProgressText g_dictionaryProgress{"candidates", "basename", "basenames", &gui::g_status.newBasenames};
+CountedProgressText g_meetInTheMiddleProgress{"tails", "directory", "directories", &gui::g_status.newMeetingPointMatches};
 
 void onRangeClaimed(const ClaimResponse& claim, const SearchRequest& req) {
     std::lock_guard<std::mutex> lock(g_status.mutex);
@@ -218,7 +231,7 @@ void runLocalDictionarySearch(const DictionaryRequest& req, const std::string& b
 
     g_dictionaryProgress.start();
     DictionarySearchHooks hooks;
-    hooks.onBasenameMatch = [](const std::string& basename, const std::string&) { g_dictionaryProgress.basename(basename); };
+    hooks.onBasenameMatch = [](const std::string& basename, const std::string&) { g_dictionaryProgress.hit(basename); };
     hooks.onCount = [](uint64_t searched, uint64_t toSearch) { g_dictionaryProgress.count(searched, toSearch); };
     hooks.onStatus = [](const std::string& filename) { g_dictionaryProgress.position(filename); };
     {
@@ -241,6 +254,61 @@ void runLocalDictionarySearch(const DictionaryRequest& req, const std::string& b
         g_status.statusText = "Searched every candidate, no match" + basenames;
 }
 
+// Runs a meet-in-the-middle search directly (see src/cli/main.cpp's main()
+// for the CLI's equivalent). Like a dictionary search it counts its own work
+// - tails rather than candidates - so the progress bar is that fraction.
+void runLocalMeetInTheMiddleSearch(const MeetInTheMiddleRequest& req, const std::string& backendName) {
+    {
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        g_status.targetName = req.prefix + "<directory>" + req.suffix;
+        g_status.outputFilePath = req.outputFilePath;
+        g_status.alphabet.clear();
+        g_status.lowerBound.clear();
+        g_status.upperBound.clear();
+        g_status.progressFraction = 0;
+        g_status.hasActiveRange = true;
+        g_status.rangeJustFinished = false;
+        g_status.statusText = "Testing the backend before the meet-in-the-middle search...";
+    }
+    std::string backendError;
+    std::unique_ptr<SearchBackend> backend = createMeetInTheMiddleBackend(backendName, backendError);
+    if (!backend) {
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        g_status.hasActiveRange = false;
+        g_status.statusText = backendError;
+        return;
+    }
+
+    g_meetInTheMiddleProgress.start();
+    MeetInTheMiddleSearchHooks hooks;
+    hooks.onPartialMatch = [](const std::string& filename) { g_meetInTheMiddleProgress.hit(filename); };
+    hooks.onCount = [](uint64_t searched, uint64_t toSearch) { g_meetInTheMiddleProgress.count(searched, toSearch); };
+    hooks.onStatus = [](const std::string& tail) { g_meetInTheMiddleProgress.position(tail); };
+    {
+        // The table is built first, which for a big one takes a while and
+        // says nothing until it's done - hence a status line of its own,
+        // replaced by the first count once the walk starts.
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        g_status.statusText = "Building the table, then searching on " + std::string(backend->name()) + "...";
+    }
+    MeetInTheMiddleResult result = runMeetInTheMiddleSearch(*backend, req, &g_quitRequested, hooks, &g_pauseRequested);
+    std::lock_guard<std::mutex> lock(g_status.mutex);
+    g_status.hasActiveRange = false;
+    g_status.rangeJustFinished = true;
+    const std::string hits = result.hits ? " - " + withCommas(result.hits) + (result.hits == 1 ? " directory" : " directories") +
+                                               " matched the meeting point"
+                                         : "";
+    g_status.searchEnded = result.ok && !result.aborted;
+    if (!result.ok)
+        g_status.statusText = "Search failed: " + result.error;
+    else if (result.aborted)
+        g_status.statusText = "Aborted" + hits;
+    else if (result.found)
+        g_status.statusText = "Match found: " + result.filename;
+    else
+        g_status.statusText = "Searched every directory, no match" + hits;
+}
+
 } // namespace
 
 namespace gui {
@@ -253,10 +321,12 @@ void workerThreadMain(AppConfig config, HWND notifyWindow) {
         callbacks.onStatus = onStatus;
         callbacks.onDictionaryCount = [](uint64_t searched, uint64_t toSearch) { g_dictionaryProgress.count(searched, toSearch); };
         callbacks.onDictionaryStatus = [](const std::string& filename) { g_dictionaryProgress.position(filename); };
-        callbacks.onDictionaryBasename = [](const std::string& basename) { g_dictionaryProgress.basename(basename); };
+        callbacks.onDictionaryBasename = [](const std::string& basename) { g_dictionaryProgress.hit(basename); };
         runCoordinator(config.coordinatorArgs, &g_pauseRequested, &g_quitRequested, &callbacks, &g_finishRangeThenPause);
     } else if (config.mode == "dictionary") {
         runLocalDictionarySearch(config.dictionaryRequest, config.backend);
+    } else if (config.mode == "meet-in-the-middle") {
+        runLocalMeetInTheMiddleSearch(config.meetInTheMiddleRequest, config.backend);
     } else {
         runLocalSearch(config.searchRequest, config.mode == "continuous", config.backend);
     }

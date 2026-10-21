@@ -12,6 +12,7 @@ using gui::SetupDialogFields;
 using gui::kTabCoordinator;
 using gui::kTabDictionary;
 using gui::kTabLocalSearch;
+using gui::kTabMeetInTheMiddle;
 
 bool configHasServerUrl(const ConfigFile& config) {
     auto it = config.coordinator.find("server_url");
@@ -38,6 +39,17 @@ bool isConfigReady(const ConfigFile& config) {
         for (const char* key : {"max_words", "prefix", "suffix", "hash_a", "hash_b"}) {
             auto it = config.dictionary.find(key);
             if (it == config.dictionary.end() || it->second.empty())
+                return false;
+        }
+        return true;
+    }
+    // Likewise only its required keys - the meeting point among them, which
+    // is what the search is for (buildMeetInTheMiddleRequest, config.cpp).
+    if (config.mode == "meet-in-the-middle") {
+        for (const char* key : {"alphabet", "suffix", "meeting_point_a_seed1", "meeting_point_a_seed2", "meeting_point_b_seed1",
+                                "meeting_point_b_seed2", "hash_a", "hash_b", "max_length"}) {
+            auto it = config.meetInTheMiddle.find(key);
+            if (it == config.meetInTheMiddle.end() || it->second.empty())
                 return false;
         }
         return true;
@@ -80,6 +92,8 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         fields.hostname = get(config.coordinator, "hostname", resolveHostname());
         fields.serverUrl = get(config.coordinator, "server_url", kDefaultServerUrl);
         fields.pollIntervalSecs = get(config.coordinator, "poll_interval_secs", "30");
+        // Empty: the dialog proposes a size for this machine instead.
+        fields.meetInTheMiddleTableMemory = get(config.coordinator, "meet_in_the_middle_table_memory", "");
         fields.alphabet = get(config.search, "alphabet", "");
         fields.maxBackslashCount = get(config.search, "max_backslash_count", "0");
         fields.minBackslashCount = get(config.search, "min_backslash_count", "0");
@@ -119,11 +133,35 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         dict.recordHashAMatches = getDict("record_hasha_matches", "false") == "true";
         dict.matchesName = getDict("matches_name", "");
         dict.resume = getDict("resume_from_last_candidate", "true") == "true";
+        // [meet-in-the-middle]'s values are unquoted on the way in, as every
+        // section's but [dictionary]'s are, so they go in as they come.
+        gui::MeetInTheMiddleFields& mitm = fields.meetInTheMiddle;
+        mitm.alphabet = get(config.meetInTheMiddle, "alphabet", "");
+        mitm.prefix = get(config.meetInTheMiddle, "prefix", "");
+        mitm.suffix = get(config.meetInTheMiddle, "suffix", "");
+        mitm.meetingPointASeed1 = get(config.meetInTheMiddle, "meeting_point_a_seed1", "");
+        mitm.meetingPointASeed2 = get(config.meetInTheMiddle, "meeting_point_a_seed2", "");
+        mitm.meetingPointBSeed1 = get(config.meetInTheMiddle, "meeting_point_b_seed1", "");
+        mitm.meetingPointBSeed2 = get(config.meetInTheMiddle, "meeting_point_b_seed2", "");
+        mitm.hashA = get(config.meetInTheMiddle, "hash_a", "");
+        mitm.hashB = get(config.meetInTheMiddle, "hash_b", "");
+        mitm.minLength = get(config.meetInTheMiddle, "min_length", mitm.minLength);
+        mitm.maxLength = get(config.meetInTheMiddle, "max_length", "");
+        mitm.tableLength = get(config.meetInTheMiddle, "table_length", "");
+        mitm.tableMemory = get(config.meetInTheMiddle, "table_memory", mitm.tableMemory);
+        mitm.maxBackslashCount = get(config.meetInTheMiddle, "max_backslash_count", mitm.maxBackslashCount);
+        mitm.minBackslashCount = get(config.meetInTheMiddle, "min_backslash_count", mitm.minBackslashCount);
+        mitm.pruneSymbolRuns = get(config.meetInTheMiddle, "prune_symbol_runs", "false") == "true";
+        mitm.pruneUnopenedBrackets = get(config.meetInTheMiddle, "prune_unopened_brackets", "false") == "true";
+        mitm.pruneAdjacentBackslashes = get(config.meetInTheMiddle, "prune_adjacent_backslashes", "false") == "true";
+        mitm.matchesName = get(config.meetInTheMiddle, "matches_name", "");
+        mitm.resume = get(config.meetInTheMiddle, "resume_from_last_candidate", "true") == "true";
         fields.matchesDir = loaded ? config.matchesDir : kDefaultMatchesDir;
 
         fields.initialTab = !loaded                                                      ? kTabCoordinator
                             : config.mode == "bounded" || config.mode == "continuous" ? kTabLocalSearch
                             : config.mode == "dictionary"                             ? kTabDictionary
+                            : config.mode == "meet-in-the-middle"                     ? kTabMeetInTheMiddle
                                                                                       : kTabCoordinator;
         fields.initialContinuous = loaded && config.mode == "continuous";
 
@@ -137,10 +175,14 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
                                            {{"server_url", fields.serverUrl},
                                             {"username", fields.username},
                                             {"hostname", fields.hostname},
-                                            {"poll_interval_secs", fields.pollIntervalSecs}},
+                                            {"poll_interval_secs", fields.pollIntervalSecs},
+                                            {"meet_in_the_middle_table_memory", fields.meetInTheMiddleTableMemory}},
                                            writeError);
         } else if (fields.mode == "dictionary") {
             writeOk = ensureConfigForMode(configPath, "dictionary", "dictionary", gui::dictionaryConfigKeys(fields.dictionary), writeError);
+        } else if (fields.mode == "meet-in-the-middle") {
+            writeOk = ensureConfigForMode(configPath, "meet-in-the-middle", "meet-in-the-middle",
+                                           gui::meetInTheMiddleConfigKeys(fields.meetInTheMiddle), writeError);
         } else {
             writeOk = ensureConfigForMode(configPath, fields.mode, "search",
                                            {{"alphabet", fields.alphabet},
@@ -200,6 +242,11 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
             if (warnings.size() > kMaxWarnings)
                 text += "\r\n... and " + std::to_string(warnings.size() - kMaxWarnings) + " more";
             MessageBoxA(nullptr, text.c_str(), "namebreak", MB_OK | MB_ICONWARNING);
+        }
+    } else if (config.mode == "meet-in-the-middle") {
+        if (!buildMeetInTheMiddleRequest(config, outConfig.meetInTheMiddleRequest, error)) {
+            MessageBoxA(nullptr, (configPath + " [meet-in-the-middle]: " + error).c_str(), "namebreak", MB_OK | MB_ICONERROR);
+            return false;
         }
     } else {
         MessageBoxA(nullptr, ("Unknown or missing mode in " + configPath).c_str(), "namebreak", MB_OK | MB_ICONERROR);
