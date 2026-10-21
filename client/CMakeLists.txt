@@ -124,8 +124,8 @@ set(SEARCH_SOURCES
     src/engine/candidate.cpp
     src/engine/dictionary.cpp
     src/engine/dictionary_search.cpp
-    src/engine/junction.cpp
-    src/engine/junction_search.cpp
+    src/engine/meet_in_the_middle.cpp
+    src/engine/meet_in_the_middle_search.cpp
     src/engine/wordlist.cpp
     src/backends/backends.cpp
     src/backends/self_test.cpp
@@ -185,7 +185,7 @@ if(WITH_OPENCL)
     list(APPEND SEARCH_SOURCES src/backends/opencl/opencl_backend.cpp)
     embed_kernel(src/backends/opencl/search.cl backends/opencl/search_kernel.h kSearchKernelSource)
     embed_kernel(src/backends/opencl/dictionary.cl backends/opencl/dictionary_kernel.h kDictionaryKernelSource)
-    embed_kernel(src/backends/opencl/junction.cl backends/opencl/junction_kernel.h kJunctionKernelSource)
+    embed_kernel(src/backends/opencl/meet_in_the_middle.cl backends/opencl/meet_in_the_middle_kernel.h kMeetInTheMiddleKernelSource)
 endif()
 
 # embed_word_list(<word list file> <header to generate, under generated/> <C++ name>)
@@ -367,12 +367,12 @@ namebreak_test(wordlist_test wordlist_test)
 namebreak_test_executable(dictionary_test tests/dictionary_test.cpp namebreak_search)
 namebreak_test(dictionary_test dictionary_test)
 
-# A junction search's own parts (src/engine/junction.h,
-# junction_search.h): the hash run backwards, the tails' numbering, the
-# backward walk, the table, the rules split between the two halves, the
+# A meet-in-the-middle search's own parts (src/engine/meet_in_the_middle.h,
+# meet_in_the_middle_search.h): the hash run backwards, the tails' numbering,
+# the backward walk, the table, the rules split between the two halves, the
 # fingerprint and the progress file - against brute force. CPU only.
-namebreak_test_executable(junction_test tests/junction_test.cpp namebreak_search)
-namebreak_test(junction_test junction_test)
+namebreak_test_executable(meet_in_the_middle_test tests/meet_in_the_middle_test.cpp namebreak_search)
+namebreak_test(meet_in_the_middle_test meet_in_the_middle_test)
 
 # What the backends that search dictionaries share (src/backends/common/
 # dictionary_batch.h): the word table, the suffix filters, a launch's
@@ -380,42 +380,44 @@ namebreak_test(junction_test junction_test)
 namebreak_test_executable(dictionary_batch_test tests/dictionary_batch_test.cpp namebreak_search)
 namebreak_test(dictionary_batch_test dictionary_batch_test)
 
-# runJunctionSearch (src/engine/junction_search.h) end to end on every
-# backend that can search junctions, against brute force - after the junction
-# self-test (src/backends/self_test.h), as createJunctionBackend runs it. As
-# built; with only three bits of each of the junction state's two seeds
-# compared (NAMEBREAK_JUNCTION_MATCH_BITS), so that about one directory in 64
-# matches the junction by chance and the lists of them really get
+# runMeetInTheMiddleSearch (src/engine/meet_in_the_middle_search.h) end to end
+# on every backend that can search meet-in-the-middle targets, against brute
+# force - after the meeting point self-test (src/backends/self_test.h), as
+# createMeetInTheMiddleBackend runs it. As built; with only three bits of each
+# of the meeting point's two seeds compared
+# (NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS), so that about one directory in 64
+# matches the meeting point by chance and the lists of them really get
 # compared; and with that and only a few tails handed to the backend per call
-# (NAMEBREAK_JUNCTION_TAILS_PER_CALL), on several threads and in GPU
-# launches with room for a single hit (NAMEBREAK_JUNCTION_HIT_CAPACITY), so
-# that a tail length is split across many calls, the walk is restarted part
-# way through over and over, and a launch's hits overflow all the time and
-# have to be found again with room for them.
-# Every backend that can search junctions: the CUDA-dialect one, OpenCL, and
-# the two CPU ones (Metal doesn't implement this mode yet).
-set(JUNCTION_BACKENDS "")
+# (NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_CALL), on several threads and in GPU
+# launches with room for a single hit
+# (NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY), so that a tail length is split
+# across many calls, the walk is restarted part way through over and over, and
+# a launch's hits overflow all the time and have to be found again with room
+# for them. Every backend that can search meet-in-the-middle targets: the
+# CUDA-dialect one, OpenCL, and the two CPU ones (Metal doesn't implement this
+# mode yet).
+set(MEET_IN_THE_MIDDLE_BACKENDS "")
 if(NOT NAMEBREAK_GPU STREQUAL "none")
-    list(APPEND JUNCTION_BACKENDS ${NAMEBREAK_GPU})
+    list(APPEND MEET_IN_THE_MIDDLE_BACKENDS ${NAMEBREAK_GPU})
 endif()
 if(WITH_OPENCL)
-    list(APPEND JUNCTION_BACKENDS opencl)
+    list(APPEND MEET_IN_THE_MIDDLE_BACKENDS opencl)
 endif()
-list(APPEND JUNCTION_BACKENDS cpu reference)
-namebreak_test_executable(junction_search_test tests/junction_search_test.cpp namebreak_search)
-foreach(backend IN LISTS JUNCTION_BACKENDS)
-    namebreak_test(junction-search-${backend} junction_search_test --backend ${backend})
+list(APPEND MEET_IN_THE_MIDDLE_BACKENDS cpu reference)
+namebreak_test_executable(meet_in_the_middle_search_test tests/meet_in_the_middle_search_test.cpp namebreak_search)
+foreach(backend IN LISTS MEET_IN_THE_MIDDLE_BACKENDS)
+    namebreak_test(meet-in-the-middle-search-${backend} meet_in_the_middle_search_test --backend ${backend})
 endforeach()
 if(NAMEBREAK_TEST_VARIANTS)
-    namebreak_search_library(namebreak_search_junction_dense NAMEBREAK_JUNCTION_MATCH_BITS=3)
-    namebreak_test_executable(junction_search_test_dense tests/junction_search_test.cpp namebreak_search_junction_dense)
-    namebreak_search_library(namebreak_search_junction_small NAMEBREAK_JUNCTION_MATCH_BITS=3
-                             NAMEBREAK_JUNCTION_TAILS_PER_CALL=7 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=4
-                             NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH=7 NAMEBREAK_JUNCTION_HIT_CAPACITY=1)
-    namebreak_test_executable(junction_search_test_small tests/junction_search_test.cpp namebreak_search_junction_small)
-    foreach(backend IN LISTS JUNCTION_BACKENDS)
-        namebreak_test(junction-search-${backend}-dense junction_search_test_dense --backend ${backend})
-        namebreak_test(junction-search-${backend}-small junction_search_test_small --backend ${backend})
+    namebreak_search_library(namebreak_search_meet_in_the_middle_dense NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS=3)
+    namebreak_test_executable(meet_in_the_middle_search_test_dense tests/meet_in_the_middle_search_test.cpp namebreak_search_meet_in_the_middle_dense)
+    namebreak_search_library(namebreak_search_meet_in_the_middle_small NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS=3
+                             NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_CALL=7 NAMEBREAK_CPU_MIN_CANDIDATES_PER_THREAD=4
+                             NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH=7 NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY=1)
+    namebreak_test_executable(meet_in_the_middle_search_test_small tests/meet_in_the_middle_search_test.cpp namebreak_search_meet_in_the_middle_small)
+    foreach(backend IN LISTS MEET_IN_THE_MIDDLE_BACKENDS)
+        namebreak_test(meet-in-the-middle-search-${backend}-dense meet_in_the_middle_search_test_dense --backend ${backend})
+        namebreak_test(meet-in-the-middle-search-${backend}-small meet_in_the_middle_search_test_small --backend ${backend})
     endforeach()
 endif()
 
@@ -490,34 +492,35 @@ add_test(NAME dictionary-cli-no-basenames-file
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/testrun/dictionary-cli-no-basenames)
 set_tests_properties(dictionary-cli-no-basenames-file PROPERTIES FIXTURES_REQUIRED dictionary-cli-no-basenames-ran)
 
-# The program itself in junction mode (src/cli/main.cpp), on the config
-# tests/data/junction_cli.conf.in makes: recovering the directory of
-# SETUPDAT\BWUNIN.PIF from the hash state after it (exit code 0); not
-# finding it, with the directory longer than the lengths searched and the
-# mode given with --mode; a config without max_length; and a junction that
-# doesn't fit the file's hashes.
-# junction_cli_test(<name> <mode> <junction_a_seed1> <max_length line> <pass regex or ""> [<argument>...])
-function(junction_cli_test name mode seed_a1 max_length regex)
-    set(JUNCTION_CLI_MODE ${mode})
-    set(JUNCTION_CLI_SEED_A1 ${seed_a1})
-    set(JUNCTION_CLI_MAX_LENGTH ${max_length})
-    configure_file(tests/data/junction_cli.conf.in ${CMAKE_BINARY_DIR}/testrun/${name}/config.conf @ONLY)
+# The program itself in meet-in-the-middle mode (src/cli/main.cpp), on the
+# config tests/data/meet_in_the_middle_cli.conf.in makes: recovering the
+# directory of SETUPDAT\BWUNIN.PIF from the hash state after it (exit code 0);
+# not finding it, with the directory longer than the lengths searched and the
+# mode given with --mode; a config without max_length; and a meeting point
+# that doesn't fit the file's hashes. meet_in_the_middle_cli_test(<name>
+# <mode> <meeting_point_a_seed1> <max_length line> <pass regex or "">
+# [<argument>...])
+function(meet_in_the_middle_cli_test name mode seed_a1 max_length regex)
+    set(MEET_IN_THE_MIDDLE_CLI_MODE ${mode})
+    set(MEET_IN_THE_MIDDLE_CLI_SEED_A1 ${seed_a1})
+    set(MEET_IN_THE_MIDDLE_CLI_MAX_LENGTH ${max_length})
+    configure_file(tests/data/meet_in_the_middle_cli.conf.in ${CMAKE_BINARY_DIR}/testrun/${name}/config.conf @ONLY)
     namebreak_test(${name} namebreak --config config.conf ${ARGN})
     if(regex)
         set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
     endif()
 endfunction()
-junction_cli_test(junction-cli-found junction 0x92F62345 "max_length = 8" "BOTH HASHES MATCH: SETUPDAT.BWUNIN.PIF")
-junction_cli_test(junction-cli-not-found bounded 0x92F62345 "max_length = 7"
-                  "Searched every directory - no match of both hashes" --mode junction)
-junction_cli_test(junction-cli-bad-config junction 0x92F62345 "" "missing required key 'max_length'")
-junction_cli_test(junction-cli-bad-junction junction 0x92F62344 "max_length = 8"
-                  "the junction state for hashA .* doesn't fit the file")
+meet_in_the_middle_cli_test(meet-in-the-middle-cli-found meet-in-the-middle 0x92F62345 "max_length = 8" "BOTH HASHES MATCH: SETUPDAT.BWUNIN.PIF")
+meet_in_the_middle_cli_test(meet-in-the-middle-cli-not-found bounded 0x92F62345 "max_length = 7"
+                            "Searched every directory - no match of both hashes" --mode meet-in-the-middle)
+meet_in_the_middle_cli_test(meet-in-the-middle-cli-bad-config meet-in-the-middle 0x92F62345 "" "missing required key 'max_length'")
+meet_in_the_middle_cli_test(meet-in-the-middle-cli-bad-meeting-point meet-in-the-middle 0x92F62344 "max_length = 8"
+                            "the meeting point for hashA .* doesn't fit the file")
 
 # What the config file (src/common/config.h) makes of a search: where
 # buildSearchRequest starts one (start_candidate and
-# resume_from_last_candidate), and the [dictionary] and [junction] sections,
-# every key of them and what they refuse. CPU only.
+# resume_from_last_candidate), and the [dictionary] and [meet-in-the-middle]
+# sections, every key of them and what they refuse. CPU only.
 namebreak_test_executable(config_test tests/config_test.cpp namebreak_common)
 namebreak_test(config_test config_test)
 
@@ -571,12 +574,12 @@ if(NAMEBREAK_NETWORK)
     find_program(CARGO_EXECUTABLE cargo)
     find_program(PYTHON3_EXECUTABLE python3)
     if(CARGO_EXECUTABLE AND PYTHON3_EXECUTABLE)
-        # Junction targets end to end: the memory a client has to declare
-        # before it's offered any, a planted directory found, a quit part
-        # way through a range of tails, and a canary - see the script.
-        namebreak_test(coordinator-junction ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_junction_test.py
+        # Meet-in-the-middle targets end to end: the memory a client has to
+        # declare before it's offered any, a planted directory found, a quit
+        # part way through a range of tails, and a canary - see the script.
+        namebreak_test(coordinator-meet-in-the-middle ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_meet_in_the_middle_test.py
             --client $<TARGET_FILE:namebreak> --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
-        set_tests_properties(coordinator-junction PROPERTIES TIMEOUT 900)
+        set_tests_properties(coordinator-meet-in-the-middle PROPERTIES TIMEOUT 900)
         namebreak_test(coordinator-dictionary ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_dictionary_test.py
             --client $<TARGET_FILE:namebreak> --client-heartbeat-1s $<TARGET_FILE:namebreak_heartbeat_1s>
             --client-one-basename $<TARGET_FILE:namebreak_one_basename_per_report>

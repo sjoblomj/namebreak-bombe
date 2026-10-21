@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, JUNCTION_SINCE, MAX_BASENAMES_PER_REPORT};
+use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, MEET_IN_THE_MIDDLE_SINCE, MAX_BASENAMES_PER_REPORT};
 use sqlx::SqlitePool;
 
 use crate::alphabet::{
@@ -14,8 +14,8 @@ use crate::alphabet::{
 use crate::error::AppError;
 use crate::dictionary::DictionaryTarget;
 use crate::disk::DiskSpace;
-use crate::junction::JunctionTarget;
-use crate::models::{i64_to_u32, PriorityRange, Range, Segment, SkipRange, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME, JUNCTION_ALPHABET_NAME};
+use crate::meet_in_the_middle::MeetInTheMiddleTarget;
+use crate::models::{i64_to_u32, PriorityRange, Range, Segment, SkipRange, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME, MEET_IN_THE_MIDDLE_ALPHABET_NAME};
 use crate::state::{now_unix, RangeConfig};
 
 fn effective_rate(config: &RangeConfig, user: &User) -> f64 {
@@ -34,19 +34,19 @@ fn dictionary_chunk_size(config: &RangeConfig, rate: f64) -> i64 {
     ((rate * config.target_chunk_seconds).round() as i64).clamp(config.min_chunk_candidates, config.max_chunk_candidates).max(1)
 }
 
-/// `effective_rate` for a junction target's ranges, which is in tails a
-/// second - see `User::ema_junction_rate_per_sec`.
-fn effective_junction_rate(config: &RangeConfig, user: &User) -> f64 {
-    user.ema_junction_rate_per_sec.unwrap_or(config.default_junction_rate_per_sec)
+/// `effective_rate` for a meet-in-the-middle target's ranges, which is in
+/// tails a second - see `User::ema_meet_in_the_middle_rate_per_sec`.
+fn effective_meet_in_the_middle_rate(config: &RangeConfig, user: &User) -> f64 {
+    user.ema_meet_in_the_middle_rate_per_sec.unwrap_or(config.default_meet_in_the_middle_rate_per_sec)
 }
 
-/// How many of a junction target's tails to carve for a client rewinding
-/// them at `rate`, so it takes about `target_chunk_seconds`. The client
-/// builds the table afresh for every range it claims, which that time has to
-/// cover too - a few seconds for a table of four characters, a quarter of a
-/// minute for five - so junction ranges want a generous
+/// How many of a meet-in-the-middle target's tails to carve for a client
+/// rewinding them at `rate`, so it takes about `target_chunk_seconds`. The
+/// client builds the table afresh for every range it claims, which that time
+/// has to cover too - a few seconds for a table of four characters, a quarter
+/// of a minute for five - so meet-in-the-middle ranges want a generous
 /// `TARGET_CHUNK_SECONDS`.
-fn junction_chunk_size(config: &RangeConfig, rate: f64) -> i64 {
+fn meet_in_the_middle_chunk_size(config: &RangeConfig, rate: f64) -> i64 {
     ((rate * config.target_chunk_seconds).round() as i64).clamp(config.min_chunk_candidates, config.max_chunk_candidates).max(1)
 }
 
@@ -131,13 +131,13 @@ pub(crate) fn to_claim_response(
         filename_upper_bound: None,
         send_basenames: false,
         encryption_key_hex: None,
-        junction: false,
-        junction_a_seed1_hex: None,
-        junction_a_seed2_hex: None,
-        junction_b_seed1_hex: None,
-        junction_b_seed2_hex: None,
+        meet_in_the_middle: false,
+        meeting_point_a_seed1_hex: None,
+        meeting_point_a_seed2_hex: None,
+        meeting_point_b_seed1_hex: None,
+        meeting_point_b_seed2_hex: None,
         directory_length: None,
-        junction_table_length: None,
+        meet_in_the_middle_table_length: None,
         first_tail_index: None,
         end_tail_index: None,
     }
@@ -187,30 +187,31 @@ pub(crate) fn to_dictionary_claim_response(target: &Target, dictionary: &Diction
         filename_upper_bound: dictionary.bounds.upper.clone(),
         send_basenames,
         encryption_key_hex,
-        junction: false,
-        junction_a_seed1_hex: None,
-        junction_a_seed2_hex: None,
-        junction_b_seed1_hex: None,
-        junction_b_seed2_hex: None,
+        meet_in_the_middle: false,
+        meeting_point_a_seed1_hex: None,
+        meeting_point_a_seed2_hex: None,
+        meeting_point_b_seed1_hex: None,
+        meeting_point_b_seed2_hex: None,
         directory_length: None,
-        junction_table_length: None,
+        meet_in_the_middle_table_length: None,
         first_tail_index: None,
         end_tail_index: None,
     }
 }
 
 /// A claim of the tails numbered `[start, end)` of directories of `length`
-/// characters of junction target `target` - see `ClaimResponse::junction`.
-pub(crate) fn to_junction_claim_response(
+/// characters of meet-in-the-middle target `target` - see
+/// `ClaimResponse::meet_in_the_middle`.
+pub(crate) fn to_meet_in_the_middle_claim_response(
     target: &Target,
-    junction: &JunctionTarget,
+    meet_in_the_middle: &MeetInTheMiddleTarget,
     range_id: i64,
     length: i64,
     start: i64,
     end: i64,
     lease_seconds: i64,
 ) -> ClaimResponse {
-    let space = &junction.space;
+    let space = &meet_in_the_middle.space;
     // What a tail looks like as a whole directory, for a human: the table's
     // characters aren't searched one by one, so they show as '?'.
     let filename = |index: i64| format!("{}{}{}", target.prefix, space.directory(length, index), target.suffix);
@@ -225,7 +226,7 @@ pub(crate) fn to_junction_claim_response(
         hash_b_hex: hex(i64_to_u32(target.hash_b)),
         prune_symbol_runs: target.prune_symbol_runs != 0,
         prune_unopened_brackets: target.prune_unopened_brackets != 0,
-        // A junction search checks the rules over the whole directory
+        // A meet-in-the-middle search checks the rules over the whole directory
         // always, so there's no "leading characters only" to ask for.
         prune_whole_candidate: false,
         max_backslash_count: target.max_backslash_count,
@@ -255,13 +256,13 @@ pub(crate) fn to_junction_claim_response(
         filename_upper_bound: None,
         send_basenames: false,
         encryption_key_hex: None,
-        junction: true,
-        junction_a_seed1_hex: Some(hex(junction.junction_a.0)),
-        junction_a_seed2_hex: Some(hex(junction.junction_a.1)),
-        junction_b_seed1_hex: Some(hex(junction.junction_b.0)),
-        junction_b_seed2_hex: Some(hex(junction.junction_b.1)),
+        meet_in_the_middle: true,
+        meeting_point_a_seed1_hex: Some(hex(meet_in_the_middle.meeting_point_a.0)),
+        meeting_point_a_seed2_hex: Some(hex(meet_in_the_middle.meeting_point_a.1)),
+        meeting_point_b_seed1_hex: Some(hex(meet_in_the_middle.meeting_point_b.0)),
+        meeting_point_b_seed2_hex: Some(hex(meet_in_the_middle.meeting_point_b.1)),
         directory_length: Some(length),
-        junction_table_length: Some(space.table_length()),
+        meet_in_the_middle_table_length: Some(space.table_length()),
         first_tail_index: Some(start),
         end_tail_index: Some(end),
     }
@@ -1017,17 +1018,17 @@ pub async fn claim_range(pool: &SqlitePool, config: &RangeConfig, user: &User) -
             continue;
         }
 
-        // A junction target's - only for a client that knows them and has
-        // room for this target's table (see junction.rs). A client that
-        // hasn't got the memory gets no work from it at all, as one that
-        // can't search a target's alphabet gets none: the table's length is
-        // what a tail even means here, so there's no smaller piece of this
-        // target to give it.
-        if target.is_junction() {
-            if client_version < JUNCTION_SINCE || !junction_table_fits(&target, user)? {
+        // A meet-in-the-middle target's - only for a client that knows them
+        // and has room for this target's table (see meet_in_the_middle.rs). A
+        // client that hasn't got the memory gets no work from it at all, as
+        // one that can't search a target's alphabet gets none: the table's
+        // length is what a tail even means here, so there's no smaller piece
+        // of this target to give it.
+        if target.is_meet_in_the_middle() {
+            if client_version < MEET_IN_THE_MIDDLE_SINCE || !meet_in_the_middle_table_fits(&target, user)? {
                 continue;
             }
-            if let Some(claim) = claim_junction_range(&mut tx, config, &target, user, now).await? {
+            if let Some(claim) = claim_meet_in_the_middle_range(&mut tx, config, &target, user, now).await? {
                 tx.commit().await?;
                 return Ok(Some(claim));
             }
@@ -1341,26 +1342,26 @@ async fn claim_dictionary_range(tx: &mut sqlx::SqliteConnection, config: &RangeC
     Ok(Some(to_dictionary_claim_response(target, &dictionary, range_id, start, end, lease_seconds)))
 }
 
-/// Whether `user` will give a table as big as junction target `target`'s -
-/// what it said at `/register`
-/// (`namebreak_protocol::RegisterRequest::junction_table_bytes`). A client
-/// that said nothing (one older than protocol 1.6) gives none.
-pub(crate) fn junction_table_fits(target: &Target, user: &User) -> Result<bool, AppError> {
-    let Some(budget) = user.junction_table_bytes else { return Ok(false) };
+/// Whether `user` will give a table as big as meet-in-the-middle target
+/// `target`'s - what it said at `/register`
+/// (`namebreak_protocol::RegisterRequest::meet_in_the_middle_table_bytes`). A
+/// client that said nothing (one older than protocol 1.6) gives none.
+pub(crate) fn meet_in_the_middle_table_fits(target: &Target, user: &User) -> Result<bool, AppError> {
+    let Some(budget) = user.meet_in_the_middle_table_bytes else { return Ok(false) };
     if budget < 0 {
         return Ok(false);
     }
-    Ok(crate::junction::of_target(target)?.space.table_bytes() <= budget as u64)
+    Ok(crate::meet_in_the_middle::of_target(target)?.space.table_bytes() <= budget as u64)
 }
 
-/// A junction target's next range for `user`: the unsearched rest of a
-/// released range first, as a dictionary target's claim does, then a fresh
-/// chunk of the length the cursor is on. One length a range - a tail is
+/// A meet-in-the-middle target's next range for `user`: the unsearched rest
+/// of a released range first, as a dictionary target's claim does, then a
+/// fresh chunk of the length the cursor is on. One length a range - a tail is
 /// the directory minus the table's characters, so the tails of two lengths
 /// aren't the same thing.
-async fn claim_junction_range(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, target: &Target, user: &User, now: i64) -> Result<Option<ClaimResponse>, AppError> {
-    let junction = crate::junction::of_target(target)?;
-    let chunk = junction_chunk_size(config, effective_junction_rate(config, user));
+async fn claim_meet_in_the_middle_range(tx: &mut sqlx::SqliteConnection, config: &RangeConfig, target: &Target, user: &User, now: i64) -> Result<Option<ClaimResponse>, AppError> {
+    let meet_in_the_middle = crate::meet_in_the_middle::of_target(target)?;
+    let chunk = meet_in_the_middle_chunk_size(config, effective_meet_in_the_middle_rate(config, user));
     let lease_seconds = config.lease_seconds;
 
     let pending = sqlx::query_as::<_, Range>("SELECT * FROM ranges WHERE target_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1")
@@ -1384,7 +1385,7 @@ async fn claim_junction_range(tx: &mut sqlx::SqliteConnection, config: &RangeCon
         .execute(&mut *tx)
         .await?;
         let (start, end) = (range.start() as i64, range.end() as i64);
-        return Ok(Some(to_junction_claim_response(target, &junction, range.id, range.candidate_len, start, end, lease_seconds)));
+        return Ok(Some(to_meet_in_the_middle_claim_response(target, &meet_in_the_middle, range.id, range.candidate_len, start, end, lease_seconds)));
     }
 
     let progress = sqlx::query_as::<_, TargetProgress>("SELECT * FROM target_progress WHERE target_id = ?").bind(target.id).fetch_one(&mut *tx).await?;
@@ -1392,14 +1393,14 @@ async fn claim_junction_range(tx: &mut sqlx::SqliteConnection, config: &RangeCon
     // The cursor's own length first, then the lengths after it: its index
     // is a tail index of its length, so a length that's run out leaves the
     // next starting from its own first tail.
-    let Some(window) = junction.space.windows().into_iter().find(|w| w.length > progress.candidate_len || (w.length == progress.candidate_len && w.end > next)) else {
+    let Some(window) = meet_in_the_middle.space.windows().into_iter().find(|w| w.length > progress.candidate_len || (w.length == progress.candidate_len && w.end > next)) else {
         return Ok(None);
     };
     let start = if window.length == progress.candidate_len { next.max(window.start) } else { window.start };
     let end = start + chunk.min(window.end - start);
-    persist_progress(&mut *tx, target.id, window.length, end as Pos, JUNCTION_ALPHABET_NAME, "").await?;
-    let range_id = insert_claimed_range(&mut *tx, target.id, window.length, start as Pos, end as Pos, JUNCTION_ALPHABET_NAME, "", None, user, lease_seconds, now).await?;
-    Ok(Some(to_junction_claim_response(target, &junction, range_id, window.length, start, end, lease_seconds)))
+    persist_progress(&mut *tx, target.id, window.length, end as Pos, MEET_IN_THE_MIDDLE_ALPHABET_NAME, "").await?;
+    let range_id = insert_claimed_range(&mut *tx, target.id, window.length, start as Pos, end as Pos, MEET_IN_THE_MIDDLE_ALPHABET_NAME, "", None, user, lease_seconds, now).await?;
+    Ok(Some(to_meet_in_the_middle_claim_response(target, &meet_in_the_middle, range_id, window.length, start, end, lease_seconds)))
 }
 
 pub struct HeartbeatOutcome {
@@ -1506,7 +1507,7 @@ pub async fn heartbeat_range(
 
 /// Records the checkpoint a client reported for `range` (see
 /// `HeartbeatRequest::last_hash_a_match_filename`, and for a dictionary
-/// target's range `next_candidate_number` or a junction target's
+/// target's range `next_candidate_number` or a meet-in-the-middle target's
 /// `next_tail_index`), in the database and in `range` itself. Returns
 /// whether it's further than the one already recorded - progress never moves
 /// backwards, whatever order reports arrive in.
@@ -1517,10 +1518,10 @@ async fn record_progress(
     next_candidate_number: Option<i64>,
     next_tail_index: Option<i64>,
 ) -> Result<bool, AppError> {
-    let new_progress = if range.is_dictionary() || range.is_junction() {
-        // A dictionary range's candidate numbers, a junction range's tail
-        // indices: either way, how far the client has got.
-        let (what, next) = if range.is_junction() { ("tail index", next_tail_index) } else { ("candidate number", next_candidate_number) };
+    let new_progress = if range.is_dictionary() || range.is_meet_in_the_middle() {
+        // A dictionary range's candidate numbers, a meet-in-the-middle
+        // range's tail indices: either way, how far the client has got.
+        let (what, next) = if range.is_meet_in_the_middle() { ("tail index", next_tail_index) } else { ("candidate number", next_candidate_number) };
         match next {
             // The last candidate searched. Nothing yet at the range's
             // start, and nothing to believe past its end.
@@ -1730,8 +1731,8 @@ pub async fn complete_range(
             let observed_rate = candidates_processed as f64 / elapsed_seconds;
             // A dictionary search's rate is kept apart - see
             // User::ema_dictionary_rate_per_sec.
-            let (old_ema, sql) = if range.is_junction() {
-                (user.ema_junction_rate_per_sec, "UPDATE users SET ema_junction_rate_per_sec = ? WHERE id = ?")
+            let (old_ema, sql) = if range.is_meet_in_the_middle() {
+                (user.ema_meet_in_the_middle_rate_per_sec, "UPDATE users SET ema_meet_in_the_middle_rate_per_sec = ? WHERE id = ?")
             } else if range.is_dictionary() {
                 (user.ema_dictionary_rate_per_sec, "UPDATE users SET ema_dictionary_rate_per_sec = ? WHERE id = ?")
             } else {
@@ -2550,7 +2551,7 @@ mod tests {
             target_chunk_seconds: 1.0,
             default_rate_per_sec: 1.0,
             default_dictionary_rate_per_sec: 1.0,
-        default_junction_rate_per_sec: 1.0,
+        default_meet_in_the_middle_rate_per_sec: 1.0,
             // Deliberately larger than either test length's full space, so every
             // claim greedily takes "the rest of the current length" in one chunk -
             // that's what forces a length boundary to actually be crossed between
@@ -2589,8 +2590,8 @@ mod tests {
             token,
             ema_rate_per_sec: None,
             ema_dictionary_rate_per_sec: None,
-            ema_junction_rate_per_sec: None,
-            junction_table_bytes: None,
+            ema_meet_in_the_middle_rate_per_sec: None,
+            meet_in_the_middle_table_bytes: None,
             created_at: now,
             last_seen_at: now,
             protocol_version: "1.0.0".to_string(),
@@ -2624,8 +2625,8 @@ mod tests {
             token,
             ema_rate_per_sec: None,
             ema_dictionary_rate_per_sec: None,
-            ema_junction_rate_per_sec: None,
-            junction_table_bytes: None,
+            ema_meet_in_the_middle_rate_per_sec: None,
+            meet_in_the_middle_table_bytes: None,
             created_at: now,
             last_seen_at: now,
             protocol_version: protocol_version.to_string(),

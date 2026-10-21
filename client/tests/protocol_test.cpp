@@ -1,7 +1,7 @@
 // The coordinator protocol's JSON (net/protocol.h): the reports this client
 // sends, exactly, and the claims it reads - an alphabet target's, as clients
 // before protocol 1.5 read them too, a dictionary target's, with its arrays
-// of strings, and a junction target's. The claims are written as the
+// of strings, and a meet-in-the-middle target's. The claims are written as the
 // server's serde writes them (coordinator/protocol/src/lib.rs). No network
 // access.
 
@@ -48,21 +48,23 @@ static void testReports() {
     check(toJson(quit) == R"({"last_hash_a_match_filename":null,"next_candidate_number":7,"basenames":["X.WAV"]})", "a dictionary range's quit");
     quit = QuitRequest();
     quit.nextTailIndex = 9;
-    check(toJson(quit) == R"({"last_hash_a_match_filename":null,"next_tail_index":9})", "a junction range's quit");
+    check(toJson(quit) == R"({"last_hash_a_match_filename":null,"next_tail_index":9})", "a meet-in-the-middle range's quit");
 
     RegisterRequest reg;
     reg.username = "ojan";
     reg.hostname = "laptop";
     reg.backend = "cuda";
     reg.clientRelease = "dev";
-    check(toJson(reg) == R"({"username":"ojan","hostname":"laptop","backend":"cuda","protocol_version":"1.6.0","client_release":"dev","junction_table_bytes":null})",
-          "a registration without junction_table_memory: no memory for a junction table");
-    reg.junctionTableBytes = 1073741824;
-    check(toJson(reg).find(R"("junction_table_bytes":1073741824})") != std::string::npos, "... and with it, what it will give");
+    check(toJson(reg) == R"({"username":"ojan","hostname":"laptop","backend":"cuda","protocol_version":"1.6.0",)"
+                         R"("client_release":"dev","meet_in_the_middle_table_bytes":null})",
+          "a registration without meet_in_the_middle_table_memory: no memory for a meet-in-the-middle table");
+    reg.meetInTheMiddleTableBytes = 1073741824;
+    check(toJson(reg).find(R"("meet_in_the_middle_table_bytes":1073741824})") != std::string::npos, "... and with it, what it will give");
 
     hb = HeartbeatRequest();
     hb.nextTailIndex = 4242;
-    check(toJson(hb) == R"({"last_hash_a_match_filename":null,"next_tail_index":4242})", "a junction range's heartbeat: the tail it has got to");
+    check(toJson(hb) == R"({"last_hash_a_match_filename":null,"next_tail_index":4242})",
+          "a meet-in-the-middle range's heartbeat: the tail it has got to");
 
     CompleteRequest complete;
     complete.found = true;
@@ -127,8 +129,8 @@ static std::string fieldsJson(const std::string& skip = "", const Fields& change
     return out;
 }
 
-// A junction target's claim, with `fields` in place of its junction fields.
-static std::string junctionClaim(const std::string& fields) {
+// A meet-in-the-middle target's claim, with `fields` in place of its meet-in-the-middle fields.
+static std::string meetInTheMiddleClaim(const std::string& fields) {
     return R"({"range_id":11,"target_id":4,"target_name":"setupdat","prefix":"","suffix":"\\BWUNIN.PIF","hash_a_hex":"0x5BAB63FE",
         "hash_b_hex":"0x8DF2CB08","prune_symbol_runs":true,"prune_unopened_brackets":false,"prune_whole_candidate":false,
         "max_backslash_count":0,"min_backslash_count":0,"prune_adjacent_backslashes":true,"insert_from_start_text":null,
@@ -138,21 +140,21 @@ static std::string junctionClaim(const std::string& fields) {
            fields + "}";
 }
 
-static const Fields kJunctionFields = {
-    {"junction", "true"},
-    {"junction_a_seed1_hex", R"("0x92F62345")"},
-    {"junction_a_seed2_hex", R"("0xB9F61953")"},
-    {"junction_b_seed1_hex", R"("0xB95115E6")"},
-    {"junction_b_seed2_hex", R"("0x7609B4F4")"},
+static const Fields kMeetInTheMiddleFields = {
+    {"meet_in_the_middle", "true"},
+    {"meeting_point_a_seed1_hex", R"("0x92F62345")"},
+    {"meeting_point_a_seed2_hex", R"("0xB9F61953")"},
+    {"meeting_point_b_seed1_hex", R"("0xB95115E6")"},
+    {"meeting_point_b_seed2_hex", R"("0x7609B4F4")"},
     {"directory_length", "6"},
-    {"junction_table_length", "4"},
+    {"meet_in_the_middle_table_length", "4"},
     {"first_tail_index", "0"},
     {"end_tail_index", "1849"},
 };
 
-static std::string junctionFieldsJson(const std::string& skip = "", const Fields& changed = {}) {
+static std::string meetInTheMiddleFieldsJson(const std::string& skip = "", const Fields& changed = {}) {
     std::string out;
-    for (const auto& [key, value] : kJunctionFields) {
+    for (const auto& [key, value] : kMeetInTheMiddleFields) {
         if (key == skip)
             continue;
         std::string v = value;
@@ -165,43 +167,45 @@ static std::string junctionFieldsJson(const std::string& skip = "", const Fields
     return out;
 }
 
-static void testJunctionClaims() {
-    printf("--- a junction target's claims ---\n");
+static void testMeetInTheMiddleClaims() {
+    printf("--- a meet-in-the-middle target's claims ---\n");
     ClaimResponse c;
-    check(parseClaimResponse(junctionClaim(junctionFieldsJson()), c), "a junction target's claim parses");
-    check(c.junction && !c.dictionary && c.rangeId == 11 && c.targetName == "setupdat", "... as a junction target's");
-    check(c.junctionASeed1Hex == "0x92F62345" && c.junctionASeed2Hex == "0xB9F61953" && c.junctionBSeed1Hex == "0xB95115E6" &&
-              c.junctionBSeed2Hex == "0x7609B4F4",
-          "... its junction, both hashes' seeds");
-    check(c.directoryLength == 6 && c.junctionTableLength == 4 && c.firstTailIndex == 0 && c.endTailIndex == 1849 && c.candidateCount == 1849,
+    check(parseClaimResponse(meetInTheMiddleClaim(meetInTheMiddleFieldsJson()), c), "a meet-in-the-middle target's claim parses");
+    check(c.meetInTheMiddle && !c.dictionary && c.rangeId == 11 && c.targetName == "setupdat", "... as a meet-in-the-middle target's");
+    check(c.meetingPointASeed1Hex == "0x92F62345" && c.meetingPointASeed2Hex == "0xB9F61953" && c.meetingPointBSeed1Hex == "0xB95115E6" &&
+              c.meetingPointBSeed2Hex == "0x7609B4F4",
+          "... its meeting point, both hashes' seeds");
+    check(c.directoryLength == 6 && c.meetInTheMiddleTableLength == 4 && c.firstTailIndex == 0 && c.endTailIndex == 1849 && c.candidateCount == 1849,
           "... the directory's length, the table's, and the tails to rewind");
     check(c.alphabet.size() == 43 && c.pruneSymbolRuns && c.pruneAdjacentBackslashes && !c.pruneWholeCandidate,
           "... its alphabet and pruning rules");
     check(c.wordLists.empty() && !c.sendBasenames, "... and none of a dictionary target's fields");
 
-    // What a junction claim has to have.
-    for (const char* key : {"junction_a_seed1_hex", "junction_a_seed2_hex", "junction_b_seed1_hex", "junction_b_seed2_hex", "directory_length",
-                            "junction_table_length", "first_tail_index", "end_tail_index"}) {
+    // What a meet-in-the-middle claim has to have.
+    for (const char* key : {"meeting_point_a_seed1_hex", "meeting_point_a_seed2_hex", "meeting_point_b_seed1_hex",
+                            "meeting_point_b_seed2_hex", "directory_length", "meet_in_the_middle_table_length", "first_tail_index",
+                            "end_tail_index"}) {
         ClaimResponse missing;
-        check(!parseClaimResponse(junctionClaim(junctionFieldsJson(key)), missing), std::string("a junction claim without ") + key + " is refused");
+        check(!parseClaimResponse(meetInTheMiddleClaim(meetInTheMiddleFieldsJson(key)), missing),
+              std::string("a meet-in-the-middle claim without ") + key + " is refused");
     }
     ClaimResponse plain;
-    check(parseClaimResponse(junctionClaim(junctionFieldsJson("junction")), plain) && !plain.junction,
-          "... but without junction: true, it's an alphabet claim, whatever else it has");
+    check(parseClaimResponse(meetInTheMiddleClaim(meetInTheMiddleFieldsJson("meet_in_the_middle")), plain) && !plain.meetInTheMiddle,
+          "... but without meet_in_the_middle: true, it's an alphabet claim, whatever else it has");
     auto refused = [](const Fields& changed, const std::string& what) {
         ClaimResponse bad;
-        check(!parseClaimResponse(junctionClaim(junctionFieldsJson("", changed)), bad), what);
+        check(!parseClaimResponse(meetInTheMiddleClaim(meetInTheMiddleFieldsJson("", changed)), bad), what);
     };
-    refused({{"junction_table_length", "7"}}, "a table longer than the directory: refused");
-    refused({{"junction_table_length", "-1"}}, "a table of fewer than no characters: refused");
+    refused({{"meet_in_the_middle_table_length", "7"}}, "a table longer than the directory: refused");
+    refused({{"meet_in_the_middle_table_length", "-1"}}, "a table of fewer than no characters: refused");
     refused({{"first_tail_index", "-1"}}, "a negative tail index: refused");
     refused({{"end_tail_index", "0"}, {"first_tail_index", "1"}}, "a range of tails ending before it starts: refused");
-    refused({{"junction_a_seed1_hex", "null"}}, "a junction seed left null: refused");
+    refused({{"meeting_point_a_seed1_hex", "null"}}, "a meeting point seed left null: refused");
     {
         // A table of none is a search that rewinds the whole directory.
         ClaimResponse noTable;
-        check(parseClaimResponse(junctionClaim(junctionFieldsJson("", {{"junction_table_length", "0"}})), noTable) &&
-                  noTable.junctionTableLength == 0,
+        check(parseClaimResponse(meetInTheMiddleClaim(meetInTheMiddleFieldsJson("", {{"meet_in_the_middle_table_length", "0"}})), noTable) &&
+                  noTable.meetInTheMiddleTableLength == 0,
               "no table at all: parses");
     }
 }
@@ -277,7 +281,7 @@ static void testClaims() {
 int main() {
     testReports();
     testClaims();
-    testJunctionClaims();
+    testMeetInTheMiddleClaims();
     if (g_failures) {
         fprintf(stderr, "%d of %d check(s) FAILED\n", g_failures, g_checks);
         return 1;

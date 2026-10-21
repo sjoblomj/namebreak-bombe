@@ -29,14 +29,15 @@ pub struct User {
     /// completed - a few hundred times lower on the same GPU, so it's kept
     /// apart (see `ranges::claim_range`).
     pub ema_dictionary_rate_per_sec: Option<f64>,
-    /// The same again for the junction targets' ranges, whose rate is in
-    /// tails a second - see `junction.rs`.
-    pub ema_junction_rate_per_sec: Option<f64>,
-    /// How much memory this client said it will give a junction search's
-    /// table, in bytes, when it registered - see
-    /// `namebreak_protocol::RegisterRequest::junction_table_bytes`. `None`
-    /// for a client that doesn't say, which gets no junction work.
-    pub junction_table_bytes: Option<i64>,
+    /// The same again for the meet-in-the-middle targets' ranges, whose rate
+    /// is in tails a second - see `meet_in_the_middle.rs`.
+    pub ema_meet_in_the_middle_rate_per_sec: Option<f64>,
+    /// How much memory this client said it will give a meet-in-the-middle
+    /// search's table, in bytes, when it registered - see
+    /// `namebreak_protocol::RegisterRequest::meet_in_the_middle_table_bytes`.
+    /// `None` for a client that doesn't say, which gets no meet-in-the-middle
+    /// work.
+    pub meet_in_the_middle_table_bytes: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -110,18 +111,18 @@ pub struct Target {
     /// 1 to have clients send the basenames that match the encryption key -
     /// see `AdminCreateTargetRequest::send_basenames`.
     pub send_basenames: i64,
-    /// A junction target's junction: the hash state after the unknown
-    /// directory, hashA's two seeds and then hashB's, stored like `hash_a`.
-    /// None for any other target - see `junction.rs`.
-    pub junction_a_seed1: Option<i64>,
-    pub junction_a_seed2: Option<i64>,
-    pub junction_b_seed1: Option<i64>,
-    pub junction_b_seed2: Option<i64>,
-    /// The longest directory a junction target searches (`start_len` is the
-    /// shortest), and how many of a directory's first characters the
-    /// client's table holds.
-    pub junction_max_length: Option<i64>,
-    pub junction_table_length: Option<i64>,
+    /// A meet-in-the-middle target's meeting point: the hash state after the
+    /// unknown directory, hashA's two seeds and then hashB's, stored like
+    /// `hash_a`. None for any other target - see `meet_in_the_middle.rs`.
+    pub meeting_point_a_seed1: Option<i64>,
+    pub meeting_point_a_seed2: Option<i64>,
+    pub meeting_point_b_seed1: Option<i64>,
+    pub meeting_point_b_seed2: Option<i64>,
+    /// The longest directory a meet-in-the-middle target searches
+    /// (`start_len` is the shortest), and how many of a directory's first
+    /// characters the client's table holds.
+    pub meet_in_the_middle_max_length: Option<i64>,
+    pub meet_in_the_middle_table_length: Option<i64>,
     /// How many basenames clients have sent for it - see `ranges::record_basenames`.
     pub basename_count: i64,
 }
@@ -133,11 +134,11 @@ pub struct Target {
 /// and the rest keep a number whole, in the index - see `alphabet::block_size`.
 pub const DICTIONARY_ALPHABET_NAME: &str = "dictionary";
 
-/// The same for a junction target's ranges and cursor: their positions are
-/// tail indices (see `junction.rs`) and `candidate_len` is the directory's
-/// length. The empty alphabet again, so a tail index is kept whole in the
-/// index column.
-pub const JUNCTION_ALPHABET_NAME: &str = "junction";
+/// The same for a meet-in-the-middle target's ranges and cursor: their
+/// positions are tail indices (see `meet_in_the_middle.rs`) and
+/// `candidate_len` is the directory's length. The empty alphabet again, so a
+/// tail index is kept whole in the index column.
+pub const MEET_IN_THE_MIDDLE_ALPHABET_NAME: &str = "meet-in-the-middle";
 
 impl Target {
     pub fn is_dictionary(&self) -> bool {
@@ -145,9 +146,9 @@ impl Target {
     }
 
     /// A target whose unknown part is a directory searched from both ends -
-    /// see `junction.rs`.
-    pub fn is_junction(&self) -> bool {
-        self.kind == "junction"
+    /// see `meet_in_the_middle.rs`.
+    pub fn is_meet_in_the_middle(&self) -> bool {
+        self.kind == "meet-in-the-middle"
     }
 }
 
@@ -224,10 +225,10 @@ impl Range {
         self.alphabet_name == DICTIONARY_ALPHABET_NAME
     }
 
-    /// A junction target's range, of one directory length's tail indices -
-    /// see `JUNCTION_ALPHABET_NAME`.
-    pub fn is_junction(&self) -> bool {
-        self.alphabet_name == JUNCTION_ALPHABET_NAME
+    /// A meet-in-the-middle target's range, of one directory length's tail
+    /// indices - see `MEET_IN_THE_MIDDLE_ALPHABET_NAME`.
+    pub fn is_meet_in_the_middle(&self) -> bool {
+        self.alphabet_name == MEET_IN_THE_MIDDLE_ALPHABET_NAME
     }
 
     pub fn start(&self) -> Pos {

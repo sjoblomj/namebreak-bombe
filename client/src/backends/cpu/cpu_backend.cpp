@@ -264,22 +264,23 @@ public:
     }
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
 
-    // A junction search: the tails of a batch rewound from the junction on
-    // every core, their states looked up in the engine's table.
-    bool supportsJunction() const override { return true; }
-    uint64_t junctionTailsPerCall() const override { return 1u << 24; }
-    void beginJunctionSearch(const JunctionConstants& constants) override {
-        junction_ = constants;
+    // A meet-in-the-middle search: the tails of a batch rewound from the
+    // meeting point on every core, their states looked up in the engine's
+    // table.
+    bool supportsMeetInTheMiddle() const override { return true; }
+    uint64_t meetInTheMiddleTailsPerCall() const override { return 1u << 24; }
+    void beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) override {
+        meet_in_the_middle_ = constants;
         cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
-        junction_.cryptTable = cryptTable_.data();
+        meet_in_the_middle_.cryptTable = cryptTable_.data();
     }
-    JunctionOutcome runJunctionBatch(const JunctionBatch& batch) override;
+    MeetInTheMiddleOutcome runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) override;
 
 private:
     unsigned threadCount_;
     DictionaryConstants dictionary_;
     DictionaryHitVerifier dictionaryVerifier_;
-    JunctionConstants junction_;
+    MeetInTheMiddleConstants meet_in_the_middle_;
     HitVerifier verifier_;
     int alphabetSize_ = 0;
     std::string alphabet_;
@@ -511,8 +512,8 @@ DictionaryOutcome CpuBackend::runDictionaryBatches(const std::vector<DictionaryB
     return outcome;
 }
 
-JunctionOutcome CpuBackend::runJunctionBatch(const JunctionBatch& batch) {
-    const JunctionTable& table = *junction_.table;
+MeetInTheMiddleOutcome CpuBackend::runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) {
+    const MeetInTheMiddleTable& table = *meet_in_the_middle_.table;
 
     // Work items: slices of the batch's tails, about eight per thread, taken
     // in turn as the threads finish (as in runBatches). All on this thread,
@@ -527,19 +528,19 @@ JunctionOutcome CpuBackend::runJunctionBatch(const JunctionBatch& batch) {
         items.push_back({from, std::min(batch.start + batch.count, from + tailsPerItem)});
 
     struct Found {
-        std::vector<JunctionHit> hits;
+        std::vector<MeetInTheMiddleHit> hits;
         uint64_t probed = 0;
     };
     std::vector<Found> found(threads);
     std::atomic<size_t> next{0};
     auto work = [&](Found& mine) {
         // One walk per thread, re-seeded for each item it takes.
-        JunctionWalk walk(junction_.alphabet, batch.tailLength, junction_.junction, junction_.cryptTable + kHashAOffset, junction_.rules,
-                          junction_.tailEntry);
+        MeetInTheMiddleWalk walk(meet_in_the_middle_.alphabet, batch.tailLength, meet_in_the_middle_.meetingPoint,
+                                 meet_in_the_middle_.cryptTable + kHashAOffset, meet_in_the_middle_.rules, meet_in_the_middle_.tailEntry);
         for (size_t i = next++; i < items.size(); i = next++) {
             for (bool more = walk.start(items[i].from, items[i].to); more; more = walk.next()) {
                 ++mine.probed;
-                const uint64_t key = junctionKey(walk.state());
+                const uint64_t key = meetingPointKey(walk.state());
                 // The filter first: all but about one lookup in
                 // kFilterBitsPerKey stop there, without touching the keys.
                 if (table.mayHold(key) && table.holds(key))
@@ -558,7 +559,7 @@ JunctionOutcome CpuBackend::runJunctionBatch(const JunctionBatch& batch) {
             worker.join();
     }
 
-    JunctionOutcome outcome;
+    MeetInTheMiddleOutcome outcome;
     for (const Found& mine : found) {
         outcome.hits.insert(outcome.hits.end(), mine.hits.begin(), mine.hits.end());
         outcome.probed += mine.probed;

@@ -27,7 +27,7 @@
     --completed: #16a34a;
     --skipped: #7c3aed;
     --dictionary: #0d9488;
-    --junction: #7c3aed;
+    --meet-in-the-middle: #7c3aed;
     --solved-bg: #fff8e1;
     --solved-border: #f5c518;
     --solved-text: #7a5b00;
@@ -58,7 +58,7 @@
       --completed: #3ecf6e;
       --skipped: #a78bfa;
       --dictionary: #14b8a6;
-      --junction: #a78bfa;
+      --meet-in-the-middle: #a78bfa;
       --solved-bg: #2c2405;
       --solved-border: #caa314;
       --solved-text: #ffd75e;
@@ -295,7 +295,7 @@
   .badge.status-completed { background: var(--completed); }
   .badge.status-skipped { background: var(--skipped); }
   .badge.kind-dictionary { background: var(--dictionary); }
-  .badge.kind-junction { background: var(--junction); }
+  .badge.kind-meet-in-the-middle { background: var(--meet-in-the-middle); }
   /* Black in both themes; the border keeps it visible on the dark card. */
   .badge.status-gap { background: #000; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18); }
   .priority-chip {
@@ -1231,7 +1231,7 @@
     tr.className = 'sweep-row';
     const td = document.createElement('td');
     td.colSpan = DETAIL_COLSPAN;
-    if (t.kind === 'junction') {
+    if (t.kind === 'meet-in-the-middle') {
       if (t.cursor_candidate) {
         td.append('▶ Next range starts at ', candidateChip(t.cursor_candidate), ` (length ${t.cursor_candidate_len})`);
       } else {
@@ -1768,7 +1768,7 @@
       frag.appendChild(dictionarySettings(t.dictionary));
       return frag;
     }
-    if (t.junction) frag.appendChild(junctionSettings(t.junction));
+    if (t.meet_in_the_middle) frag.appendChild(meetInTheMiddleSettings(t.meet_in_the_middle));
 
     const rules = [];
     if (t.prune_symbol_runs) rules.push(hint('symbol runs', 'Skips candidates with 3+ consecutive non-alphanumeric, non-space characters'));
@@ -1802,16 +1802,16 @@
     return frag;
   }
 
-  // What a junction target searches: the hash state after the unknown
-  // directory, which is what the client looks for, how much of the
+  // What a meet-in-the-middle target searches: the hash state after the
+  // unknown directory, which is what the client looks for, how much of the
   // directory its table holds (and what that costs it in memory - a client
   // that won't give that much gets none of this target's work), and how
   // many tails that leaves to rewind.
-  function junctionSettings(j) {
+  function meetInTheMiddleSettings(j) {
     const frag = document.createDocumentFragment();
-    frag.appendChild(settingsLine('Junction', [
-      hint(`hashA ${j.junction_a}`, 'seed1 and seed2 of the hash state right after the directory'),
-      [`hashB ${j.junction_b}`],
+    frag.appendChild(settingsLine('Meeting point', [
+      hint(`hashA ${j.meeting_point_a}`, 'seed1 and seed2 of the hash state right after the directory'),
+      [`hashB ${j.meeting_point_b}`],
     ]));
     frag.appendChild(settingsLine('Table', [
       hint(`first ${characters(j.table_length)}`, 'Held by the client as a table, by the state each one reaches - the forward half of the search'),
@@ -1819,7 +1819,7 @@
       hint(fmtBytes(j.table_bytes), 'A client that will not give a table this much memory gets no work from this target'),
     ]));
     frag.appendChild(settingsLine('To rewind', [
-      hint(`${j.tail_count} tails`, 'The backward half: a tail is a directory without the table\'s characters, rewound from the junction'),
+      hint(`${j.tail_count} tails`, 'The backward half: a tail is a directory without the table\'s characters, rewound from the meeting point'),
       [`for ${j.directory_count} directories`],
     ]));
     return frag;
@@ -2014,10 +2014,10 @@
       kind.title = 'Candidates made of words from word lists';
       head.appendChild(kind);
     }
-    if (t.kind === 'junction') {
+    if (t.kind === 'meet-in-the-middle') {
       const kind = document.createElement('span');
-      kind.className = 'badge kind-junction';
-      kind.textContent = 'Junction';
+      kind.className = 'badge kind-meet-in-the-middle';
+      kind.textContent = 'Meet in the Middle';
       kind.title = 'An unknown directory, searched from both ends at once from the hash state after it';
       head.appendChild(kind);
     }
@@ -2068,8 +2068,8 @@
 
     const bounds = document.createElement('div');
     bounds.className = 'target-bounds';
-    if (t.kind === 'junction') {
-      const j = t.junction;
+    if (t.kind === 'meet-in-the-middle') {
+      const j = t.meet_in_the_middle;
       bounds.append(`Directories of ${j.min_length === j.max_length ? characters(j.min_length) : `${j.min_length} to ${j.max_length} characters`}`);
     } else if (t.kind !== 'dictionary') {
       bounds.append(candidateChip(t.lower_bound), ' → ', candidateChip(t.upper_bound));

@@ -1,0 +1,19 @@
+# The config meet-in-the-middle-cli-* tests run the program with (see
+# CMakeLists.txt): the directory "SETUPDAT" of "SETUPDAT\BWUNIN.PIF", searched
+# from the hash state after it, over the seven characters that directory is
+# made of.
+mode = @MEET_IN_THE_MIDDLE_CLI_MODE@
+
+[meet-in-the-middle]
+alphabet = SETUPDA
+suffix = \BWUNIN.PIF
+meeting_point_a_seed1 = @MEET_IN_THE_MIDDLE_CLI_SEED_A1@
+meeting_point_a_seed2 = 0xB9F61953
+meeting_point_b_seed1 = 0xB95115E6
+meeting_point_b_seed2 = 0x7609B4F4
+hash_a = 0x5BAB63FE
+hash_b = 0x8DF2CB08
+@MEET_IN_THE_MIDDLE_CLI_MAX_LENGTH@
+table_length = 5
+prune_adjacent_backslashes = true
+matches_name = bwunin

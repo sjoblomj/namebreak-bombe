@@ -10,11 +10,11 @@ mod disk;
 #[cfg(test)]
 mod dictionary_tests;
 #[cfg(test)]
-mod junction_tests;
+mod meet_in_the_middle_tests;
 mod error;
 mod handlers;
-mod junction;
 mod likely_prefixes;
+mod meet_in_the_middle;
 mod models;
 mod mpq;
 mod ranges;

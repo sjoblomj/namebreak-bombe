@@ -22,16 +22,16 @@
 //! basenames found -
 //! and its result is kept in `canaries` (see `complete`).
 
-use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, JUNCTION_SINCE};
+use namebreak_protocol::{ClaimResponse, Version, DICTIONARY_SINCE, MEET_IN_THE_MIDDLE_SINCE};
 use rand::RngExt;
 
 use crate::alphabet::{alphabet_size, candidate_to_index, client_alphabet_for, index_to_candidate, max_supported_len, space_size, split_end, Pos};
 use crate::error::AppError;
 use crate::dictionary::DictionarySpace;
-use crate::junction::{self, JunctionSpace, JunctionTarget};
+use crate::meet_in_the_middle::{self, MeetInTheMiddleSpace, MeetInTheMiddleTarget};
 use crate::mpq::{continue_hash, mpq_hash, FILE_KEY_OFFSET, HASH_A_OFFSET, HASH_B_OFFSET, INITIAL_STATE};
-use crate::models::{u32_to_i64, Range, Target, User, DICTIONARY_ALPHABET_NAME, JUNCTION_ALPHABET_NAME};
-use crate::ranges::{insert_claimed_range, junction_table_fits, to_claim_response, to_dictionary_claim_response, to_junction_claim_response};
+use crate::models::{u32_to_i64, Range, Target, User, DICTIONARY_ALPHABET_NAME, MEET_IN_THE_MIDDLE_ALPHABET_NAME};
+use crate::ranges::{insert_claimed_range, meet_in_the_middle_table_fits, to_claim_response, to_dictionary_claim_response, to_meet_in_the_middle_claim_response};
 use crate::state::RangeConfig;
 
 /// Every canary's target's name. One name for all of them, as a client keeps
@@ -65,8 +65,8 @@ pub async fn maybe_claim(
     for candidate in templates {
         let searchable = if candidate.is_dictionary() {
             client_version >= DICTIONARY_SINCE
-        } else if candidate.is_junction() {
-            client_version >= JUNCTION_SINCE && junction_table_fits(&candidate, user)?
+        } else if candidate.is_meet_in_the_middle() {
+            client_version >= MEET_IN_THE_MIDDLE_SINCE && meet_in_the_middle_table_fits(&candidate, user)?
         } else {
             client_alphabet_for(&candidate.alphabet_name, &candidate.alphabet, client_version) == Some(candidate.alphabet.as_str())
                 && candidate.insertions().searchable_by(client_version)
@@ -82,9 +82,9 @@ pub async fn maybe_claim(
     if template.is_dictionary() {
         let Some(rate) = user.ema_dictionary_rate_per_sec else { return Ok(None) };
         dictionary_canary(tx, config, user, &template, rate, now).await
-    } else if template.is_junction() {
-        let Some(rate) = user.ema_junction_rate_per_sec else { return Ok(None) };
-        junction_canary(tx, config, user, &template, rate, now).await
+    } else if template.is_meet_in_the_middle() {
+        let Some(rate) = user.ema_meet_in_the_middle_rate_per_sec else { return Ok(None) };
+        meet_in_the_middle_canary(tx, config, user, &template, rate, now).await
     } else {
         let Some(rate) = user.ema_rate_per_sec else { return Ok(None) };
         alphabet_canary(tx, config, user, &template, rate, now).await
@@ -228,15 +228,15 @@ async fn dictionary_canary(
     Ok(Some(claim))
 }
 
-/// A canary copying junction target `template`: its alphabet, prefix,
+/// A canary copying meet-in-the-middle target `template`: its alphabet, prefix,
 /// suffix, pruning rules and - so that the client searches exactly the way
 /// it does for the real target, within the memory it declared - the same
-/// table length. Its junction is the state after a directory planted in the
-/// range, and its hashes that directory's filename's, so finding it is
-/// finding that directory: to the client it's an ordinary junction claim.
-/// One length only, the planted directory's, so the walk has nothing else
-/// in it.
-async fn junction_canary(
+/// table length. Its meeting point is the state after a directory planted in
+/// the range, and its hashes that directory's filename's, so finding it is
+/// finding that directory: to the client it's an ordinary meet-in-the-middle
+/// claim. One length only, the planted directory's, so the walk has nothing
+/// else in it.
+async fn meet_in_the_middle_canary(
     tx: &mut sqlx::SqliteConnection,
     config: &RangeConfig,
     user: &User,
@@ -244,26 +244,26 @@ async fn junction_canary(
     rate: f64,
     now: i64,
 ) -> Result<Option<ClaimResponse>, AppError> {
-    let settings = junction::of_target(template)?;
+    let settings = meet_in_the_middle::of_target(template)?;
     let cursor_length: i64 = sqlx::query_scalar("SELECT candidate_len FROM target_progress WHERE target_id = ?").bind(template.id).fetch_one(&mut *tx).await?;
     let length = cursor_length.clamp(settings.space.min_length(), settings.space.max_length());
-    let Some(canary) = plan_junction(&settings.space, length, (rate * config.canary_seconds).max(1.0) as i64) else {
+    let Some(canary) = plan_meet_in_the_middle(&settings.space, length, (rate * config.canary_seconds).max(1.0) as i64) else {
         return Ok(None);
     };
-    // The junction of the planted directory - what the client searches for -
-    // and the hashes of the name it makes, which it checks what it finds
-    // against.
+    // The meeting point of the planted directory - what the client searches
+    // for - and the hashes of the name it makes, which it checks what it
+    // finds against.
     let directory = format!("{}{}", template.prefix, canary.planted);
     let filename = format!("{directory}{}", template.suffix);
-    let junction_a = continue_hash(INITIAL_STATE, &directory, HASH_A_OFFSET);
-    let junction_b = continue_hash(INITIAL_STATE, &directory, HASH_B_OFFSET);
+    let meeting_point_a = continue_hash(INITIAL_STATE, &directory, HASH_A_OFFSET);
+    let meeting_point_b = continue_hash(INITIAL_STATE, &directory, HASH_B_OFFSET);
 
     let target_id: i64 = sqlx::query_scalar(
         "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, \
          prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, \
-         priority, start_len, kind, junction_a_seed1, junction_a_seed2, junction_b_seed1, junction_b_seed2, junction_max_length, \
-         junction_table_length, created_at, is_virtual) \
-         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, 0, ?, ?, ?, 'active', 0, ?, 'junction', ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
+         priority, start_len, kind, meeting_point_a_seed1, meeting_point_a_seed2, meeting_point_b_seed1, meeting_point_b_seed2, meet_in_the_middle_max_length, \
+         meet_in_the_middle_table_length, created_at, is_virtual) \
+         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, 0, ?, ?, ?, 'active', 0, ?, 'meet-in-the-middle', ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
     )
     .bind(CANARY_TARGET_NAME)
     .bind(&template.prefix)
@@ -278,10 +278,10 @@ async fn junction_canary(
     .bind(&template.alphabet)
     // One length: the planted directory's, so start_len is also the longest.
     .bind(length)
-    .bind(u32_to_i64(junction_a.0))
-    .bind(u32_to_i64(junction_a.1))
-    .bind(u32_to_i64(junction_b.0))
-    .bind(u32_to_i64(junction_b.1))
+    .bind(u32_to_i64(meeting_point_a.0))
+    .bind(u32_to_i64(meeting_point_a.1))
+    .bind(u32_to_i64(meeting_point_b.0))
+    .bind(u32_to_i64(meeting_point_b.1))
     .bind(length)
     .bind(settings.space.table_length())
     .bind(now)
@@ -292,17 +292,17 @@ async fn junction_canary(
         .bind(target_id)
         .bind(length)
         .bind(canary.end)
-        .bind(JUNCTION_ALPHABET_NAME)
+        .bind(MEET_IN_THE_MIDDLE_ALPHABET_NAME)
         .execute(&mut *tx)
         .await?;
 
     let lease_seconds = config.lease_seconds;
     let range_id =
-        insert_claimed_range(&mut *tx, target_id, length, canary.start as Pos, canary.end as Pos, JUNCTION_ALPHABET_NAME, "", None, user, lease_seconds, now)
+        insert_claimed_range(&mut *tx, target_id, length, canary.start as Pos, canary.end as Pos, MEET_IN_THE_MIDDLE_ALPHABET_NAME, "", None, user, lease_seconds, now)
             .await?;
     let target = record(tx, target_id, range_id, user, &filename, (canary.end - canary.start) as Pos, now).await?;
-    let junction = JunctionTarget { space: canary.space, junction_a, junction_b };
-    Ok(Some(to_junction_claim_response(&target, &junction, range_id, length, canary.start, canary.end, lease_seconds)))
+    let meet_in_the_middle = MeetInTheMiddleTarget { space: canary.space, meeting_point_a, meeting_point_b };
+    Ok(Some(to_meet_in_the_middle_claim_response(&target, &meet_in_the_middle, range_id, length, canary.start, canary.end, lease_seconds)))
 }
 
 /// Keeps a canary's planted `filename` in `canaries`, and reads its target
@@ -343,30 +343,32 @@ fn plan_dictionary(space: &DictionarySpace, words: i64, count: i64) -> Dictionar
     DictionaryCanaryPlan { start, end: start + count, planted }
 }
 
-/// Where a junction canary goes: its range [start, end) of tail indices,
-/// the directory planted in it, and the space of its own one-length target.
+/// Where a meet-in-the-middle canary goes: its range [start, end) of tail
+/// indices, the directory planted in it, and the space of its own one-length
+/// target.
 #[derive(Debug)]
-struct JunctionCanaryPlan {
-    space: JunctionSpace,
+struct MeetInTheMiddleCanaryPlan {
+    space: MeetInTheMiddleSpace,
     start: i64,
     end: i64,
     planted: String,
 }
 
-/// A junction canary of `count` tails (fewer, if that's more than the length
-/// has) at directory `length`, with a directory of letters and digits
-/// planted at a random place in it - no pruning rule skips one of those, as
-/// for an alphabet canary, and the canary leaves `min_backslash_count` at 0
-/// since the planted directory has no '\'. `None` if the alphabet has
-/// neither letters nor digits, or the length can't make a space of its own.
-fn plan_junction(space: &JunctionSpace, length: i64, count: i64) -> Option<JunctionCanaryPlan> {
+/// A meet-in-the-middle canary of `count` tails (fewer, if that's more than
+/// the length has) at directory `length`, with a directory of letters and
+/// digits planted at a random place in it - no pruning rule skips one of
+/// those, as for an alphabet canary, and the canary leaves
+/// `min_backslash_count` at 0 since the planted directory has no '\'. `None`
+/// if the alphabet has neither letters nor digits, or the length can't make a
+/// space of its own.
+fn plan_meet_in_the_middle(space: &MeetInTheMiddleSpace, length: i64, count: i64) -> Option<MeetInTheMiddleCanaryPlan> {
     let plantable: Vec<char> = space.alphabet().chars().filter(|c| c.is_ascii_uppercase() || c.is_ascii_digit()).collect();
     if plantable.is_empty() {
         return None;
     }
     // Its own target searches this length alone, with the template's table:
     // the same memory, and a walk of just the tails around the planted one.
-    let one_length = JunctionSpace::new(space.alphabet(), length, length, space.table_length()).ok()?;
+    let one_length = MeetInTheMiddleSpace::new(space.alphabet(), length, length, space.table_length()).ok()?;
     let tails = one_length.tails_at(length);
     let count = count.clamp(1, tails);
     let mut rng = rand::rng();
@@ -374,7 +376,7 @@ fn plan_junction(space: &JunctionSpace, length: i64, count: i64) -> Option<Junct
     let index = one_length.tail_index(&planted[space.table_length() as usize..]).expect("planted from the alphabet's own characters");
     let offset = rng.random_range(0..count);
     let start = (index - offset).clamp(0, tails - count);
-    Some(JunctionCanaryPlan { space: one_length, start, end: start + count, planted })
+    Some(MeetInTheMiddleCanaryPlan { space: one_length, start, end: start + count, planted })
 }
 
 /// Where a canary goes: its range [start, end) of `len`-character

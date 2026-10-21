@@ -48,8 +48,8 @@ bool parseInsertion(const std::string& s, Insertion& out) {
     return true;
 }
 
-// parseConfigBytes (config.h), which [junction]'s `table_memory` and
-// [coordinator]'s `junction_table_memory` both read.
+// parseConfigBytes (config.h), which [meet-in-the-middle]'s `table_memory` and
+// [coordinator]'s `meet_in_the_middle_table_memory` both read.
 bool parseBytesImpl(const std::string& s, uint64_t& out) {
     const std::string text = trim(s);
     if (text.empty())
@@ -259,11 +259,11 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 currentSection = &out.coordinator;
             } else if (name == "dictionary") {
                 currentSection = &out.dictionary;
-            } else if (name == "junction") {
-                currentSection = &out.junction;
+            } else if (name == "meet-in-the-middle") {
+                currentSection = &out.meetInTheMiddle;
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": unknown section [" + name +
-                        "] (expected [search], [coordinator], [dictionary] or [junction])";
+                        "] (expected [search], [coordinator], [dictionary] or [meet-in-the-middle])";
                 return false;
             }
             continue;
@@ -297,7 +297,7 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 out.checkForUpdates = value == "true";
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search], [coordinator], [dictionary] or [junction] section (only 'mode', 'matches_dir', "
+                        "' must be inside a [search], [coordinator], [dictionary] or [meet-in-the-middle] section (only 'mode', 'matches_dir', "
                         "'backend' and 'check_for_updates' are allowed before any section)";
                 return false;
             }
@@ -416,18 +416,18 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
     return true;
 }
 
-bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::string& error) {
-    out = JunctionRequest();
-    ConfigSectionReader r(config.junction);
+bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleRequest& out, std::string& error) {
+    out = MeetInTheMiddleRequest();
+    ConfigSectionReader r(config.meetInTheMiddle);
     std::string suffix, maxLengthStr, hashAHex, hashBHex;
-    std::string junctionHex[4];
-    static const char* kJunctionKeys[4] = {"junction_a_seed1", "junction_a_seed2", "junction_b_seed1", "junction_b_seed2"};
+    std::string meetingPointHex[4];
+    static const char* kMeetInTheMiddleKeys[4] = {"meeting_point_a_seed1", "meeting_point_a_seed2", "meeting_point_b_seed1", "meeting_point_b_seed2"};
 
     if (!r.getRequired("alphabet", out.alphabet, error)) return false;
     out.prefix = r.getOptional("prefix", "");
     if (!r.getRequired("suffix", suffix, error)) return false;
     for (int i = 0; i < 4; ++i) {
-        if (!r.getRequired(kJunctionKeys[i], junctionHex[i], error))
+        if (!r.getRequired(kMeetInTheMiddleKeys[i], meetingPointHex[i], error))
             return false;
     }
     if (!r.getRequired("hash_a", hashAHex, error)) return false;
@@ -446,19 +446,19 @@ bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::s
 
     const std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
-        error = "unknown key '" + unknown + "' in [junction] section";
+        error = "unknown key '" + unknown + "' in [meet-in-the-middle] section";
         return false;
     }
 
     uint32_t seeds[4] = {0, 0, 0, 0};
     for (int i = 0; i < 4; ++i) {
-        if (!hexToU32(junctionHex[i], seeds[i])) {
-            error = std::string("invalid ") + kJunctionKeys[i] + ": " + junctionHex[i];
+        if (!hexToU32(meetingPointHex[i], seeds[i])) {
+            error = std::string("invalid ") + kMeetInTheMiddleKeys[i] + ": " + meetingPointHex[i];
             return false;
         }
     }
-    out.junctionA = {seeds[0], seeds[1]};
-    out.junctionB = {seeds[2], seeds[3]};
+    out.meetingPointA = {seeds[0], seeds[1]};
+    out.meetingPointB = {seeds[2], seeds[3]};
     if (!hexToU32(hashAHex, out.targetHashA)) {
         error = "invalid hash_a: " + hashAHex;
         return false;
@@ -509,7 +509,7 @@ bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::s
     // decides where the walk's nodes are cut, and a `next` from a search
     // that split the directory elsewhere means something else entirely.
     if (tableLengthStr.empty()) {
-        out.tableLength = junctionTableLengthForBytes((int) out.alphabet.size(), out.maxLength, out.tableBytes);
+        out.tableLength = meetInTheMiddleTableLengthForBytes((int) out.alphabet.size(), out.maxLength, out.tableBytes);
     } else if (!parseCount("table_length", tableLengthStr, out.tableLength)) {
         return false;
     } else if (out.tableLength > out.maxLength) {
@@ -517,18 +517,18 @@ bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::s
         return false;
     }
     out.outputFilePath = namedFilePath(config.matchesDir, "matches", matchesName);
-    out.progressFilePath = namedFilePath(config.matchesDir, "junction", matchesName);
+    out.progressFilePath = namedFilePath(config.matchesDir, "meet-in-the-middle", matchesName);
 
     if (resume) {
-        JunctionProgress progress;
+        MeetInTheMiddleProgress progress;
         bool exists = false;
-        if (!readJunctionProgress(out.progressFilePath, progress, exists, error))
+        if (!readMeetInTheMiddleProgress(out.progressFilePath, progress, exists, error))
             return false;
         if (!exists) {
             printf("resume_from_last_candidate: no progress file %s yet - starting from the beginning\n", out.progressFilePath.c_str());
-        } else if (progress.fingerprint != junctionFingerprint(out)) {
+        } else if (progress.fingerprint != meetInTheMiddleFingerprint(out)) {
             error = "resume_from_last_candidate: " + out.progressFilePath +
-                    " is from a search with different settings (alphabet, prefix, suffix, junction, hashes, lengths, table length or "
+                    " is from a search with different settings (alphabet, prefix, suffix, meeting point, hashes, lengths, table length or "
                     "rules) - remove it, or set resume_from_last_candidate = false, to start this one from the beginning";
             return false;
         } else {
@@ -806,10 +806,10 @@ bool ensureConfigForMode(const std::string& path, const std::string& mode, const
         error = loadErr;
         return false;
     }
-    const std::map<std::string, std::string>& existingSection = sectionName == "coordinator" ? existing.coordinator
-                                                               : sectionName == "dictionary"  ? existing.dictionary
-                                                               : sectionName == "junction"    ? existing.junction
-                                                                                              : existing.search;
+    const std::map<std::string, std::string>& existingSection = sectionName == "coordinator"        ? existing.coordinator
+                                                               : sectionName == "dictionary"        ? existing.dictionary
+                                                               : sectionName == "meet-in-the-middle" ? existing.meetInTheMiddle
+                                                                                                     : existing.search;
 
     for (const auto& kv : keys) {
         if (kv.second.empty())

@@ -1,7 +1,7 @@
 // Correctness test for what the config file (common/config.h) makes of a
 // search: where buildSearchRequest starts one - start_candidate, which is
 // optional, and resume_from_last_candidate, which may move the start to the
-// last line of the matches file - and the [dictionary] and [junction]
+// last line of the matches file - and the [dictionary] and [meet-in-the-middle]
 // sections, every key of them and what they refuse. Pure CPU.
 //
 // Writes matches files under ./config_test/ - ctest runs this from its own
@@ -389,134 +389,136 @@ static void testEnsureDictionaryConfig() {
     }
 }
 
-// A valid [junction] section: the directory of SETUPDAT\BWUNIN.PIF, from the
-// hash state after it (the same values as tests/data/junction_cli.conf.in).
-static ConfigFile makeJunctionConfig() {
+// A valid [meet-in-the-middle] section: the directory of SETUPDAT\BWUNIN.PIF,
+// from the hash state after it (the same values as
+// tests/data/meet_in_the_middle_cli.conf.in).
+static ConfigFile makeMeetInTheMiddleConfig() {
     ConfigFile config;
     config.matchesDir = kDir;
-    config.junction = {
-        {"alphabet", "SETUPDA"},           {"suffix", "\\BWUNIN.PIF"},        {"junction_a_seed1", "0x92F62345"},
-        {"junction_a_seed2", "0xB9F61953"}, {"junction_b_seed1", "0xB95115E6"}, {"junction_b_seed2", "0x7609B4F4"},
+    config.meetInTheMiddle = {
+        {"alphabet", "SETUPDA"},           {"suffix", "\\BWUNIN.PIF"},        {"meeting_point_a_seed1", "0x92F62345"},
+        {"meeting_point_a_seed2", "0xB9F61953"}, {"meeting_point_b_seed1", "0xB95115E6"}, {"meeting_point_b_seed2", "0x7609B4F4"},
         {"hash_a", "0x5BAB63FE"},          {"hash_b", "0x8DF2CB08"},           {"max_length", "8"},
     };
     return config;
 }
 
-static bool buildJunction(const ConfigFile& config, JunctionRequest& req, std::string& error) {
-    return buildJunctionRequest(config, req, error);
+static bool buildMeetInTheMiddle(const ConfigFile& config, MeetInTheMiddleRequest& req, std::string& error) {
+    return buildMeetInTheMiddleRequest(config, req, error);
 }
 
-// What buildJunctionRequest says about `config`: "" if it accepts it.
-static std::string junctionErrorOf(const ConfigFile& config) {
-    JunctionRequest req;
+// What buildMeetInTheMiddleRequest says about `config`: "" if it accepts it.
+static std::string meetInTheMiddleErrorOf(const ConfigFile& config) {
+    MeetInTheMiddleRequest req;
     std::string error;
-    return buildJunctionRequest(config, req, error) ? "" : error;
+    return buildMeetInTheMiddleRequest(config, req, error) ? "" : error;
 }
 
-static void testJunctionRequest() {
-    printf("--- [junction] ---\n");
-    ConfigFile config = makeJunctionConfig();
-    JunctionRequest req;
+static void testMeetInTheMiddleRequest() {
+    printf("--- [meet-in-the-middle] ---\n");
+    ConfigFile config = makeMeetInTheMiddleConfig();
+    MeetInTheMiddleRequest req;
     std::string error;
-    check(buildJunction(config, req, error) && req.alphabet == "SETUPDA" && req.suffix == "\\BWUNIN.PIF" && req.prefix.empty(),
+    check(buildMeetInTheMiddle(config, req, error) && req.alphabet == "SETUPDA" && req.suffix == "\\BWUNIN.PIF" && req.prefix.empty(),
           "the alphabet, the suffix and no prefix");
-    check(req.junctionA == HashState{0x92F62345, 0xB9F61953} && req.junctionB == HashState{0xB95115E6, 0x7609B4F4},
-          "both junction states");
+    check(req.meetingPointA == HashState{0x92F62345, 0xB9F61953} && req.meetingPointB == HashState{0xB95115E6, 0x7609B4F4},
+          "both meeting points");
     check(req.targetHashA == 0x5BAB63FE && req.targetHashB == 0x8DF2CB08, "both hashes");
     check(req.minLength == 1 && req.maxLength == 8, "the lengths, the shortest one by default");
     check(!req.rules.any(), "no pruning rules by default");
-    check(req.outputFilePath == kDir + "/matches.txt" && req.progressFilePath == kDir + "/junction.txt", "the files it writes");
+    check(req.outputFilePath == kDir + "/matches.txt" && req.progressFilePath == kDir + "/meet-in-the-middle.txt", "the files it writes");
 
     // The table's length: worked out from the memory it may use, so that the
     // progress file's fingerprint is of the split the search really uses.
-    check(req.tableLength == junctionTableLengthForBytes(7, 8, (uint64_t) 1 << 30),
+    check(req.tableLength == meetInTheMiddleTableLengthForBytes(7, 8, (uint64_t) 1 << 30),
           "no table_length: as long as the default table_memory allows (" + std::to_string(req.tableLength) + " characters)");
     for (const auto& pair : std::vector<std::pair<std::string, uint64_t>>{
              {"4096", 4096}, {"64K", 64ull * 1024}, {"512M", 512ull * 1024 * 1024}, {"2G", 2ull * 1024 * 1024 * 1024}}) {
-        config.junction["table_memory"] = pair.first;
-        check(buildJunction(config, req, error) && req.tableBytes == pair.second, "table_memory = " + pair.first);
+        config.meetInTheMiddle["table_memory"] = pair.first;
+        check(buildMeetInTheMiddle(config, req, error) && req.tableBytes == pair.second, "table_memory = " + pair.first);
     }
-    config.junction["table_memory"] = "1T";
-    check(junctionErrorOf(config).find("table_memory") != std::string::npos, "table_memory with an unknown suffix: an error");
-    config.junction["table_memory"] = "lots";
-    check(junctionErrorOf(config).find("table_memory") != std::string::npos, "table_memory that isn't a number: an error");
-    config.junction.erase("table_memory");
+    config.meetInTheMiddle["table_memory"] = "1T";
+    check(meetInTheMiddleErrorOf(config).find("table_memory") != std::string::npos, "table_memory with an unknown suffix: an error");
+    config.meetInTheMiddle["table_memory"] = "lots";
+    check(meetInTheMiddleErrorOf(config).find("table_memory") != std::string::npos, "table_memory that isn't a number: an error");
+    config.meetInTheMiddle.erase("table_memory");
 
-    config.junction["table_length"] = "5";
-    check(buildJunction(config, req, error) && req.tableLength == 5, "table_length given: used as it is");
-    config.junction["table_length"] = "9";
-    check(junctionErrorOf(config).find("max_length") != std::string::npos, "table_length past max_length: an error");
-    config.junction.erase("table_length");
+    config.meetInTheMiddle["table_length"] = "5";
+    check(buildMeetInTheMiddle(config, req, error) && req.tableLength == 5, "table_length given: used as it is");
+    config.meetInTheMiddle["table_length"] = "9";
+    check(meetInTheMiddleErrorOf(config).find("max_length") != std::string::npos, "table_length past max_length: an error");
+    config.meetInTheMiddle.erase("table_length");
 
-    config.junction["prefix"] = "SETUPDAT\\";
-    check(buildJunction(config, req, error) && req.prefix == "SETUPDAT\\", "a prefix");
-    config.junction.erase("prefix");
+    config.meetInTheMiddle["prefix"] = "SETUPDAT\\";
+    check(buildMeetInTheMiddle(config, req, error) && req.prefix == "SETUPDAT\\", "a prefix");
+    config.meetInTheMiddle.erase("prefix");
 
-    config.junction["min_length"] = "3";
-    config.junction["prune_symbol_runs"] = "true";
-    config.junction["prune_unopened_brackets"] = "true";
-    config.junction["prune_adjacent_backslashes"] = "true";
-    config.junction["max_backslash_count"] = "2";
-    config.junction["min_backslash_count"] = "1";
-    check(buildJunction(config, req, error) && req.minLength == 3 && req.rules.symbolRuns && req.rules.unopenedBrackets &&
+    config.meetInTheMiddle["min_length"] = "3";
+    config.meetInTheMiddle["prune_symbol_runs"] = "true";
+    config.meetInTheMiddle["prune_unopened_brackets"] = "true";
+    config.meetInTheMiddle["prune_adjacent_backslashes"] = "true";
+    config.meetInTheMiddle["max_backslash_count"] = "2";
+    config.meetInTheMiddle["min_backslash_count"] = "1";
+    check(buildMeetInTheMiddle(config, req, error) && req.minLength == 3 && req.rules.symbolRuns && req.rules.unopenedBrackets &&
               req.rules.adjacentBackslashes && req.rules.maxBackslashCount == 2 && req.rules.minBackslashCount == 1,
           "the lengths and every rule");
-    config.junction["prune_symbol_runs"] = "sometimes";
-    check(junctionErrorOf(config).find("prune_symbol_runs") != std::string::npos, "a rule that isn't a boolean: an error");
-    config = makeJunctionConfig();
+    config.meetInTheMiddle["prune_symbol_runs"] = "sometimes";
+    check(meetInTheMiddleErrorOf(config).find("prune_symbol_runs") != std::string::npos, "a rule that isn't a boolean: an error");
+    config = makeMeetInTheMiddleConfig();
 
-    config.junction["matches_name"] = "bwunin";
-    check(buildJunction(config, req, error) && req.outputFilePath == kDir + "/matches-bwunin.txt" &&
-              req.progressFilePath == kDir + "/junction-bwunin.txt",
+    config.meetInTheMiddle["matches_name"] = "bwunin";
+    check(buildMeetInTheMiddle(config, req, error) && req.outputFilePath == kDir + "/matches-bwunin.txt" &&
+              req.progressFilePath == kDir + "/meet-in-the-middle-bwunin.txt",
           "matches_name names both files");
-    config.junction.erase("matches_name");
+    config.meetInTheMiddle.erase("matches_name");
 
-    for (const char* key : {"alphabet", "suffix", "hash_a", "hash_b", "max_length", "junction_a_seed1", "junction_b_seed2"}) {
-        ConfigFile missing = makeJunctionConfig();
-        missing.junction.erase(key);
-        check(junctionErrorOf(missing).find(std::string("missing required key '") + key + "'") != std::string::npos,
+    for (const char* key : {"alphabet", "suffix", "hash_a", "hash_b", "max_length", "meeting_point_a_seed1", "meeting_point_b_seed2"}) {
+        ConfigFile missing = makeMeetInTheMiddleConfig();
+        missing.meetInTheMiddle.erase(key);
+        check(meetInTheMiddleErrorOf(missing).find(std::string("missing required key '") + key + "'") != std::string::npos,
               std::string("without ") + key + ": an error");
     }
-    config.junction["junction_a_seed1"] = "not hex";
-    check(junctionErrorOf(config).find("junction_a_seed1") != std::string::npos, "a seed that isn't hex: an error");
-    config = makeJunctionConfig();
-    config.junction["prune_whole_candidate"] = "true";
-    check(junctionErrorOf(config).find("unknown key") != std::string::npos, "a key [junction] doesn't have: an error");
+    config.meetInTheMiddle["meeting_point_a_seed1"] = "not hex";
+    check(meetInTheMiddleErrorOf(config).find("meeting_point_a_seed1") != std::string::npos, "a seed that isn't hex: an error");
+    config = makeMeetInTheMiddleConfig();
+    config.meetInTheMiddle["prune_whole_candidate"] = "true";
+    check(meetInTheMiddleErrorOf(config).find("unknown key") != std::string::npos, "a key [meet-in-the-middle] doesn't have: an error");
 }
 
-static void testJunctionResume() {
-    printf("--- resume_from_last_candidate in [junction] ---\n");
-    ConfigFile config = makeJunctionConfig();
-    config.junction["matches_name"] = "resume";
-    config.junction["table_length"] = "5";
-    JunctionRequest req;
+static void testMeetInTheMiddleResume() {
+    printf("--- resume_from_last_candidate in [meet-in-the-middle] ---\n");
+    ConfigFile config = makeMeetInTheMiddleConfig();
+    config.meetInTheMiddle["matches_name"] = "resume";
+    config.meetInTheMiddle["table_length"] = "5";
+    MeetInTheMiddleRequest req;
     std::string error;
-    buildJunction(config, req, error);
+    buildMeetInTheMiddle(config, req, error);
     const std::string progressPath = req.progressFilePath;
     std::filesystem::remove(progressPath);
-    const std::string fingerprint = junctionFingerprint(req);
+    const std::string fingerprint = meetInTheMiddleFingerprint(req);
 
-    config.junction["resume_from_last_candidate"] = "true";
-    check(buildJunction(config, req, error) && req.startNumber == 0, "no progress file: from the beginning");
-    writeJunctionProgress(progressPath, {fingerprint, 11}, 400, "?????AT", error);
-    check(buildJunction(config, req, error) && req.startNumber == 11, "a progress file from this search: resumes from its node");
-    config.junction["resume_from_last_candidate"] = "false";
-    check(buildJunction(config, req, error) && req.startNumber == 0, "resume_from_last_candidate = false: from the beginning anyway");
-    config.junction["resume_from_last_candidate"] = "true";
+    config.meetInTheMiddle["resume_from_last_candidate"] = "true";
+    check(buildMeetInTheMiddle(config, req, error) && req.startNumber == 0, "no progress file: from the beginning");
+    writeMeetInTheMiddleProgress(progressPath, {fingerprint, 11}, 400, "?????AT", error);
+    check(buildMeetInTheMiddle(config, req, error) && req.startNumber == 11, "a progress file from this search: resumes from its node");
+    config.meetInTheMiddle["resume_from_last_candidate"] = "false";
+    check(buildMeetInTheMiddle(config, req, error) && req.startNumber == 0, "resume_from_last_candidate = false: from the beginning anyway");
+    config.meetInTheMiddle["resume_from_last_candidate"] = "true";
 
     // The table's length decides where the walk's nodes are cut, so a search
     // that split the directory elsewhere mustn't be resumed as this one.
-    config.junction["table_length"] = "4";
-    check(junctionErrorOf(config).find("different settings") != std::string::npos,
+    config.meetInTheMiddle["table_length"] = "4";
+    check(meetInTheMiddleErrorOf(config).find("different settings") != std::string::npos,
           "a progress file from a search with another table length: refuses to resume, saying why");
-    config.junction["table_length"] = "5";
-    config.junction["min_length"] = "2";
-    check(junctionErrorOf(config).find("different settings") != std::string::npos, "... or with other lengths");
-    config.junction.erase("min_length");
-    check(buildJunction(config, req, error) && req.startNumber == 11, "and resumes again once it's the same search");
+    config.meetInTheMiddle["table_length"] = "5";
+    config.meetInTheMiddle["min_length"] = "2";
+    check(meetInTheMiddleErrorOf(config).find("different settings") != std::string::npos, "... or with other lengths");
+    config.meetInTheMiddle.erase("min_length");
+    check(buildMeetInTheMiddle(config, req, error) && req.startNumber == 11, "and resumes again once it's the same search");
 
     writeFile(progressPath, "fingerprint = 0123456789abcdef\n");
-    check(junctionErrorOf(config).find("isn't a junction search's progress file") != std::string::npos, "a broken progress file: an error");
+    check(meetInTheMiddleErrorOf(config).find("isn't a meet-in-the-middle search's progress file") != std::string::npos,
+          "a broken progress file: an error");
     std::filesystem::remove(progressPath);
 }
 
@@ -649,8 +651,8 @@ int main() {
     testDictionaryRequest();
     testDictionaryResume();
     testEnsureDictionaryConfig();
-    testJunctionRequest();
-    testJunctionResume();
+    testMeetInTheMiddleRequest();
+    testMeetInTheMiddleResume();
 
     std::filesystem::remove_all(kDir);
     if (g_failures) {

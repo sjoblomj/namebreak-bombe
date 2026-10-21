@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_ENGINE_JUNCTION_H
-#define NAMEBREAK_ENGINE_JUNCTION_H
+#ifndef NAMEBREAK_ENGINE_MEET_IN_THE_MIDDLE_H
+#define NAMEBREAK_ENGINE_MEET_IN_THE_MIDDLE_H
 
 #include <cstdint>
 #include <string>
@@ -10,13 +10,14 @@
 #include "engine/limits.h"
 #include "engine/mpq_hash.h"
 
-// A junction search: the file's name is a known prefix, an unknown
+// A meet-in-the-middle search: the file's name is a known prefix, an unknown
 // directory, and a known suffix - and the hash state right after the
 // directory, where the suffix begins, is already known for hashA and for
-// hashB. That state is the junction, and it's what the search looks for: the
-// directory is whatever string takes the hash from the prefix's state to it.
-// (A junction is recovered from two files of the same unknown directory
-// whose basenames are known - see README.md's "Junction mode".)
+// hashB. That state is the meeting point, and it's what the search looks
+// for: the directory is whatever string takes the hash from the prefix's
+// state to it.
+// (A meeting point is recovered from two files of the same unknown directory
+// whose basenames are known - see README.md's "Meet-in-the-middle mode".)
 //
 // Knowing the state at both ends is what makes the mode worth having,
 // because every step of the hash
@@ -26,10 +27,10 @@
 // search can come at the directory from both ends and meet in the middle:
 //
 //   * forward, from the prefix's state: every directory of the table's
-//     length, kept in a table by the state it reaches (JunctionTable);
-//   * backward, from the junction: every *tail* - a directory's last
-//     characters - rewound character by character (JunctionWalk), and the
-//     state it reaches looked up in the table.
+//     length, kept in a table by the state it reaches (MeetInTheMiddleTable);
+//   * backward, from the meeting point: every *tail* - a directory's last
+//     characters - rewound character by character (MeetInTheMiddleWalk),
+//     and the state it reaches looked up in the table.
 //
 // A tail of j characters whose state is in the table means a directory of
 // tableLength + j characters: the table's prefix, then the tail. So a
@@ -37,15 +38,16 @@
 // instead of the alphabet^n candidates a brute force hashes - the table
 // buys back one character of search per character it holds, as far as there
 // is memory for it. Directories shorter than the table's length are found
-// while it's being built, by the same walk (JunctionTable::build).
+// while it's being built, by the same walk (MeetInTheMiddleTable::build).
 //
 // Terminology:
-// * Directory = the part of the name that is unknown, what a junction search
-//   brute-forces (the "candidate" of the other modes)
-// * Filename  = Prefix + Directory + Suffix
-// * Junction  = the hash state after Prefix + Directory
-// * Tail      = a directory's last characters, which the backward walk
-//   rewinds from the junction; its first characters are the table's
+// * Directory    = the part of the name that is unknown, what a
+//   meet-in-the-middle search brute-forces (the "candidate" of the other
+//   modes)
+// * Filename     = Prefix + Directory + Suffix
+// * MeetingPoint = the hash state after Prefix + Directory
+// * Tail         = a directory's last characters, which the backward walk
+//   rewinds from the meeting point; its first characters are the table's
 
 // 33's inverse modulo 2^32 (33 * kInv33 == 1): seed2's step multiplies it by
 // 1 + (1 << 5), so undoing that step divides by 33 - which, 33 being odd, is
@@ -69,11 +71,11 @@ inline HashState hashStepBack(HashState after, unsigned char ch, const uint32_t*
 // inverse of continueHash(state, text, offset, cryptTable).
 HashState rewindHash(HashState state, const std::string& text, int offset, const uint32_t* cryptTable);
 
-// The key a junction search compares states by - see junctionKey
+// The key a meet-in-the-middle search compares states by - see meetingPointKey
 // (hash_match.h), which masks it to the bits that must match (all 64 in the
 // program, fewer in the tests' dense-hit builds).
-inline uint64_t junctionKey(HashState state) {
-    return junctionKey(state.first, state.second);
+inline uint64_t meetingPointKey(HashState state) {
+    return meetingPointKey(state.first, state.second);
 }
 
 // --- The pruning rules, from the right ---------------------------------------
@@ -118,14 +120,14 @@ PruneState dirPruneStart(const std::string& prefix);
 // to right, from dirPruneStart(prefix), plus the rules that only a whole
 // directory settles: min_backslash_count over all of it, and a '\' it ends
 // with next to one `suffix` begins with. Every directory the walk and the
-// table skip is one this rejects, so a junction search reports exactly the
-// directories this accepts (and that match the junction).
+// table skip is one this rejects, so a meet-in-the-middle search reports
+// exactly the directories this accepts (and that match the meeting point).
 bool dirPasses(const PruneRules& rules, const std::string& prefix, const std::string& suffix, const std::string& dir);
 
 // --- The space ---------------------------------------------------------------
 
-// Which directories a junction search covers, and how the nodes of its
-// backward walk are numbered.
+// Which directories a meet-in-the-middle search covers, and how the nodes of
+// its backward walk are numbered.
 //
 // A node is one tail, of 0 to maxTailLength() characters. Its number counts
 // through the lengths, shortest first, and within a length through the tails
@@ -134,7 +136,7 @@ bool dirPasses(const PruneRules& rules, const std::string& prefix, const std::st
 // the one whose state the most other tails share. (The empty tail, number 0,
 // is a node like any other: the directory is then exactly the table's
 // length.)
-class JunctionSpace {
+class MeetInTheMiddleSpace {
 public:
     // False, with `error` set, on an unusable alphabet or length - including
     // a tail space too big to number in 64 bits.
@@ -142,7 +144,7 @@ public:
     // `tableLength` is how many of a directory's first characters the table
     // holds, 0 to maxLength (clamp it before calling: a table longer than
     // the longest directory is the caller's mistake, not a silent fix).
-    static bool create(const std::string& alphabet, int minLength, int maxLength, int tableLength, JunctionSpace& out,
+    static bool create(const std::string& alphabet, int minLength, int maxLength, int tableLength, MeetInTheMiddleSpace& out,
                        std::string& error);
 
     const std::string& alphabet() const { return alphabet_; }
@@ -186,12 +188,13 @@ private:
 // How many directories a table of `tableLength` characters holds, at most -
 // the pruning rules may leave out some of them. UINT64_MAX if that doesn't
 // fit in 64 bits.
-uint64_t junctionTableCount(int alphabetSize, int tableLength);
+uint64_t meetInTheMiddleTableCount(int alphabetSize, int tableLength);
 
 // The largest table length whose table fits in `bytes` of memory, for an
 // alphabet of `alphabetSize` characters - 0 if even a one-character table
-// doesn't, and never more than `maxLength`. See JunctionTable::bytesFor.
-int junctionTableLengthForBytes(int alphabetSize, int maxLength, uint64_t bytes);
+// doesn't, and never more than `maxLength`. See
+// MeetInTheMiddleTable::bytesFor.
+int meetInTheMiddleTableLengthForBytes(int alphabetSize, int maxLength, uint64_t bytes);
 
 // --- The forward half --------------------------------------------------------
 
@@ -203,7 +206,7 @@ int junctionTableLengthForBytes(int alphabetSize, int maxLength, uint64_t bytes)
 // memory allows, so that doubling would cost a whole character of reach).
 // The few directories a search ever looks up again are re-walked instead
 // (prefixesFor).
-class JunctionTable {
+class MeetInTheMiddleTable {
 public:
     // The memory a table of `tableLength` holds, for an alphabet of
     // `alphabetSize`: its keys and its filter. UINT64_MAX if that length's
@@ -213,19 +216,19 @@ public:
     // Builds the table of `space`: the hashA state of every directory of
     // space.tableLength() characters that `rules` allow, hashed onto
     // `startState` (the state after the filename's prefix) and keyed by
-    // junctionKey.
+    // meetingPointKey.
     //
     // The walk gets there through every *shorter* directory, so it checks
-    // those against `junction` as it goes, since nothing else would: the
+    // those against `meetingPoint` as it goes, since nothing else would: the
     // backward walk only ever adds characters to a full-length prefix.
-    // Every shorter directory that matches the junction - and that is at
+    // Every shorter directory that matches the meeting point - and that is at
     // least space.minLength() characters - is appended to `shortMatches`,
     // for the caller to check in full as it does the walk's own hits.
     //
     // `cryptTable` must outlive the table: prefixesFor walks the hash again.
     // False, with `error` set, if the table doesn't fit in memory.
-    static bool build(const JunctionSpace& space, HashState startState, const PruneState& prefixEntry, const PruneRules& rules,
-                      const uint32_t* cryptTable, HashState junction, std::vector<std::string>& shortMatches, JunctionTable& out,
+    static bool build(const MeetInTheMiddleSpace& space, HashState startState, const PruneState& prefixEntry, const PruneRules& rules,
+                      const uint32_t* cryptTable, HashState meetingPoint, std::vector<std::string>& shortMatches, MeetInTheMiddleTable& out,
                       std::string& error);
 
     // Whether the table may hold `key` - a bitmap of the keys' mixed bits,
@@ -272,7 +275,7 @@ public:
     static constexpr uint64_t kFilterBitsPerKey = 8;
 
 private:
-    JunctionSpace space_;
+    MeetInTheMiddleSpace space_;
     HashState startState_{0, 0};
     PruneState prefixEntry_;
     PruneRules rules_;
@@ -285,7 +288,7 @@ private:
 
 // --- The backward half -------------------------------------------------------
 
-// The tails of one length, walked from the junction: the mirror of
+// The tails of one length, walked from the meeting point: the mirror of
 // IncrementalPrefixHasher (mpq_hash.h), running the hash backwards.
 //
 // Like it, it keeps the hash state after each rewound character and
@@ -293,12 +296,12 @@ private:
 // amortized rather than one per character of the tail. The pruning rules ride
 // along on the same stack: a tail they reject is skipped together with every
 // longer tail that ends in it, by jumping the index straight past them all.
-class JunctionWalk {
+class MeetInTheMiddleWalk {
 public:
     // `table` is the crypt table at hashA's offset (cryptTable +
     // kHashAOffset), and must outlive the walk. `entry` is the rules' state
     // to the directory's right - tailPruneStart(suffix).
-    JunctionWalk(std::string alphabet, int tailLength, HashState junction, const uint32_t* table, const PruneRules& rules,
+    MeetInTheMiddleWalk(std::string alphabet, int tailLength, HashState meetingPoint, const uint32_t* table, const PruneRules& rules,
                  const TailPruneState& entry);
 
     // Positions the walk on the first tail the rules allow whose index is in
@@ -309,7 +312,7 @@ public:
 
     // The tail the walk is on: its index, the characters themselves (in the
     // directory's own order, its last character last) and the hash state
-    // after the directory's first characters - the junction, rewound over
+    // after the directory's first characters - the meeting point, rewound over
     // the tail. Only between a true start()/next() and the next call.
     uint64_t index() const { return index_; }
     const std::string& tail() const { return tail_; }
@@ -350,10 +353,10 @@ private:
     // place_[k] = alphabet^(tailLength_ - k): what one step of digit_[k] is
     // worth in the index.
     std::vector<uint64_t> place_;
-    // stack_[k] = the junction rewound over the first k characters,
-    // prune_[k] = the rules' state after them. stack_[0] is the junction.
+    // stack_[k] = the meeting point rewound over the first k characters,
+    // prune_[k] = the rules' state after them. stack_[0] is the meeting point.
     std::vector<HashState> stack_;
     std::vector<TailPruneState> prune_;
 };
 
-#endif // NAMEBREAK_ENGINE_JUNCTION_H
+#endif // NAMEBREAK_ENGINE_MEET_IN_THE_MIDDLE_H

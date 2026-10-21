@@ -34,10 +34,10 @@ pub struct RangeConfig {
     /// apart - see `User::ema_dictionary_rate_per_sec`. A GPU searches about
     /// 20 billion a second, a CPU about 0.2.
     pub default_dictionary_rate_per_sec: f64,
-    /// And for a junction target's ranges, which are counted in tails: a
-    /// GPU rewinds and looks up about 2 billion a second, a CPU about 0.07 -
-    /// see `User::ema_junction_rate_per_sec`.
-    pub default_junction_rate_per_sec: f64,
+    /// And for a meet-in-the-middle target's ranges, which are counted in
+    /// tails: a GPU rewinds and looks up about 2 billion a second, a CPU
+    /// about 0.07 - see `User::ema_meet_in_the_middle_rate_per_sec`.
+    pub default_meet_in_the_middle_rate_per_sec: f64,
     pub min_chunk_candidates: i64,
     pub max_chunk_candidates: i64,
     /// How long a claimed range stays leased after the last sign of life
@@ -87,7 +87,7 @@ impl RangeConfig {
             target_chunk_seconds: env_f64("TARGET_CHUNK_SECONDS", 900.0),
             default_rate_per_sec: env_f64("DEFAULT_RATE_PER_SEC", 500_000_000.0),
             default_dictionary_rate_per_sec: env_f64("DEFAULT_DICTIONARY_RATE_PER_SEC", 1_000_000_000.0),
-            default_junction_rate_per_sec: env_f64("DEFAULT_JUNCTION_RATE_PER_SEC", 1_000_000_000.0),
+            default_meet_in_the_middle_rate_per_sec: env_f64("DEFAULT_MEET_IN_THE_MIDDLE_RATE_PER_SEC", 1_000_000_000.0),
             min_chunk_candidates: env_i64("MIN_CHUNK_CANDIDATES", 1_000_000),
             max_chunk_candidates: env_i64("MAX_CHUNK_CANDIDATES", 1_000_000_000_000_000),
             lease_seconds: env_i64("LEASE_SECONDS", 6 * 60 * 60),

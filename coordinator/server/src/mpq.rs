@@ -1,8 +1,8 @@
 //! The MPQ hash, as the client computes it (`client/src/engine/mpq_hash.h`).
 //! The server needs it to plant a canary's filename (`canary.rs`) and to
-//! check a junction target's state against the file's hashes
-//! (`junction.rs`): in both, a name the server makes up has to hash to
-//! exactly what a client will compute for it.
+//! check a meet-in-the-middle target's state against the file's hashes
+//! (`meet_in_the_middle.rs`): in both, a name the server makes up has to hash
+//! to exactly what a client will compute for it.
 
 use std::sync::OnceLock;
 
@@ -74,15 +74,15 @@ mod tests {
     #[test]
     fn continue_hash_picks_up_where_it_left_off() {
         // The state after a directory, continued over the rest of the name,
-        // is the whole name's hash - what a junction target rests on.
+        // is the whole name's hash - what a meet-in-the-middle target rests on.
         for offset in [HASH_A_OFFSET, HASH_B_OFFSET, FILE_KEY_OFFSET] {
             let whole = continue_hash(INITIAL_STATE, "SETUPDAT\\BWUNIN.PIF", offset);
             let after_dir = continue_hash(INITIAL_STATE, "SETUPDAT", offset);
             assert_eq!(continue_hash(after_dir, "\\BWUNIN.PIF", offset), whole);
         }
         // And the hashes of that name, worked out by another implementation
-        // of the MPQ hash altogether (client/tests/junction_test.cpp has the
-        // same two).
+        // of the MPQ hash altogether
+        // (client/tests/meet_in_the_middle_test.cpp has the same two).
         assert_eq!(mpq_hash("SETUPDAT\\BWUNIN.PIF", HASH_A_OFFSET), 0x5BAB_63FE);
         assert_eq!(mpq_hash("SETUPDAT\\BWUNIN.PIF", HASH_B_OFFSET), 0x8DF2_CB08);
     }

@@ -47,14 +47,14 @@ NAMEBREAK_HOST_DEVICE inline bool basenameKeyMatches(uint32_t hash, uint32_t key
     return (hash & kBasenameMatchMask) == (key & kBasenameMatchMask);
 }
 
-// And the same for a junction search (engine/junction.h), where what must
-// match isn't a hash but the whole hash state after the unknown directory:
-// how many of the low bits *of each of seed1 and seed2* must equal the
-// junction's. All 32 of each - the state entire - in the program. The
-// junction search tests build with fewer
-// (-DNAMEBREAK_JUNCTION_MATCH_BITS=3, so six bits in all), so that
-// directories match the junction by chance all the time, and every path a
-// match takes - looking its directories back up in the table, checking them
+// And the same for a meet-in-the-middle search (engine/meet_in_the_middle.h),
+// where what must match isn't a hash but the whole hash state after the
+// unknown directory: how many of the low bits *of each of seed1 and seed2*
+// must equal the meeting point's. All 32 of each - the state entire - in the
+// program. The meet-in-the-middle search tests build with fewer
+// (-DNAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS=3, so six bits in all), so that
+// directories match the meeting point by chance all the time, and every path
+// a match takes - looking its directories back up in the table, checking them
 // in full, reporting them - runs thousands of times rather than once in a
 // search that plants one.
 //
@@ -64,21 +64,22 @@ NAMEBREAK_HOST_DEVICE inline bool basenameKeyMatches(uint32_t hash, uint32_t key
 // step undone as well - it multiplies, subtracts and XORs, and a shift only
 // moves bits up). So two states whose seeds agree in their low n bits still
 // agree there after the same character is hashed onto them, or rewound off
-// them, and a junction search's two halves meet on those bits exactly as
-// they meet on the whole state. Taking the low bits of seed1 alone, or more
-// of one seed than the other, would not carry through a step like that: the
-// table and the walk would then be comparing different things.
-#ifndef NAMEBREAK_JUNCTION_MATCH_BITS
-#define NAMEBREAK_JUNCTION_MATCH_BITS 32
+// them, and a meet-in-the-middle search's two halves meet on those bits
+// exactly as they meet on the whole state. Taking the low bits of seed1
+// alone, or more of one seed than the other, would not carry through a step
+// like that: the table and the walk would then be comparing different things.
+#ifndef NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS
+#define NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS 32
 #endif
-static_assert(NAMEBREAK_JUNCTION_MATCH_BITS >= 1 && NAMEBREAK_JUNCTION_MATCH_BITS <= 32, "NAMEBREAK_JUNCTION_MATCH_BITS must be 1-32");
-constexpr uint32_t kJunctionSeedMask = 0xFFFFFFFFu >> (32 - NAMEBREAK_JUNCTION_MATCH_BITS);
+static_assert(NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS >= 1 && NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS <= 32,
+              "NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS must be 1-32");
+constexpr uint32_t kMeetInTheMiddleSeedMask = 0xFFFFFFFFu >> (32 - NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS);
 
 // The two seeds of a hash state as one key, each masked to the bits that
-// must match. Two states with the same key are a junction search's "same
-// place".
-NAMEBREAK_HOST_DEVICE inline uint64_t junctionKey(uint32_t seed1, uint32_t seed2) {
-    return (((uint64_t) (seed2 & kJunctionSeedMask)) << 32) | (seed1 & kJunctionSeedMask);
+// must match. Two states with the same key are a meet-in-the-middle search's
+// "same place".
+NAMEBREAK_HOST_DEVICE inline uint64_t meetingPointKey(uint32_t seed1, uint32_t seed2) {
+    return (((uint64_t) (seed2 & kMeetInTheMiddleSeedMask)) << 32) | (seed1 & kMeetInTheMiddleSeedMask);
 }
 
 #endif // NAMEBREAK_ENGINE_HASH_MATCH_H

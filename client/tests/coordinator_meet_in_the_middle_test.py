@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-"""Junction targets end to end: the real coordinator server (../coordinator)
+"""Meet-in-the-middle targets end to end: the real coordinator server (../coordinator)
 and this client in coordinator mode, talking over HTTP on localhost.
 
-Phase 1 - the memory a client will give: a junction target whose table is
+Phase 1 - the memory a client will give: a meet-in-the-middle target whose table is
 bigger than one client will allow and another says nothing about. Neither
 gets any work from it, while a third, which will give enough, gets it - and
 each says at registration what it's offering, which the server keeps. (A
 table of four characters of 43, about 30 MB - enough to tell the three apart
 without a test allocating gigabytes.)
 
-Phase 2 - finding the directory: a junction target for a planted name, over
+Phase 2 - finding the directory: a meet-in-the-middle target for a planted name, over
 an alphabet small enough to walk in a moment. The client claims it, rewinds
 the tails, finds the directory, and the server records the find, solves the
 target and shows it all on the dashboard.
 
-Phase 3 - a quit part way: a junction target whose range is hours of work.
+Phase 3 - a quit part way: a meet-in-the-middle target whose range is hours of work.
 The client is told to quit (SIGTERM, or Ctrl+Break on Windows) once it has
 got somewhere, and its quit report has to carry how far it got as a tail
 index - the server splits the range there and hands the rest out, which the
 next claim takes up from exactly that tail.
 
 Phase 4 - a canary: a server that hands out nothing but canaries, and a
-junction target whose own directory is nowhere in the alphabet it searches,
+meet-in-the-middle target whose own directory is nowhere in the alphabet it searches,
 so that it stays active and unsolved. The client's first claim is a real
 range of it, which measures its tails a second; from then on it's handed
 canaries of that target, and it has to find the directory planted in each -
 the server recording the canary as found.
 
-    coordinator_junction_test.py --client <namebreak> --coordinator <coordinator dir> [--backend cpu]
+    coordinator_meet_in_the_middle_test.py --client <namebreak> --coordinator <coordinator dir> [--backend cpu]
 
 Builds the server with cargo first. Runs in a directory of its own under the
 current one.
@@ -75,7 +75,7 @@ TABLE = crypt_table()
 def mpq_state(text, offset, state=(0x7FED7FED, 0xEEEEEEEE)):
     """Storm's hash state after `text` (already uppercase, with '\\'), from
     `state`: 0x100 is hash A's table, 0x200 hash B's. The state after a
-    directory is what a junction target is given."""
+    directory is what a meet-in-the-middle target is given."""
     seed1, seed2 = state
     for ch in text.encode("ascii"):
         seed1 = (TABLE[offset + ch] ^ (seed1 + seed2)) & 0xFFFFFFFF
@@ -87,7 +87,7 @@ def hex32(value):
     return "0x%08X" % value
 
 
-def junction_settings(prefix, directory, suffix, min_length, max_length, table_length):
+def meet_in_the_middle_settings(prefix, directory, suffix, min_length, max_length, table_length):
     """What a target for `prefix` + `directory` + `suffix` is made with: the
     hash state after the directory, and the whole name's two hashes - as an
     operator who had recovered them would give them."""
@@ -96,9 +96,9 @@ def junction_settings(prefix, directory, suffix, min_length, max_length, table_l
     return {
         "hash_a_hex": hex32(mpq_state(prefix + directory + suffix, 0x100)[0]),
         "hash_b_hex": hex32(mpq_state(prefix + directory + suffix, 0x200)[0]),
-        "junction": {
-            "junction_a_seed1_hex": hex32(a[0]), "junction_a_seed2_hex": hex32(a[1]),
-            "junction_b_seed1_hex": hex32(b[0]), "junction_b_seed2_hex": hex32(b[1]),
+        "meet_in_the_middle": {
+            "meeting_point_a_seed1_hex": hex32(a[0]), "meeting_point_a_seed2_hex": hex32(a[1]),
+            "meeting_point_b_seed1_hex": hex32(b[0]), "meeting_point_b_seed2_hex": hex32(b[1]),
             "min_length": min_length, "max_length": max_length, "table_length": table_length,
         },
     }
@@ -202,7 +202,7 @@ class Client:
     # Every client started, to stop whatever happens.
     started = []
 
-    def __init__(self, binary, workdir, server, backend, name, junction_table_memory="1G"):
+    def __init__(self, binary, workdir, server, backend, name, meet_in_the_middle_table_memory="1G"):
         self.name = name
         self.matches = os.path.join(workdir, name + "-matches")
         config = os.path.join(workdir, name + ".conf")
@@ -216,8 +216,8 @@ class Client:
             f.write("username = %s\n" % name)
             f.write("hostname = test\n")
             f.write("poll_interval_secs = 1\n")
-            if junction_table_memory is not None:
-                f.write("junction_table_memory = %s\n" % junction_table_memory)
+            if meet_in_the_middle_table_memory is not None:
+                f.write("meet_in_the_middle_table_memory = %s\n" % meet_in_the_middle_table_memory)
         self.output_path = os.path.join(workdir, name + ".log")
         self.output = open(self.output_path, "w")
         # On Windows, a process group of its own, for quit()'s Ctrl+Break to
@@ -258,9 +258,9 @@ def wait_for(what, condition, client, timeout=300):
 
 
 def registered(server, name):
-    """What the server kept of a client's declared junction table memory -
+    """What the server kept of a client's declared meet-in-the-middle table memory -
     None until it has registered."""
-    rows = server.rows("SELECT junction_table_bytes FROM users WHERE username = ?", name)
+    rows = server.rows("SELECT meet_in_the_middle_table_bytes FROM users WHERE username = ?", name)
     return rows[0][0] if rows else None
 
 
@@ -268,27 +268,27 @@ def phase1(server, client_binary, workdir, backend):
     """The memory a client will give decides whether it's offered the work."""
     print("--- phase 1: the memory a client will give ---", flush=True)
     # Four characters of 43 is about 30 MB of table.
-    target = server.create("junction-table-memory", junction_settings("", "SETUPDATA", "\\BWUNIN.PIF", 9, 9, 4), alphabet=BIG_ALPHABET,
+    target = server.create("meet-in-the-middle-table-memory", meet_in_the_middle_settings("", "SETUPDATA", "\\BWUNIN.PIF", 9, 9, 4), alphabet=BIG_ALPHABET,
                            priority=10)
-    table_bytes = server.target(target)["junction"]["table_bytes"]
+    table_bytes = server.target(target)["meet_in_the_middle"]["table_bytes"]
     check((16 << 20) < table_bytes < (64 << 20), "its table is about 30 MB: %d bytes" % table_bytes)
 
     # Too little, and nothing said at all: no work from it, and no range of
     # it ever carved. (A client's own output is block-buffered into its log,
     # so what it said is read once it has exited.)
     for name, memory, expected in [("stingy", "16M", 16 << 20), ("silent", None, None)]:
-        client = Client(client_binary, workdir, server, backend, name, junction_table_memory=memory)
+        client = Client(client_binary, workdir, server, backend, name, meet_in_the_middle_table_memory=memory)
         wait_for(name + " to register", lambda: server.rows("SELECT 1 FROM users WHERE username = ?", name), client, timeout=120)
         check(registered(server, name) == expected, "the server keeps what %s will give a table: %s" % (name, registered(server, name)))
         time.sleep(2)  # long enough to have claimed, had it been offered anything
         check(not server.ranges(target), "a client that %s gets none of its work" % ("won't give the table's memory" if memory else "says nothing"))
         client.quit()
-        said = "16 MB for a junction table" if memory else "no junction work"
+        said = "16 MB for a meet-in-the-middle table" if memory else "no meet-in-the-middle work"
         check(said in client.text(), "and says so when it registers: " + said)
 
     # One that will give enough gets it, and stops once it has - leaving this
     # target out of the way of the phases below.
-    giving = Client(client_binary, workdir, server, backend, "giving", junction_table_memory="1G")
+    giving = Client(client_binary, workdir, server, backend, "giving", meet_in_the_middle_table_memory="1G")
     wait_for("a claim of it", lambda: bool(server.ranges(target)), giving, timeout=180)
     check(registered(server, "giving") == (1 << 30), "a client that will give the memory gets the work")
     giving.quit()
@@ -301,7 +301,7 @@ def phase2(server, client_binary, workdir, backend):
     directory, suffix = "SETUPDAT", "\\BWUNIN.PIF"
     # Seven characters, eight of them a directory, five in the table: 343
     # tails, a moment's work either way.
-    target = server.create("junction-find", junction_settings("", directory, suffix, 8, 8, 5), alphabet=SMALL_ALPHABET, priority=5,
+    target = server.create("meet-in-the-middle-find", meet_in_the_middle_settings("", directory, suffix, 8, 8, 5), alphabet=SMALL_ALPHABET, priority=5,
                            prune_symbol_runs=True, prune_adjacent_backslashes=True)
     client = Client(client_binary, workdir, server, backend, "finder")
     wait_for("the find", lambda: server.target(target)["status"] == "solved", client, timeout=180)
@@ -309,10 +309,10 @@ def phase2(server, client_binary, workdir, backend):
     shown = server.target(target)
     check(shown["found_filename"] == directory + suffix, "the server records the name: " + str(shown["found_filename"]))
     check("BOTH HASHES MATCH: " + directory + suffix in client.text(), "and the client said so too")
-    check(shown["junction"]["table_length"] == 5 and shown["junction"]["tail_count"] == "343", "the dashboard shows the table and the tails")
+    check(shown["meet_in_the_middle"]["table_length"] == 5 and shown["meet_in_the_middle"]["tail_count"] == "343", "the dashboard shows the table and the tails")
     range_row = shown["ranges"][0]
     check(range_row["candidate_len"] == 8 and range_row["first_candidate"].startswith("?????"), "its range is tails of one length: " + range_row["first_candidate"])
-    check(os.path.isfile(os.path.join(client.matches, "matches-junction-find.txt")), "the client wrote the match to its own file")
+    check(os.path.isfile(os.path.join(client.matches, "matches-meet-in-the-middle-find.txt")), "the client wrote the match to its own file")
     client.quit()
 
 
@@ -321,7 +321,7 @@ def phase3(server, client_binary, workdir, backend):
     print("--- phase 3: a quit part way ---", flush=True)
     # 43 characters, 11 of them a directory, 4 in the table: ten billion
     # tails a range, hours of work on a CPU and minutes on a GPU.
-    target = server.create("junction-quit", junction_settings("", "SETUPDATXYZ", "\\BWUNIN.PIF", 11, 11, 4), alphabet=BIG_ALPHABET, priority=1)
+    target = server.create("meet-in-the-middle-quit", meet_in_the_middle_settings("", "SETUPDATXYZ", "\\BWUNIN.PIF", 11, 11, 4), alphabet=BIG_ALPHABET, priority=1)
     client = Client(client_binary, workdir, server, backend, "quitter")
     wait_for("a claim", lambda: bool(server.ranges(target)), client, timeout=180)
     first = server.ranges(target)[0]
@@ -349,26 +349,26 @@ def phase3(server, client_binary, workdir, backend):
 
 
 def phase4(server, client_binary, workdir, backend):
-    """A canary of a junction target: the client has to find the directory
+    """A canary of a meet-in-the-middle target: the client has to find the directory
     planted in it."""
     print("--- phase 4: a canary ---", flush=True)
-    measured = server.rows("SELECT ema_junction_rate_per_sec FROM users WHERE ema_junction_rate_per_sec IS NOT NULL")
+    measured = server.rows("SELECT ema_meet_in_the_middle_rate_per_sec FROM users WHERE ema_meet_in_the_middle_rate_per_sec IS NOT NULL")
     check(bool(measured), "a completed range measured a client's tails a second: %s" % (measured[0][0] if measured else None))
 
     # Nothing but canaries from here on - the probability is read at startup.
     server = server.restarted({"CANARY_PROBABILITY": "1", "CANARY_SECONDS": "2"})
-    # A real junction, of a directory made of characters this target's
+    # A real meeting point, of a directory made of characters this target's
     # alphabet hasn't - so nothing it searches can be the file, and it stays
     # active for its canaries to copy. Eight characters, five of them the
     # table: 512 tails a range.
     suffix = "\\BWUNIN.PIF"
     alphabet = "BCFGHIJK"
-    target = server.create("junction-canary-template", junction_settings("", "SETUPDAT", suffix, 8, 8, 5), alphabet=alphabet, priority=7)
+    target = server.create("meet-in-the-middle-canary-template", meet_in_the_middle_settings("", "SETUPDAT", suffix, 8, 8, 5), alphabet=alphabet, priority=7)
     client = Client(client_binary, workdir, server, backend, "canaried")
     # Its first claim is real work (a canary needs a measured rate), which
     # measures it; the claims after that are canaries.
     wait_for("the client's own rate to be measured",
-             lambda: bool(server.rows("SELECT 1 FROM users WHERE username = 'canaried' AND ema_junction_rate_per_sec IS NOT NULL")),
+             lambda: bool(server.rows("SELECT 1 FROM users WHERE username = 'canaried' AND ema_meet_in_the_middle_rate_per_sec IS NOT NULL")),
              client, timeout=240)
     check(server.target(target)["status"] == "active", "its own directory is nowhere in the alphabet it searches, so it's still active")
     # Its result is 'pending' from the moment it's handed out, so what's
@@ -407,7 +407,7 @@ def main():
         return 1
     server_binary = os.path.join(coordinator, "target", "debug", "namebreak-server")
 
-    workdir = os.path.abspath("coordinator_junction_test")
+    workdir = os.path.abspath("coordinator_meet_in_the_middle_test")
     shutil.rmtree(workdir, ignore_errors=True)
     os.makedirs(workdir)
     server = Server(server_binary, workdir)
