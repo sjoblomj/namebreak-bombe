@@ -214,7 +214,7 @@ void requestQuit(HWND hwnd) {
         return; // already shutting down - ignore a repeat click
     const char* message = g_activeMode == "coordinator"
                                ? "Quit namebreak? This stops searching now; the coordinator is told how far the current range got, and hands out the rest again."
-                           : g_activeMode == "dictionary"
+                           : g_activeMode == "dictionary" || g_activeMode == "meet-in-the-middle"
                                ? "Quit namebreak? This stops the search now. How far it got is saved, for a search with Resume from last candidate to carry on from."
                                : "Quit namebreak? This stops the search now.";
     int result = MessageBoxA(hwnd, message, "Confirm Quit", MB_YESNO | MB_ICONQUESTION);
@@ -245,7 +245,7 @@ void updateUiFromSharedState() {
     Insertion insertFromStart, insertFromEnd;
     double progressFraction;
     bool hasActiveRange, rangeJustFinished, searchEnded;
-    std::vector<std::string> newBasenames;
+    std::vector<std::string> newBasenames, newMeetingPointMatches;
     std::string newSearchPosition;
     {
         std::lock_guard<std::mutex> lock(g_status.mutex);
@@ -265,6 +265,7 @@ void updateUiFromSharedState() {
         rangeJustFinished = g_status.rangeJustFinished;
         g_status.rangeJustFinished = false; // one-shot edge, consumed here
         newBasenames.swap(g_status.newBasenames);
+        newMeetingPointMatches.swap(g_status.newMeetingPointMatches);
         newSearchPosition.swap(g_status.newSearchPosition);
     }
 
@@ -345,15 +346,20 @@ void updateUiFromSharedState() {
         matchesChanged = true;
     };
     // Coordinator mode may search dictionary ranges, whose basenames and
-    // search positions go in the box too, so its Hash A matches are said to
-    // be.
-    const bool dictionaryLines = g_activeMode == "coordinator" || g_activeMode == "dictionary";
+    // search positions go in the box too, as a meet-in-the-middle search's
+    // own lines do - so its Hash A matches are said to be.
+    const bool dictionaryLines =
+        g_activeMode == "coordinator" || g_activeMode == "dictionary" || g_activeMode == "meet-in-the-middle";
     if (!latestMatch.empty() && latestMatch != g_lastMatch) {
         g_lastMatch = latestMatch;
         addMatchLine(dictionaryLines ? "Hash A match: " + latestMatch : latestMatch);
     }
     for (const std::string& basename : newBasenames)
         addMatchLine("Basename: " + basename);
+    // A directory whose state matched the meeting point - which is what a
+    // meet-in-the-middle search looks for; the hashes then decide.
+    for (const std::string& filename : newMeetingPointMatches)
+        addMatchLine("Matched the meeting point: " + filename);
     if (!newSearchPosition.empty()) {
         if (!g_recentMatches.empty() && g_recentMatches.back().rfind(kSearchingPrefix, 0) == 0)
             g_recentMatches.pop_back();
@@ -386,10 +392,12 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
     SendMessage(g_hwndProgress, PBM_SETMARQUEE, TRUE, 100);
 
     // A dictionary search with an encryption key finds basenames that match
-    // it too, which go in the same box, as does how far it has got.
+    // it too, which go in the same box, as does how far it has got - and so
+    // does a meet-in-the-middle search's own progress.
     CreateWindowExA(0, "STATIC",
-                     g_activeMode == "dictionary" || g_activeMode == "coordinator" ? "Search log (most recent last):"
-                                                                                  : "Hash A matches (most recent last):",
+                     g_activeMode == "dictionary" || g_activeMode == "coordinator" || g_activeMode == "meet-in-the-middle"
+                         ? "Search log (most recent last):"
+                         : "Hash A matches (most recent last):",
                      WS_CHILD | WS_VISIBLE, 10, 95, 470, 18, hwnd, nullptr, hInstance, nullptr);
     g_hwndMatches = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 115, 470, 280,

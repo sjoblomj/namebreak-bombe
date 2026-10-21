@@ -109,7 +109,7 @@ pause/resume the search.` on startup when it is.
 file given with `--config <file>`, every time it starts; without one it
 stops and says what the smallest working one looks like (the Windows GUI
 runs its setup dialog instead, and writes one). It's a flat `key = value`
-file with up to three `[section]` blocks; `#`-led lines and blank lines are
+file with up to four `[section]` blocks; `#`-led lines and blank lines are
 ignored, and a value only needs `"..."` quoting if it has meaningful
 leading/trailing whitespace (a literal `\` needs no escaping).
 
@@ -561,6 +561,14 @@ directories that check would reject anyway. That property is what
 `tests/meet_in_the_middle_test.cpp` checks exhaustively, over every
 directory of a small alphabet at every split between the two halves.
 
+The Windows GUI's setup has a Meet in the Middle tab with these keys, and
+checks them as a search would before it writes them - including that hashing
+the suffix onto the meeting point really gives the file's two hashes, which
+is the mistake worth catching before a search walks the whole space for
+nothing. While it searches, its progress bar is how many of the tails it has
+rewound, and a directory that matches the meeting point is listed with the
+Hash-A matches.
+
 ### In coordinator mode
 
 A meet-in-the-middle target can be shared out (the coordinator README's
@@ -580,6 +588,10 @@ Left out (or 0), this client is handed no meet-in-the-middle target's work
 at all - a table is memory you have to agree to spare, and on a GPU it has
 to fit in the device's own as well. The client says which it is when it
 registers, and a server hands out no target whose table is bigger than it.
+The Windows GUI's setup asks for it on its Coordinator tab, as a slider over
+the sizes a table can usefully take (None, then powers of two from 256 MB up
+to what the machine has), with what this machine has and has free above it
+and, under it, how long a table the chosen size holds.
 The table is built afresh for every range claimed (a few seconds for four
 characters of 43, a quarter of a minute for five), and progress is reported
 as the tail the walk has got to, so a range taken over by someone else
