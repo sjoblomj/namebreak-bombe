@@ -181,6 +181,7 @@ if(WITH_METAL)
     set_source_files_properties(src/backends/metal/metal_backend.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
     embed_kernel(src/backends/metal/search.metal backends/metal/search_kernel.h kSearchKernelSource)
     embed_kernel(src/backends/metal/dictionary.metal backends/metal/dictionary_kernel.h kDictionaryKernelSource)
+    embed_kernel(src/backends/metal/meet_in_the_middle.metal backends/metal/meet_in_the_middle_kernel.h kMeetInTheMiddleKernelSource)
 endif()
 if(WITH_OPENCL)
     list(APPEND SEARCH_SOURCES src/backends/opencl/opencl_backend.cpp)
@@ -400,17 +401,8 @@ namebreak_test(dictionary_batch_test dictionary_batch_test)
 # (NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY), so that a tail length is split
 # across many calls, the walk is restarted part way through over and over, and
 # a launch's hits overflow all the time and have to be found again with room
-# for them. Every backend that can search meet-in-the-middle targets: the
-# CUDA-dialect one, OpenCL, and the two CPU ones (Metal doesn't implement this
-# mode yet).
-set(MEET_IN_THE_MIDDLE_BACKENDS "")
-if(NOT NAMEBREAK_GPU STREQUAL "none")
-    list(APPEND MEET_IN_THE_MIDDLE_BACKENDS ${NAMEBREAK_GPU})
-endif()
-if(WITH_OPENCL)
-    list(APPEND MEET_IN_THE_MIDDLE_BACKENDS opencl)
-endif()
-list(APPEND MEET_IN_THE_MIDDLE_BACKENDS cpu reference)
+# for them. On every backend.
+set(MEET_IN_THE_MIDDLE_BACKENDS ${ROW_BACKENDS} reference)
 namebreak_test_executable(meet_in_the_middle_search_test tests/meet_in_the_middle_search_test.cpp namebreak_search)
 foreach(backend IN LISTS MEET_IN_THE_MIDDLE_BACKENDS)
     namebreak_test(meet-in-the-middle-search-${backend} meet_in_the_middle_search_test --backend ${backend})

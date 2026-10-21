@@ -464,8 +464,8 @@ in it is used; `table_length` sets it outright instead. A character more
 costs as many times more memory as the alphabet has characters, so in
 practice the table is 4 or 5 characters long and the walk does the rest.
 
-Every backend but Metal searches meet-in-the-middle targets: the CUDA/HIP
-one, OpenCL, `cpu` and `reference`. On the RTX 3080 Ti Laptop, both GPU
+Every backend searches meet-in-the-middle targets: the CUDA/HIP one,
+OpenCL, Metal, `cpu` and `reference`. On the RTX 3080 Ti Laptop, both GPU
 backends rewind about 2.2 billion tails a second with the 31 MB table (CUDA
 2.20, OpenCL 2.37) and about half that with the 1.4 GB one (1.13 and 1.22),
 whose lookups miss every cache; the `cpu` backend does about 66 million.
@@ -499,11 +499,13 @@ keys. A launch covers about 67 million tails
 (`NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH`), reports how many it
 looked up and the tails it found, and is launched again with more room if it
 found more than it had room for - as a dictionary launch is. The kernels are
-`meetInTheMiddleKernel` in `src/backends/cuda/cuda_backend.cu` and
-`src/backends/opencl/meet_in_the_middle.cl`;
-`src/backends/common/meet_in_the_middle_launch.h` is what the two share.
-Metal has no meet-in-the-middle kernel yet, so the Metal backend says it
-can't search meet-in-the-middle targets and isn't picked for one.
+`meetInTheMiddleKernel` in `src/backends/cuda/cuda_backend.cu`,
+`src/backends/opencl/meet_in_the_middle.cl` and
+`src/backends/metal/meet_in_the_middle.metal` (the OpenCL one in Metal's
+shading language); `src/backends/common/meet_in_the_middle_launch.h` is
+what they share. On a Mac the table lives in memory the CPU and GPU share,
+but Metal still caps it: a table bigger than one buffer may be, or than
+the GPU's recommended working set, is refused the same way.
 
 ### An example
 
@@ -846,7 +848,12 @@ so a GPU build still works on a machine without that GPU:
   run on the CPU, each threadgroup's threads around its barrier, behind a
   C++ transcription of the `.mm`'s dictionary search, where the dictionary
   self-test and every `dictionary-search` configuration pass, and planted
-  kernel bugs fail them.
+  kernel bugs fail them. And its meet-in-the-middle kernel
+  (`meet_in_the_middle.metal`) the same way: compiled for each search's
+  alphabet and rules as Metal would, behind a C++ transcription of the
+  `.mm`'s meet-in-the-middle search, where the meet-in-the-middle self-test
+  and every `meet-in-the-middle-search` configuration pass, and the
+  kernel's mutations fail them.
 - `opencl/` - any GPU with an OpenCL driver: AMD, Intel (including
   integrated ones) and NVIDIA, with nothing but the vendor's regular driver
   installed. CUDA's kernel ported (`search.cl`), lookup filter, row groups,

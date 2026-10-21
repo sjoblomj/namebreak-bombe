@@ -17,8 +17,7 @@ meeting point's seeds compared ("meet-in-the-middle") and with that plus small
 launches with room for a single hit ("meet-in-the-middle-small" - see
 meet_in_the_middle_search_test_small in CMakeLists.txt). The self-test there is
 createMeetInTheMiddleBackend's too. A meet-in-the-middle mutation is caught by those - or
-some of them - and none of the others. A backend that can't search
-meet-in-the-middle targets (Metal) doesn't run those two checks at all.
+some of them - and none of the others.
 
 And two more for a dictionary search: tests/dictionary_search_test.cpp,
 built with few of hashA's and the basename hash's bits compared
@@ -97,6 +96,7 @@ BACKEND_H = "src/engine/backend.h"
 DICT_ENGINE = "src/engine/dictionary_search.cpp"
 CL_DICT_KERNEL = "src/backends/opencl/dictionary.cl"
 MTL_DICT_KERNEL = "src/backends/metal/dictionary.metal"
+MTL_MEET_IN_THE_MIDDLE_KERNEL = "src/backends/metal/meet_in_the_middle.metal"
 
 
 @dataclass
@@ -526,6 +526,61 @@ OPENCL_MEET_IN_THE_MIDDLE_MUTATIONS = [
     Mutation("jregrow", "a launch with more hits than room for them not launched again",
              [(CL_HOST, "        if (counts[1] <= meetInTheMiddleHitCapacity_)\n            break;", "        if (true)\n            break;")],
              caught_by=("meet-in-the-middle-small",)),
+]
+
+# The Metal meet-in-the-middle kernel (meet_in_the_middle.metal) and its host
+# side: the OpenCL kernel's mutations, and the tails a threadgroup counts
+# together.
+METAL_MEET_IN_THE_MIDDLE_MUTATIONS = [
+    Mutation("jstepback", "the hash undone by another multiplier than 33's inverse",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "    const uint before2 = (seed2 - ord - seed1 - 3) * 0x3E0F83E1u;",
+               "    const uint before2 = (seed2 - ord - seed1 - 3) * 0x3E0F83E3u;")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jrowdigits", "a row's characters rewound in the wrong order",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "                digit[i] = (uint) (rest % ALPHABET_SIZE);",
+               "                digit[args.tailLength - 2 - i] = (uint) (rest % ALPHABET_SIZE);")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jlastk", "a row's last tail never looked up",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "            const uint toK = row == args.lastRow ? args.lastRowEndK : ALPHABET_SIZE;",
+               "            const uint toK = row == args.lastRow ? args.lastRowEndK : ALPHABET_SIZE - 1;")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jfirstk", "a batch's first row walked from its own start, not the batch's",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "            const uint fromK = row == args.firstRow ? args.firstRowStartK : 0;",
+               "            const uint fromK = 0;")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jfilterbit", "the table's filter read at the wrong bit of its word",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "    if (!((filter[bit >> 6] >> (bit & 63)) & 1))", "    if (!((filter[bit >> 6] >> (bit & 31)) & 1))")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jbinary", "the table's keys searched so that an equal one is passed by",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "        if (keys[mid] < key)", "        if (keys[mid] <= key)")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jprobed", "the tails looked up never counted",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "                ++probed;", "")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jseedmask", "the meeting point's key made of seed1 alone",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL,
+               "    const ulong key = ((ulong) (seed2 & (uint) (MEET_IN_THE_MIDDLE_SEED_MASK)) << 32) | (seed1 & (uint) (MEET_IN_THE_MIDDLE_SEED_MASK));",
+               "    const ulong key = (ulong) (seed1 & (uint) (MEET_IN_THE_MIDDLE_SEED_MASK));")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jhitindex", "a hit reported as the first tail of its row",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "                        hits[slot] = row * ALPHABET_SIZE + k;", "                        hits[slot] = row * ALPHABET_SIZE;")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jgroupsum", "only the threadgroup's first thread's tails counted",
+             [(MTL_MEET_IN_THE_MIDDLE_KERNEL, "    if (probed != 0)\n        atomic_fetch_add_explicit(&sProbed, probed, memory_order_relaxed);",
+               "    if (probed != 0 && lid == 0)\n        atomic_fetch_add_explicit(&sProbed, probed, memory_order_relaxed);")],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jentry", "the rules started as if nothing followed the directory",
+             [(MTL_HOST, '@"ENTRY_SYMBOL_RUN": @(key[5]),\n            @"ENTRY_BACKSLASHES": @(key[6]),\n            @"ENTRY_NEXT_IS_BACKSLASH": @(key[7]),',
+               '@"ENTRY_SYMBOL_RUN": @(0),\n            @"ENTRY_BACKSLASHES": @(0),\n            @"ENTRY_NEXT_IS_BACKSLASH": @(0),')],
+             caught_by=MEET_IN_THE_MIDDLE_CAUGHT),
+    Mutation("jregrow", "a launch with more hits than room for them not launched again",
+             [(MTL_HOST, "        if (counts[1] <= meetInTheMiddleHitCapacity_)\n            break;", "        if (true)\n            break;")],
+             caught_by=("meet-in-the-middle-small",)),
+    # A thread per row, but the grid rounded up to whole threadgroups: the
+    # threads past the last row must do nothing.
+    Mutation("jextragroup", "a whole threadgroup too many launched", expect="harmless",
+             edits=[(MTL_HOST, "const NSUInteger threadgroups = (NSUInteger) ((rows.rowCount() + threadgroupSize - 1) / threadgroupSize);",
+                     "const NSUInteger threadgroups = (NSUInteger) ((rows.rowCount() + threadgroupSize - 1) / threadgroupSize) + 1;")]),
 ]
 
 # The CPU backend's meet-in-the-middle walk, and MeetInTheMiddleWalk itself,
@@ -994,7 +1049,7 @@ METAL_MUTATIONS = [
              [(MTL_KERNEL, "            rowBits >>= 1;\n", "")]),
     Mutation("stalelists", "the lists on the GPU kept when they're cleared for another alphabet",
              [(MTL_HOST, "if (rowPruning_.generation() != groupsGeneration_) {", "if (false) {")]),
-] + ROW_PRUNING_MUTATIONS
+] + ROW_PRUNING_MUTATIONS + METAL_MEET_IN_THE_MIDDLE_MUTATIONS + MEET_IN_THE_MIDDLE_KERNEL_MUTATIONS + MEET_IN_THE_MIDDLE_MUTATIONS
 
 # The CPU backend: the same filter, its own row walk, and its rows shared out
 # among its threads as work items.
@@ -1146,11 +1201,6 @@ CHECKS = [
     ("meet-in-the-middle", "meet_in_the_middle_search_test_dense"),
     ("meet-in-the-middle-small", "meet_in_the_middle_search_test_small"),
 ]
-# The meet-in-the-middle checks, and the backends that can run them: a backend
-# that can't search meet-in-the-middle targets would only skip them (exit 77),
-# which the runner takes for a backend that can't run here at all.
-MEET_IN_THE_MIDDLE_CHECKS = ("meet-in-the-middle", "meet-in-the-middle-small")
-MEET_IN_THE_MIDDLE_BACKENDS = ("cuda", "hip", "opencl", "cpu")
 
 
 class ExperimentError(Exception):
@@ -1345,12 +1395,6 @@ def main():
     parser.add_argument("--no-ccache", dest="ccache", action="store_false",
                         help="don't run the compilers through ccache (it is used when found, to cache unchanged files across mutations)")
     args = parser.parse_args()
-
-    # A backend that can't search meet-in-the-middle targets doesn't run those
-    # checks: they would skip (exit 77), which the runner takes for a backend
-    # that can't run on this machine at all.
-    if args.backend not in MEET_IN_THE_MIDDLE_BACKENDS:
-        CHECKS[:] = [check for check in CHECKS if check[0] not in MEET_IN_THE_MIDDLE_CHECKS]
 
     mutations = BACKENDS[args.backend][1]
     if args.list:

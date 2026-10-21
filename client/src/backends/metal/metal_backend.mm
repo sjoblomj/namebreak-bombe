@@ -19,10 +19,13 @@
 
 #include "backends/common/dictionary_batch.h"
 #include "backends/common/lowbits_filter.h"
+#include "backends/common/meet_in_the_middle_launch.h"
 #include "backends/common/row_batch.h"
 #include "backends/common/row_pruning.h"
-#include "backends/metal/dictionary_kernel.h" // generated from dictionary.metal - see CMakeLists.txt
-#include "backends/metal/search_kernel.h"     // generated from search.metal
+#include "backends/metal/dictionary_kernel.h"         // generated from dictionary.metal - see CMakeLists.txt
+#include "backends/metal/meet_in_the_middle_kernel.h" // generated from meet_in_the_middle.metal
+#include "backends/metal/search_kernel.h"             // generated from search.metal
+#include "engine/candidate.h"
 #include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
@@ -51,6 +54,31 @@ constexpr uint64_t kDictionaryCandidatesPerLaunch = 1ull << 26;
 constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
 constexpr NSUInteger kDictionaryThreadgroupSize = dictionaryThreadsPerBlockOr(256);
 constexpr int kDictionaryTailsPerCell = dictionaryTailsPerCellOr(32);
+
+// A meet-in-the-middle search's launches (meet_in_the_middle.metal): about
+// how many tails one rewinds, how many hits it has room for at first (see
+// backends/common/meet_in_the_middle_launch.h) and the threadgroup's size,
+// unless the pipeline allows fewer. Not tuned yet: the OpenCL backend's
+// values.
+constexpr uint64_t kMeetInTheMiddleTailsPerLaunch = NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH;
+constexpr uint32_t kMeetInTheMiddleHitCapacity = NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY;
+constexpr NSUInteger kMeetInTheMiddleThreadgroupSize = 256;
+
+// Must match MeetInTheMiddleArgs in meet_in_the_middle.metal.
+struct MeetInTheMiddleArgs {
+    uint64_t keyCount;
+    uint64_t firstRow;
+    uint64_t lastRow;
+    int32_t filterShift;
+    uint32_t meetingPointSeed1;
+    uint32_t meetingPointSeed2;
+    int32_t tailLength;
+    uint32_t firstRowStartK;
+    uint32_t lastRowEndK;
+    uint32_t capacity;
+    uint32_t unused;
+};
+static_assert(sizeof(MeetInTheMiddleArgs) == 56, "MeetInTheMiddleArgs must match meet_in_the_middle.metal's");
 
 // Must match DictionaryArgs in dictionary.metal.
 struct DictionaryArgs {
@@ -120,9 +148,18 @@ public:
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
     void endDictionarySearch() override;
 
+    // A meet-in-the-middle search: one launch of meet_in_the_middle.metal's
+    // kernel per call.
+    bool supportsMeetInTheMiddle() const override { return true; }
+    uint64_t meetInTheMiddleTailsPerCall() const override { return kMeetInTheMiddleTailsPerLaunch; }
+    void beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) override;
+    MeetInTheMiddleOutcome runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) override;
+    void endMeetInTheMiddleSearch() override;
+
 private:
     id<MTLComputePipelineState> pipelineFor(int trailingLen, bool listed);
     id<MTLComputePipelineState> dictionaryPipeline();
+    id<MTLComputePipelineState> meetInTheMiddlePipeline();
     void uploadGroups();
     // A shared-storage buffer holding `bytes` bytes (at least one) - with
     // `data` copied in, if given. Ends the process if it can't be made.
@@ -189,6 +226,20 @@ private:
     std::vector<DictionaryLaunchBatch> dictionaryLaunch_;
     id<MTLBuffer> dictionaryBatches_, dictionaryCounts_, dictionaryHashAHits_, dictionaryBasenameHits_;
     uint32_t dictionaryHitCapacity_ = 0;
+
+    // A meet-in-the-middle search's: the engine's table and the alphabet as
+    // the kernel reads it - made by beginMeetInTheMiddleSearch and let go by
+    // endMeetInTheMiddleSearch - and what the kernel is compiled with.
+    MeetInTheMiddleConstants meet_in_the_middle_ = {};
+    id<MTLBuffer> meetInTheMiddleKeys_, meetInTheMiddleFilter_, meetInTheMiddleChars_;
+    // Compiled once per alphabet size, rules and the rules' state to the
+    // directory's right, and kept, as the other searches' pipelines are.
+    std::map<std::vector<int>, id<MTLComputePipelineState>> meetInTheMiddlePipelines_;
+    // Kept from one search to the next: the counts - tails looked up and
+    // hits, 0 at every launch - and the hits, room for
+    // meetInTheMiddleHitCapacity_ of them.
+    id<MTLBuffer> meetInTheMiddleCounts_, meetInTheMiddleHits_;
+    uint32_t meetInTheMiddleHitCapacity_ = 0;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -631,6 +682,190 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
         }
     }
     dictionaryVerifier_.addHits(batches, hashA, basename, outcome);
+    return outcome;
+}
+
+void MetalBackend::beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) {
+    if (!announcedDevice_) {
+        printf("Metal device: %s\n", device_.name.UTF8String);
+        announcedDevice_ = true;
+    }
+    endMeetInTheMiddleSearch();
+    meet_in_the_middle_ = constants;
+    const MeetInTheMiddleTable& table = *constants.table;
+
+    // The alphabet, as the kernel reads it: each character's hashA crypt
+    // table key, its own value, and what the pruning rules make of it.
+    std::vector<uint32_t> chars(4 * std::max<size_t>(1, constants.alphabet.size()), 0u);
+    for (size_t k = 0; k < constants.alphabet.size(); ++k) {
+        const unsigned char ch = (unsigned char) constants.alphabet[k];
+        chars[4 * k] = constants.cryptTable[kHashAOffset + ch];
+        chars[4 * k + 1] = ch;
+        chars[4 * k + 2] = (isRunSymbol_CPU((char) ch) ? 1u : 0u) | (ch == '\\' ? 2u : 0u);
+    }
+    meetInTheMiddleChars_ = sharedBuffer(chars.size() * sizeof(uint32_t), chars.data());
+
+    // The table: the one thing a meet-in-the-middle search has that can be
+    // too big for the GPU - the engine sizes it to the memory it was given,
+    // not to what Metal lets a buffer have, or a GPU work with.
+    const size_t keyBytes = table.size() * sizeof(uint64_t);
+    const size_t filterBytes = (size_t) table.filterWords() * sizeof(uint64_t);
+    const uint64_t workingSet = device_.recommendedMaxWorkingSetSize;
+    if (std::max(keyBytes, filterBytes) > device_.maxBufferLength || keyBytes + filterBytes > workingSet) {
+        fprintf(stderr,
+                "The meet-in-the-middle search's table needs %zu MB on the Metal device, which works with %llu MB at most\n"
+                "and %llu MB in one buffer.\n"
+                "Give the table less memory (config.conf's table_memory, a character shorter is %u times smaller),\n"
+                "or search on the cpu backend (--backend cpu), which uses the machine's own memory.\n",
+                (keyBytes + filterBytes) / (1024 * 1024), (unsigned long long) (workingSet / (1024 * 1024)),
+                (unsigned long long) (device_.maxBufferLength / (1024 * 1024)), (unsigned) constants.alphabet.size());
+        exit(1);
+    }
+    meetInTheMiddleKeys_ = sharedBuffer(keyBytes, table.keys());
+    meetInTheMiddleFilter_ = sharedBuffer(filterBytes, table.filter());
+
+    // The counts are 0 at every launch: zeroed here, and after every launch
+    // that had anything to report (see runMeetInTheMiddleBatch).
+    if (!meetInTheMiddleCounts_)
+        meetInTheMiddleCounts_ = sharedBuffer(2 * sizeof(uint32_t));
+    memset(meetInTheMiddleCounts_.contents, 0, 2 * sizeof(uint32_t));
+    if (!meetInTheMiddleHits_) {
+        meetInTheMiddleHitCapacity_ = kMeetInTheMiddleHitCapacity;
+        meetInTheMiddleHits_ = sharedBuffer(meetInTheMiddleHitCapacity_ * sizeof(uint64_t));
+    }
+}
+
+void MetalBackend::endMeetInTheMiddleSearch() {
+    meetInTheMiddleKeys_ = nil;
+    meetInTheMiddleFilter_ = nil;
+    meetInTheMiddleChars_ = nil;
+}
+
+id<MTLComputePipelineState> MetalBackend::meetInTheMiddlePipeline() {
+    // The alphabet and the rules are compiled in: they don't change within a
+    // search, and the alphabet's size makes the kernel's divisions by it
+    // multiplications.
+    const PruneRules& rules = meet_in_the_middle_.rules;
+    const TailPruneState& entry = meet_in_the_middle_.tailEntry;
+    const std::vector<int> key = {(int) meet_in_the_middle_.alphabet.size(),
+                                  rules.any() ? 1 : 0,
+                                  rules.symbolRuns ? 1 : 0,
+                                  rules.adjacentBackslashes ? 1 : 0,
+                                  rules.maxBackslashCount,
+                                  entry.symbolRun,
+                                  entry.backslashes,
+                                  entry.nextIsBackslash ? 1 : 0};
+    auto found = meetInTheMiddlePipelines_.find(key);
+    if (found != meetInTheMiddlePipelines_.end())
+        return found->second;
+
+    @autoreleasepool {
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        options.preprocessorMacros = @{
+            @"ALPHABET_SIZE": @(key[0]),
+            @"MAX_CANDIDATE_LEN": @(MAX_CANDIDATE_LEN),
+            @"MEET_IN_THE_MIDDLE_SEED_MASK": @(kMeetInTheMiddleSeedMask),
+            @"RULE_ANY": @(key[1]),
+            @"RULE_SYMBOL_RUNS": @(key[2]),
+            @"RULE_ADJACENT_BACKSLASHES": @(key[3]),
+            @"RULE_MAX_BACKSLASH_COUNT": @(key[4]),
+            @"ENTRY_SYMBOL_RUN": @(key[5]),
+            @"ENTRY_BACKSLASHES": @(key[6]),
+            @"ENTRY_NEXT_IS_BACKSLASH": @(key[7]),
+        };
+        NSError* error = nil;
+        id<MTLLibrary> library = [device_ newLibraryWithSource:@(kMeetInTheMiddleKernelSource) options:options error:&error];
+        if (!library) {
+            fprintf(stderr, "Metal: compiling the meet-in-the-middle kernel (alphabet %d) failed:\n%s\n", key[0],
+                    error.localizedDescription.UTF8String);
+            exit(1);
+        }
+        id<MTLFunction> function = [library newFunctionWithName:@"searchMeetInTheMiddle"];
+        id<MTLComputePipelineState> pipeline = [device_ newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) {
+            fprintf(stderr, "Metal: creating the meet-in-the-middle pipeline failed: %s\n", error.localizedDescription.UTF8String);
+            exit(1);
+        }
+        meetInTheMiddlePipelines_[key] = pipeline;
+        return pipeline;
+    }
+}
+
+MeetInTheMiddleOutcome MetalBackend::runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) {
+    MeetInTheMiddleOutcome outcome;
+    if (batch.count == 0)
+        return outcome;
+    id<MTLComputePipelineState> pipeline = meetInTheMiddlePipeline();
+    const MeetInTheMiddleRows rows = meetInTheMiddleRowsOf(batch, meet_in_the_middle_.alphabet.size());
+    // The grid's threads are counted in 32 bits.
+    if (rows.rowCount() > UINT32_MAX) {
+        // runMeetInTheMiddleSearch's calls are far smaller (meetInTheMiddleTailsPerCall).
+        fprintf(stderr, "INTERNAL ERROR: a meet-in-the-middle launch of %llu rows - exiting\n", (unsigned long long) rows.rowCount());
+        exit(1);
+    }
+    MeetInTheMiddleArgs args = {};
+    args.keyCount = meet_in_the_middle_.table->size();
+    args.firstRow = rows.firstRow;
+    args.lastRow = rows.lastRow;
+    args.filterShift = meet_in_the_middle_.table->filterShift();
+    args.meetingPointSeed1 = meet_in_the_middle_.meetingPoint.first;
+    args.meetingPointSeed2 = meet_in_the_middle_.meetingPoint.second;
+    args.tailLength = batch.tailLength;
+    args.firstRowStartK = rows.firstRowStartK;
+    args.lastRowEndK = rows.lastRowEndK;
+    const NSUInteger threadgroupSize = std::min(kMeetInTheMiddleThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
+    // A thread per row, rounded up to whole threadgroups.
+    const NSUInteger threadgroups = (NSUInteger) ((rows.rowCount() + threadgroupSize - 1) / threadgroupSize);
+
+    // Launched again, with room for every hit, as long as it had more than it
+    // had room for - which a real search, comparing the meeting point's whole
+    // 64-bit state, practically never does.
+    auto* counts = static_cast<uint32_t*>(meetInTheMiddleCounts_.contents);
+    for (;;) {
+        args.capacity = meetInTheMiddleHitCapacity_;
+        @autoreleasepool {
+            id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBytes:&args length:sizeof(args) atIndex:0];
+            [encoder setBuffer:meetInTheMiddleKeys_ offset:0 atIndex:1];
+            [encoder setBuffer:meetInTheMiddleFilter_ offset:0 atIndex:2];
+            [encoder setBuffer:meetInTheMiddleChars_ offset:0 atIndex:3];
+            [encoder setBuffer:meetInTheMiddleCounts_ offset:0 atIndex:4];
+            [encoder setBuffer:meetInTheMiddleHits_ offset:0 atIndex:5];
+            [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupSize, 1, 1)];
+            [encoder endEncoding];
+            [commands commit];
+            [commands waitUntilCompleted];
+            if (commands.status == MTLCommandBufferStatusError) {
+                fprintf(stderr, "Metal: the meet-in-the-middle kernel failed: %s\n", commands.error.localizedDescription.UTF8String);
+                exit(1);
+            }
+        }
+        if (counts[0] > batch.count || counts[1] > batch.count) {
+            fprintf(stderr, "INTERNAL ERROR: a meet-in-the-middle launch of %llu tails looked up %u of them and found %u - exiting\n",
+                    (unsigned long long) batch.count, counts[0], counts[1]);
+            exit(1);
+        }
+        if (counts[1] <= meetInTheMiddleHitCapacity_)
+            break;
+        meetInTheMiddleHitCapacity_ = std::max(counts[1], 2 * meetInTheMiddleHitCapacity_);
+        meetInTheMiddleHits_ = sharedBuffer(meetInTheMiddleHitCapacity_ * sizeof(uint64_t));
+        counts[0] = counts[1] = 0;
+    }
+
+    outcome.probed = counts[0];
+    const auto* hits = static_cast<const uint64_t*>(meetInTheMiddleHits_.contents);
+    for (uint32_t i = 0; i < counts[1]; ++i) {
+        const uint64_t index = hits[i];
+        if (index < batch.start || index >= batch.start + batch.count) {
+            fprintf(stderr, "INTERNAL ERROR: the meet-in-the-middle kernel reported the tail at %llu, which its batch doesn't have - exiting\n",
+                    (unsigned long long) index);
+            exit(1);
+        }
+        outcome.hits.push_back({batch.tailLength, index});
+    }
+    counts[0] = counts[1] = 0;
     return outcome;
 }
 

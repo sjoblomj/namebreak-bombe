@@ -854,10 +854,12 @@ divided the tails by 43.
   would amortize that over 1,849 - **estimated** small, since the digit
   work is already a fraction of a tail's cost, and it would cost registers
   for the second character's state.
-- [ ] **Metal.** There's no meet-in-the-middle kernel for it yet, so the Metal backend
-  says it can't search meet-in-the-middle targets and isn't picked for one. The kernel is
-  the smallest of the three (one `mpqStepBack`, a filter bit, a binary
-  search); what it needs is a Mac to test on.
+- [x] **Metal.** `meet_in_the_middle.metal`, the OpenCL kernel in Metal's
+  shading language, with the OpenCL backend's launch size and 256-thread
+  threadgroups. Only run on the CPU through an emulation of Metal so far
+  (see README.md's Backends), so it has **no figures yet** - neither its
+  speed nor whether the launch size and threadgroup suit an Apple GPU;
+  what it needs is a Mac to measure on.
 
 ## Tooling
 
