@@ -1,5 +1,5 @@
-#ifndef NAMEBREAK_ENGINE_JUNCTION_SEARCH_H
-#define NAMEBREAK_ENGINE_JUNCTION_SEARCH_H
+#ifndef NAMEBREAK_ENGINE_MEET_IN_THE_MIDDLE_SEARCH_H
+#define NAMEBREAK_ENGINE_MEET_IN_THE_MIDDLE_SEARCH_H
 
 #include <atomic>
 #include <chrono>
@@ -9,20 +9,21 @@
 #include <vector>
 
 #include "engine/backend.h"
-#include "engine/junction.h"
+#include "engine/meet_in_the_middle.h"
 
-// A junction search: a file whose name is a known prefix, an unknown
+// A meet-in-the-middle search: a file whose name is a known prefix, an unknown
 // directory and a known suffix, where the hash state after the directory -
-// the junction - is already known, for hashA and for hashB. See junction.h
-// for what that buys (the search comes at the directory from both ends and
-// meets in the middle) and README.md's "Junction mode" for how to run one.
+// the meeting point - is already known, for hashA and for hashB. See
+// meet_in_the_middle.h for what that buys (the search comes at the directory
+// from both ends and meets in the middle) and README.md's "Meet-in-the-middle
+// mode" for how to run one.
 //
 // The search goes through the directories in the order of its backward
-// walk's nodes (JunctionSpace): shortest tail first, and within a tail
+// walk's nodes (MeetInTheMiddleSpace): shortest tail first, and within a tail
 // length by the tail's index. A node's number is where a search resumes
 // from, and what a range of a search is given in.
 
-struct JunctionRequest {
+struct MeetInTheMiddleRequest {
     // The characters the unknown directory is made of.
     std::string alphabet;
     // The filename around it. The prefix may be empty; the suffix is what
@@ -32,10 +33,10 @@ struct JunctionRequest {
     std::string suffix;
     // The hash state after prefix + the directory, for hashA and for hashB -
     // recovered from other files of the same directory (see README.md's
-    // "Junction mode"). Hashing `suffix` onto them must give the file's two
-    // hashes, or the search refuses to start.
-    HashState junctionA{0, 0};
-    HashState junctionB{0, 0};
+    // "Meet-in-the-middle mode"). Hashing `suffix` onto them must give the
+    // file's two hashes, or the search refuses to start.
+    HashState meetingPointA{0, 0};
+    HashState meetingPointB{0, 0};
     uint32_t targetHashA = 0;
     uint32_t targetHashB = 0;
     // How long the directory may be, in characters.
@@ -44,9 +45,9 @@ struct JunctionRequest {
     // How many of a directory's first characters the table holds - the rest
     // are what the backward walk searches, so each character here is one
     // the search doesn't brute-force. Negative (the default): as many as
-    // `tableBytes` has room for (junctionTableLengthForBytes). 0: no table
-    // at all, and the whole directory is rewound from the junction - a
-    // brute force in the other direction, which only a test wants.
+    // `tableBytes` has room for (meetInTheMiddleTableLengthForBytes). 0: no
+    // table at all, and the whole directory is rewound from the meeting point
+    // - a brute force in the other direction, which only a test wants.
     int tableLength = -1;
     // The memory the table may take, when its length is left to be worked
     // out. A character more needs about as many times more memory as the
@@ -54,7 +55,7 @@ struct JunctionRequest {
     uint64_t tableBytes = (uint64_t) 1 << 30;
     // The cheap rules that skip implausible directories - as in a bounded
     // search, but applied to every character of the directory rather than
-    // its leading ones (see dirPasses, junction.h).
+    // its leading ones (see dirPasses, meet_in_the_middle.h).
     PruneRules rules;
     // The walk's nodes to search: [startNumber, endNumber). Every node
     // before startNumber counts as searched (see the progress file).
@@ -63,15 +64,15 @@ struct JunctionRequest {
     // The most recent hit, or the match of both hashes - see
     // SearchRequest::outputFilePath (search.h).
     std::string outputFilePath = "matches.txt";
-    // The progress file - see writeJunctionProgress. Written this often,
+    // The progress file - see writeMeetInTheMiddleProgress. Written this often,
     // whenever the search pauses, and when it ends. Empty for none.
-    std::string progressFilePath = "junction.txt";
+    std::string progressFilePath = "meet-in-the-middle.txt";
     std::chrono::milliseconds progressInterval{30000};
     // How often a line of progress is printed.
     std::chrono::milliseconds statusInterval{10000};
 };
 
-struct JunctionResult {
+struct MeetInTheMiddleResult {
     // False only for a problem with the request or its files - see `error`.
     bool ok = true;
     std::string error;
@@ -84,7 +85,7 @@ struct JunctionResult {
     // number of nodes there are) once all of them have.
     uint64_t nextNumber = 0;
     // How many tails were looked up in the table (those the rules skipped
-    // aren't), and how many directories matched the junction.
+    // aren't), and how many directories matched the meeting point.
     uint64_t tailsProbed = 0;
     uint64_t hits = 0;
     // The table the search used: how many of a directory's characters it
@@ -94,60 +95,62 @@ struct JunctionResult {
     uint64_t tableBytes = 0;
 };
 
-// What a junction search tells its caller as it goes - each optional, and
-// each called on the thread running the search.
-struct JunctionSearchHooks {
-    // With the filename of every directory that matched the junction.
+// What a meet-in-the-middle search tells its caller as it goes - each
+// optional, and each called on the thread running the search.
+struct MeetInTheMiddleSearchHooks {
+    // With the filename of every directory that matched the meeting point.
     std::function<void(const std::string& filename)> onPartialMatch;
     // After every call to the backend, and at the end, with the search's
-    // JunctionResult::nextNumber so far.
+    // MeetInTheMiddleResult::nextNumber so far.
     std::function<void(uint64_t nextNumber)> onProgress;
     // Alongside onProgress: how many of the walk's nodes have been searched,
     // of how many there are to search - what the progress line's percentage
     // is of.
     std::function<void(uint64_t searched, uint64_t toSearch)> onCount;
-    // With every line of progress (see JunctionRequest::statusInterval), the
-    // last of them at the end: the tail the walk is about to reach, with the
-    // table's characters written as '?' - "" once there's none left.
+    // With every line of progress (see
+    // MeetInTheMiddleRequest::statusInterval), the last of them at the end:
+    // the tail the walk is about to reach, with the table's characters
+    // written as '?' - "" once there's none left.
     std::function<void(const std::string& tail)> onStatus;
 };
 
-// Runs a junction search on `backend`, which must supportsJunction(). The
-// rest as runSearch (search.h): abortRequested stops it, pauseRequested
-// holds it between calls to the backend, and onPartialMatch is called with
-// every directory that matches the junction.
-JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& req, std::atomic<bool>* abortRequested = nullptr,
+// Runs a meet-in-the-middle search on `backend`, which must
+// supportsMeetInTheMiddle(). The rest as runSearch (search.h): abortRequested
+// stops it, pauseRequested holds it between calls to the backend, and
+// onPartialMatch is called with every directory that matches the meeting
+// point.
+MeetInTheMiddleResult runMeetInTheMiddleSearch(SearchBackend& backend, const MeetInTheMiddleRequest& req, std::atomic<bool>* abortRequested = nullptr,
                                  std::function<void(const std::string&)> onPartialMatch = nullptr,
                                  const std::atomic<bool>* pauseRequested = nullptr);
 // The same, with every hook.
-JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& req, std::atomic<bool>* abortRequested,
-                                 const JunctionSearchHooks& hooks, const std::atomic<bool>* pauseRequested = nullptr);
+MeetInTheMiddleResult runMeetInTheMiddleSearch(SearchBackend& backend, const MeetInTheMiddleRequest& req, std::atomic<bool>* abortRequested,
+                                 const MeetInTheMiddleSearchHooks& hooks, const std::atomic<bool>* pauseRequested = nullptr);
 
-// Whether the junction states and the file's hashes agree: hashing the
-// suffix onto the junction must give the hash, for hashA and for hashB. They
-// come from different places (the junction from the other files of its
-// directory, the hashes from the archive), and a junction that
+// Whether the meeting points and the file's hashes agree: hashing the
+// suffix onto the meeting point must give the hash, for hashA and for hashB.
+// They come from different places (the meeting point from the other files of
+// its directory, the hashes from the archive), and a meeting point that
 // doesn't fit the hashes - the state after the wrong position in the name,
 // say, or the state of another file's directory - would have the search walk
-// the whole space and find nothing, so it's checked before it starts.
-// False, with `error` saying which of the two doesn't fit.
-bool junctionFitsHashes(const JunctionRequest& req, const uint32_t* cryptTable, std::string& error);
+// the whole space and find nothing, so it's checked before it starts. False,
+// with `error` saying which of the two doesn't fit.
+bool meetingPointFitsHashes(const MeetInTheMiddleRequest& req, const uint32_t* cryptTable, std::string& error);
 
-// How much of a junction search a table of `tableLength` characters leaves
-// to brute-force: how many tails the walk has to rewind, all lengths
+// How much of a meet-in-the-middle search a table of `tableLength` characters
+// leaves to brute-force: how many tails the walk has to rewind, all lengths
 // together. UINT64_MAX if that doesn't fit in 64 bits.
-uint64_t junctionTailsToWalk(int alphabetSize, int maxLength, int tableLength);
+uint64_t meetInTheMiddleTailsToWalk(int alphabetSize, int maxLength, int tableLength);
 
 // Identifies everything that decides which directories a search covers and
 // what it looks for - every field of `req` but the start and end, the file
 // paths and the intervals. 16 hex digits.
-std::string junctionFingerprint(const JunctionRequest& req);
+std::string meetInTheMiddleFingerprint(const MeetInTheMiddleRequest& req);
 
 // The progress file: which search wrote it, and the node number every node
 // below which has been searched - plus, for a human, how many nodes there
 // are and the tail at that number. Lines of `key = value`:
 //
-//   # namebreak junction search progress
+//   # namebreak meet-in-the-middle search progress
 //   fingerprint = 0123456789abcdef
 //   next = 123456
 //   total = 147008443
@@ -155,15 +158,15 @@ std::string junctionFingerprint(const JunctionRequest& req);
 //
 // Replaced as a whole each time (replaceFileContents, match_writer.h), so
 // it's never half written.
-struct JunctionProgress {
+struct MeetInTheMiddleProgress {
     std::string fingerprint;
     uint64_t next = 0;
 };
-bool writeJunctionProgress(const std::string& path, const JunctionProgress& progress, uint64_t total, const std::string& tail,
+bool writeMeetInTheMiddleProgress(const std::string& path, const MeetInTheMiddleProgress& progress, uint64_t total, const std::string& tail,
                            std::string& error);
-// False, with `error` set, if the file can't be read or isn't a junction
+// False, with `error` set, if the file can't be read or isn't a meeting point
 // search's progress file. `exists` is false (and the result true) if there's
 // no file at all.
-bool readJunctionProgress(const std::string& path, JunctionProgress& out, bool& exists, std::string& error);
+bool readMeetInTheMiddleProgress(const std::string& path, MeetInTheMiddleProgress& out, bool& exists, std::string& error);
 
-#endif // NAMEBREAK_ENGINE_JUNCTION_SEARCH_H
+#endif // NAMEBREAK_ENGINE_MEET_IN_THE_MIDDLE_SEARCH_H

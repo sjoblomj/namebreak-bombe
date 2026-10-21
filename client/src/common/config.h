@@ -10,7 +10,7 @@
 
 #include "common/matches_file.h"
 #include "engine/dictionary_search.h"
-#include "engine/junction_search.h"
+#include "engine/meet_in_the_middle_search.h"
 #include "engine/search.h"
 
 // Where namebreak reads its config from absent a --config <file> argument -
@@ -25,21 +25,25 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 // namebreak's on-disk config.conf - read from "./config.conf" (the current
 // working directory) unless overridden via --config <file>. A flat key=value
 // file with four possible [section] headers:
-//   [search]      - bounded/continuous parameters (mode picks which of the
-//                   two actually runs; both take the same parameters)
-//   [coordinator] - coordinator-mode parameters (see coordinator_runner.h),
-//                   including junction_table_memory: how much memory this
-//                   client will give a junction target's table
-//   [dictionary]  - dictionary-mode parameters (see buildDictionaryRequest)
-//   [junction]    - junction-mode parameters (see buildJunctionRequest)
+//   [search]              - bounded/continuous parameters (mode picks which
+//                           of the two actually runs; both take the same
+//                           parameters)
+//   [coordinator]         - coordinator-mode parameters (see
+//                           coordinator_runner.h), including
+//                           meet_in_the_middle_table_memory: how much memory
+//                           this client will give a meet-in-the-middle
+//                           target's table
+//   [dictionary]          - dictionary-mode parameters (see
+//                           buildDictionaryRequest)
+//   [meet-in-the-middle]  - meet-in-the-middle-mode parameters (see
+//                           buildMeetInTheMiddleRequest)
 // plus four keys allowed before any section: `mode = continuous|bounded|
-// coordinator|dictionary|junction` (overridable by passing --mode <mode> -
-// see main()),
-// `matches_dir = <directory>` (optional - see matches_file.h),
-// `backend = <name>` (optional, overridable by --backend <name> - see
-// backends/backends.h; unset, the first one that can run here), and
-// `check_for_updates = true|false` (optional, default true - whether to look
-// for a newer release at startup; see net/update_check.h). '#'-led lines
+// coordinator|dictionary|meet-in-the-middle` (overridable by passing --mode
+// <mode> - see main()), `matches_dir = <directory>` (optional - see
+// matches_file.h), `backend = <name>` (optional, overridable by --backend
+// <name> - see backends/backends.h; unset, the first one that can run here),
+// and `check_for_updates = true|false` (optional, default true - whether to
+// look for a newer release at startup; see net/update_check.h). '#'-led lines
 // and blank lines are ignored; a value may optionally be wrapped in "..." if
 // it needs meaningful leading/trailing whitespace (no other escaping - a
 // candidate/prefix/suffix containing a literal backslash needs none).
@@ -55,7 +59,7 @@ struct ConfigFile {
     // so starts and ends with a '"' of its own. buildDictionaryRequest
     // unquotes the values that aren't lists.
     std::map<std::string, std::string> dictionary;
-    std::map<std::string, std::string> junction;
+    std::map<std::string, std::string> meetInTheMiddle;
 };
 
 // Returns false with a human-readable `error` (including path:line) on any
@@ -94,17 +98,19 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
 // is, spaces and commas included - or not, and then trimmed.
 bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, std::vector<std::string>& warnings, std::string& error);
 
-// Builds a JunctionRequest from `config`'s [junction] section (and
-// matches_dir). Returns false with `error` set if a required key is missing,
-// a value doesn't parse, or - with resume_from_last_candidate - the progress
-// file is from a different search.
+// Builds a MeetInTheMiddleRequest from `config`'s [meet-in-the-middle]
+// section (and matches_dir). Returns false with `error` set if a required key
+// is missing, a value doesn't parse, or - with resume_from_last_candidate -
+// the progress file is from a different search.
 //
-// Keys (see README.md's "Junction mode"):
+// Keys (see README.md's "Meet-in-the-middle mode"):
 //   alphabet            required
 //   prefix              optional, default none
 //   suffix              required - what follows the unknown directory
-//   junction_a_seed1, junction_a_seed2   required, the hash state after the
-//   junction_b_seed1, junction_b_seed2   directory for hashA and for hashB
+//   meeting_point_a_seed1, meeting_point_a_seed2,
+//   meeting_point_b_seed1, meeting_point_b_seed2
+//                       required - the hash state after the directory, for
+//                       hashA and for hashB
 //   hash_a, hash_b      required - the file's own two hashes
 //   min_length          optional, default 1
 //   max_length          required
@@ -117,14 +123,15 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 //   matches_name        names the files: matches-<name>.txt, ...
 //   resume_from_last_candidate          default false
 //
-// Unlike runJunctionSearch's own default, `table_length` is worked out here
-// when it isn't given, so that `out.tableLength` is always the length the
-// search will really use - the progress file's fingerprint depends on it.
-bool buildJunctionRequest(const ConfigFile& config, JunctionRequest& out, std::string& error);
+// Unlike runMeetInTheMiddleSearch's own default, `table_length` is worked out
+// here when it isn't given, so that `out.tableLength` is always the length
+// the search will really use - the progress file's fingerprint depends on it.
+bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleRequest& out, std::string& error);
 
-// A number of bytes, as [junction]'s `table_memory` and [coordinator]'s
-// `junction_table_memory` give it: digits, optionally followed by K, M or G
-// (1024, 1024^2, 1024^3 - case doesn't matter). False on anything else.
+// A number of bytes, as [meet-in-the-middle]'s `table_memory` and
+// [coordinator]'s `meet_in_the_middle_table_memory` give it: digits,
+// optionally followed by K, M or G (1024, 1024^2, 1024^3 - case doesn't
+// matter). False on anything else.
 bool parseConfigBytes(const std::string& text, uint64_t& out);
 
 // Reads a list value as described above buildDictionaryRequest. False, with

@@ -39,9 +39,9 @@ unknown name lists the ones the build has.
   repeats until stopped. A target is searched by alphabet, as `bounded` mode
   searches, by words, as `dictionary` mode does (see [Dictionary targets
   in coordinator mode](#dictionary-targets-in-coordinator-mode)), or from a
-  junction, as `junction` mode does - for which `junction_table_memory` says
+  meeting point, as `meet-in-the-middle` mode does - for which `meet_in_the_middle_table_memory` says
   how much memory you'll give its table, and without which the server hands
-  out none of that work (see [Junction mode](#junction-mode)). See
+  out none of that work (see [Meet-in-the-middle mode](#meet-in-the-middle-mode)). See
   [`../coordinator/README.md`](../coordinator/README.md) for the server side
   and how this mode is configured.
 - **`dictionary`** - searches candidates made of words: one word, or several
@@ -49,10 +49,10 @@ unknown name lists the ones the build has.
   (`english-1`) and word lists of your own - and, given the file's
   encryption key, records every candidate whose basename matches it. See
   [Dictionary mode](#dictionary-mode).
-- **`junction`** - for a file whose directory is unknown, but where the hash
+- **`meet-in-the-middle`** - for a file whose directory is unknown, but where the hash
   state right after that directory is known: it searches the directory from
   both ends at once, which buys back one character of brute force for every
-  character it can keep a table of. See [Junction mode](#junction-mode).
+  character it can keep a table of. See [Meet-in-the-middle mode](#meet-in-the-middle-mode).
 
 Exit code is `0` if both hashes matched, `2` if the search space was
 exhausted without a match, `1` on any setup/config error.
@@ -156,18 +156,18 @@ coordinator README linked above for the full picture.
 
 The most recent Hash-A match (a candidate matching the first hash, whether
 or not it matches the second) is kept in a matches file: one filename on one
-line, replaced as the search goes - at most once a second - so the file stays
-a few dozen bytes however long the search runs. A match of both hashes is
-always the line it ends with: the search stops there. It's also appended to
-`found.txt` beside the matches files, which gets nothing else and is never
-replaced, so a later search writing the same matches file can't lose it.
-They all go in one directory -
-`matches/` in the current directory, or whatever a top-level
-`matches_dir = <directory>` line (next to `mode`) says; it's created if
-missing. `bounded`/`continuous` mode writes `matches.txt` there (or
-`matches-<matches_name>.txt`), `dictionary` mode the same and two more files
-(see [Dictionary mode](#dictionary-mode)), `junction` mode the same and a
-progress file (see [Junction mode](#junction-mode)), and `coordinator` mode one
+line, replaced as the search goes - at most once a second - so the file
+stays a few dozen bytes however long the search runs. A match of both hashes
+is always the line it ends with: the search stops there. It's also appended
+to `found.txt` beside the matches files, which gets nothing else and is
+never replaced, so a later search writing the same matches file can't lose
+it. They all go in one directory - `matches/` in the current directory, or
+whatever a top-level `matches_dir = <directory>` line (next to `mode`) says;
+it's created if missing. `bounded`/`continuous` mode writes `matches.txt`
+there (or `matches-<matches_name>.txt`), `dictionary` mode the same and two
+more files (see [Dictionary mode](#dictionary-mode)), `meet-in-the-middle`
+mode the same and a progress file (see [Meet-in-the-middle
+mode](#meet-in-the-middle-mode)), and `coordinator` mode one
 `matches-<target name>.txt` per target - and, for a dictionary target, the
 basenames not sent yet and the word lists it downloaded (see [Dictionary
 targets in coordinator mode](#dictionary-targets-in-coordinator-mode)).
@@ -367,20 +367,20 @@ The dictionary engine itself is unchanged by this: a range is a
 file, and with `DictionarySearchHooks` (`src/engine/dictionary_search.h`)
 telling the coordinator loop each basename and how far it has got.
 
-## Junction mode
+## Meet-in-the-middle mode
 
-`mode = junction` is for a file whose name is a known prefix, an **unknown
-directory**, and a known suffix - and where the MPQ hash state right after
-that directory is already known, for Hash A and for Hash B. That state is
-the *junction*, and it, rather than the file's hashes, is what the search
-looks for: the directory is whatever string takes the hash from the prefix's
-state to it.
+`mode = meet-in-the-middle` is for a file whose name is a known prefix, an
+**unknown directory**, and a known suffix - and where the MPQ hash state
+right after that directory is already known, for Hash A and for Hash B. That
+state is the *meeting point*, and it, rather than the file's hashes, is what
+the search looks for: the directory is whatever string takes the hash from
+the prefix's state to it.
 
-A junction comes from the files *around* the one being searched. When an
-archive holds a run of files whose basenames are known but whose directory
-isn't - the install scripts of Brood War's `INSTALL.EXE`, say, where the
-basenames are in the scripts themselves - then every one of them is
-`<the same unknown directory>` + `\` + `<a known basename>`. Two of those
+A meeting point comes from the files *around* the one being searched. When
+an archive holds a run of files whose basenames are known but whose
+directory isn't - the install scripts of Brood War's `INSTALL.EXE`, say,
+where the basenames are in the scripts themselves - then every one of them
+is `<the same unknown directory>` + `\` + `<a known basename>`. Two of those
 are enough to pin down the state after the directory, by trying all 2^32
 values of `seed2` against the first name and checking each survivor against
 the second. The four numbers that comes to - `seed1` and `seed2` after the
@@ -409,7 +409,7 @@ middle:
 
 - **forward**, from the state after the prefix: every directory of
   `table_length` characters, kept in a table by the state it reaches;
-- **backward**, from the junction: every *tail* - a directory's last
+- **backward**, from the meeting point: every *tail* - a directory's last
   characters - rewound character by character, and the state it reaches
   looked up in that table.
 
@@ -437,19 +437,19 @@ in it is used; `table_length` sets it outright instead. A character more
 costs as many times more memory as the alphabet has characters, so in
 practice the table is 4 or 5 characters long and the walk does the rest.
 
-Every backend but Metal searches junctions: the CUDA/HIP one, OpenCL, `cpu`
-and `reference`. On the RTX 3080 Ti Laptop, both GPU backends rewind about
-2.2 billion tails a second with the 31 MB table (CUDA 2.20, OpenCL 2.37) and
-about half that with the 1.4 GB one (1.13 and 1.22), whose lookups miss every
-cache; the `cpu` backend does about 66 million. Halving the lookups' speed
-to hold one character more is a bargain: that character divides the tails by
-43.
+Every backend but Metal searches meet-in-the-middle targets: the CUDA/HIP
+one, OpenCL, `cpu` and `reference`. On the RTX 3080 Ti Laptop, both GPU
+backends rewind about 2.2 billion tails a second with the 31 MB table (CUDA
+2.20, OpenCL 2.37) and about half that with the 1.4 GB one (1.13 and 1.22),
+whose lookups miss every cache; the `cpu` backend does about 66 million.
+Halving the lookups' speed to hold one character more is a bargain: that
+character divides the tails by 43.
 
 So an 11-character directory takes a 5-character table (13 s to build on the
 CPU, 1.4 GB) and 6.5 billion tails (5 s on the GPU): under twenty seconds in
 all, where the 43^11 = 9.3 * 10^17 names of that space are about a week of
 the same GPU's time to search through. One character further on, where a
-plain search is a year, a junction search is four minutes.
+plain search is a year, a meet-in-the-middle search is four minutes.
 
 The table lives in the device's own memory, so it has to fit there. A search
 whose table is bigger than the GPU has says so and stops, rather than
@@ -469,29 +469,30 @@ have in common.
 Each of the row's tails then costs one step of the hash undone, one bit of
 the table's filter, and - for about one in eight - a binary search of its
 keys. A launch covers about 67 million tails
-(`NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH`), reports how many it looked up and
-the tails it found, and is launched again with more room if it found more
-than it had room for - as a dictionary launch is. The kernels are
-`junctionKernel` in `src/backends/cuda/cuda_backend.cu` and
-`src/backends/opencl/junction.cl`; `src/backends/common/junction_launch.h`
-is what the two share. Metal has no junction kernel yet, so the Metal
-backend says it can't search junctions and isn't picked for one.
+(`NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH`), reports how many it
+looked up and the tails it found, and is launched again with more room if it
+found more than it had room for - as a dictionary launch is. The kernels are
+`meetInTheMiddleKernel` in `src/backends/cuda/cuda_backend.cu` and
+`src/backends/opencl/meet_in_the_middle.cl`;
+`src/backends/common/meet_in_the_middle_launch.h` is what the two share.
+Metal has no meet-in-the-middle kernel yet, so the Metal backend says it
+can't search meet-in-the-middle targets and isn't picked for one.
 
 ### An example
 
 The directory of Brood War's `SETUPDAT\BWUNIN.PIF`, had it not been known,
-from the junction a recovery like that gives for it:
+from the meeting point a recovery like that gives for it:
 
 ```ini
-mode = junction
+mode = meet-in-the-middle
 
-[junction]
+[meet-in-the-middle]
 alphabet = " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\_"
 suffix = \BWUNIN.PIF
-junction_a_seed1 = 0x92F62345
-junction_a_seed2 = 0xB9F61953
-junction_b_seed1 = 0xB95115E6
-junction_b_seed2 = 0x7609B4F4
+meeting_point_a_seed1 = 0x92F62345
+meeting_point_a_seed2 = 0xB9F61953
+meeting_point_b_seed1 = 0xB95115E6
+meeting_point_b_seed2 = 0x7609B4F4
 hash_a = 0x5BAB63FE
 hash_b = 0x8DF2CB08
 max_length = 8
@@ -506,39 +507,39 @@ the GPU: a 4-character table (31 MB) and 3.5 million tails, where a plain
 8-character search of the same alphabet is 43^8 = 11.7 trillion candidates,
 about eight seconds of this GPU's own time.
 
-`[junction]` keys:
+`[meet-in-the-middle]` keys:
 
 | Key | Required | Meaning |
 |---|---|---|
 | `alphabet` | yes | The characters the unknown directory is made of (at most 63, each once). A `\` among them searches directories with subdirectories in them. |
-| `prefix` | no (default none) | Known text before the unknown directory. The junction must be the state after the prefix *and* the directory. |
+| `prefix` | no (default none) | Known text before the unknown directory. The meeting point must be the state after the prefix *and* the directory. |
 | `suffix` | yes | Known text after it - for a file in that directory, the `\` and the basename. |
-| `junction_a_seed1`, `junction_a_seed2` | yes | Hash A's state after the directory, hex. |
-| `junction_b_seed1`, `junction_b_seed2` | yes | Hash B's state after the directory, hex. |
-| `hash_a`, `hash_b` | yes | The file's own two hashes, hex. Hashing `suffix` onto the junction must give them, or the search refuses to start - see below. |
+| `meeting_point_a_seed1`, `meeting_point_a_seed2` | yes | Hash A's state after the directory, hex. |
+| `meeting_point_b_seed1`, `meeting_point_b_seed2` | yes | Hash B's state after the directory, hex. |
+| `hash_a`, `hash_b` | yes | The file's own two hashes, hex. Hashing `suffix` onto the meeting point must give them, or the search refuses to start - see below. |
 | `min_length` | no (default 1) | The shortest directory to report. |
 | `max_length` | yes | The longest to search, up to `MAX_CANDIDATE_LEN` (16). |
 | `table_length` | no | How many of a directory's first characters the table holds. Left out, the longest that fits in `table_memory`. |
 | `table_memory` | no (default `1G`) | How much memory the table may take: bytes, or with a `K`, `M` or `G` after it. |
 | `prune_symbol_runs`, `prune_unopened_brackets`, `prune_adjacent_backslashes`, `max_backslash_count`, `min_backslash_count` | no | The same cheap rules as `[search]` - but applied to *every* character of the directory, not only its leading ones, and `prune_adjacent_backslashes` also counts a `\` the suffix begins with next to one the directory ends with. |
-| `matches_name` | no | Names the files it writes: `matches-<name>.txt` and `junction-<name>.txt` instead of `matches.txt` and `junction.txt`. |
+| `matches_name` | no | Names the files it writes: `matches-<name>.txt` and `meet-in-the-middle-<name>.txt` instead of `matches.txt` and `meet-in-the-middle.txt`. |
 | `resume_from_last_candidate` | no (default false) | Carry on from the progress file - unless that was written by a search with other settings, which it refuses to resume. |
 
-### The junction has to fit the hashes
+### The meeting point has to fit the hashes
 
-The junction and the file's hashes come from different places - the junction
-from a recovery like `junction.c`, the hashes from the archive - so before
-anything is searched, hashing the suffix onto the junction must give the
-file's two hashes. A junction for the state after the wrong position in the
-name, or for another file's directory, would otherwise have the search walk
-the whole space and quietly find nothing. The search says which of the two
-doesn't fit and stops.
+The meeting point and the file's hashes come from different places - the
+meeting point from a key recovery, the hashes from the archive - so before
+anything is searched, hashing the suffix onto the meeting point must give
+the file's two hashes. A meeting point for the state after the wrong
+position in the name, or for another file's directory, would otherwise have
+the search walk the whole space and quietly find nothing. The search says
+which of the two doesn't fit and stops.
 
 It means the two halves of the search are checked against each other too: a
-directory that reaches the junction's 64-bit state necessarily hashes to
-Hash A, and the search reports it, then checks Hash B in full. Both together
-leave about one directory in 2^96 to match by chance - the search says how
-many it expects before it starts, which for a real search is 0.
+directory that reaches the meeting point's 64-bit state necessarily hashes
+to Hash A, and the search reports it, then checks Hash B in full. Both
+together leave about one directory in 2^96 to match by chance - the search
+says how many it expects before it starts, which for a real search is 0.
 
 ### Pruning, and what it may skip
 
@@ -553,36 +554,36 @@ behind it.
 `min_backslash_count` and `prune_unopened_brackets` can't be judged from a
 piece: characters further left could always supply the missing backslash, or
 open the bracket the piece closes. Those are checked once a whole directory
-is in hand, as every rule is before anything is reported - so a junction
-search reports exactly the directories that match the junction and pass the
-rules in full, and the halves' own skipping only ever drops directories that
-check would reject anyway. That property is what `tests/junction_test.cpp`
-checks exhaustively, over every directory of a small alphabet at every split
-between the two halves.
+is in hand, as every rule is before anything is reported - so a meeting
+point search reports exactly the directories that match the meeting point
+and pass the rules in full, and the halves' own skipping only ever drops
+directories that check would reject anyway. That property is what
+`tests/meet_in_the_middle_test.cpp` checks exhaustively, over every
+directory of a small alphabet at every split between the two halves.
 
 ### In coordinator mode
 
-A junction target can be shared out (the coordinator README's "Junction
-targets"): the server fixes how many characters the table holds - what a
-tail even is depends on it - and hands out a stretch of one directory
-length's tails at a time. What it costs in memory is therefore the same for
-every client of that target, so a client says how much it will give one in
-`[coordinator]`'s `junction_table_memory`:
+A meet-in-the-middle target can be shared out (the coordinator README's
+"Meet-in-the-middle targets"): the server fixes how many characters the
+table holds - what a tail even is depends on it - and hands out a stretch of
+one directory length's tails at a time. What it costs in memory is therefore
+the same for every client of that target, so a client says how much it will
+give one in `[coordinator]`'s `meet_in_the_middle_table_memory`:
 
 ```ini
 [coordinator]
 server_url = https://namebreak-coordinator.fly.dev
-junction_table_memory = 1G
+meet_in_the_middle_table_memory = 1G
 ```
 
-Left out (or 0), this client is handed no junction target's work at all -
-a table is memory you have to agree to spare, and on a GPU it has to fit in
-the device's own as well. The client says which it is when it registers, and
-a server hands out no target whose table is bigger than it. The table is
-built afresh for every range claimed (a few seconds for four characters of
-43, a quarter of a minute for five), and progress is reported as the tail
-the walk has got to, so a range taken over by someone else resumes exactly
-there.
+Left out (or 0), this client is handed no meet-in-the-middle target's work
+at all - a table is memory you have to agree to spare, and on a GPU it has
+to fit in the device's own as well. The client says which it is when it
+registers, and a server hands out no target whose table is bigger than it.
+The table is built afresh for every range claimed (a few seconds for four
+characters of 43, a quarter of a minute for five), and progress is reported
+as the tail the walk has got to, so a range taken over by someone else
+resumes exactly there.
 
 ### Progress, resuming and ranges
 
@@ -590,15 +591,15 @@ The search goes through the backward walk's *nodes*: one per tail, shortest
 first, and within a length in the order of the tail *reversed* - the
 directory's last character changes slowest, because it's the first the walk
 rewinds and so the one whose state the most tails share. A node's number is
-what the progress file (`matches/junction.txt`) records, and what a range of
-a search is given in, so `resume_from_last_candidate = true` carries on
-exactly where the last run stopped.
+what the progress file (`matches/meet-in-the-middle.txt`) records, and what
+a range of a search is given in, so `resume_from_last_candidate = true`
+carries on exactly where the last run stopped.
 
 Note that the node order is not the order the directories themselves sort
 in, as the other modes' candidates are searched - the search reports a
 directory when the walk reaches *its tail*, and the tails of one length come
-before every longer one. The coordinator can't hand out junction ranges yet;
-the numbering is what it will use when it can.
+before every longer one. The coordinator can't hand out meet-in-the-middle
+ranges yet; the numbering is what it will use when it can.
 
 ## Compiling
 
@@ -656,73 +657,72 @@ constant - except for 40, 42 and 43 (`CompiledAlphabetSizes` in
 `lowbits_filter_test`, of the lookup filter), plus
 end-to-end tests of every backend that compare real search results against
 an independent brute-force reference (thousands of cases: alphabet sizes
-from 1 to 63, every last-character position, ranges starting/ending mid-row and
-crossing launch boundaries, prefix/suffix lengths 0-63 including bytes >=
-0x80, the both-hashes-match path, and a seeded fuzzer), and the dense-hit
+from 1 to 63, every last-character position, ranges starting/ending mid-row
+and crossing launch boundaries, prefix/suffix lengths 0-63 including bytes
+>= 0x80, the both-hashes-match path, and a seeded fuzzer), and the dense-hit
 stress tests (`stress-*`), which make one candidate in 4096 a hit and
 compare every one of them with a brute force - see [The lookup
 filter](#the-lookup-filter-most-candidates-are-never-hashed), and a
 known-answer test (`listfile-*`), which must find each of the 6,407 names of
-a real StarCraft listfile (`tests/data/sc-listfile.txt`) from its two hashes,
-in a small search planted around it - with hashes from the test's own copy
-of the MPQ hash, so it also catches a bug the client's hashing shares with
-every other test. Dictionary mode has its own: `dictionary_test` (numbering,
-bounds and counting against brute force), `wordlist_test` (which pins
-`english-1`), `dictionary_batch_test` (the word table, suffix filters,
+a real StarCraft listfile (`tests/data/sc-listfile.txt`) from its two
+hashes, in a small search planted around it - with hashes from the test's
+own copy of the MPQ hash, so it also catches a bug the client's hashing
+shares with every other test. Dictionary mode has its own: `dictionary_test`
+(numbering, bounds and counting against brute force), `wordlist_test` (which
+pins `english-1`), `dictionary_batch_test` (the word table, suffix filters,
 launch plan and hit checking the GPU backends share), `dictionary-search-*`
 (the dictionary self-test, then whole searches on each backend against brute
 force - also with one candidate in 256 a hit, and one in 256 a basename
-matching the key by chance, with tails, and with few candidates and
-batches per call, stopped and resumed part way, the GPU kernels' thread
-blocks a few words each and three tails to a cell, room for a single hit
-and a one-bit suffix filter, and cut into ranges of numbers as a
-coordinator hands them out). Junction mode has `junction_test` (the hash run
+matching the key by chance, with tails, and with few candidates and batches
+per call, stopped and resumed part way, the GPU kernels' thread blocks a few
+words each and three tails to a cell, room for a single hit and a one-bit
+suffix filter, and cut into ranges of numbers as a coordinator hands them
+out). Meet-in-the-middle mode has `meet_in_the_middle_test` (the hash run
 backwards, the tails' numbering, the backward walk, the table and the
 pruning rules split between the two halves, all against brute force),
-`junction-search-*` (the junction self-test, then whole searches on each
-backend against brute force at every split between the table and the walk -
-also with three bits of each of the junction's seeds compared, so about one
-directory in 64 matches it by chance, and with a few tails per call, room
-for a single hit per launch, and ranges, stopping and resuming and pausing)
-and `junction-cli-*` (the program itself recovering `SETUPDAT` from the
-state after it). And
-`dictionary-cli-*` (the program itself). The coordinator client's own parts
-have `protocol_test` (the JSON, an
-alphabet claim as older clients read it and a dictionary claim with its
-arrays), `basename_outbox_test` (the basenames waiting to be sent, and that
-no report says the search got past one it doesn't carry - also while one
-thread adds and another sends) and `word_lists_test` (a claim's word lists:
-compiled in, kept, downloaded and checked); and `coordinator-dictionary`
-(`tests/coordinator_dictionary_test.py`, when cargo and Python 3 are there)
-runs the real server, `../coordinator`, against the program in coordinator
-mode: quitting part way through a dictionary range, searching dictionary
-and alphabet targets to the end, the server going away and coming back
-while basenames wait to be sent (with `namebreak_heartbeat_1s`, built to
-heartbeat every second), and more basenames than a report carries (with
-`namebreak_one_basename_per_report`, built to carry one, and pairs of
-`english-1` candidates whose basenames share a key): a quit carrying the
-first of two whose range, handed out again, finds the second; a completion
-after the first is sent in a heartbeat; and a backlog sent one heartbeat
-straight after another. The search
-itself is built in several configurations for the tests (different GPU window, launch
-sizes and rows per thread, the stress tests' weaker match, a one-bit
-filter), each with its own
-compile of the CUDA backend - the build runs them in parallel.
-`cmake --build --preset default --target run_search_bench` times the real
-search over a fixed range (`build/tests/search_bench --scale <n>` for a
-longer one), pruning as the real configuration does (`--prune symbols` or
-`none` for less, `--whole` to prune the whole candidate; `--alphabet`,
-`--prefix` and `--suffix` time a coordinator target's). It reports the range covered per second, the rate at
+`meet-in-the-middle-search-*` (the meet-in-the-middle self-test, then whole
+searches on each backend against brute force at every split between the
+table and the walk - also with three bits of each of the meeting point's
+seeds compared, so about one directory in 64 matches it by chance, and with
+a few tails per call, room for a single hit per launch, and ranges, stopping
+and resuming and pausing) and `meet-in-the-middle-cli-*` (the program itself
+recovering `SETUPDAT` from the state after it). And `dictionary-cli-*` (the
+program itself). The coordinator client's own parts have `protocol_test`
+(the JSON, an alphabet claim as older clients read it and a dictionary claim
+with its arrays), `basename_outbox_test` (the basenames waiting to be sent,
+and that no report says the search got past one it doesn't carry - also
+while one thread adds and another sends) and `word_lists_test` (a claim's
+word lists: compiled in, kept, downloaded and checked); and
+`coordinator-dictionary` (`tests/coordinator_dictionary_test.py`, when cargo
+and Python 3 are there) runs the real server, `../coordinator`, against the
+program in coordinator mode: quitting part way through a dictionary range,
+searching dictionary and alphabet targets to the end, the server going away
+and coming back while basenames wait to be sent (with
+`namebreak_heartbeat_1s`, built to heartbeat every second), and more
+basenames than a report carries (with `namebreak_one_basename_per_report`,
+built to carry one, and pairs of `english-1` candidates whose basenames
+share a key): a quit carrying the first of two whose range, handed out
+again, finds the second; a completion after the first is sent in a
+heartbeat; and a backlog sent one heartbeat straight after another. The
+search itself is built in several configurations for the tests (different
+GPU window, launch sizes and rows per thread, the stress tests' weaker
+match, a one-bit filter), each with its own compile of the CUDA backend -
+the build runs them in parallel. `cmake --build --preset default --target
+run_search_bench` times the real search over a fixed range
+(`build/tests/search_bench --scale <n>` for a longer one), pruning as the
+real configuration does (`--prune symbols` or `none` for less, `--whole` to
+prune the whole candidate; `--alphabet`, `--prefix` and `--suffix` time a
+coordinator target's). It reports the range covered per second, the rate at
 which the backend searched what pruning left, and a projection for a real
-search, whose leading characters all vary - the timed range only varies
-its last few, so it prunes far less than a real search would. The
-projection takes the share a real search prunes from random leading values
-put through the engine's own checks; compare GPU windows by it. And `--target run_mutation_test` (and
-`run_mutation_test_opencl`) checks that the tests catch deliberately broken
-kernels - see [The lookup
+search, whose leading characters all vary - the timed range only varies its
+last few, so it prunes far less than a real search would. The projection
+takes the share a real search prunes from random leading values put through
+the engine's own checks; compare GPU windows by it. And `--target
+run_mutation_test` (and `run_mutation_test_opencl`) checks that the tests
+catch deliberately broken kernels - see [The lookup
 filter](#the-lookup-filter-most-candidates-are-never-hashed) - which takes
-minutes, so it isn't part of `ctest`. Everything is built into `build/`; deleting it is the clean
-build.
+minutes, so it isn't part of `ctest`. Everything is built into `build/`;
+deleting it is the clean build.
 
 ## Releases
 
@@ -743,7 +743,7 @@ backends' tests actually run there.
 
 | Directory | What's in it |
 |---|---|
-| `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU; the dictionary search, `runDictionarySearch()`, with its word lists; and the junction search, `runJunctionSearch()`, with the hash run backwards |
+| `src/engine/` | The search itself: `runSearch()`, candidate/bound arithmetic, hashing on the CPU; the dictionary search, `runDictionarySearch()`, with its word lists; and the meet-in-the-middle search, `runMeetInTheMiddleSearch()`, with the hash run backwards |
 | `src/backends/` | What the search runs its batches on (see Backends below) |
 | `src/common/` | The config file, and the few OS-specific helpers (terminal, hostname) |
 | `src/net/` | The coordinator client: HTTP, the wire protocol, the claim/heartbeat loop, and a dictionary target's word lists and the basenames waiting to be sent (left out by `NAMEBREAK_NETWORK=OFF`) |
@@ -1262,73 +1262,73 @@ candidates - and run against each check on its own (the integration and
 stress tests with the self-test switched off). `tests/mutation_test.py`
 does it, a backend at a time: `cmake --build --preset default --target
 run_mutation_test` for the CUDA kernel (about an hour on the RTX 3080 Ti
-Laptop, with the pruning mutations below), `run_mutation_test_opencl` for the OpenCL one (about four).
-Run it after any change to a kernel - and when it
-says a mutation no longer applies, because the code it breaks has changed,
-update the mutation rather than drop it. It also runs two more checks on
-every copy, for what the other three rarely or never reach: the overflow
-test (more hits in a launch than it can record), and the stress test built
-for tiny batches, a few per launch (`stress-small`) - with 16 leading
-values per launch, nearly every search of the other tests is a single
-launch, and only this one has many, where what one launch leaves behind can
-break the next. A dictionary search and a junction search have their own
-two checks each (the dictionary and junction search tests, built for dense
-hits and for small launches), which their own mutations are held to. It
-first checks that the unchanged code passes every check, and that a change
-which mustn't matter (one thread, or one work-group, too few or too many
-launched) passes them too, so that it can't pass by always saying "caught". Against the CUDA kernel as it is now - row
-groups split into chunks, 16 batches per launch, and its hits read back
-with its hit count - twenty-six mutations: rows' masks cut to
-32 bits; seed1 and seed2 swapped in the lookup; a batch's last row, or
-first row, one candidate short; the edges of the range ignored; the loop
-over a row's flagged candidates stopping one early; the suffix hashed one
-character short; the table built for the wrong target; in the
-chunking, a chunk's first or last row skipped; the range cut one row short
-at its start or end; the first or last row's cut applied to the wrong row;
-one character too few of a group hashed; the wrong character in a row's
-own step; the last chunk, or the last group, of a batch never searched; and
-in the batching, every batch of a launch searched with the first one's
-seeds and edges; every hit recorded as, or checked with, the first
-batch's; a launch's last batch never searched; the hits past the first 16
-read one short, and the hit count never reset after a launch with hits;
-and two in the engine - the batches left over at the end of a candidate
-length never searched, and a launch whose hits overflowed never searched
-again batch by batch. Every kernel mutation but the last two was caught by
-the self-test, by the integration test and by the stress test - the
-integration test failed 6-1007 of its 2,266 cases, the stress test 17-315 of
-its 346, and the wrong-target table stopped both at their first search. The
-rest can only be caught where they can happen: more than 16 hits in a
-launch only in the stress test (which caught it), a count left over from
-one launch only in a search of many (the self-test, which searches its
-grouped batches twice in one search, and `stress-small`); the engine's two
-not by the self-test, which tests a backend without the engine (the first
-was caught by the integration and stress tests, the overflow one by the
-overflow test alone). Since the CUDA kernel hashes a chunk's flagged
+Laptop, with the pruning mutations below), `run_mutation_test_opencl` for
+the OpenCL one (about four). Run it after any change to a kernel - and when
+it says a mutation no longer applies, because the code it breaks has
+changed, update the mutation rather than drop it. It also runs two more
+checks on every copy, for what the other three rarely or never reach: the
+overflow test (more hits in a launch than it can record), and the stress
+test built for tiny batches, a few per launch (`stress-small`) - with 16
+leading values per launch, nearly every search of the other tests is a
+single launch, and only this one has many, where what one launch leaves
+behind can break the next. A dictionary search and a meet-in-the-middle
+search have their own two checks each (the dictionary and meet-in-the-middle
+search tests, built for dense hits and for small launches), which their own
+mutations are held to. It first checks that the unchanged code passes every
+check, and that a change which mustn't matter (one thread, or one
+work-group, too few or too many launched) passes them too, so that it can't
+pass by always saying "caught". Against the CUDA kernel as it is now - row
+groups split into chunks, 16 batches per launch, and its hits read back with
+its hit count - twenty-six mutations: rows' masks cut to 32 bits; seed1 and
+seed2 swapped in the lookup; a batch's last row, or first row, one candidate
+short; the edges of the range ignored; the loop over a row's flagged
+candidates stopping one early; the suffix hashed one character short; the
+table built for the wrong target; in the chunking, a chunk's first or last
+row skipped; the range cut one row short at its start or end; the first or
+last row's cut applied to the wrong row; one character too few of a group
+hashed; the wrong character in a row's own step; the last chunk, or the last
+group, of a batch never searched; and in the batching, every batch of a
+launch searched with the first one's seeds and edges; every hit recorded as,
+or checked with, the first batch's; a launch's last batch never searched;
+the hits past the first 16 read one short, and the hit count never reset
+after a launch with hits; and two in the engine - the batches left over at
+the end of a candidate length never searched, and a launch whose hits
+overflowed never searched again batch by batch. Every kernel mutation but
+the last two was caught by the self-test, by the integration test and by the
+stress test - the integration test failed 6-1007 of its 2,266 cases, the
+stress test 17-315 of its 346, and the wrong-target table stopped both at
+their first search. The rest can only be caught where they can happen: more
+than 16 hits in a launch only in the stress test (which caught it), a count
+left over from one launch only in a search of many (the self-test, which
+searches its grouped batches twice in one search, and `stress-small`); the
+engine's two not by the self-test, which tests a backend without the engine
+(the first was caught by the integration and stress tests, the overflow one
+by the overflow test alone). Since the CUDA kernel hashes a chunk's flagged
 candidates after all of its rows, three more: only the first flagged
-candidate of a chunk's last flagged row hashed, the flagged rows hashed
-from the next row's state, and a row's flag recorded as the next row's -
-each caught by all three checks. Against the OpenCL kernel, twenty-one: the same kinds
-of bug in its mask, lookup, row edges, loop, suffix and chunking, plus a
-lowest-set-bit taken one too high, its own copy of the table index shifting
-one bit too far, and the kernel compiled for a table one bit narrower - with
-half as many work-items, and a work-group too many, as the changes that
-mustn't matter. Every one was caught by all three checks too (the
-integration test failed 6-1007 of its 2,266 cases, the stress test 48-394 of
-its 436), each time the script was run on it. The Metal kernel has its own
-list (`--backend metal`, on a Mac); with no Mac here, its kernel mutations
-were run through an emulation of Metal on the CPU (see [Backends](#backends)),
-and each was caught by all three checks there too, while half as many
-threads, or a threadgroup too many, went unnoticed, as they must. The CPU
-backend has its own list too (`--backend cpu`), since it got the filter:
-the same kinds of bug in its mask, lookup, row edges, loop and suffix, the
-highest flagged bit taken for the lowest, and in its own code the row
-walk's characters wrapping one early, the wrong one rehashed after a
-change, a work item's first row decoded one off, a row skipped between two
-work items, a call's last batch never searched, hits recorded or checked
-with the wrong batch, and an overflow hidden by counting a thread's hits no
-higher than can be recorded - with larger work items, and everything on one
-thread, as the changes that mustn't matter. Each was caught by the checks
-it names (the integration test failed 17-1138 of its 2,338 cases, the
+candidate of a chunk's last flagged row hashed, the flagged rows hashed from
+the next row's state, and a row's flag recorded as the next row's - each
+caught by all three checks. Against the OpenCL kernel, twenty-one: the same
+kinds of bug in its mask, lookup, row edges, loop, suffix and chunking, plus
+a lowest-set-bit taken one too high, its own copy of the table index
+shifting one bit too far, and the kernel compiled for a table one bit
+narrower - with half as many work-items, and a work-group too many, as the
+changes that mustn't matter. Every one was caught by all three checks too
+(the integration test failed 6-1007 of its 2,266 cases, the stress test
+48-394 of its 436), each time the script was run on it. The Metal kernel has
+its own list (`--backend metal`, on a Mac); with no Mac here, its kernel
+mutations were run through an emulation of Metal on the CPU (see
+[Backends](#backends)), and each was caught by all three checks there too,
+while half as many threads, or a threadgroup too many, went unnoticed, as
+they must. The CPU backend has its own list too (`--backend cpu`), since it
+got the filter: the same kinds of bug in its mask, lookup, row edges, loop
+and suffix, the highest flagged bit taken for the lowest, and in its own
+code the row walk's characters wrapping one early, the wrong one rehashed
+after a change, a work item's first row decoded one off, a row skipped
+between two work items, a call's last batch never searched, hits recorded or
+checked with the wrong batch, and an overflow hidden by counting a thread's
+hits no higher than can be recorded - with larger work items, and everything
+on one thread, as the changes that mustn't matter. Each was caught by the
+checks it names (the integration test failed 17-1138 of its 2,338 cases, the
 stress test 55-426 of its 511).
 
 Each round of this found something. The first one added the self-test's

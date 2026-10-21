@@ -20,14 +20,14 @@
 #include <vector>
 
 #include "backends/common/dictionary_batch.h"
-#include "backends/common/junction_launch.h"
+#include "backends/common/meet_in_the_middle_launch.h"
 #include "backends/common/launch_waiter.h"
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
 #include "backends/common/row_pruning.h"
-#include "backends/opencl/dictionary_kernel.h" // generated from dictionary.cl - see CMakeLists.txt
-#include "backends/opencl/junction_kernel.h"   // generated from junction.cl
-#include "backends/opencl/search_kernel.h"     // generated from search.cl
+#include "backends/opencl/dictionary_kernel.h"         // generated from dictionary.cl - see CMakeLists.txt
+#include "backends/opencl/meet_in_the_middle_kernel.h" // generated from meet_in_the_middle.cl
+#include "backends/opencl/search_kernel.h"             // generated from search.cl
 #include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
 #include "engine/limits.h"
@@ -109,13 +109,14 @@ constexpr int kHitsReadWithCount = MAX_MATCHES < 16 ? MAX_MATCHES : 16;
 // is the last two's product. And with tails, how many a cell has (see
 // DictionaryLaunchBatch). The CUDA backend's values (see its tuning.h).
 constexpr uint64_t kDictionaryCandidatesPerLaunch = 1ull << 28;
-// A junction search's launches (junction.cl): about how many tails one
-// rewinds, how many hits it has room for at first, and its work-group size.
-// The CUDA backend's values again (NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH,
-// NAMEBREAK_JUNCTION_HIT_CAPACITY).
-constexpr uint64_t kJunctionTailsPerLaunch = NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH;
-constexpr cl_uint kJunctionHitCapacity = NAMEBREAK_JUNCTION_HIT_CAPACITY;
-constexpr size_t kJunctionWorkGroupSize = 256;
+// A meet-in-the-middle search's launches (meet_in_the_middle.cl): about how
+// many tails one rewinds, how many hits it has room for at first, and its
+// work-group size. The CUDA backend's values again
+// (NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH,
+// NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY).
+constexpr uint64_t kMeetInTheMiddleTailsPerLaunch = NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH;
+constexpr cl_uint kMeetInTheMiddleHitCapacity = NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY;
+constexpr size_t kMeetInTheMiddleWorkGroupSize = 256;
 constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
 constexpr size_t kDictionaryWorkGroupSize = dictionaryThreadsPerBlockOr(256);
 constexpr int kDictionaryTailsPerCell = dictionaryTailsPerCellOr(32);
@@ -164,13 +165,13 @@ public:
             clReleaseKernel(entry.second.kernel);
             clReleaseProgram(entry.second.program);
         }
-        for (auto& entry : junctionKernels_) {
+        for (auto& entry : meetInTheMiddleKernels_) {
             clReleaseKernel(entry.second.kernel);
             clReleaseProgram(entry.second.program);
         }
         releaseDictionaryBuffers();
-        releaseJunctionBuffers();
-        for (cl_mem buffer : {junctionCounts_, junctionHits_}) {
+        releaseMeetInTheMiddleBuffers();
+        for (cl_mem buffer : {meetInTheMiddleCounts_, meetInTheMiddleHits_}) {
             if (buffer)
                 clReleaseMemObject(buffer);
         }
@@ -205,12 +206,12 @@ public:
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
     void endDictionarySearch() override { releaseDictionaryBuffers(); }
 
-    // A junction search: one launch of junction.cl's kernel per call.
-    bool supportsJunction() const override { return true; }
-    uint64_t junctionTailsPerCall() const override { return kJunctionTailsPerLaunch; }
-    void beginJunctionSearch(const JunctionConstants& constants) override;
-    JunctionOutcome runJunctionBatch(const JunctionBatch& batch) override;
-    void endJunctionSearch() override { releaseJunctionBuffers(); }
+    // A meet-in-the-middle search: one launch of meet_in_the_middle.cl's kernel per call.
+    bool supportsMeetInTheMiddle() const override { return true; }
+    uint64_t meetInTheMiddleTailsPerCall() const override { return kMeetInTheMiddleTailsPerLaunch; }
+    void beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) override;
+    MeetInTheMiddleOutcome runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) override;
+    void endMeetInTheMiddleSearch() override { releaseMeetInTheMiddleBuffers(); }
 
 private:
     struct CompiledKernel {
@@ -221,8 +222,8 @@ private:
 
     const CompiledKernel& kernelFor(int trailingLen, bool listed);
     const CompiledKernel& dictionaryKernel();
-    const CompiledKernel& junctionKernel();
-    void releaseJunctionBuffers();
+    const CompiledKernel& meetInTheMiddleKernel();
+    void releaseMeetInTheMiddleBuffers();
     void uploadGroups();
     // Compiles `source` with `options`, ending the process if it doesn't.
     cl_program buildProgram(const char* source, const std::string& options, const char* what);
@@ -310,19 +311,19 @@ private:
     cl_mem dictionaryCounts_ = nullptr;
     cl_mem dictionaryHashAHits_ = nullptr, dictionaryBasenameHits_ = nullptr;
 
-    // A junction search's: the engine's table and the alphabet as the kernel
-    // reads it - made by beginJunctionSearch and released by
-    // endJunctionSearch - the kernels compiled for the rules of a search
-    // (keyed by the options they were compiled with), and the counts and
-    // hits a launch reports.
-    JunctionConstants junction_ = {};
-    cl_mem junctionKeys_ = nullptr, junctionFilter_ = nullptr, junctionChars_ = nullptr;
-    cl_ulong junctionKeyCount_ = 0;
-    cl_int junctionFilterShift_ = 64;
-    std::map<std::string, CompiledKernel> junctionKernels_;
-    cl_mem junctionCounts_ = nullptr;
-    cl_mem junctionHits_ = nullptr;
-    cl_uint junctionHitCapacity_ = 0;
+    // A meet-in-the-middle search's: the engine's table and the alphabet as
+    // the kernel reads it - made by beginMeetInTheMiddleSearch and released
+    // by endMeetInTheMiddleSearch - the kernels compiled for the rules of a
+    // search (keyed by the options they were compiled with), and the counts
+    // and hits a launch reports.
+    MeetInTheMiddleConstants meet_in_the_middle_ = {};
+    cl_mem meetInTheMiddleKeys_ = nullptr, meetInTheMiddleFilter_ = nullptr, meetInTheMiddleChars_ = nullptr;
+    cl_ulong meetInTheMiddleKeyCount_ = 0;
+    cl_int meetInTheMiddleFilterShift_ = 64;
+    std::map<std::string, CompiledKernel> meetInTheMiddleKernels_;
+    cl_mem meetInTheMiddleCounts_ = nullptr;
+    cl_mem meetInTheMiddleHits_ = nullptr;
+    cl_uint meetInTheMiddleHitCapacity_ = 0;
     cl_uint dictionaryHitCapacity_ = 0;
 };
 
@@ -696,15 +697,15 @@ void OpenClBackend::releaseDictionaryBuffers() {
     }
 }
 
-void OpenClBackend::beginJunctionSearch(const JunctionConstants& constants) {
+void OpenClBackend::beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) {
     if (!announcedDevice_) {
         printf("OpenCL device: %s (%s)\n", deviceInfoString(device_, CL_DEVICE_NAME).c_str(),
                deviceInfoString(device_, CL_DEVICE_VERSION).c_str());
         announcedDevice_ = true;
     }
-    releaseJunctionBuffers();
-    junction_ = constants;
-    const JunctionTable& table = *constants.table;
+    releaseMeetInTheMiddleBuffers();
+    meet_in_the_middle_ = constants;
+    const MeetInTheMiddleTable& table = *constants.table;
 
     // The alphabet, as the kernel reads it: each character's hashA crypt
     // table key, its own value, and what the pruning rules make of it.
@@ -715,25 +716,26 @@ void OpenClBackend::beginJunctionSearch(const JunctionConstants& constants) {
         chars[k].s[1] = ch;
         chars[k].s[2] = (isRunSymbol_CPU((char) ch) ? 1u : 0u) | (ch == '\\' ? 2u : 0u);
     }
-    junctionChars_ = createBuffer(CL_MEM_READ_ONLY, chars.size() * sizeof(cl_uint4));
-    CL_CHECK(clEnqueueWriteBuffer(queue_, junctionChars_, CL_TRUE, 0, chars.size() * sizeof(cl_uint4), chars.data(), 0, nullptr, nullptr));
+    meetInTheMiddleChars_ = createBuffer(CL_MEM_READ_ONLY, chars.size() * sizeof(cl_uint4));
+    CL_CHECK(clEnqueueWriteBuffer(queue_, meetInTheMiddleChars_, CL_TRUE, 0, chars.size() * sizeof(cl_uint4), chars.data(), 0, nullptr, nullptr));
 
-    // The table: the one thing a junction search has that doesn't fit in a
-    // kernel argument, and the one thing that can be too big for the device
+    // The table: the one thing a meet-in-the-middle search has that doesn't
+    // fit in a kernel argument, and the one thing that can be too big for the
+    // device
     // - the engine sizes it to the memory it was given, which is the
     // machine's, not this device's.
-    junctionKeyCount_ = table.size();
-    junctionFilterShift_ = table.filterShift();
+    meetInTheMiddleKeyCount_ = table.size();
+    meetInTheMiddleFilterShift_ = table.filterShift();
     const size_t keyBytes = std::max<size_t>(1, table.size() * sizeof(cl_ulong));
     const size_t filterBytes = std::max<size_t>(1, (size_t) table.filterWords() * sizeof(cl_ulong));
     cl_int keyErr = CL_SUCCESS, filterErr = CL_SUCCESS;
-    junctionKeys_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, keyBytes, nullptr, &keyErr);
-    junctionFilter_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, filterBytes, nullptr, &filterErr);
+    meetInTheMiddleKeys_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, keyBytes, nullptr, &keyErr);
+    meetInTheMiddleFilter_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, filterBytes, nullptr, &filterErr);
     if (keyErr != CL_SUCCESS || filterErr != CL_SUCCESS) {
         cl_ulong deviceBytes = 0;
         clGetDeviceInfo(device_, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(deviceBytes), &deviceBytes, nullptr);
         fprintf(stderr,
-                "The junction search's table needs %zu MB on the OpenCL device, and it has %llu MB in all.\n"
+                "The meet-in-the-middle search's table needs %zu MB on the OpenCL device, and it has %llu MB in all.\n"
                 "Give the table less memory (config.conf's table_memory, a character shorter is %u times smaller),\n"
                 "or search on the cpu backend (--backend cpu), which uses the machine's own memory.\n",
                 (keyBytes + filterBytes) / (1024 * 1024), (unsigned long long) (deviceBytes / (1024 * 1024)),
@@ -741,123 +743,123 @@ void OpenClBackend::beginJunctionSearch(const JunctionConstants& constants) {
         exit(1);
     }
     if (table.size() > 0)
-        CL_CHECK(clEnqueueWriteBuffer(queue_, junctionKeys_, CL_TRUE, 0, table.size() * sizeof(cl_ulong), table.keys(), 0, nullptr, nullptr));
-    CL_CHECK(clEnqueueWriteBuffer(queue_, junctionFilter_, CL_TRUE, 0, (size_t) table.filterWords() * sizeof(cl_ulong), table.filter(), 0,
+        CL_CHECK(clEnqueueWriteBuffer(queue_, meetInTheMiddleKeys_, CL_TRUE, 0, table.size() * sizeof(cl_ulong), table.keys(), 0, nullptr, nullptr));
+    CL_CHECK(clEnqueueWriteBuffer(queue_, meetInTheMiddleFilter_, CL_TRUE, 0, (size_t) table.filterWords() * sizeof(cl_ulong), table.filter(), 0,
                                   nullptr, nullptr));
 
     // The counts are 0 at every launch: zeroed here, and after every launch
-    // that had anything to report (see runJunctionBatch).
-    if (!junctionCounts_)
-        junctionCounts_ = createBuffer(CL_MEM_READ_WRITE, 2 * sizeof(cl_uint));
+    // that had anything to report (see runMeetInTheMiddleBatch).
+    if (!meetInTheMiddleCounts_)
+        meetInTheMiddleCounts_ = createBuffer(CL_MEM_READ_WRITE, 2 * sizeof(cl_uint));
     const cl_uint zeros[2] = {0, 0};
-    CL_CHECK(clEnqueueWriteBuffer(queue_, junctionCounts_, CL_TRUE, 0, sizeof(zeros), zeros, 0, nullptr, nullptr));
-    if (!junctionHits_) {
-        junctionHitCapacity_ = kJunctionHitCapacity;
-        junctionHits_ = createBuffer(CL_MEM_READ_WRITE, junctionHitCapacity_ * sizeof(cl_ulong));
+    CL_CHECK(clEnqueueWriteBuffer(queue_, meetInTheMiddleCounts_, CL_TRUE, 0, sizeof(zeros), zeros, 0, nullptr, nullptr));
+    if (!meetInTheMiddleHits_) {
+        meetInTheMiddleHitCapacity_ = kMeetInTheMiddleHitCapacity;
+        meetInTheMiddleHits_ = createBuffer(CL_MEM_READ_WRITE, meetInTheMiddleHitCapacity_ * sizeof(cl_ulong));
     }
     waiter_.beginSearch();
 }
 
-void OpenClBackend::releaseJunctionBuffers() {
-    for (cl_mem* buffer : {&junctionKeys_, &junctionFilter_, &junctionChars_}) {
+void OpenClBackend::releaseMeetInTheMiddleBuffers() {
+    for (cl_mem* buffer : {&meetInTheMiddleKeys_, &meetInTheMiddleFilter_, &meetInTheMiddleChars_}) {
         if (*buffer)
             clReleaseMemObject(*buffer);
         *buffer = nullptr;
     }
 }
 
-const OpenClBackend::CompiledKernel& OpenClBackend::junctionKernel() {
+const OpenClBackend::CompiledKernel& OpenClBackend::meetInTheMiddleKernel() {
     // The alphabet and the rules are compiled in: they don't change within a
     // search, and the alphabet's size makes the kernel's divisions by it
     // multiplications.
-    const PruneRules& rules = junction_.rules;
-    const std::string options = "-cl-std=CL1.2 -DALPHABET_SIZE=" + std::to_string(junction_.alphabet.size()) +
+    const PruneRules& rules = meet_in_the_middle_.rules;
+    const std::string options = "-cl-std=CL1.2 -DALPHABET_SIZE=" + std::to_string(meet_in_the_middle_.alphabet.size()) +
                                 " -DMAX_CANDIDATE_LEN=" + std::to_string(MAX_CANDIDATE_LEN) +
-                                " -DJUNCTION_SEED_MASK=" + std::to_string(kJunctionSeedMask) + "u" +
+                                " -DMEET_IN_THE_MIDDLE_SEED_MASK=" + std::to_string(kMeetInTheMiddleSeedMask) + "u" +
                                 " -DRULE_ANY=" + std::to_string(rules.any() ? 1 : 0) +
                                 " -DRULE_SYMBOL_RUNS=" + std::to_string(rules.symbolRuns ? 1 : 0) +
                                 " -DRULE_ADJACENT_BACKSLASHES=" + std::to_string(rules.adjacentBackslashes ? 1 : 0) +
                                 " -DRULE_MAX_BACKSLASH_COUNT=" + std::to_string(rules.maxBackslashCount) +
-                                " -DENTRY_SYMBOL_RUN=" + std::to_string(junction_.tailEntry.symbolRun) +
-                                " -DENTRY_BACKSLASHES=" + std::to_string(junction_.tailEntry.backslashes) +
-                                " -DENTRY_NEXT_IS_BACKSLASH=" + std::to_string(junction_.tailEntry.nextIsBackslash ? 1 : 0);
-    auto found = junctionKernels_.find(options);
-    if (found != junctionKernels_.end())
+                                " -DENTRY_SYMBOL_RUN=" + std::to_string(meet_in_the_middle_.tailEntry.symbolRun) +
+                                " -DENTRY_BACKSLASHES=" + std::to_string(meet_in_the_middle_.tailEntry.backslashes) +
+                                " -DENTRY_NEXT_IS_BACKSLASH=" + std::to_string(meet_in_the_middle_.tailEntry.nextIsBackslash ? 1 : 0);
+    auto found = meetInTheMiddleKernels_.find(options);
+    if (found != meetInTheMiddleKernels_.end())
         return found->second;
     CompiledKernel compiled;
-    compiled.program = buildProgram(kJunctionKernelSource, options, "junction");
+    compiled.program = buildProgram(kMeetInTheMiddleKernelSource, options, "meet-in-the-middle");
     cl_int err = CL_SUCCESS;
-    compiled.kernel = clCreateKernel(compiled.program, "searchJunction", &err);
+    compiled.kernel = clCreateKernel(compiled.program, "searchMeetInTheMiddle", &err);
     CL_CHECK(err);
     size_t kernelMax = 0;
     CL_CHECK(clGetKernelWorkGroupInfo(compiled.kernel, device_, CL_KERNEL_WORK_GROUP_SIZE, sizeof(kernelMax), &kernelMax, nullptr));
-    compiled.workGroupSize = std::min(kJunctionWorkGroupSize, kernelMax);
-    return junctionKernels_.emplace(options, compiled).first->second;
+    compiled.workGroupSize = std::min(kMeetInTheMiddleWorkGroupSize, kernelMax);
+    return meetInTheMiddleKernels_.emplace(options, compiled).first->second;
 }
 
-JunctionOutcome OpenClBackend::runJunctionBatch(const JunctionBatch& batch) {
-    JunctionOutcome outcome;
+MeetInTheMiddleOutcome OpenClBackend::runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) {
+    MeetInTheMiddleOutcome outcome;
     if (batch.count == 0)
         return outcome;
-    const CompiledKernel& compiled = junctionKernel();
-    const uint64_t alphabetSize = junction_.alphabet.size();
-    const JunctionRows rows = junctionRowsOf(batch, alphabetSize);
+    const CompiledKernel& compiled = meetInTheMiddleKernel();
+    const uint64_t alphabetSize = meet_in_the_middle_.alphabet.size();
+    const MeetInTheMiddleRows rows = meetInTheMiddleRowsOf(batch, alphabetSize);
     const cl_ulong firstRow = rows.firstRow, lastRow = rows.lastRow;
     const cl_uint firstRowStartK = rows.firstRowStartK, lastRowEndK = rows.lastRowEndK;
-    const cl_uint junctionSeed1 = junction_.junction.first, junctionSeed2 = junction_.junction.second;
+    const cl_uint meetingPointSeed1 = meet_in_the_middle_.meetingPoint.first, meetingPointSeed2 = meet_in_the_middle_.meetingPoint.second;
     const cl_int tailLength = batch.tailLength;
     const size_t local = compiled.workGroupSize;
     const size_t global = (size_t) ((rows.rowCount() + local - 1) / local) * local;
 
     // Launched again, with room for every hit, as long as it had more than it
-    // had room for - which a real search, comparing the junction's whole
+    // had room for - which a real search, comparing the meeting point's whole
     // 64-bit state, practically never does.
     cl_uint counts[2] = {0, 0};
     for (;;) {
         cl_kernel kernel = compiled.kernel;
         int arg = 0;
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &junctionKeys_));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(junctionKeyCount_), &junctionKeyCount_));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &junctionFilter_));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(junctionFilterShift_), &junctionFilterShift_));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &junctionChars_));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(junctionSeed1), &junctionSeed1));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(junctionSeed2), &junctionSeed2));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &meetInTheMiddleKeys_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(meetInTheMiddleKeyCount_), &meetInTheMiddleKeyCount_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &meetInTheMiddleFilter_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(meetInTheMiddleFilterShift_), &meetInTheMiddleFilterShift_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &meetInTheMiddleChars_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(meetingPointSeed1), &meetingPointSeed1));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(meetingPointSeed2), &meetingPointSeed2));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(tailLength), &tailLength));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(firstRow), &firstRow));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(lastRow), &lastRow));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(firstRowStartK), &firstRowStartK));
         CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(lastRowEndK), &lastRowEndK));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &junctionCounts_));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &junctionHits_));
-        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(junctionHitCapacity_), &junctionHitCapacity_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &meetInTheMiddleCounts_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &meetInTheMiddleHits_));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(meetInTheMiddleHitCapacity_), &meetInTheMiddleHitCapacity_));
         const LaunchWaiter::Clock::time_point launched = LaunchWaiter::Clock::now();
         CL_CHECK(clEnqueueNDRangeKernel(queue_, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr));
         CL_CHECK(clFlush(queue_)); // on its way to the device before this sleeps
         waiter_.wait(batch.count, launched, [&] {
-            CL_CHECK(clEnqueueReadBuffer(queue_, junctionCounts_, CL_TRUE, 0, sizeof(counts), counts, 0, nullptr, nullptr));
+            CL_CHECK(clEnqueueReadBuffer(queue_, meetInTheMiddleCounts_, CL_TRUE, 0, sizeof(counts), counts, 0, nullptr, nullptr));
         });
         if (counts[0] > batch.count || counts[1] > batch.count) {
-            fprintf(stderr, "INTERNAL ERROR: a junction launch of %llu tails looked up %u of them and found %u - exiting\n",
+            fprintf(stderr, "INTERNAL ERROR: a meet-in-the-middle launch of %llu tails looked up %u of them and found %u - exiting\n",
                     (unsigned long long) batch.count, counts[0], counts[1]);
             exit(1);
         }
-        if (counts[1] <= junctionHitCapacity_)
+        if (counts[1] <= meetInTheMiddleHitCapacity_)
             break;
-        CL_CHECK(clReleaseMemObject(junctionHits_));
-        junctionHitCapacity_ = std::max(counts[1], 2 * junctionHitCapacity_);
-        junctionHits_ = createBuffer(CL_MEM_READ_WRITE, junctionHitCapacity_ * sizeof(cl_ulong));
+        CL_CHECK(clReleaseMemObject(meetInTheMiddleHits_));
+        meetInTheMiddleHitCapacity_ = std::max(counts[1], 2 * meetInTheMiddleHitCapacity_);
+        meetInTheMiddleHits_ = createBuffer(CL_MEM_READ_WRITE, meetInTheMiddleHitCapacity_ * sizeof(cl_ulong));
         const cl_uint zeros[2] = {0, 0};
-        CL_CHECK(clEnqueueWriteBuffer(queue_, junctionCounts_, CL_TRUE, 0, sizeof(zeros), zeros, 0, nullptr, nullptr));
+        CL_CHECK(clEnqueueWriteBuffer(queue_, meetInTheMiddleCounts_, CL_TRUE, 0, sizeof(zeros), zeros, 0, nullptr, nullptr));
     }
 
     outcome.probed = counts[0];
     if (counts[1] > 0) {
         std::vector<cl_ulong> hits(counts[1]);
-        CL_CHECK(clEnqueueReadBuffer(queue_, junctionHits_, CL_TRUE, 0, counts[1] * sizeof(cl_ulong), hits.data(), 0, nullptr, nullptr));
+        CL_CHECK(clEnqueueReadBuffer(queue_, meetInTheMiddleHits_, CL_TRUE, 0, counts[1] * sizeof(cl_ulong), hits.data(), 0, nullptr, nullptr));
         for (cl_ulong index : hits) {
             if (index < batch.start || index >= batch.start + batch.count) {
-                fprintf(stderr, "INTERNAL ERROR: the junction kernel reported the tail at %llu, which its batch doesn't have - exiting\n",
+                fprintf(stderr, "INTERNAL ERROR: the meet-in-the-middle kernel reported the tail at %llu, which its batch doesn't have - exiting\n",
                         (unsigned long long) index);
                 exit(1);
             }
@@ -866,7 +868,7 @@ JunctionOutcome OpenClBackend::runJunctionBatch(const JunctionBatch& batch) {
     }
     if (counts[0] != 0 || counts[1] != 0) {
         static const cl_uint kZeros[2] = {0, 0};
-        CL_CHECK(clEnqueueWriteBuffer(queue_, junctionCounts_, CL_FALSE, 0, sizeof(kZeros), kZeros, 0, nullptr, nullptr));
+        CL_CHECK(clEnqueueWriteBuffer(queue_, meetInTheMiddleCounts_, CL_FALSE, 0, sizeof(kZeros), kZeros, 0, nullptr, nullptr));
     }
     return outcome;
 }

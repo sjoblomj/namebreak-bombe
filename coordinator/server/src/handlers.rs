@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use namebreak_protocol::{
     AdminCreatePriorityRangeRequest, AdminCreatePriorityRangeResponse, AdminCreateSkipRangeRequest, AdminCreateSkipRangeResponse, AdminCreateTargetRequest,
     AdminCreateTargetResponse, AdminDeletePriorityRangeResponse, AdminDeleteSkipRangeResponse, AdminPatchTargetRequest,
-    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, DictionarySettings, HeartbeatRequest, HeartbeatResponse, JunctionSettings,
+    AlphabetInfo, ClientReleases, AlphabetsResponse, CompleteRequest, DictionarySettings, HeartbeatRequest, HeartbeatResponse, MeetInTheMiddleSettings,
     QuitRequest, RegisterRequest, RegisterResponse, StatusResponse, TargetStatus, Version, WordListInfo, PROTOCOL_VERSION,
 };
 
@@ -18,9 +18,9 @@ use crate::alphabet::{
 use crate::auth::{AdminAuth, AuthedUser};
 use crate::client_release;
 use crate::dictionary::{self, FilenameBounds};
-use crate::junction;
+use crate::meet_in_the_middle;
 use crate::error::AppError;
-use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME, JUNCTION_ALPHABET_NAME};
+use crate::models::{parse_hash_hex, u32_to_i64, Target, TargetProgress, User, DICTIONARY_ALPHABET_NAME, MEET_IN_THE_MIDDLE_ALPHABET_NAME};
 use crate::ranges::{self, SegmentOwner};
 use crate::state::{generate_token, now_unix, AppState};
 
@@ -65,12 +65,12 @@ pub async fn register(
         // Refreshed on every registration, not just created once: a
         // returning client may have been upgraded (or downgraded) since it
         // last registered, and claim_range always wants the current picture.
-        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ?, client_release = ?, junction_table_bytes = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ?, client_release = ?, meet_in_the_middle_table_bytes = ? WHERE id = ?")
             .bind(now)
             .bind(&client_version)
             .bind(backend)
             .bind(client_release)
-            .bind(req.junction_table_bytes)
+            .bind(req.meet_in_the_middle_table_bytes)
             .bind(existing.id)
             .execute(&state.pool)
             .await?;
@@ -83,7 +83,7 @@ pub async fn register(
 
     let token = generate_token();
     let user_id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend, client_release, junction_table_bytes) \
+        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend, client_release, meet_in_the_middle_table_bytes) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(username)
@@ -94,7 +94,7 @@ pub async fn register(
     .bind(&client_version)
     .bind(backend)
     .bind(client_release)
-    .bind(req.junction_table_bytes)
+    .bind(req.meet_in_the_middle_table_bytes)
     .fetch_one(&state.pool)
     .await?;
 
@@ -291,13 +291,13 @@ pub async fn admin_create_target(
         return Err(AppError::BadRequest("name is required".into()));
     }
     if let Some(settings) = &req.dictionary {
-        if req.junction.is_some() {
-            return Err(AppError::BadRequest("a target is searched by words or by a junction, not both".into()));
+        if req.meet_in_the_middle.is_some() {
+            return Err(AppError::BadRequest("a target is searched by words or by a meeting point, not both".into()));
         }
         return create_dictionary_target(&state, &req, settings).await;
     }
-    if let Some(settings) = &req.junction {
-        return create_junction_target(&state, &req, settings).await;
+    if let Some(settings) = &req.meet_in_the_middle {
+        return create_meet_in_the_middle_target(&state, &req, settings).await;
     }
     if req.send_basenames {
         return Err(AppError::BadRequest("send_basenames is for dictionary targets - an alphabet search doesn't compare basenames".into()));
@@ -523,13 +523,14 @@ async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetReque
     Ok(Json(AdminCreateTargetResponse { target_id }))
 }
 
-/// The settings an alphabet target has that a junction target doesn't:
-/// it searches a directory of a known length range, with no bounds, no
-/// inserted text and no basenames, and its pruning rules always look at the
-/// whole directory. `start_len` is `junction.min_length` instead, and
-/// priority and skip ranges (patterns over candidate indices) aren't a
-/// junction target's either - the admin endpoints that make them refuse one.
-fn junction_settings_not_given(req: &AdminCreateTargetRequest) -> Vec<&'static str> {
+/// The settings an alphabet target has that a meet-in-the-middle target
+/// doesn't: it searches a directory of a known length range, with no bounds,
+/// no inserted text and no basenames, and its pruning rules always look at
+/// the whole directory. `start_len` is `meet_in_the_middle.min_length`
+/// instead, and priority and skip ranges (patterns over candidate indices)
+/// aren't a meet-in-the-middle target's either - the admin endpoints that
+/// make them refuse one.
+fn meet_in_the_middle_settings_not_given(req: &AdminCreateTargetRequest) -> Vec<&'static str> {
     [
         ("lower_bound", !req.lower_bound.is_empty()),
         ("upper_bound", !req.upper_bound.is_empty()),
@@ -546,17 +547,18 @@ fn junction_settings_not_given(req: &AdminCreateTargetRequest) -> Vec<&'static s
     .collect()
 }
 
-/// `admin_create_target` for a junction target (`req.junction` - see
-/// `JunctionSettings`): its alphabet and lengths have to make a space whose
-/// tails can be numbered (`junction::JunctionSpace::new`), and its junction
-/// has to fit the file's hashes (`junction::fits_hashes`) - a junction for
-/// the wrong place in the name would have every client search the whole
-/// space and find nothing. Its cursor starts at the first tail of the
-/// shortest directory.
-async fn create_junction_target(state: &AppState, req: &AdminCreateTargetRequest, settings: &JunctionSettings) -> Result<Json<AdminCreateTargetResponse>, AppError> {
-    let not_given = junction_settings_not_given(req);
+/// `admin_create_target` for a meet-in-the-middle target
+/// (`req.meet_in_the_middle` - see `MeetInTheMiddleSettings`): its alphabet
+/// and lengths have to make a space whose tails can be numbered
+/// (`meet_in_the_middle::MeetInTheMiddleSpace::new`), and its meeting point
+/// has to fit the file's hashes (`meet_in_the_middle::fits_hashes`) - a
+/// meeting point for the wrong place in the name would have every client
+/// search the whole space and find nothing. Its cursor starts at the first
+/// tail of the shortest directory.
+async fn create_meet_in_the_middle_target(state: &AppState, req: &AdminCreateTargetRequest, settings: &MeetInTheMiddleSettings) -> Result<Json<AdminCreateTargetResponse>, AppError> {
+    let not_given = meet_in_the_middle_settings_not_given(req);
     if !not_given.is_empty() {
-        return Err(AppError::BadRequest(format!("{} isn't for a junction target", not_given.join(", "))));
+        return Err(AppError::BadRequest(format!("{} isn't for a meet-in-the-middle target", not_given.join(", "))));
     }
     if let Some(name) = &req.base_file_name {
         validate_base_file_name(name)?;
@@ -565,16 +567,16 @@ async fn create_junction_target(state: &AppState, req: &AdminCreateTargetRequest
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
     let seed = |what: &str, hex: &str| parse_hash_hex(hex).map_err(|_| AppError::BadRequest(format!("invalid {what}")));
-    let junction_a = (seed("junction_a_seed1_hex", &settings.junction_a_seed1_hex)?, seed("junction_a_seed2_hex", &settings.junction_a_seed2_hex)?);
-    let junction_b = (seed("junction_b_seed1_hex", &settings.junction_b_seed1_hex)?, seed("junction_b_seed2_hex", &settings.junction_b_seed2_hex)?);
+    let meeting_point_a = (seed("meeting_point_a_seed1_hex", &settings.meeting_point_a_seed1_hex)?, seed("meeting_point_a_seed2_hex", &settings.meeting_point_a_seed2_hex)?);
+    let meeting_point_b = (seed("meeting_point_b_seed1_hex", &settings.meeting_point_b_seed1_hex)?, seed("meeting_point_b_seed2_hex", &settings.meeting_point_b_seed2_hex)?);
     let (alphabet_name, alphabet) = resolve_alphabet(req.alphabet_name.as_deref(), req.alphabet.as_deref())?;
-    let space = junction::JunctionSpace::new(&alphabet, settings.min_length, settings.max_length, settings.table_length).map_err(AppError::BadRequest)?;
-    junction::fits_hashes(junction_a, junction_b, &req.suffix, hash_a, hash_b).map_err(AppError::BadRequest)?;
+    let space = meet_in_the_middle::MeetInTheMiddleSpace::new(&alphabet, settings.min_length, settings.max_length, settings.table_length).map_err(AppError::BadRequest)?;
+    meet_in_the_middle::fits_hashes(meeting_point_a, meeting_point_b, &req.suffix, hash_a, hash_b).map_err(AppError::BadRequest)?;
     let longest = req.prefix.len() + space.max_length() as usize + req.suffix.len();
-    if longest > junction::MAX_FILENAME_LENGTH {
+    if longest > meet_in_the_middle::MAX_FILENAME_LENGTH {
         return Err(AppError::BadRequest(format!(
             "the longest filename ({longest} characters) is longer than the {} a client searches",
-            junction::MAX_FILENAME_LENGTH
+            meet_in_the_middle::MAX_FILENAME_LENGTH
         )));
     }
 
@@ -583,9 +585,9 @@ async fn create_junction_target(state: &AppState, req: &AdminCreateTargetRequest
     let target_id: i64 = sqlx::query_scalar(
         "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, \
          prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, \
-         priority, description, start_len, base_file_name, kind, junction_a_seed1, junction_a_seed2, junction_b_seed1, junction_b_seed2, \
-         junction_max_length, junction_table_length, created_at) \
-         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 'junction', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         priority, description, start_len, base_file_name, kind, meeting_point_a_seed1, meeting_point_a_seed2, meeting_point_b_seed1, meeting_point_b_seed2, \
+         meet_in_the_middle_max_length, meet_in_the_middle_table_length, created_at) \
+         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 'meet-in-the-middle', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -603,10 +605,10 @@ async fn create_junction_target(state: &AppState, req: &AdminCreateTargetRequest
     .bind(&req.description)
     .bind(space.min_length())
     .bind(&req.base_file_name)
-    .bind(u32_to_i64(junction_a.0))
-    .bind(u32_to_i64(junction_a.1))
-    .bind(u32_to_i64(junction_b.0))
-    .bind(u32_to_i64(junction_b.1))
+    .bind(u32_to_i64(meeting_point_a.0))
+    .bind(u32_to_i64(meeting_point_a.1))
+    .bind(u32_to_i64(meeting_point_b.0))
+    .bind(u32_to_i64(meeting_point_b.1))
     .bind(space.max_length())
     .bind(space.table_length())
     .bind(now)
@@ -615,7 +617,7 @@ async fn create_junction_target(state: &AppState, req: &AdminCreateTargetRequest
     sqlx::query("INSERT INTO target_progress (target_id, candidate_len, next_block, next_index, alphabet_name, alphabet) VALUES (?, ?, 0, 0, ?, '')")
         .bind(target_id)
         .bind(space.min_length())
-        .bind(JUNCTION_ALPHABET_NAME)
+        .bind(MEET_IN_THE_MIDDLE_ALPHABET_NAME)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -624,7 +626,7 @@ async fn create_junction_target(state: &AppState, req: &AdminCreateTargetRequest
         tails = %space.total_tails(),
         table_length = space.table_length(),
         table_bytes = space.table_bytes(),
-        "created a junction target"
+        "created a meet-in-the-middle target"
     );
     Ok(Json(AdminCreateTargetResponse { target_id }))
 }
@@ -937,12 +939,12 @@ pub async fn admin_patch_target(
     } else if req.send_basenames == Some(true) {
         return Err(AppError::BadRequest("send_basenames is for dictionary targets - an alphabet search doesn't compare basenames".into()));
     }
-    // A junction target's alphabet and lengths are what its tails are
+    // A meet-in-the-middle target's alphabet and lengths are what its tails are
     // numbered by, so they're fixed once it has ranges; the rest of an
-    // alphabet target's search settings aren't a junction target's at all
-    // (see JunctionSettings). Its priority, description, status and pruning
-    // rules can be patched like any other target's.
-    if existing.is_junction() {
+    // alphabet target's search settings aren't a meet-in-the-middle target's
+    // at all (see MeetInTheMiddleSettings). Its priority, description, status
+    // and pruning rules can be patched like any other target's.
+    if existing.is_meet_in_the_middle() {
         let fixed: Vec<&str> = [
             ("alphabet_name", req.alphabet_name.is_some()),
             ("alphabet", req.alphabet.is_some()),
@@ -957,7 +959,7 @@ pub async fn admin_patch_target(
         .collect();
         if !fixed.is_empty() {
             return Err(AppError::BadRequest(format!(
-                "{} isn't for a junction target - its alphabet and lengths are what its tails are numbered by, so make another target to                  search them differently",
+                "{} isn't for a meet-in-the-middle target - its alphabet and lengths are what its tails are numbered by, so make another target to                  search them differently",
                 fixed.join(", ")
             )));
         }
@@ -1117,9 +1119,9 @@ pub async fn admin_create_priority_range(
     if target.is_dictionary() {
         return Err(AppError::BadRequest("a dictionary target has no priority ranges - its candidates aren't strings of an alphabet".into()));
     }
-    if target.is_junction() {
+    if target.is_meet_in_the_middle() {
         return Err(AppError::BadRequest(
-            "a junction target has no priority ranges - what it hands out is the tails of a directory, not candidates a pattern can pin              down (see junction.rs)"
+            "a meet-in-the-middle target has no priority ranges - what it hands out is the tails of a directory, not candidates a pattern can pin              down (see meet_in_the_middle.rs)"
                 .into(),
         ));
     }
@@ -1241,9 +1243,9 @@ pub async fn admin_create_skip_range(
     if target.is_dictionary() {
         return Err(AppError::BadRequest("a dictionary target has no skip ranges - its candidates aren't strings of an alphabet".into()));
     }
-    if target.is_junction() {
+    if target.is_meet_in_the_middle() {
         return Err(AppError::BadRequest(
-            "a junction target has no skip ranges - what it hands out is the tails of a directory, not candidates a pattern can pin down              (see junction.rs)"
+            "a meet-in-the-middle target has no skip ranges - what it hands out is the tails of a directory, not candidates a pattern can pin down              (see meet_in_the_middle.rs)"
                 .into(),
         ));
     }
@@ -1272,7 +1274,7 @@ mod tests {
             backend: "cuda".into(),
             protocol_version: protocol_version.to_string(),
             client_release: None,
-            junction_table_bytes: None,
+            meet_in_the_middle_table_bytes: None,
         }
     }
 
@@ -1343,7 +1345,7 @@ mod tests {
             target_chunk_seconds: 1.0,
             default_rate_per_sec: 1.0,
             default_dictionary_rate_per_sec: 1.0,
-        default_junction_rate_per_sec: 1.0,
+        default_meet_in_the_middle_rate_per_sec: 1.0,
             min_chunk_candidates: 1,
             max_chunk_candidates: 1,
             lease_seconds: 60,

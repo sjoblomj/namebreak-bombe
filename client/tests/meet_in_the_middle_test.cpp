@@ -1,10 +1,10 @@
-// Correctness test for the parts of a junction search that don't need a
-// backend (engine/junction.h, engine/junction_search.h): the hash run
-// backwards, how the backward walk's tails are numbered, the walk itself,
-// the table, the pruning rules split between the two halves, the junction's
-// own consistency check, the fingerprint and the progress file - every one
-// of them against brute force, or against the forward hash they have to
-// agree with. Pure CPU.
+// Correctness test for the parts of a meet-in-the-middle search that don't
+// need a backend (engine/meet_in_the_middle.h,
+// engine/meet_in_the_middle_search.h): the hash run backwards, how the
+// backward walk's tails are numbered, the walk itself, the table, the pruning
+// rules split between the two halves, the meeting point's own consistency
+// check, the fingerprint and the progress file - every one of them against
+// brute force, or against the forward hash they have to agree with. Pure CPU.
 //
 // What could go wrong here is the kind of bug that loses a directory
 // silently rather than crashing: an inverse step that's off by one
@@ -13,8 +13,8 @@
 // spot-checked - the small spaces are walked exhaustively, every tail and
 // every directory, and compared with what a plain loop says they should be.
 //
-// Writes its files under ./junction_test/ - ctest runs this from its own
-// directory under build/testrun/.
+// Writes its files under ./meet_in_the_middle_test/ - ctest runs this from
+// its own directory under build/testrun/.
 
 #include <algorithm>
 #include <cstdio>
@@ -25,8 +25,8 @@
 #include <string>
 #include <vector>
 
-#include "engine/junction.h"
-#include "engine/junction_search.h"
+#include "engine/meet_in_the_middle.h"
+#include "engine/meet_in_the_middle_search.h"
 #include "engine/mpq_hash.h"
 
 static int g_failures = 0;
@@ -40,7 +40,7 @@ static void check(bool ok, const std::string& what) {
     }
 }
 
-static const std::string kDir = "junction_test";
+static const std::string kDir = "meet_in_the_middle_test";
 
 static uint32_t g_cryptTable[0x500];
 
@@ -97,28 +97,28 @@ static void testStepBack() {
 // --- The space ---------------------------------------------------------------
 
 static void testSpace() {
-    printf("--- JunctionSpace ---\n");
+    printf("--- MeetInTheMiddleSpace ---\n");
     std::string error;
-    JunctionSpace space;
-    check(!JunctionSpace::create("", 1, 4, 2, space, error) && !error.empty(), "an empty alphabet is refused");
-    check(!JunctionSpace::create("AAB", 1, 4, 2, space, error) && error.find("more than once") != std::string::npos,
+    MeetInTheMiddleSpace space;
+    check(!MeetInTheMiddleSpace::create("", 1, 4, 2, space, error) && !error.empty(), "an empty alphabet is refused");
+    check(!MeetInTheMiddleSpace::create("AAB", 1, 4, 2, space, error) && error.find("more than once") != std::string::npos,
           "an alphabet with a character twice is refused");
-    check(!JunctionSpace::create("AB", 0, 4, 2, space, error), "a shortest directory of 0 characters is refused");
-    check(!JunctionSpace::create("AB", 5, 4, 2, space, error), "a shortest longer than the longest is refused");
-    check(!JunctionSpace::create("AB", 1, MAX_CANDIDATE_LEN + 1, 2, space, error), "a directory longer than MAX_CANDIDATE_LEN is refused");
-    check(!JunctionSpace::create("AB", 1, 4, 5, space, error), "a table longer than the longest directory is refused");
-    check(!JunctionSpace::create(std::string(MAX_ALPHABET_SIZE + 1, 'x'), 1, 4, 2, space, error), "too big an alphabet is refused");
+    check(!MeetInTheMiddleSpace::create("AB", 0, 4, 2, space, error), "a shortest directory of 0 characters is refused");
+    check(!MeetInTheMiddleSpace::create("AB", 5, 4, 2, space, error), "a shortest longer than the longest is refused");
+    check(!MeetInTheMiddleSpace::create("AB", 1, MAX_CANDIDATE_LEN + 1, 2, space, error), "a directory longer than MAX_CANDIDATE_LEN is refused");
+    check(!MeetInTheMiddleSpace::create("AB", 1, 4, 5, space, error), "a table longer than the longest directory is refused");
+    check(!MeetInTheMiddleSpace::create(std::string(MAX_ALPHABET_SIZE + 1, 'x'), 1, 4, 2, space, error), "too big an alphabet is refused");
     // 43 characters to the power of 12 is past 2^64; to the power of 11 isn't.
     const std::string big = " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_";
     check(big.size() == 43, "the real alphabet has 43 characters");
-    check(!JunctionSpace::create(big, 1, 12, 0, space, error) && error.find("64 bits") != std::string::npos,
+    check(!MeetInTheMiddleSpace::create(big, 1, 12, 0, space, error) && error.find("64 bits") != std::string::npos,
           "a tail space too big to number is refused");
-    check(JunctionSpace::create(big, 1, 11, 0, space, error), "one that just fits isn't");
+    check(MeetInTheMiddleSpace::create(big, 1, 11, 0, space, error), "one that just fits isn't");
 
     const std::string alphabet = "AB-";
     for (int maxLength = 1; maxLength <= 5; ++maxLength) {
         for (int tableLength = 0; tableLength <= maxLength; ++tableLength) {
-            if (!JunctionSpace::create(alphabet, 1, maxLength, tableLength, space, error)) {
+            if (!MeetInTheMiddleSpace::create(alphabet, 1, maxLength, tableLength, space, error)) {
                 check(false, "create " + std::to_string(maxLength) + "/" + std::to_string(tableLength) + ": " + error);
                 continue;
             }
@@ -274,22 +274,22 @@ static void testRules() {
 // --- The walk ----------------------------------------------------------------
 
 static void testWalk() {
-    printf("--- JunctionWalk ---\n");
+    printf("--- MeetInTheMiddleWalk ---\n");
     const std::string alphabet = "AB-\\";
     const std::string suffix = "\\X.Y";
-    const HashState junction = continueHash(kInitialHashState, "SETUPDAT\\SOMEDIR", kHashAOffset, g_cryptTable);
+    const HashState meetingPoint = continueHash(kInitialHashState, "SETUPDAT\\SOMEDIR", kHashAOffset, g_cryptTable);
     int visited = 0;
     for (const PruneRules& rules : ruleSets()) {
         for (int tailLength = 0; tailLength <= 4; ++tailLength) {
-            JunctionSpace space;
+            MeetInTheMiddleSpace space;
             std::string error;
-            if (!JunctionSpace::create(alphabet, 1, tailLength + 1, 1, space, error)) {
+            if (!MeetInTheMiddleSpace::create(alphabet, 1, tailLength + 1, 1, space, error)) {
                 check(false, error);
                 continue;
             }
             // What the walk must visit, and with what: every tail of this
-            // length the rules allow, in index order, each with the junction
-            // rewound over it from scratch.
+            // length the rules allow, in index order, each with the meeting
+            // point rewound over it from scratch.
             std::vector<std::pair<uint64_t, std::string>> wanted;
             for (uint64_t index = 0; index < space.countOf(tailLength); ++index) {
                 const std::string tail = space.tailOf(space.numberOf(tailLength, index));
@@ -304,19 +304,19 @@ static void testWalk() {
                 bool states = true;
                 for (uint64_t from = 0; from < space.countOf(tailLength); from += piece) {
                     const uint64_t to = std::min(space.countOf(tailLength), from + piece);
-                    JunctionWalk walk(alphabet, tailLength, junction, g_cryptTable + kHashAOffset, rules, tailPruneStart(suffix));
+                    MeetInTheMiddleWalk walk(alphabet, tailLength, meetingPoint, g_cryptTable + kHashAOffset, rules, tailPruneStart(suffix));
                     for (bool more = walk.start(from, to); more; more = walk.next()) {
                         got.emplace_back(walk.index(), walk.tail());
-                        states = states && walk.state() == rewindHash(junction, walk.tail(), kHashAOffset, g_cryptTable);
+                        states = states && walk.state() == rewindHash(meetingPoint, walk.tail(), kHashAOffset, g_cryptTable);
                         ++visited;
                     }
                 }
                 const std::string what = "tails of " + std::to_string(tailLength) + " in pieces of " + std::to_string(piece);
                 check(got == wanted, what + ": exactly the tails the rules allow, in index order");
-                check(states, what + ": each with the junction rewound over it");
+                check(states, what + ": each with the meeting point rewound over it");
             }
             // A range that starts past the end has nothing in it.
-            JunctionWalk walk(alphabet, tailLength, junction, g_cryptTable + kHashAOffset, rules, tailPruneStart(suffix));
+            MeetInTheMiddleWalk walk(alphabet, tailLength, meetingPoint, g_cryptTable + kHashAOffset, rules, tailPruneStart(suffix));
             check(!walk.start(space.countOf(tailLength), space.countOf(tailLength) + 10), "a range past the last tail is empty");
             check(!walk.start(3, 3), "and so is an empty one");
         }
@@ -327,30 +327,30 @@ static void testWalk() {
 // --- The table ---------------------------------------------------------------
 
 static void testTable() {
-    printf("--- JunctionTable ---\n");
+    printf("--- MeetInTheMiddleTable ---\n");
     const std::string alphabet = "AB-\\";
     const std::string namePrefix = "SETUPDAT\\";
     const std::string suffix = "\\X.Y";
     for (const PruneRules& rules : ruleSets()) {
         for (int tableLength = 0; tableLength <= 3; ++tableLength) {
-            // The junction of a directory that's partly in the table and
+            // The meeting point of a directory that's partly in the table and
             // partly in the walk, so that the shorter directories have
             // something to miss.
             const int maxLength = 4;
-            JunctionSpace space;
+            MeetInTheMiddleSpace space;
             std::string error;
-            if (!JunctionSpace::create(alphabet, 1, maxLength, tableLength, space, error)) {
+            if (!MeetInTheMiddleSpace::create(alphabet, 1, maxLength, tableLength, space, error)) {
                 check(false, error);
                 continue;
             }
             const HashState startState = continueHash(kInitialHashState, namePrefix, kHashAOffset, g_cryptTable);
-            // A junction that some *short* directory reaches, to test that
+            // A meeting point that some *short* directory reaches, to test that
             // the build reports those: the state after "AB".
-            const HashState junction = continueHash(startState, "AB", kHashAOffset, g_cryptTable);
+            const HashState meetingPoint = continueHash(startState, "AB", kHashAOffset, g_cryptTable);
 
             std::vector<std::string> shortMatches;
-            JunctionTable table;
-            if (!JunctionTable::build(space, startState, dirPruneStart(namePrefix), rules, g_cryptTable, junction, shortMatches, table,
+            MeetInTheMiddleTable table;
+            if (!MeetInTheMiddleTable::build(space, startState, dirPruneStart(namePrefix), rules, g_cryptTable, meetingPoint, shortMatches, table,
                                       error)) {
                 check(false, error);
                 continue;
@@ -364,7 +364,7 @@ static void testTable() {
                 if (rules.any() && prefixRejected(rules, namePrefix, dir))
                     continue;
                 wantedPrefixes.push_back(dir);
-                wantedKeys.insert(junctionKey(continueHash(startState, dir, kHashAOffset, g_cryptTable)));
+                wantedKeys.insert(meetingPointKey(continueHash(startState, dir, kHashAOffset, g_cryptTable)));
             }
             const std::string what = "table of " + std::to_string(tableLength);
             check(table.size() == wantedPrefixes.size(),
@@ -378,7 +378,7 @@ static void testTable() {
             std::mt19937_64 rng(99);
             int falseHolds = 0;
             for (int i = 0; i < 2000; ++i) {
-                const uint64_t key = junctionKey((uint32_t) rng(), (uint32_t) rng());
+                const uint64_t key = meetingPointKey((uint32_t) rng(), (uint32_t) rng());
                 if (!wantedKeys.count(key) && table.holds(key))
                     ++falseHolds;
                 // A key the table holds must get past the filter; one it
@@ -394,10 +394,10 @@ static void testTable() {
             std::vector<uint64_t> keys;
             std::vector<std::vector<std::string>> wantedFor;
             for (const std::string& dir : wantedPrefixes) {
-                const uint64_t key = junctionKey(continueHash(startState, dir, kHashAOffset, g_cryptTable));
+                const uint64_t key = meetingPointKey(continueHash(startState, dir, kHashAOffset, g_cryptTable));
                 std::vector<std::string> mine;
                 for (const std::string& other : wantedPrefixes) {
-                    if (junctionKey(continueHash(startState, other, kHashAOffset, g_cryptTable)) == key)
+                    if (meetingPointKey(continueHash(startState, other, kHashAOffset, g_cryptTable)) == key)
                         mine.push_back(other);
                 }
                 keys.push_back(key);
@@ -412,19 +412,19 @@ static void testTable() {
             check(gotFor == wantedFor, what + ": and a batch of keys at once gives the same");
 
             // The shorter directories the build checks on the way: exactly
-            // those shorter than the table that reach the junction.
+            // those shorter than the table that reach the meeting point.
             std::vector<std::string> wantedShort;
             for (int length = 1; length < tableLength; ++length) {
                 for (const std::string& dir : allStrings(alphabet, length)) {
                     if (rules.any() && prefixRejected(rules, namePrefix, dir))
                         continue;
-                    if (junctionKey(continueHash(startState, dir, kHashAOffset, g_cryptTable)) == junctionKey(junction))
+                    if (meetingPointKey(continueHash(startState, dir, kHashAOffset, g_cryptTable)) == meetingPointKey(meetingPoint))
                         wantedShort.push_back(dir);
                 }
             }
             std::sort(shortMatches.begin(), shortMatches.end());
             std::sort(wantedShort.begin(), wantedShort.end());
-            check(shortMatches == wantedShort, what + ": the directories shorter than it that reach the junction are reported (" +
+            check(shortMatches == wantedShort, what + ": the directories shorter than it that reach the meeting point are reported (" +
                                                    std::to_string(wantedShort.size()) + ")");
             if (tableLength > 2 && !rules.any())
                 check(!wantedShort.empty(), what + ": and there is one to report ('AB')");
@@ -437,81 +437,82 @@ static void testTable() {
 static void testTableSize() {
     printf("--- how big a table fits ---\n");
     const int alphabetSize = 43;
-    check(junctionTableCount(alphabetSize, 0) == 1 && junctionTableCount(alphabetSize, 4) == 3418801 &&
-              junctionTableCount(alphabetSize, 16) == UINT64_MAX,
+    check(meetInTheMiddleTableCount(alphabetSize, 0) == 1 && meetInTheMiddleTableCount(alphabetSize, 4) == 3418801 &&
+              meetInTheMiddleTableCount(alphabetSize, 16) == UINT64_MAX,
           "how many directories a table holds");
-    check(JunctionTable::bytesFor(alphabetSize, 0) > 0, "even a table of nothing takes a little");
+    check(MeetInTheMiddleTable::bytesFor(alphabetSize, 0) > 0, "even a table of nothing takes a little");
     bool grows = true;
     for (int length = 1; length <= 8; ++length)
-        grows = grows && JunctionTable::bytesFor(alphabetSize, length) > JunctionTable::bytesFor(alphabetSize, length - 1);
+        grows = grows && MeetInTheMiddleTable::bytesFor(alphabetSize, length) > MeetInTheMiddleTable::bytesFor(alphabetSize, length - 1);
     check(grows, "a character more needs more memory");
-    check(JunctionTable::bytesFor(alphabetSize, 5) / (1024 * 1024) > 1000 && JunctionTable::bytesFor(alphabetSize, 5) / (1024 * 1024) < 2000,
+    check(MeetInTheMiddleTable::bytesFor(alphabetSize, 5) / (1024 * 1024) > 1000 &&
+              MeetInTheMiddleTable::bytesFor(alphabetSize, 5) / (1024 * 1024) < 2000,
           "five characters of the real alphabet is between 1 and 2 GB");
-    check(JunctionTable::bytesFor(alphabetSize, 16) == UINT64_MAX, "a table too big to count is UINT64_MAX");
+    check(MeetInTheMiddleTable::bytesFor(alphabetSize, 16) == UINT64_MAX, "a table too big to count is UINT64_MAX");
 
     bool withinBudget = true, largest = true;
     for (uint64_t bytes : {(uint64_t) 0, (uint64_t) 1024, (uint64_t) 1 << 20, (uint64_t) 1 << 30, (uint64_t) 8 << 30}) {
-        const int length = junctionTableLengthForBytes(alphabetSize, 12, bytes);
-        withinBudget = withinBudget && (length == 0 || JunctionTable::bytesFor(alphabetSize, length) <= bytes);
-        largest = largest && (length == 12 || JunctionTable::bytesFor(alphabetSize, length + 1) > bytes);
+        const int length = meetInTheMiddleTableLengthForBytes(alphabetSize, 12, bytes);
+        withinBudget = withinBudget && (length == 0 || MeetInTheMiddleTable::bytesFor(alphabetSize, length) <= bytes);
+        largest = largest && (length == 12 || MeetInTheMiddleTable::bytesFor(alphabetSize, length + 1) > bytes);
     }
     check(withinBudget, "the table length chosen for a budget fits in it");
     check(largest, "and is the largest that does");
-    check(junctionTableLengthForBytes(alphabetSize, 3, (uint64_t) 8 << 30) == 3, "never longer than the longest directory");
+    check(meetInTheMiddleTableLengthForBytes(alphabetSize, 3, (uint64_t) 8 << 30) == 3, "never longer than the longest directory");
 }
 
-// --- The junction's own consistency ------------------------------------------
+// --- The meeting point's own consistency ------------------------------------------
 
 static void testFitsHashes() {
-    printf("--- junctionFitsHashes ---\n");
-    JunctionRequest req;
+    printf("--- meetingPointFitsHashes ---\n");
+    MeetInTheMiddleRequest req;
     req.alphabet = "AB";
     req.prefix = "SETUPDAT\\";
     req.suffix = "\\BWUNIN.PIF";
     const std::string dir = "GEN";
-    req.junctionA = continueHash(kInitialHashState, req.prefix + dir, kHashAOffset, g_cryptTable);
-    req.junctionB = continueHash(kInitialHashState, req.prefix + dir, kHashBOffset, g_cryptTable);
+    req.meetingPointA = continueHash(kInitialHashState, req.prefix + dir, kHashAOffset, g_cryptTable);
+    req.meetingPointB = continueHash(kInitialHashState, req.prefix + dir, kHashBOffset, g_cryptTable);
     const std::string filename = req.prefix + dir + req.suffix;
     req.targetHashA = continueHash(kInitialHashState, filename, kHashAOffset, g_cryptTable).first;
     req.targetHashB = continueHash(kInitialHashState, filename, kHashBOffset, g_cryptTable).first;
 
     std::string error;
-    check(junctionFitsHashes(req, g_cryptTable, error), "a junction and the hashes of a real name fit");
-    JunctionRequest wrongA = req;
-    wrongA.junctionA.second ^= 1;
-    check(!junctionFitsHashes(wrongA, g_cryptTable, error) && error.find("hashA") != std::string::npos,
-          "a junction state that isn't hashA's is caught");
-    JunctionRequest wrongB = req;
-    wrongB.junctionB.first ^= 0x100;
-    check(!junctionFitsHashes(wrongB, g_cryptTable, error) && error.find("hashB") != std::string::npos, "and so is hashB's");
-    JunctionRequest wrongSuffix = req;
+    check(meetingPointFitsHashes(req, g_cryptTable, error), "a meeting point and the hashes of a real name fit");
+    MeetInTheMiddleRequest wrongA = req;
+    wrongA.meetingPointA.second ^= 1;
+    check(!meetingPointFitsHashes(wrongA, g_cryptTable, error) && error.find("hashA") != std::string::npos,
+          "a meeting point that isn't hashA's is caught");
+    MeetInTheMiddleRequest wrongB = req;
+    wrongB.meetingPointB.first ^= 0x100;
+    check(!meetingPointFitsHashes(wrongB, g_cryptTable, error) && error.find("hashB") != std::string::npos, "and so is hashB's");
+    MeetInTheMiddleRequest wrongSuffix = req;
     wrongSuffix.suffix = "\\BWUNIN.EXE";
-    check(!junctionFitsHashes(wrongSuffix, g_cryptTable, error), "a junction at the wrong place in the name is caught");
+    check(!meetingPointFitsHashes(wrongSuffix, g_cryptTable, error), "a meeting point at the wrong place in the name is caught");
 
     // A known answer: the two hashes of "SETUPDAT\BWUNIN.PIF", worked out by
     // another implementation of the MPQ hash altogether, must fit the state
-    // after the directory "SETUPDAT" - the same shape of thing a junction
+    // after the directory "SETUPDAT" - the same shape of thing a meeting point
     // search is given, with the hashes in it from something other than this
     // code.
-    JunctionRequest known;
+    MeetInTheMiddleRequest known;
     known.suffix = "\\BWUNIN.PIF";
-    known.junctionA = continueHash(kInitialHashState, "SETUPDAT", kHashAOffset, g_cryptTable);
-    known.junctionB = continueHash(kInitialHashState, "SETUPDAT", kHashBOffset, g_cryptTable);
+    known.meetingPointA = continueHash(kInitialHashState, "SETUPDAT", kHashAOffset, g_cryptTable);
+    known.meetingPointB = continueHash(kInitialHashState, "SETUPDAT", kHashBOffset, g_cryptTable);
     known.targetHashA = 0x5BAB63FE;
     known.targetHashB = 0x8DF2CB08;
-    check(junctionFitsHashes(known, g_cryptTable, error),
+    check(meetingPointFitsHashes(known, g_cryptTable, error),
           "the state after 'SETUPDAT' fits the known hashes of 'SETUPDAT\\BWUNIN.PIF'");
 }
 
 // --- The fingerprint and the progress file -----------------------------------
 
-static JunctionRequest sampleRequest() {
-    JunctionRequest req;
+static MeetInTheMiddleRequest sampleRequest() {
+    MeetInTheMiddleRequest req;
     req.alphabet = "AB-";
     req.prefix = "SETUPDAT\\";
     req.suffix = "\\X.Y";
-    req.junctionA = {0x11111111, 0x22222222};
-    req.junctionB = {0x33333333, 0x44444444};
+    req.meetingPointA = {0x11111111, 0x22222222};
+    req.meetingPointB = {0x33333333, 0x44444444};
     req.targetHashA = 0x55555555;
     req.targetHashB = 0x66666666;
     req.minLength = 1;
@@ -521,15 +522,15 @@ static JunctionRequest sampleRequest() {
 }
 
 static void testFingerprint() {
-    printf("--- junctionFingerprint ---\n");
-    const JunctionRequest base = sampleRequest();
-    const std::string fingerprint = junctionFingerprint(base);
+    printf("--- meetInTheMiddleFingerprint ---\n");
+    const MeetInTheMiddleRequest base = sampleRequest();
+    const std::string fingerprint = meetInTheMiddleFingerprint(base);
     check(fingerprint.size() == 16 && fingerprint.find_first_not_of("0123456789abcdef") == std::string::npos, "16 hex digits");
 
     // What must change it.
-    std::vector<std::pair<std::string, JunctionRequest>> changed;
-    auto with = [&](const std::string& what, JunctionRequest req) { changed.emplace_back(what, req); };
-    JunctionRequest r = base;
+    std::vector<std::pair<std::string, MeetInTheMiddleRequest>> changed;
+    auto with = [&](const std::string& what, MeetInTheMiddleRequest req) { changed.emplace_back(what, req); };
+    MeetInTheMiddleRequest r = base;
     r.alphabet = "AB\\";
     with("another alphabet", r);
     r = base;
@@ -539,11 +540,11 @@ static void testFingerprint() {
     r.suffix = "\\X.Z";
     with("another suffix", r);
     r = base;
-    r.junctionA.first ^= 1;
-    with("another junction for hashA", r);
+    r.meetingPointA.first ^= 1;
+    with("another meeting point for hashA", r);
     r = base;
-    r.junctionB.second ^= 1;
-    with("another junction for hashB", r);
+    r.meetingPointB.second ^= 1;
+    with("another meeting point for hashB", r);
     r = base;
     r.targetHashA ^= 1;
     with("another hashA", r);
@@ -566,7 +567,7 @@ static void testFingerprint() {
     r.rules.maxBackslashCount = 2;
     with("another backslash count", r);
     for (const auto& one : changed)
-        check(junctionFingerprint(one.second) != fingerprint, one.first + " makes another fingerprint");
+        check(meetInTheMiddleFingerprint(one.second) != fingerprint, one.first + " makes another fingerprint");
 
     // What mustn't.
     r = base;
@@ -576,37 +577,37 @@ static void testFingerprint() {
     r.progressFilePath = "elsewhere-too.txt";
     r.tableBytes = 12345;
     r.statusInterval = std::chrono::milliseconds(1);
-    check(junctionFingerprint(r) == fingerprint, "where it starts and stops, its files and its memory don't");
+    check(meetInTheMiddleFingerprint(r) == fingerprint, "where it starts and stops, its files and its memory don't");
 }
 
 static void testProgressFile() {
     printf("--- the progress file ---\n");
     std::filesystem::create_directories(kDir);
-    const std::string path = kDir + "/junction.txt";
+    const std::string path = kDir + "/meet-in-the-middle.txt";
     std::filesystem::remove(path);
 
-    JunctionProgress progress;
+    MeetInTheMiddleProgress progress;
     bool exists = true;
     std::string error;
-    check(readJunctionProgress(path, progress, exists, error) && !exists, "no file yet: no progress, no error");
+    check(readMeetInTheMiddleProgress(path, progress, exists, error) && !exists, "no file yet: no progress, no error");
 
-    const std::string fingerprint = junctionFingerprint(sampleRequest());
-    check(writeJunctionProgress(path, {fingerprint, 4242}, 99999, "??AB-", error), "written");
-    JunctionProgress read;
-    check(readJunctionProgress(path, read, exists, error) && exists && read.fingerprint == fingerprint && read.next == 4242,
+    const std::string fingerprint = meetInTheMiddleFingerprint(sampleRequest());
+    check(writeMeetInTheMiddleProgress(path, {fingerprint, 4242}, 99999, "??AB-", error), "written");
+    MeetInTheMiddleProgress read;
+    check(readMeetInTheMiddleProgress(path, read, exists, error) && exists && read.fingerprint == fingerprint && read.next == 4242,
           "and read back");
 
     std::ofstream(path, std::ios::trunc) << "fingerprint = " << fingerprint << "\n";
-    check(!readJunctionProgress(path, read, exists, error) && error.find("'next'") != std::string::npos, "a file without `next` is refused");
+    check(!readMeetInTheMiddleProgress(path, read, exists, error) && error.find("'next'") != std::string::npos, "a file without `next` is refused");
     std::ofstream(path, std::ios::trunc) << "next = 1\n";
-    check(!readJunctionProgress(path, read, exists, error) && error.find("'fingerprint'") != std::string::npos,
+    check(!readMeetInTheMiddleProgress(path, read, exists, error) && error.find("'fingerprint'") != std::string::npos,
           "and one without a fingerprint");
     std::ofstream(path, std::ios::trunc) << "fingerprint = nothex\nnext = 1\n";
-    check(!readJunctionProgress(path, read, exists, error), "and one whose fingerprint isn't hex");
+    check(!readMeetInTheMiddleProgress(path, read, exists, error), "and one whose fingerprint isn't hex");
     std::ofstream(path, std::ios::trunc) << "fingerprint = " << fingerprint << "\nnext = soon\n";
-    check(!readJunctionProgress(path, read, exists, error), "and one whose `next` isn't a number");
+    check(!readMeetInTheMiddleProgress(path, read, exists, error), "and one whose `next` isn't a number");
     std::ofstream(path, std::ios::trunc) << "no equals sign here\n";
-    check(!readJunctionProgress(path, read, exists, error), "and one that isn't key = value at all");
+    check(!readMeetInTheMiddleProgress(path, read, exists, error), "and one that isn't key = value at all");
 }
 
 int main() {

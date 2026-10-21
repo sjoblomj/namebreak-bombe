@@ -49,16 +49,17 @@ public:
     }
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
 
-    // A junction search, rewinding every tail from scratch - none of
-    // JunctionWalk's stack of states, and no filter in front of the table.
-    bool supportsJunction() const override { return true; }
-    uint64_t junctionTailsPerCall() const override { return 1u << 18; }
-    void beginJunctionSearch(const JunctionConstants& constants) override {
-        junction_ = constants;
+    // A meet-in-the-middle search, rewinding every tail from scratch - none of
+    // MeetInTheMiddleWalk's stack of states, and no filter in front of the
+    // table.
+    bool supportsMeetInTheMiddle() const override { return true; }
+    uint64_t meetInTheMiddleTailsPerCall() const override { return 1u << 18; }
+    void beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) override {
+        meet_in_the_middle_ = constants;
         cryptTable_.assign(constants.cryptTable, constants.cryptTable + 0x500);
-        junction_.cryptTable = cryptTable_.data();
+        meet_in_the_middle_.cryptTable = cryptTable_.data();
     }
-    JunctionOutcome runJunctionBatch(const JunctionBatch& batch) override;
+    MeetInTheMiddleOutcome runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) override;
 
 private:
     // One step of the MPQ hash recurrence, with the crypt table at `offset`
@@ -83,17 +84,17 @@ private:
     PruneRules rules_;
     std::vector<TrailingInsertion> insertions_;
     DictionaryConstants dictionary_;
-    JunctionConstants junction_;
+    MeetInTheMiddleConstants meet_in_the_middle_;
 };
 
-JunctionOutcome ReferenceBackend::runJunctionBatch(const JunctionBatch& batch) {
-    JunctionOutcome outcome;
-    const std::string& alphabet = junction_.alphabet;
+MeetInTheMiddleOutcome ReferenceBackend::runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) {
+    MeetInTheMiddleOutcome outcome;
+    const std::string& alphabet = meet_in_the_middle_.alphabet;
     for (uint64_t n = 0; n < batch.count; ++n) {
         const uint64_t index = batch.start + n;
         // The tail of that index: the directory's last character is the
         // index's most significant digit, being the first one rewound (see
-        // JunctionSpace).
+        // MeetInTheMiddleSpace).
         std::string tail(batch.tailLength, ' ');
         uint64_t rest = index;
         for (int k = 0; k < batch.tailLength; ++k) {
@@ -103,15 +104,16 @@ JunctionOutcome ReferenceBackend::runJunctionBatch(const JunctionBatch& batch) {
         // The rules, over the whole tail from the right - no skipping of
         // anything they reject, just a verdict per tail.
         bool pruned = false;
-        if (junction_.rules.any()) {
-            TailPruneState prune = junction_.tailEntry;
+        if (meet_in_the_middle_.rules.any()) {
+            TailPruneState prune = meet_in_the_middle_.tailEntry;
             for (int k = batch.tailLength - 1; k >= 0 && !pruned; --k)
-                pruned = !tailPruneStep(junction_.rules, prune, tail[k]);
+                pruned = !tailPruneStep(meet_in_the_middle_.rules, prune, tail[k]);
         }
         if (pruned)
             continue;
         ++outcome.probed;
-        if (junction_.table->holds(junctionKey(rewindHash(junction_.junction, tail, kHashAOffset, junction_.cryptTable))))
+        if (meet_in_the_middle_.table->holds(
+                meetingPointKey(rewindHash(meet_in_the_middle_.meetingPoint, tail, kHashAOffset, meet_in_the_middle_.cryptTable))))
             outcome.hits.push_back({batch.tailLength, index});
     }
     return outcome;

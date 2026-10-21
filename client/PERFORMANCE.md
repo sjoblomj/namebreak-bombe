@@ -804,15 +804,16 @@ afternoon).
   (32 words per thread, 256 threads to a work-group); Metal's kernel has
   only run emulated on the CPU.
 
-## Junction searches
+## Meet-in-the-middle searches
 
-A junction search (README.md's [Junction mode](README.md#junction-mode))
-splits the unknown directory between a table of its first characters, built
-on the CPU, and a backward walk of its last, which is what a backend runs:
-one work-item takes a *row* - the tails that share every character but the
-one rewound last - and each of the row's tails then costs one step of the
-hash undone, one bit of the table's filter, and, for the few that get past
-it, a binary search of the table's keys.
+A meet-in-the-middle search (README.md's [Meet-in-the-middle
+mode](README.md#meet-in-the-middle-mode)) splits the unknown directory
+between a table of its first characters, built on the CPU, and a backward
+walk of its last, which is what a backend runs: one work-item takes a *row*
+- the tails that share every character but the one rewound last - and each
+of the row's tails then costs one step of the hash undone, one bit of the
+table's filter, and, for the few that get past it, a binary search of the
+table's keys.
 
 Measured on the RTX 3080 Ti Laptop and i9-12900H: 43 characters, 6.47
 billion tails (a directory of 10 or 11 characters, with nothing to find, so
@@ -853,8 +854,8 @@ divided the tails by 43.
   would amortize that over 1,849 - **estimated** small, since the digit
   work is already a fraction of a tail's cost, and it would cost registers
   for the second character's state.
-- [ ] **Metal.** There's no junction kernel for it yet, so the Metal backend
-  says it can't search junctions and isn't picked for one. The kernel is
+- [ ] **Metal.** There's no meet-in-the-middle kernel for it yet, so the Metal backend
+  says it can't search meet-in-the-middle targets and isn't picked for one. The kernel is
   the smallest of the three (one `mpqStepBack`, a filter bit, a binary
   search); what it needs is a Mac to test on.
 

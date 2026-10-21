@@ -1,30 +1,31 @@
-// End-to-end correctness test for runJunctionSearch()
-// (engine/junction_search.h) on one backend, against brute force: every
-// directory of the space made and hashed from scratch here, with this file's
-// own hash function, and compared with what the search reports - the
-// directories that match the junction, the match of both hashes, how many
-// tails it looked up - over random alphabets, prefixes, suffixes, directory
-// lengths, pruning rules and, for each of them, every split between the
-// table and the backward walk. Plus ranges, stopping and resuming, pausing,
-// the refusals, and the files it writes.
+// End-to-end correctness test for runMeetInTheMiddleSearch()
+// (engine/meet_in_the_middle_search.h) on one backend, against brute force:
+// every directory of the space made and hashed from scratch here, with this
+// file's own hash function, and compared with what the search reports - the
+// directories that match the meeting point, the match of both hashes, how
+// many tails it looked up - over random alphabets, prefixes, suffixes,
+// directory lengths, pruning rules and, for each of them, every split between
+// the table and the backward walk. Plus ranges, stopping and resuming,
+// pausing, the refusals, and the files it writes.
 //
 // The split is what matters most here: a directory of n characters is found
 // as the table's first p and the walk's last n - p, and every p from 0 (the
-// whole directory rewound from the junction) to n (all of it in the table)
-// has to find exactly the same directories. A table that keeps the wrong
-// state, or a tail whose index doesn't line up with it, would show up as one
-// split finding something the others don't.
+// whole directory rewound from the meeting point) to n (all of it in the
+// table) has to find exactly the same directories. A table that keeps the
+// wrong state, or a tail whose index doesn't line up with it, would show up
+// as one split finding something the others don't.
 //
 // Built against several search libraries (see CMakeLists.txt): one with only
-// a few of the junction state's bits compared (NAMEBREAK_JUNCTION_MATCH_BITS),
-// so that directories match the junction by chance all the time and the
-// reported lists really get compared, and one that hands the backend only a
-// few tails per call (NAMEBREAK_JUNCTION_TAILS_PER_CALL) on several threads.
+// a few of the meeting point's bits compared
+// (NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS), so that directories match the
+// meeting point by chance all the time and the reported lists really get
+// compared, and one that hands the backend only a few tails per call
+// (NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_CALL) on several threads.
 //
-//   junction_search_test --backend <name>
+//   meet_in_the_middle_search_test --backend <name>
 //
-// Writes its files under ./junction_search_test/ - ctest runs this from its
-// own directory under build/testrun/.
+// Writes its files under ./meet_in_the_middle_search_test/ - ctest runs this
+// from its own directory under build/testrun/.
 
 #include <algorithm>
 #include <atomic>
@@ -41,7 +42,7 @@
 
 #include "backends/backends.h"
 #include "engine/hash_match.h"
-#include "engine/junction_search.h"
+#include "engine/meet_in_the_middle_search.h"
 #include "engine/mpq_hash.h"
 
 static int g_failures = 0;
@@ -58,7 +59,7 @@ static void check(bool ok, const std::string& what) {
     }
 }
 
-static const std::string kDir = "junction_search_test";
+static const std::string kDir = "meet_in_the_middle_search_test";
 static uint32_t g_table[0x500];
 
 // The MPQ hash state of `s` from the start, with the crypt table at `offset`
@@ -109,14 +110,14 @@ static bool tailRejected(const PruneRules& rules, const std::string& suffix, con
 }
 
 // Brute force: every directory of the request's lengths, hashed from
-// scratch, that matches the junction and passes the rules in full - and that
-// the range [startNumber, endNumber) covers. The directories shorter than
-// the table belong to the range that holds the walk's first node.
-static Expected expectedOf(const JunctionRequest& req, int tableLength) {
-    JunctionSpace space;
+// scratch, that matches the meeting point and passes the rules in full - and
+// that the range [startNumber, endNumber) covers. The directories shorter
+// than the table belong to the range that holds the walk's first node.
+static Expected expectedOf(const MeetInTheMiddleRequest& req, int tableLength) {
+    MeetInTheMiddleSpace space;
     std::string error;
     Expected out;
-    if (!JunctionSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error)) {
+    if (!MeetInTheMiddleSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error)) {
         fprintf(stderr, "the test's own space: %s\n", error.c_str());
         return out;
     }
@@ -126,7 +127,7 @@ static Expected expectedOf(const JunctionRequest& req, int tableLength) {
     for (int length = req.minLength; length <= req.maxLength; ++length) {
         for (const std::string& dir : allStrings(req.alphabet, length)) {
             const auto state = stateOf(req.prefix + dir, kHashAOffset);
-            if (junctionKey(state.first, state.second) != junctionKey(req.junctionA.first, req.junctionA.second))
+            if (meetingPointKey(state.first, state.second) != meetingPointKey(req.meetingPointA.first, req.meetingPointA.second))
                 continue;
             if (!dirPasses(req.rules, req.prefix, req.suffix, dir))
                 continue;
@@ -165,18 +166,18 @@ static Expected expectedOf(const JunctionRequest& req, int tableLength) {
 // --- Running one --------------------------------------------------------------
 
 struct Run {
-    JunctionResult result;
+    MeetInTheMiddleResult result;
     std::vector<std::string> dirs; // what the hook reported, sorted
 };
 
 // Runs `req` with `tableLength` and collects what it reports.
-static Run run(SearchBackend& backend, JunctionRequest req, int tableLength, std::atomic<bool>* abort = nullptr,
+static Run run(SearchBackend& backend, MeetInTheMiddleRequest req, int tableLength, std::atomic<bool>* abort = nullptr,
                const std::atomic<bool>* pause = nullptr) {
     req.tableLength = tableLength;
     req.outputFilePath = kDir + "/matches.txt";
-    req.progressFilePath = kDir + "/junction.txt";
+    req.progressFilePath = kDir + "/meet-in-the-middle.txt";
     Run out;
-    JunctionSearchHooks hooks;
+    MeetInTheMiddleSearchHooks hooks;
     hooks.onPartialMatch = [&](const std::string& filename) {
         // Reported with the prefix and suffix around it, as every mode does.
         if (filename.size() >= req.prefix.size() + req.suffix.size() && filename.compare(0, req.prefix.size(), req.prefix) == 0 &&
@@ -186,17 +187,17 @@ static Run run(SearchBackend& backend, JunctionRequest req, int tableLength, std
             out.dirs.push_back("(not this search's name: " + filename + ")");
         }
     };
-    out.result = runJunctionSearch(backend, req, abort, hooks, pause);
+    out.result = runMeetInTheMiddleSearch(backend, req, abort, hooks, pause);
     std::sort(out.dirs.begin(), out.dirs.end());
     return out;
 }
 
-// A request for a file whose directory is `dir`: the junction states and the
+// A request for a file whose directory is `dir`: the meeting points and the
 // two hashes worked out here, from scratch, as a recovery from the other
 // files of that directory would give them.
-static JunctionRequest requestFor(const std::string& alphabet, const std::string& prefix, const std::string& dir,
+static MeetInTheMiddleRequest requestFor(const std::string& alphabet, const std::string& prefix, const std::string& dir,
                                   const std::string& suffix, int minLength, int maxLength) {
-    JunctionRequest req;
+    MeetInTheMiddleRequest req;
     req.alphabet = alphabet;
     req.prefix = prefix;
     req.suffix = suffix;
@@ -204,8 +205,8 @@ static JunctionRequest requestFor(const std::string& alphabet, const std::string
     req.maxLength = maxLength;
     const std::pair<uint32_t, uint32_t> a = stateOf(prefix + dir, kHashAOffset);
     const std::pair<uint32_t, uint32_t> b = stateOf(prefix + dir, kHashBOffset);
-    req.junctionA = {a.first, a.second};
-    req.junctionB = {b.first, b.second};
+    req.meetingPointA = {a.first, a.second};
+    req.meetingPointB = {b.first, b.second};
     req.targetHashA = stateOf(prefix + dir + suffix, kHashAOffset).first;
     req.targetHashB = stateOf(prefix + dir + suffix, kHashBOffset).first;
     // Nothing is printed every few seconds in a test that takes less than
@@ -218,7 +219,7 @@ static JunctionRequest requestFor(const std::string& alphabet, const std::string
 // Both halves must find the same directories, whatever the split: this runs
 // `req` at every table length from 0 to maxLength and compares each with
 // brute force.
-static void checkEverySplit(SearchBackend& backend, const JunctionRequest& req, const std::string& what) {
+static void checkEverySplit(SearchBackend& backend, const MeetInTheMiddleRequest& req, const std::string& what) {
     for (int tableLength = 0; tableLength <= req.maxLength; ++tableLength) {
         const Expected wanted = expectedOf(req, tableLength);
         const Run got = run(backend, req, tableLength);
@@ -237,7 +238,7 @@ static void checkEverySplit(SearchBackend& backend, const JunctionRequest& req, 
                   where + ": finds '" + wanted.filename + "'" + (got.result.found ? "" : " (it didn't: '" + got.result.filename + "')"));
         } else {
             check(got.dirs == wanted.dirs && !got.result.found,
-                  where + ": reports the " + std::to_string(wanted.dirs.size()) + " directories that match the junction" +
+                  where + ": reports the " + std::to_string(wanted.dirs.size()) + " directories that match the meeting point" +
                       (got.dirs == wanted.dirs ? "" : " (it reported " + std::to_string(got.dirs.size()) + ")"));
             check(got.result.tailsProbed == wanted.probed, where + ": looks up " + std::to_string(wanted.probed) + " tails" +
                                                                (got.result.tailsProbed == wanted.probed
@@ -261,7 +262,8 @@ static void testEverySplit(SearchBackend& backend) {
     checkEverySplit(backend, requestFor("AB-", "", "AB", "\\X.Y", 1, 4), "'AB', with longer ones searched too");
     checkEverySplit(backend, requestFor("AB-", "", "A", "\\X.Y", 2, 4), "'A', shorter than the shortest searched");
     // And one longer than the search goes to: nothing to find, so every
-    // directory that matches the junction by chance is reported and compared.
+    // directory that matches the meeting point by chance is reported and
+    // compared.
     checkEverySplit(backend, requestFor("AB-\\", "", "BAB-AB", "\\X.Y", 1, 4), "a directory longer than the search goes to");
     checkEverySplit(backend, requestFor("AB-", "X", "ABABAB", "A.B", 1, 5), "another, with a suffix that has no '\\'");
 }
@@ -276,11 +278,11 @@ static void testRules(SearchBackend& backend) {
     PruneRules min;
     min.minBackslashCount = 1;
 
-    JunctionRequest req = requestFor("A-\\()", "", "A\\A-", "\\X.Y", 1, 4);
+    MeetInTheMiddleRequest req = requestFor("A-\\()", "", "A\\A-", "\\X.Y", 1, 4);
     req.rules = all;
     checkEverySplit(backend, req, "a directory the rules allow");
     // One the rules reject: not reported at all, however the split falls.
-    JunctionRequest rejected = requestFor("A-\\()", "", "A---", "\\X.Y", 1, 4);
+    MeetInTheMiddleRequest rejected = requestFor("A-\\()", "", "A---", "\\X.Y", 1, 4);
     rejected.rules = all;
     for (int tableLength = 0; tableLength <= rejected.maxLength; ++tableLength) {
         const Run got = run(backend, rejected, tableLength);
@@ -289,21 +291,21 @@ static void testRules(SearchBackend& backend) {
               "a directory with three symbols in a row is never reported, table " + std::to_string(tableLength));
     }
     // A '\' at the end, which the suffix's '\' makes two in a row.
-    JunctionRequest trailing = requestFor("A-\\()", "", "A-A\\", "\\X.Y", 1, 4);
+    MeetInTheMiddleRequest trailing = requestFor("A-\\()", "", "A-A\\", "\\X.Y", 1, 4);
     trailing.rules = all;
     for (int tableLength = 0; tableLength <= trailing.maxLength; ++tableLength) {
         const Run got = run(backend, trailing, tableLength);
         check(got.result.ok && !got.result.found, "a directory ending with '\\' is never reported, table " + std::to_string(tableLength));
     }
     // min_backslash_count, which only a whole directory settles.
-    JunctionRequest few = requestFor("A-\\", "", "AA-", "\\X.Y", 1, 3);
+    MeetInTheMiddleRequest few = requestFor("A-\\", "", "AA-", "\\X.Y", 1, 3);
     few.rules = min;
     for (int tableLength = 0; tableLength <= few.maxLength; ++tableLength) {
         const Run got = run(backend, few, tableLength);
         check(got.result.ok && !got.result.found, "a directory without a '\\' is never reported with min_backslash_count, table " +
                                                       std::to_string(tableLength));
     }
-    JunctionRequest enough = requestFor("A-\\", "", "A\\-", "\\X.Y", 1, 3);
+    MeetInTheMiddleRequest enough = requestFor("A-\\", "", "A\\-", "\\X.Y", 1, 3);
     enough.rules = min;
     checkEverySplit(backend, enough, "one with a '\\'");
 }
@@ -336,7 +338,7 @@ static void testRandom(SearchBackend& backend) {
         const std::string prefix = (rng() % 3) == 0 ? "" : ((rng() % 2) == 0 ? "SETUPDAT\\" : "X");
         const std::string suffix = (rng() % 3) == 0 ? "A.B" : ((rng() % 2) == 0 ? "\\X.Y" : "\\A_LONGER_BASENAME.TXT");
 
-        JunctionRequest req = requestFor(alphabet, prefix, dir, suffix, minLength, maxLength);
+        MeetInTheMiddleRequest req = requestFor(alphabet, prefix, dir, suffix, minLength, maxLength);
         if ((rng() % 2) == 0) {
             req.rules.symbolRuns = (rng() % 2) == 0;
             req.rules.unopenedBrackets = (rng() % 2) == 0;
@@ -357,11 +359,11 @@ static void testRanges(SearchBackend& backend) {
     // directory is longer than the lengths searched, so that nothing stops
     // any of them part way through and every range can be held to reporting
     // exactly its own share.
-    const JunctionRequest req = requestFor("AB-\\", "", "BAB-AB", "\\X.Y", 1, 4);
+    const MeetInTheMiddleRequest req = requestFor("AB-\\", "", "BAB-AB", "\\X.Y", 1, 4);
     const int tableLength = 2;
-    JunctionSpace space;
+    MeetInTheMiddleSpace space;
     std::string error;
-    check(JunctionSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error), "the space");
+    check(MeetInTheMiddleSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error), "the space");
 
     const Run whole = run(backend, req, tableLength);
     for (uint64_t piece : {(uint64_t) 1, (uint64_t) 7, space.size() / 3 + 1}) {
@@ -370,7 +372,7 @@ static void testRanges(SearchBackend& backend) {
         bool ok = true, covered = true;
         uint64_t previousNext = 0;
         for (uint64_t from = 0; from < space.size(); from += piece) {
-            JunctionRequest part = req;
+            MeetInTheMiddleRequest part = req;
             part.startNumber = from;
             part.endNumber = std::min(space.size(), from + piece);
             const Expected wanted = expectedOf(part, tableLength);
@@ -395,12 +397,12 @@ static void testRanges(SearchBackend& backend) {
     }
 
     // A range past the end, and an empty one: nothing to do, no complaint.
-    JunctionRequest past = req;
+    MeetInTheMiddleRequest past = req;
     past.startNumber = space.size();
     past.endNumber = space.size() + 100;
     const Run none = run(backend, past, tableLength);
     check(none.result.ok && !none.result.found && none.dirs.empty() && none.result.tailsProbed == 0, "a range past the last node is empty");
-    JunctionRequest empty = req;
+    MeetInTheMiddleRequest empty = req;
     empty.startNumber = 5;
     empty.endNumber = 5;
     check(run(backend, empty, tableLength).result.ok, "and so is an empty one");
@@ -413,25 +415,25 @@ static void testFindsItAndWritesIt(SearchBackend& backend) {
     // altogether, not by anything here. Only the seven
     // characters it is made of are searched, so the whole thing is small -
     // but it is a real recovery: five characters in the table, three rewound
-    // from the junction.
-    JunctionRequest req;
+    // from the meeting point.
+    MeetInTheMiddleRequest req;
     req.alphabet = "SETUPDA";
     req.suffix = "\\BWUNIN.PIF";
     req.minLength = 1;
     req.maxLength = 8;
-    req.junctionA = {stateOf("SETUPDAT", kHashAOffset).first, stateOf("SETUPDAT", kHashAOffset).second};
-    req.junctionB = {stateOf("SETUPDAT", kHashBOffset).first, stateOf("SETUPDAT", kHashBOffset).second};
+    req.meetingPointA = {stateOf("SETUPDAT", kHashAOffset).first, stateOf("SETUPDAT", kHashAOffset).second};
+    req.meetingPointB = {stateOf("SETUPDAT", kHashBOffset).first, stateOf("SETUPDAT", kHashBOffset).second};
     req.targetHashA = 0x5BAB63FE;
     req.targetHashB = 0x8DF2CB08;
     req.statusInterval = std::chrono::milliseconds(60000);
     req.progressInterval = std::chrono::milliseconds(60000);
     std::string error;
-    check(junctionFitsHashes(req, g_table, error), "the junction of 'SETUPDAT' fits the hashes of 'SETUPDAT\\BWUNIN.PIF'");
+    check(meetingPointFitsHashes(req, g_table, error), "the meeting point of 'SETUPDAT' fits the hashes of 'SETUPDAT\\BWUNIN.PIF'");
 
     std::filesystem::remove_all(kDir);
     const Run got = run(backend, req, 5);
     check(got.result.ok && got.result.found && got.result.filename == "SETUPDAT\\BWUNIN.PIF",
-          "an eight-character directory is recovered from its junction: " + got.result.filename);
+          "an eight-character directory is recovered from its meeting point: " + got.result.filename);
     check(got.result.tableLength == 5 && got.result.tableEntries == 16807, "with the first five characters of it in the table");
 
     // The matches file ends with the name, and found.txt has it too.
@@ -445,12 +447,12 @@ static void testFindsItAndWritesIt(SearchBackend& backend) {
     check(std::getline(found, foundLine) && foundLine.find("SETUPDAT\\BWUNIN.PIF") != std::string::npos, "and found.txt has it");
 
     // The progress file is this search's, and says it got to the end.
-    JunctionProgress progress;
+    MeetInTheMiddleProgress progress;
     bool exists = false;
-    JunctionRequest asRun = req;
+    MeetInTheMiddleRequest asRun = req;
     asRun.tableLength = 5;
-    check(readJunctionProgress(kDir + "/junction.txt", progress, exists, error) && exists &&
-              progress.fingerprint == junctionFingerprint(asRun),
+    check(readMeetInTheMiddleProgress(kDir + "/meet-in-the-middle.txt", progress, exists, error) && exists &&
+              progress.fingerprint == meetInTheMiddleFingerprint(asRun),
           "the progress file is this search's");
 
     // The directory shorter than the table: found while the table is built.
@@ -459,11 +461,11 @@ static void testFindsItAndWritesIt(SearchBackend& backend) {
 
 static void testStopAndResume(SearchBackend& backend) {
     printf("--- stopping and resuming ---\n");
-    const JunctionRequest req = requestFor("AB-\\", "", "B-A\\", "\\X.Y", 1, 4);
+    const MeetInTheMiddleRequest req = requestFor("AB-\\", "", "B-A\\", "\\X.Y", 1, 4);
     const int tableLength = 1;
-    JunctionSpace space;
+    MeetInTheMiddleSpace space;
     std::string error;
-    check(JunctionSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error), "the space");
+    check(MeetInTheMiddleSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error), "the space");
     const Run whole = run(backend, req, tableLength);
 
     // Stopped after the first call to the backend, then resumed from where
@@ -475,26 +477,26 @@ static void testStopAndResume(SearchBackend& backend) {
     while (from < space.size() && rounds < 100) {
         ++rounds;
         std::atomic<bool> abort{false};
-        JunctionRequest part = req;
+        MeetInTheMiddleRequest part = req;
         part.startNumber = from;
         // Stops as soon as the search has done anything at all.
-        JunctionSearchHooks hooks;
+        MeetInTheMiddleSearchHooks hooks;
         Run got;
         hooks.onPartialMatch = [&](const std::string& filename) { got.dirs.push_back(filename.substr(0, filename.size() - req.suffix.size())); };
         hooks.onProgress = [&](uint64_t) { abort.store(true); };
         part.tableLength = tableLength;
         part.outputFilePath = kDir + "/matches.txt";
-        part.progressFilePath = kDir + "/junction.txt";
-        got.result = runJunctionSearch(backend, part, &abort, hooks, nullptr);
+        part.progressFilePath = kDir + "/meet-in-the-middle.txt";
+        got.result = runMeetInTheMiddleSearch(backend, part, &abort, hooks, nullptr);
         resumed = resumed && got.result.ok && got.result.nextNumber > from;
         together.insert(together.end(), got.dirs.begin(), got.dirs.end());
         foundOnce = foundOnce || got.result.found;
         if (got.result.found)
             break;
         // What a resume reads: the progress file's own number.
-        JunctionProgress progress;
+        MeetInTheMiddleProgress progress;
         bool exists = false;
-        if (!readJunctionProgress(kDir + "/junction.txt", progress, exists, error) || !exists) {
+        if (!readMeetInTheMiddleProgress(kDir + "/meet-in-the-middle.txt", progress, exists, error) || !exists) {
             check(false, "the progress file after a stop: " + error);
             break;
         }
@@ -517,7 +519,7 @@ static void testStopAndResume(SearchBackend& backend) {
 
 static void testPause(SearchBackend& backend) {
     printf("--- pausing ---\n");
-    const JunctionRequest req = requestFor("AB-\\", "", "B-AB", "\\X.Y", 1, 4);
+    const MeetInTheMiddleRequest req = requestFor("AB-\\", "", "B-AB", "\\X.Y", 1, 4);
     std::atomic<bool> pause{true};
     std::atomic<bool> abort{false};
     // Held before the first call, then let go: it finishes as usual.
@@ -545,24 +547,24 @@ static void testPause(SearchBackend& backend) {
 
 static void testRefusals(SearchBackend& backend) {
     printf("--- what a search refuses ---\n");
-    const JunctionRequest good = requestFor("AB-", "", "AB", "\\X.Y", 1, 3);
+    const MeetInTheMiddleRequest good = requestFor("AB-", "", "AB", "\\X.Y", 1, 3);
     check(run(backend, good, 1).result.ok, "a good request runs");
 
-    JunctionRequest wrongJunction = good;
-    wrongJunction.junctionA.first ^= 1;
-    const Run wrong = run(backend, wrongJunction, 1);
+    MeetInTheMiddleRequest wrongMeetingPoint = good;
+    wrongMeetingPoint.meetingPointA.first ^= 1;
+    const Run wrong = run(backend, wrongMeetingPoint, 1);
     check(!wrong.result.ok && wrong.result.error.find("hashA") != std::string::npos,
-          "a junction that doesn't fit the file's hashes is refused: " + wrong.result.error);
+          "a meeting point that doesn't fit the file's hashes is refused: " + wrong.result.error);
 
-    JunctionRequest badAlphabet = good;
+    MeetInTheMiddleRequest badAlphabet = good;
     badAlphabet.alphabet = "AAB";
     check(!run(backend, badAlphabet, 1).result.ok, "an alphabet with a character twice is refused");
 
-    JunctionRequest tooLong = good;
+    MeetInTheMiddleRequest tooLong = good;
     tooLong.maxLength = MAX_CANDIDATE_LEN + 1;
     check(!run(backend, tooLong, 1).result.ok, "a directory longer than MAX_CANDIDATE_LEN is refused");
 
-    JunctionRequest longName = requestFor("AB-", std::string(MAX_FILENAME_LEN - 4, 'P'), "AB", "\\X.Y", 1, 3);
+    MeetInTheMiddleRequest longName = requestFor("AB-", std::string(MAX_FILENAME_LEN - 4, 'P'), "AB", "\\X.Y", 1, 3);
     check(!run(backend, longName, 1).result.ok, "a filename longer than MAX_FILENAME_LEN is refused");
 
     // A table longer than the longest directory is cut down to it, not
@@ -571,10 +573,11 @@ static void testRefusals(SearchBackend& backend) {
     check(clamped.result.ok && clamped.result.tableLength == good.maxLength, "a table longer than the directory is cut down to it");
 
     // And the table's length left to the memory it may use.
-    JunctionRequest byMemory = good;
+    MeetInTheMiddleRequest byMemory = good;
     byMemory.tableBytes = 1024;
     Run sized = run(backend, byMemory, -1);
-    check(sized.result.ok && sized.result.tableLength >= 1 && JunctionTable::bytesFor((int) good.alphabet.size(), sized.result.tableLength) <= 1024,
+    check(sized.result.ok && sized.result.tableLength >= 1 &&
+              MeetInTheMiddleTable::bytesFor((int) good.alphabet.size(), sized.result.tableLength) <= 1024,
           "with no table length given, as much of one as the memory allows (" + std::to_string(sized.result.tableLength) + " characters)");
 }
 
@@ -590,14 +593,14 @@ int main(int argc, char* argv[]) {
     }
     std::string error;
     bool selfTestFailed = false;
-    std::unique_ptr<SearchBackend> backend = createJunctionBackend(backendName, error, &selfTestFailed);
+    std::unique_ptr<SearchBackend> backend = createMeetInTheMiddleBackend(backendName, error, &selfTestFailed);
     if (!backend) {
         fprintf(stderr, "%s\n", error.c_str());
         return selfTestFailed ? 1 : 77;
     }
     prepareCryptTable(g_table);
     std::filesystem::create_directories(kDir);
-    printf("backend %s, bits compared of each of the junction's two seeds: %d\n", backendName.c_str(), NAMEBREAK_JUNCTION_MATCH_BITS);
+    printf("backend %s, bits compared of each of the meeting point's two seeds: %d\n", backendName.c_str(), NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS);
 
     testEverySplit(*backend);
     testRules(*backend);
@@ -608,7 +611,7 @@ int main(int argc, char* argv[]) {
     testPause(*backend);
     testRefusals(*backend);
 
-    printf("directories that match the junction, compared one by one: %llu\n", (unsigned long long) g_hitsCompared);
+    printf("directories that match the meeting point, compared one by one: %llu\n", (unsigned long long) g_hitsCompared);
     std::filesystem::remove_all(kDir);
     if (g_failures) {
         fprintf(stderr, "%d of %d check(s) FAILED\n", g_failures, g_checks);

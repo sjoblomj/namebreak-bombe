@@ -17,7 +17,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
-#include "backends/common/junction_launch.h"
+#include "backends/common/meet_in_the_middle_launch.h"
 #include "backends/common/launch_waiter.h"
 #include "backends/common/lowbits_filter.h"
 #include "backends/common/row_batch.h"
@@ -950,13 +950,14 @@ dictionaryKernel(const DictionaryLaunchBatch* __restrict__ batches, uint32_t bat
 
 namespace {
 
-// --- Junction searches -------------------------------------------------------
+// --- Meet-in-the-middle searches -------------------------------------------------------
 //
-// The backward half of a junction search (engine/junction.h): every tail of
-// a batch rewound from the junction, and the state it reaches looked up in
-// the table the engine built of the forward half. The table is the one thing
-// here that doesn't fit in a kernel argument - up to a gigabyte and more of
-// keys, uploaded once per search by beginJunctionSearch.
+// The backward half of a meet-in-the-middle search
+// (engine/meet_in_the_middle.h): every tail of a batch rewound from the
+// meeting point, and the state it reaches looked up in the table the engine
+// built of the forward half. The table is the one thing here that doesn't fit
+// in a kernel argument - up to a gigabyte and more of keys, uploaded once per
+// search by beginMeetInTheMiddleSearch.
 //
 // One thread takes one *row*: the alphabetSize tails that share every
 // character but the one rewound last - the first character of the tail,
@@ -968,102 +969,105 @@ namespace {
 // one the most tails have in common.)
 
 // What the pruning rules make of one character - as much of them as a tail
-// can be judged by (see tailPruneStep, engine/junction.h).
-constexpr uint32_t kJunctionSymbol = 1;    // neither alphanumeric nor a space
-constexpr uint32_t kJunctionBackslash = 2;
+// can be judged by (see tailPruneStep, engine/meet_in_the_middle.h).
+constexpr uint32_t kMeetInTheMiddleSymbol = 1;    // neither alphanumeric nor a space
+constexpr uint32_t kMeetInTheMiddleBackslash = 2;
 
-// The alphabet, as the junction kernel needs each character: its hashA
-// crypt-table key, its own value, and those flags. In constant memory, as
-// the search kernel's d_alphabetKey/d_alphabetOrd are - every lane of a warp
-// usually reads the same entry (the rows of a warp differ in their high
+// The alphabet, as the meet-in-the-middle kernel needs each character: its
+// hashA crypt-table key, its own value, and those flags. In constant memory,
+// as the search kernel's d_alphabetKey/d_alphabetOrd are - every lane of a
+// warp usually reads the same entry (the rows of a warp differ in their high
 // digits, and their k loops run in step), which the constant cache serves
 // without serializing.
-struct JunctionChar {
+struct MeetInTheMiddleChar {
     uint32_t key;
     uint32_t ord;
     uint32_t flags;
 };
-__device__ __constant__ JunctionChar d_junctionChars[MAX_ALPHABET_SIZE];
+__device__ __constant__ MeetInTheMiddleChar d_meetInTheMiddleChars[MAX_ALPHABET_SIZE];
 
 // The rules themselves - PruneRules, less the two only a whole directory
 // settles - and the state of them over the characters rewound so far
 // (TailPruneState).
-struct JunctionRules {
+struct MeetInTheMiddleRules {
     int symbolRuns;
     int adjacentBackslashes;
     int maxBackslashCount;
     int any;
 };
-struct JunctionPrune {
+struct MeetInTheMiddlePrune {
     int symbolRun;
     int backslashes;
     int nextIsBackslash;
 };
 
 // Steps `state` over a character, to the left of the ones so far; false if it
-// breaks one of `rules`. Must agree with tailPruneStep (engine/junction.cpp)
-// exactly, or the GPU would search other tails than the CPU.
-__device__ __forceinline__ bool junctionPruneStep(const JunctionRules& rules, JunctionPrune& state, uint32_t flags) {
-    if (flags & kJunctionSymbol) {
+// breaks one of `rules`. Must agree with tailPruneStep
+// (engine/meet_in_the_middle.cpp) exactly, or the GPU would search other
+// tails than the CPU.
+__device__ __forceinline__ bool meetInTheMiddlePruneStep(const MeetInTheMiddleRules& rules, MeetInTheMiddlePrune& state, uint32_t flags) {
+    if (flags & kMeetInTheMiddleSymbol) {
         if (++state.symbolRun >= 3 && rules.symbolRuns)
             return false;
         state.symbolRun = state.symbolRun < 2 ? state.symbolRun : 2;
     } else {
         state.symbolRun = 0;
     }
-    if (flags & kJunctionBackslash) {
+    if (flags & kMeetInTheMiddleBackslash) {
         if (state.nextIsBackslash && rules.adjacentBackslashes)
             return false;
         if (++state.backslashes > rules.maxBackslashCount && rules.maxBackslashCount != 0)
             return false;
     }
-    state.nextIsBackslash = (flags & kJunctionBackslash) != 0;
+    state.nextIsBackslash = (flags & kMeetInTheMiddleBackslash) != 0;
     return true;
 }
 
 // One step of the hash undone: the state the character `ord`, whose crypt
 // table key is `key`, was hashed onto. Must match hashStepBack
-// (engine/junction.h) exactly - 0x3E0F83E1 is 33's inverse modulo 2^32.
+// (engine/meet_in_the_middle.h) exactly - 0x3E0F83E1 is 33's inverse modulo
+// 2^32.
 __device__ __forceinline__ void mpqStepBack(uint32_t& seed1, uint32_t& seed2, uint32_t key, uint32_t ord) {
     const uint32_t before2 = (seed2 - ord - seed1 - 3) * 0x3E0F83E1u;
     seed1 = (seed1 ^ key) - before2;
     seed2 = before2;
 }
 
-// What a junction launch reports: how many tails it looked up in the table
-// (the rules skipped the rest) and how many of them the table held - every
-// one of them, past `capacity` too - and the first `capacity` hits, as the
-// tails' indices. A launch with more hits than it had room for is launched
-// again with room for them all (see runJunctionBatch), as a dictionary
-// launch is.
-struct JunctionResults {
+// What a meet-in-the-middle launch reports: how many tails it looked up in
+// the table (the rules skipped the rest) and how many of them the table held
+// - every one of them, past `capacity` too - and the first `capacity` hits,
+// as the tails' indices. A launch with more hits than it had room for is
+// launched again with room for them all (see runMeetInTheMiddleBatch), as a
+// dictionary launch is.
+struct MeetInTheMiddleResults {
     unsigned int* counts; // counts[0]: tails looked up, counts[1]: hits
     uint64_t* hits;
     uint32_t capacity;
 };
 
 // Everything else one launch needs - a kernel argument, so passed by value.
-struct JunctionLaunch {
+struct MeetInTheMiddleLaunch {
     const uint64_t* keys; // the table's, sorted
     const uint64_t* filter;
     uint64_t keyCount;
     uint64_t firstRow;
     uint64_t lastRow;
-    uint32_t junctionSeed1;
-    uint32_t junctionSeed2;
+    uint32_t meetingPointSeed1;
+    uint32_t meetingPointSeed2;
     uint32_t alphabetSize;
     uint32_t firstRowStartK; // the batch starts mid-row at its first row, ends mid-row at its last
     uint32_t lastRowEndK;
     int filterShift;
     int tailLength;
-    JunctionRules rules;
-    JunctionPrune entry; // the rules' state to the directory's right (tailPruneStart)
+    MeetInTheMiddleRules rules;
+    MeetInTheMiddlePrune entry; // the rules' state to the directory's right (tailPruneStart)
 };
 
 // Whether the table holds `key`: the filter first - all but about one lookup
-// in JunctionTable::kFilterBitsPerKey stops there, without touching the keys
+// in MeetInTheMiddleTable::kFilterBitsPerKey stops there, without touching
+// the keys
 // - and then a binary search of the keys themselves.
-__device__ __forceinline__ bool junctionTableHolds(const JunctionLaunch& p, uint64_t key) {
+__device__ __forceinline__ bool meetInTheMiddleTableHolds(const MeetInTheMiddleLaunch& p, uint64_t key) {
     const uint64_t bit = (key * 0x9E3779B97F4A7C15ull) >> p.filterShift;
     if (!((__ldg(&p.filter[bit >> 6]) >> (bit & 63)) & 1))
         return false;
@@ -1078,7 +1082,7 @@ __device__ __forceinline__ bool junctionTableHolds(const JunctionLaunch& p, uint
     return lo < p.keyCount && __ldg(&p.keys[lo]) == key;
 }
 
-__global__ void junctionKernel(JunctionLaunch p, JunctionResults results) {
+__global__ void meetInTheMiddleKernel(MeetInTheMiddleLaunch p, MeetInTheMiddleResults results) {
     // The launch's tails looked up, counted per block and added to the
     // global count once - an atomic per tail would cost more than the
     // lookups do.
@@ -1090,12 +1094,12 @@ __global__ void junctionKernel(JunctionLaunch p, JunctionResults results) {
     const uint64_t row = p.firstRow + (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int probed = 0;
     if (row <= p.lastRow) {
-        uint32_t seed1 = p.junctionSeed1, seed2 = p.junctionSeed2;
-        JunctionPrune prune = p.entry;
+        uint32_t seed1 = p.meetingPointSeed1, seed2 = p.meetingPointSeed2;
+        MeetInTheMiddlePrune prune = p.entry;
         bool pruned = false;
         // The characters rewound before the row's own: the row's digits, most
         // significant first - the directory's last character first (see
-        // JunctionSpace for the numbering).
+        // MeetInTheMiddleSpace for the numbering).
         if (p.tailLength > 1) {
             uint32_t digit[MAX_CANDIDATE_LEN];
             uint64_t rest = row;
@@ -1104,8 +1108,8 @@ __global__ void junctionKernel(JunctionLaunch p, JunctionResults results) {
                 rest /= p.alphabetSize;
             }
             for (int i = 0; i < p.tailLength - 1; ++i) {
-                const JunctionChar c = d_junctionChars[digit[i]];
-                if (p.rules.any && !junctionPruneStep(p.rules, prune, c.flags)) {
+                const MeetInTheMiddleChar c = d_meetInTheMiddleChars[digit[i]];
+                if (p.rules.any && !meetInTheMiddlePruneStep(p.rules, prune, c.flags)) {
                     // Every tail of the row breaks the rules, and so does
                     // every row whose digits start like this one's - the
                     // engine's own walk skips them all at once; here they
@@ -1117,10 +1121,10 @@ __global__ void junctionKernel(JunctionLaunch p, JunctionResults results) {
             }
         }
         if (!pruned && p.tailLength == 0) {
-            // The one tail of no characters: the junction itself, which is
+            // The one tail of no characters: the meeting point itself, which is
             // where a directory of exactly the table's length ends.
             probed = 1;
-            if (junctionTableHolds(p, junctionKey(seed1, seed2))) {
+            if (meetInTheMiddleTableHolds(p, meetingPointKey(seed1, seed2))) {
                 const unsigned int slot = atomicAdd(&results.counts[1], 1u);
                 if (slot < results.capacity)
                     results.hits[slot] = 0;
@@ -1129,14 +1133,14 @@ __global__ void junctionKernel(JunctionLaunch p, JunctionResults results) {
             const uint32_t fromK = row == p.firstRow ? p.firstRowStartK : 0;
             const uint32_t toK = row == p.lastRow ? p.lastRowEndK : p.alphabetSize;
             for (uint32_t k = fromK; k < toK; ++k) {
-                const JunctionChar c = d_junctionChars[k];
-                JunctionPrune last = prune;
-                if (p.rules.any && !junctionPruneStep(p.rules, last, c.flags))
+                const MeetInTheMiddleChar c = d_meetInTheMiddleChars[k];
+                MeetInTheMiddlePrune last = prune;
+                if (p.rules.any && !meetInTheMiddlePruneStep(p.rules, last, c.flags))
                     continue;
                 uint32_t s1 = seed1, s2 = seed2;
                 mpqStepBack(s1, s2, c.key, c.ord);
                 ++probed;
-                if (junctionTableHolds(p, junctionKey(s1, s2))) {
+                if (meetInTheMiddleTableHolds(p, meetingPointKey(s1, s2))) {
                     const unsigned int slot = atomicAdd(&results.counts[1], 1u);
                     if (slot < results.capacity)
                         results.hits[slot] = row * p.alphabetSize + k;
@@ -1172,9 +1176,9 @@ public:
             if (hits)
                 (void) cudaFree(hits);
         }
-        freeJunctionBuffers();
-        if (pinnedJunctionCounts_)
-            (void) cudaFreeHost(pinnedJunctionCounts_);
+        freeMeetInTheMiddleBuffers();
+        if (pinnedMeetInTheMiddleCounts_)
+            (void) cudaFreeHost(pinnedMeetInTheMiddleCounts_);
     }
 
 #ifdef NAMEBREAK_HIP
@@ -1205,13 +1209,14 @@ public:
     DictionaryOutcome runDictionaryBatches(const std::vector<DictionaryBatch>& batches) override;
     void endDictionarySearch() override;
 
-    // A junction search: one launch of junctionKernel per call, over about
-    // NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH tails (tuning.h).
-    bool supportsJunction() const override { return true; }
-    uint64_t junctionTailsPerCall() const override { return NAMEBREAK_JUNCTION_TAILS_PER_LAUNCH; }
-    void beginJunctionSearch(const JunctionConstants& constants) override;
-    JunctionOutcome runJunctionBatch(const JunctionBatch& batch) override;
-    void endJunctionSearch() override;
+    // A meet-in-the-middle search: one launch of meetInTheMiddleKernel per
+    // call, over about NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH tails
+    // (tuning.h).
+    bool supportsMeetInTheMiddle() const override { return true; }
+    uint64_t meetInTheMiddleTailsPerCall() const override { return NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH; }
+    void beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) override;
+    MeetInTheMiddleOutcome runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) override;
+    void endMeetInTheMiddleSearch() override;
 
 private:
     int alphabetSize_ = 0;
@@ -1285,22 +1290,22 @@ private:
     DictionaryHit* dictionaryBasenameHits_ = nullptr;
     uint32_t dictionaryHitCapacity_ = 0;
 
-    // A junction search's: the engine's table, copied to the GPU by
-    // beginJunctionSearch and freed by endJunctionSearch, and what the kernel
-    // is launched with. The counts are read back behind the kernel into
-    // pinned host memory, as a dictionary launch's are.
-    void freeJunctionBuffers();
-    JunctionConstants junction_ = {};
-    uint64_t* junctionKeys_ = nullptr;
-    uint64_t* junctionFilter_ = nullptr;
-    uint64_t junctionKeyCount_ = 0;
-    int junctionFilterShift_ = 64;
-    JunctionRules junctionRules_ = {};
-    JunctionPrune junctionEntry_ = {};
-    unsigned int* junctionCounts_ = nullptr;
-    unsigned int* pinnedJunctionCounts_ = nullptr;
-    uint64_t* junctionHits_ = nullptr;
-    uint32_t junctionHitCapacity_ = 0;
+    // A meet-in-the-middle search's: the engine's table, copied to the GPU by
+    // beginMeetInTheMiddleSearch and freed by endMeetInTheMiddleSearch, and
+    // what the kernel is launched with. The counts are read back behind the
+    // kernel into pinned host memory, as a dictionary launch's are.
+    void freeMeetInTheMiddleBuffers();
+    MeetInTheMiddleConstants meet_in_the_middle_ = {};
+    uint64_t* meetInTheMiddleKeys_ = nullptr;
+    uint64_t* meetInTheMiddleFilter_ = nullptr;
+    uint64_t meetInTheMiddleKeyCount_ = 0;
+    int meetInTheMiddleFilterShift_ = 64;
+    MeetInTheMiddleRules meetInTheMiddleRules_ = {};
+    MeetInTheMiddlePrune meetInTheMiddleEntry_ = {};
+    unsigned int* meetInTheMiddleCounts_ = nullptr;
+    unsigned int* pinnedMeetInTheMiddleCounts_ = nullptr;
+    uint64_t* meetInTheMiddleHits_ = nullptr;
+    uint32_t meetInTheMiddleHitCapacity_ = 0;
 };
 
 // How many of the lookup filter's entries beginSearch checks against their
@@ -1681,64 +1686,64 @@ void CudaBackend::endDictionarySearch() {
     freeDictionaryBuffers();
 }
 
-void CudaBackend::beginJunctionSearch(const JunctionConstants& constants) {
-    junction_ = constants;
-    const JunctionTable& table = *constants.table;
+void CudaBackend::beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) {
+    meet_in_the_middle_ = constants;
+    const MeetInTheMiddleTable& table = *constants.table;
 
     // The alphabet, as the kernel reads it.
-    JunctionChar chars[MAX_ALPHABET_SIZE] = {};
+    MeetInTheMiddleChar chars[MAX_ALPHABET_SIZE] = {};
     for (size_t k = 0; k < constants.alphabet.size(); ++k) {
         const unsigned char ch = (unsigned char) constants.alphabet[k];
         chars[k].key = constants.cryptTable[kHashAOffset + ch];
         chars[k].ord = ch;
-        chars[k].flags = (isRunSymbol_CPU((char) ch) ? kJunctionSymbol : 0) | (ch == '\\' ? kJunctionBackslash : 0);
+        chars[k].flags = (isRunSymbol_CPU((char) ch) ? kMeetInTheMiddleSymbol : 0) | (ch == '\\' ? kMeetInTheMiddleBackslash : 0);
     }
-    CUDA_CHECK(cudaMemcpyToSymbol(d_junctionChars, chars, sizeof chars));
-    junctionRules_.symbolRuns = constants.rules.symbolRuns;
-    junctionRules_.adjacentBackslashes = constants.rules.adjacentBackslashes;
-    junctionRules_.maxBackslashCount = constants.rules.maxBackslashCount;
-    junctionRules_.any = constants.rules.any();
-    junctionEntry_.symbolRun = constants.tailEntry.symbolRun;
-    junctionEntry_.backslashes = constants.tailEntry.backslashes;
-    junctionEntry_.nextIsBackslash = constants.tailEntry.nextIsBackslash;
+    CUDA_CHECK(cudaMemcpyToSymbol(d_meetInTheMiddleChars, chars, sizeof chars));
+    meetInTheMiddleRules_.symbolRuns = constants.rules.symbolRuns;
+    meetInTheMiddleRules_.adjacentBackslashes = constants.rules.adjacentBackslashes;
+    meetInTheMiddleRules_.maxBackslashCount = constants.rules.maxBackslashCount;
+    meetInTheMiddleRules_.any = constants.rules.any();
+    meetInTheMiddleEntry_.symbolRun = constants.tailEntry.symbolRun;
+    meetInTheMiddleEntry_.backslashes = constants.tailEntry.backslashes;
+    meetInTheMiddleEntry_.nextIsBackslash = constants.tailEntry.nextIsBackslash;
 
-    // The table: the one thing a junction search has that a kernel argument
-    // can't carry, and the one thing that can be too big for the GPU - the
-    // engine sizes it to the memory it was given, which is the machine's,
-    // not this device's.
-    junctionKeyCount_ = table.size();
-    junctionFilterShift_ = table.filterShift();
+    // The table: the one thing a meet-in-the-middle search has that a kernel
+    // argument can't carry, and the one thing that can be too big for the GPU
+    // - the engine sizes it to the memory it was given, which is the
+    // machine's, not this device's.
+    meetInTheMiddleKeyCount_ = table.size();
+    meetInTheMiddleFilterShift_ = table.filterShift();
     const size_t keyBytes = std::max<size_t>(1, table.size() * sizeof(uint64_t));
     const size_t filterBytes = std::max<size_t>(1, (size_t) table.filterWords() * sizeof(uint64_t));
-    if (cudaMalloc(&junctionKeys_, keyBytes) != cudaSuccess || cudaMalloc(&junctionFilter_, filterBytes) != cudaSuccess) {
+    if (cudaMalloc(&meetInTheMiddleKeys_, keyBytes) != cudaSuccess || cudaMalloc(&meetInTheMiddleFilter_, filterBytes) != cudaSuccess) {
         size_t freeBytes = 0, totalBytes = 0;
         (void) cudaGetLastError();
         (void) cudaMemGetInfo(&freeBytes, &totalBytes);
         fprintf(stderr,
-                "The junction search's table needs %zu MB on the GPU, and this one has %zu MB free of %zu MB.\n"
+                "The meet-in-the-middle search's table needs %zu MB on the GPU, and this one has %zu MB free of %zu MB.\n"
                 "Give the table less memory (config.conf's table_memory, a character shorter is %u times smaller),\n"
                 "or search on the cpu backend (--backend cpu), which uses the machine's own memory.\n",
                 (keyBytes + filterBytes) / (1024 * 1024), freeBytes / (1024 * 1024), totalBytes / (1024 * 1024),
                 (unsigned) constants.alphabet.size());
         exit(1);
     }
-    CUDA_CHECK(cudaMemcpy(junctionKeys_, table.keys(), table.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(junctionFilter_, table.filter(), (size_t) table.filterWords() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(meetInTheMiddleKeys_, table.keys(), table.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(meetInTheMiddleFilter_, table.filter(), (size_t) table.filterWords() * sizeof(uint64_t), cudaMemcpyHostToDevice));
 
-    if (!junctionCounts_) {
-        CUDA_CHECK(cudaMalloc(&junctionCounts_, 2 * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMallocHost((void**) &pinnedJunctionCounts_, 2 * sizeof(unsigned int)));
+    if (!meetInTheMiddleCounts_) {
+        CUDA_CHECK(cudaMalloc(&meetInTheMiddleCounts_, 2 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMallocHost((void**) &pinnedMeetInTheMiddleCounts_, 2 * sizeof(unsigned int)));
     }
-    CUDA_CHECK(cudaMemset(junctionCounts_, 0, 2 * sizeof(unsigned int)));
-    if (!junctionHits_) {
-        junctionHitCapacity_ = NAMEBREAK_JUNCTION_HIT_CAPACITY;
-        CUDA_CHECK(cudaMalloc(&junctionHits_, junctionHitCapacity_ * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(meetInTheMiddleCounts_, 0, 2 * sizeof(unsigned int)));
+    if (!meetInTheMiddleHits_) {
+        meetInTheMiddleHitCapacity_ = NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY;
+        CUDA_CHECK(cudaMalloc(&meetInTheMiddleHits_, meetInTheMiddleHitCapacity_ * sizeof(uint64_t)));
     }
     waiter_.beginSearch();
 }
 
-void CudaBackend::freeJunctionBuffers() {
-    for (uint64_t** buffer : {&junctionKeys_, &junctionFilter_}) {
+void CudaBackend::freeMeetInTheMiddleBuffers() {
+    for (uint64_t** buffer : {&meetInTheMiddleKeys_, &meetInTheMiddleFilter_}) {
         if (*buffer) {
             (void) cudaFree(*buffer);
             *buffer = nullptr;
@@ -1746,76 +1751,76 @@ void CudaBackend::freeJunctionBuffers() {
     }
 }
 
-void CudaBackend::endJunctionSearch() {
+void CudaBackend::endMeetInTheMiddleSearch() {
     CUDA_CHECK(cudaDeviceSynchronize());
-    freeJunctionBuffers();
+    freeMeetInTheMiddleBuffers();
 }
 
-JunctionOutcome CudaBackend::runJunctionBatch(const JunctionBatch& batch) {
-    JunctionOutcome outcome;
+MeetInTheMiddleOutcome CudaBackend::runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) {
+    MeetInTheMiddleOutcome outcome;
     if (batch.count == 0)
         return outcome;
-    const uint64_t alphabetSize = junction_.alphabet.size();
+    const uint64_t alphabetSize = meet_in_the_middle_.alphabet.size();
 
-    JunctionLaunch p = {};
-    p.keys = junctionKeys_;
-    p.filter = junctionFilter_;
-    p.keyCount = junctionKeyCount_;
-    p.junctionSeed1 = junction_.junction.first;
-    p.junctionSeed2 = junction_.junction.second;
+    MeetInTheMiddleLaunch p = {};
+    p.keys = meetInTheMiddleKeys_;
+    p.filter = meetInTheMiddleFilter_;
+    p.keyCount = meetInTheMiddleKeyCount_;
+    p.meetingPointSeed1 = meet_in_the_middle_.meetingPoint.first;
+    p.meetingPointSeed2 = meet_in_the_middle_.meetingPoint.second;
     p.alphabetSize = (uint32_t) alphabetSize;
-    p.filterShift = junctionFilterShift_;
+    p.filterShift = meetInTheMiddleFilterShift_;
     p.tailLength = batch.tailLength;
-    p.rules = junctionRules_;
-    p.entry = junctionEntry_;
-    const JunctionRows rows = junctionRowsOf(batch, alphabetSize);
+    p.rules = meetInTheMiddleRules_;
+    p.entry = meetInTheMiddleEntry_;
+    const MeetInTheMiddleRows rows = meetInTheMiddleRowsOf(batch, alphabetSize);
     p.firstRow = rows.firstRow;
     p.lastRow = rows.lastRow;
     p.firstRowStartK = rows.firstRowStartK;
     p.lastRowEndK = rows.lastRowEndK;
     const uint64_t blocks = (rows.rowCount() + kThreadsPerBlock - 1) / kThreadsPerBlock;
     if (blocks > UINT32_MAX || batch.count > UINT32_MAX) {
-        // runJunctionSearch's calls are far smaller (junctionTailsPerCall).
-        fprintf(stderr, "INTERNAL ERROR: a junction launch of %llu tails, %llu blocks - exiting\n", (unsigned long long) batch.count,
+        // runMeetInTheMiddleSearch's calls are far smaller (meetInTheMiddleTailsPerCall).
+        fprintf(stderr, "INTERNAL ERROR: a meet-in-the-middle launch of %llu tails, %llu blocks - exiting\n", (unsigned long long) batch.count,
                 (unsigned long long) blocks);
         exit(1);
     }
 
     // Launched again, with room for every hit, as long as it had more than it
-    // had room for - which a real search, comparing the junction's whole
+    // had room for - which a real search, comparing the meeting point's whole
     // 64-bit state, practically never does.
     unsigned int counts[2];
     for (;;) {
-        const JunctionResults results{junctionCounts_, junctionHits_, junctionHitCapacity_};
+        const MeetInTheMiddleResults results{meetInTheMiddleCounts_, meetInTheMiddleHits_, meetInTheMiddleHitCapacity_};
         const auto launched = std::chrono::steady_clock::now();
-        junctionKernel<<<(unsigned) blocks, kThreadsPerBlock>>>(p, results);
+        meetInTheMiddleKernel<<<(unsigned) blocks, kThreadsPerBlock>>>(p, results);
         CUDA_CHECK(cudaGetLastError());
         // The counts' copy is queued right behind the kernel, as a
         // dictionary launch's are (see launchDictionary).
-        CUDA_CHECK(cudaMemcpyAsync(pinnedJunctionCounts_, junctionCounts_, 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, 0));
+        CUDA_CHECK(cudaMemcpyAsync(pinnedMeetInTheMiddleCounts_, meetInTheMiddleCounts_, 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, 0));
         waiter_.wait(batch.count, launched, [] { CUDA_CHECK(cudaDeviceSynchronize()); });
-        counts[0] = pinnedJunctionCounts_[0];
-        counts[1] = pinnedJunctionCounts_[1];
+        counts[0] = pinnedMeetInTheMiddleCounts_[0];
+        counts[1] = pinnedMeetInTheMiddleCounts_[1];
         if (counts[0] > batch.count || counts[1] > batch.count) {
-            fprintf(stderr, "INTERNAL ERROR: a junction launch of %llu tails looked up %u of them and found %u - exiting\n",
+            fprintf(stderr, "INTERNAL ERROR: a meet-in-the-middle launch of %llu tails looked up %u of them and found %u - exiting\n",
                     (unsigned long long) batch.count, counts[0], counts[1]);
             exit(1);
         }
-        if (counts[1] <= junctionHitCapacity_)
+        if (counts[1] <= meetInTheMiddleHitCapacity_)
             break;
-        CUDA_CHECK(cudaFree(junctionHits_));
-        junctionHitCapacity_ = std::max(counts[1], 2 * junctionHitCapacity_);
-        CUDA_CHECK(cudaMalloc(&junctionHits_, junctionHitCapacity_ * sizeof(uint64_t)));
-        CUDA_CHECK(cudaMemset(junctionCounts_, 0, 2 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaFree(meetInTheMiddleHits_));
+        meetInTheMiddleHitCapacity_ = std::max(counts[1], 2 * meetInTheMiddleHitCapacity_);
+        CUDA_CHECK(cudaMalloc(&meetInTheMiddleHits_, meetInTheMiddleHitCapacity_ * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(meetInTheMiddleCounts_, 0, 2 * sizeof(unsigned int)));
     }
 
     outcome.probed = counts[0];
     if (counts[1] > 0) {
         std::vector<uint64_t> hits(counts[1]);
-        CUDA_CHECK(cudaMemcpy(hits.data(), junctionHits_, counts[1] * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hits.data(), meetInTheMiddleHits_, counts[1] * sizeof(uint64_t), cudaMemcpyDeviceToHost));
         for (uint64_t index : hits) {
             if (index < batch.start || index >= batch.start + batch.count) {
-                fprintf(stderr, "INTERNAL ERROR: the junction kernel reported the tail at %llu, which its batch doesn't have - exiting\n",
+                fprintf(stderr, "INTERNAL ERROR: the meet-in-the-middle kernel reported the tail at %llu, which its batch doesn't have - exiting\n",
                         (unsigned long long) index);
                 exit(1);
             }
@@ -1823,7 +1828,7 @@ JunctionOutcome CudaBackend::runJunctionBatch(const JunctionBatch& batch) {
         }
     }
     if (counts[0] != 0 || counts[1] != 0)
-        CUDA_CHECK(cudaMemsetAsync(junctionCounts_, 0, 2 * sizeof(unsigned int), 0));
+        CUDA_CHECK(cudaMemsetAsync(meetInTheMiddleCounts_, 0, 2 * sizeof(unsigned int), 0));
     return outcome;
 }
 

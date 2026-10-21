@@ -63,21 +63,21 @@ namespace {
 
 // Which mode a backend is being picked for - each has its own self-test, and
 // its own question of whether a backend can search that way at all.
-enum class Mode { Plain, Dictionary, Junction };
+enum class Mode { Plain, Dictionary, MeetInTheMiddle };
 
 bool supportsMode(const SearchBackend& backend, Mode mode) {
     switch (mode) {
     case Mode::Dictionary:
         return backend.supportsDictionary();
-    case Mode::Junction:
-        return backend.supportsJunction();
+    case Mode::MeetInTheMiddle:
+        return backend.supportsMeetInTheMiddle();
     default:
         return true;
     }
 }
 
 const char* cannotSearch(Mode mode) {
-    return mode == Mode::Dictionary ? "can't search dictionaries" : "can't search junctions";
+    return mode == Mode::Dictionary ? "can't search dictionaries" : "can't search meet-in-the-middle targets";
 }
 
 // Whether `backend` passes its self-tests - the mode's own too. If not,
@@ -89,7 +89,7 @@ bool passesSelfTests(SearchBackend& backend, Mode mode, std::string& why) {
         why = "dictionary search: " + why;
         return false;
     }
-    if (mode == Mode::Junction && !selfTestJunctionBackend(backend, why))
+    if (mode == Mode::MeetInTheMiddle && !selfTestMeetInTheMiddleBackend(backend, why))
         return false;
     return true;
 }
@@ -158,6 +158,6 @@ std::unique_ptr<SearchBackend> createDictionaryBackend(const std::string& name, 
     return create(name, error, selfTestFailed, Mode::Dictionary);
 }
 
-std::unique_ptr<SearchBackend> createJunctionBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
-    return create(name, error, selfTestFailed, Mode::Junction);
+std::unique_ptr<SearchBackend> createMeetInTheMiddleBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
+    return create(name, error, selfTestFailed, Mode::MeetInTheMiddle);
 }

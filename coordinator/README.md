@@ -21,32 +21,35 @@ coordinator/
   server/     axum + sqlx(SQLite) coordinator - owns all range bookkeeping
 ```
 
-Visit the server's base URL in a browser (`GET /`) for a live dashboard - every
-target with its bound filenames, prefix, suffix, pruning rules and insertions, its ranges, each range's status and who worked on it (from
-`last_assigned_user_id`, which - unlike `assigned_user_id` - is never cleared on
-reclaim), and a solved target's find called out with a prominent banner. If a
-range was reassigned partway through (see progress checkpointing below), each
-finished portion shows up as its own row credited to whoever actually searched
-it, rather than the whole thing appearing under just the most recent claimer.
-A junction target shows its junction, how much of the directory its table
-holds (and what that costs a client in memory), and how many tails that
-leaves to rewind, with its ranges as directories whose table characters are
-'?'. That's the **Targets** tab. The **Matches** tab lists every name found, newest
-first - who found it and when, its Hash A and Hash B, and the targets it
-solved (targets sharing a Hash A/Hash B pair share a row). The **Volunteers** tab ranks every username that
-has claimed work or found a name by candidates searched (the sizes of its
-completed ranges, across all its hostnames - a little generous, since a range
-closed early by a find still counts in full), alongside its completed ranges,
-hostnames and names found (targets sharing a Hash A/Hash B pair are one find),
-and its canaries found out of those handed to it (see below).
-The **Introduction** tab explains what namebreaking is. The open tab is kept
-in the URL's `#fragment`, so `/#volunteers` links straight to it.
-Plain HTML/CSS/JS (`server/static/dashboard.html`, embedded into the binary at
-compile time), which loads `GET /api/v1/dashboard` once each time it's opened
-(or reloaded) - no build step, no framework. With desktop notifications on,
-it checks the much smaller `GET /api/v1/status` every minute for finds, and
-loads the dashboard's data again when there's one. `GET /api/v1/dashboard`
-and `GET /` are both public (no auth), matching `GET /api/v1/status`.
+Visit the server's base URL in a browser (`GET /`) for a live dashboard -
+every target with its bound filenames, prefix, suffix, pruning rules and
+insertions, its ranges, each range's status and who worked on it (from
+`last_assigned_user_id`, which - unlike `assigned_user_id` - is never
+cleared on reclaim), and a solved target's find called out with a prominent
+banner. If a range was reassigned partway through (see progress
+checkpointing below), each finished portion shows up as its own row credited
+to whoever actually searched it, rather than the whole thing appearing under
+just the most recent claimer. A meet-in-the-middle target shows its meeting
+point, how much of the directory its table holds (and what that costs a
+client in memory), and how many tails that leaves to rewind, with its ranges
+as directories whose table characters are '?'. That's the **Targets** tab.
+The **Matches** tab lists every name found, newest first - who found it and
+when, its Hash A and Hash B, and the targets it solved (targets sharing a
+Hash A/Hash B pair share a row). The **Volunteers** tab ranks every username
+that has claimed work or found a name by candidates searched (the sizes of
+its completed ranges, across all its hostnames - a little generous, since a
+range closed early by a find still counts in full), alongside its completed
+ranges, hostnames and names found (targets sharing a Hash A/Hash B pair are
+one find), and its canaries found out of those handed to it (see below). The
+**Introduction** tab explains what namebreaking is. The open tab is kept in
+the URL's `#fragment`, so `/#volunteers` links straight to it. Plain
+HTML/CSS/JS (`server/static/dashboard.html`, embedded into the binary at
+compile time), which loads `GET /api/v1/dashboard` once each time it's
+opened (or reloaded) - no build step, no framework. With desktop
+notifications on, it checks the much smaller `GET /api/v1/status` every
+minute for finds, and loads the dashboard's data again when there's one.
+`GET /api/v1/dashboard` and `GET /` are both public (no auth), matching `GET
+/api/v1/status`.
 
 See the top-level plan/design notes for the full rationale; the short version:
 
@@ -55,7 +58,7 @@ See the top-level plan/design notes for the full rationale; the short version:
   is the only thing standing between a real client and a generic bot scraping
   the API, so it's intentionally simple rather than absent.
 - **Protocol versioning** (now 1.6.0 - dictionary targets came with 1.5,
-  junction targets with 1.6): every client declares its own `protocol_version`
+  meet-in-the-middle targets with 1.6): every client declares its own `protocol_version`
   (`X.Y.Z`) at `/register`; the server rejects registration outright on a
   MAJOR version mismatch against its own `PROTOCOL_VERSION`
   (`coordinator/protocol/src/lib.rs`), asking for an upgrade. A client's
@@ -278,18 +281,18 @@ See the top-level plan/design notes for the full rationale; the short version:
   get their work. With `send_basenames`, clients also send every candidate
   whose basename matches the target's encryption key, which the server
   keeps and the dashboard shows.
-- **Junction targets**: a target can be a file whose *directory* is unknown,
-  where the hash state right after that directory - the *junction* - is
+- **Meet-in-the-middle targets**: a target can be a file whose *directory* is unknown,
+  where the hash state right after that directory - the *meeting point* - is
   known: the client then searches the directory from both ends at once,
   meeting in the middle, which buys back one character of brute force for
-  every character it can keep a table of (see **Junction targets** below and
-  the client README's "Junction mode"). Its ranges are stretches of one
+  every character it can keep a table of (see **Meet-in-the-middle targets** below and
+  the client README's "Meet-in-the-middle mode"). Its ranges are stretches of one
   directory length's *tails* - the directory without the table's characters
-  - numbered as the client numbers them (`server/src/junction.rs`, the
-  server's half of the client's `engine/junction.h`). The table is what the
+  - numbered as the client numbers them (`server/src/meet_in_the_middle.rs`, the
+  server's half of the client's `engine/meet_in_the_middle.h`). The table is what the
   search costs in memory, and it's the same for every client of a target,
   since a tail is whatever the table doesn't cover: a client says at
-  `/register` how much it will give one (`junction_table_bytes`), and gets
+  `/register` how much it will give one (`meet_in_the_middle_table_bytes`), and gets
   no work from a target whose table wouldn't fit in it - as a client that
   can't search a target's alphabet gets none. Only clients of protocol 1.6
   and later get any of it.
@@ -622,24 +625,25 @@ reversible):
 curl -X DELETE localhost:8080/api/v1/admin/targets/1 -H 'X-Admin-Token: devsecret'
 ```
 
-### Junction targets
+### Meet-in-the-middle targets
 
-A junction target is for a file whose name is a known prefix, an **unknown
-directory** and a known suffix, where the MPQ hash state right after that
-directory is already known - for Hash A and for Hash B. That state is the
-*junction*. It comes from the other files of the same unknown directory: two
-whose basenames are known pin it down, by trying all 2^32 values of `seed2`
-against the first name's hash and checking each survivor against the second.
+A meet-in-the-middle target is for a file whose name is a known prefix, an
+**unknown directory** and a known suffix, where the MPQ hash state right
+after that directory is already known - for Hash A and for Hash B. That
+state is the *meeting point*. It comes from the other files of the same
+unknown directory: two whose basenames are known pin it down, by trying all
+2^32 values of `seed2` against the first name's hash and checking each
+survivor against the second.
 
 The client searches such a directory from both ends at once (the client
-README's "Junction mode" has the whole argument): forward from the prefix
-into a **table** of every directory of its first `table_length` characters,
-by the hash state each one reaches, and backward from the junction, every
-**tail** - the directory's last characters - rewound character by character
-and looked up in that table. A directory of *n* characters is therefore one
-of the table's prefixes followed by a tail of *n - table_length*
-characters, and the work is the tails: `alphabet^(n - table_length)` of
-them, not `alphabet^n` candidates.
+README's "Meet-in-the-middle mode" has the whole argument): forward from the
+prefix into a **table** of every directory of its first `table_length`
+characters, by the hash state each one reaches, and backward from the
+meeting point, every **tail** - the directory's last characters - rewound
+character by character and looked up in that table. A directory of *n*
+characters is therefore one of the table's prefixes followed by a tail of *n
+- table_length* characters, and the work is the tails: `alphabet^(n -
+table_length)` of them, not `alphabet^n` candidates.
 
 ```sh
 curl -X POST localhost:8080/api/v1/admin/targets \
@@ -650,18 +654,18 @@ curl -X POST localhost:8080/api/v1/admin/targets \
     "hash_a_hex": "0x5BAB63FE", "hash_b_hex": "0x8DF2CB08",
     "alphabet": " ()-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\_",
     "prune_symbol_runs": true, "prune_adjacent_backslashes": true,
-    "junction": {
-      "junction_a_seed1_hex": "0x92F62345", "junction_a_seed2_hex": "0xB9F61953",
-      "junction_b_seed1_hex": "0xB95115E6", "junction_b_seed2_hex": "0x7609B4F4",
+    "meet_in_the_middle": {
+      "meeting_point_a_seed1_hex": "0x92F62345", "meeting_point_a_seed2_hex": "0xB9F61953",
+      "meeting_point_b_seed1_hex": "0xB95115E6", "meeting_point_b_seed2_hex": "0x7609B4F4",
       "min_length": 6, "max_length": 9, "table_length": 4
     }
   }'
 ```
 
-- `junction_a_seed1_hex`/`junction_a_seed2_hex` and the `_b_` pair: the hash
+- `meeting_point_a_seed1_hex`/`meeting_point_a_seed2_hex` and the `_b_` pair: the hash
   state after the directory, for Hash A and Hash B. Hashing the suffix onto
   them must give the target's two hashes, or the target is refused, saying
-  which doesn't fit - a junction for the wrong position in the name would
+  which doesn't fit - a meeting point for the wrong position in the name would
   otherwise have every client search the whole space and find nothing.
 - `min_length` (default 1) to `max_length`: how long the directory may be,
   at most 16 characters, and no more tails of one length than 2^63.
@@ -684,7 +688,7 @@ curl -X POST localhost:8080/api/v1/admin/targets \
 
 The target's `alphabet` (predefined or custom), `prefix`, `suffix` and
 pruning rules work as an alphabet target's, except that the rules always
-apply to the whole directory - `prune_whole_candidate` isn't a junction
+apply to the whole directory - `prune_whole_candidate` isn't a meeting point
 target's, nor are the bounds, the inserted text, `start_len`,
 `auto_priority`, `send_basenames`, an encryption key, or priority and skip
 ranges (what it hands out is tails, not candidates a pattern can pin down).
@@ -705,12 +709,12 @@ dashboard already shows targets that share a Hash A/Hash B pair as one find.
 by the tail *reversed* (the directory's last character turning slowest, as
 the client rewinds it first). The lengths are swept shortest first, a chunk
 at a time, and a chunk is sized from the client's measured tails a second
-(`ema_junction_rate_per_sec`, measured apart from the other kinds of
-search). A heartbeat's `next_tail_index` is the progress checkpoint, as a
+(`ema_meet_in_the_middle_rate_per_sec`, measured apart from the other kinds
+of search). A heartbeat's `next_tail_index` is the progress checkpoint, as a
 dictionary range's `next_candidate_number` is - and unlike an alphabet
-search, a junction search always knows exactly how far it has got, so every
-heartbeat carries real progress and a reassigned range is always split
-where its client actually left off.
+search, a meet-in-the-middle search always knows exactly how far it has got,
+so every heartbeat carries real progress and a reassigned range is always
+split where its client actually left off.
 
 The client builds the table afresh for every range it claims (a few seconds
 for four characters, a quarter of a minute for five), so
@@ -739,17 +743,17 @@ EOF
 
 `hostname` (optional) defaults to the machine's actual hostname;
 `poll_interval_secs` (optional) defaults to 30; and
-`junction_table_memory` (optional, default none) is how much memory this
-client will give a junction target's table - `1G`, `512M`, or a number of
-bytes. Without it, the server hands out no junction target's work: that
-table is memory a volunteer has to agree to spare, and on a GPU it has to
-fit in the device's own too (see **Junction targets** above). namebreak
-re-registers
-(idempotently) on every start, claims a range, searches it in-process against
-exactly that range, reports the result, and loops. If the search fails to
-even start (bad claim data, matches file not writable), it skips reporting
-completion and lets the range's lease expire so the server reassigns it - it
-won't report success or silently drop bad work.
+`meet_in_the_middle_table_memory` (optional, default none) is how much
+memory this client will give a meet-in-the-middle target's table - `1G`,
+`512M`, or a number of bytes. Without it, the server hands out no
+meet-in-the-middle target's work: that table is memory a volunteer has to
+agree to spare, and on a GPU it has to fit in the device's own too (see
+**Meet-in-the-middle targets** above). namebreak re-registers (idempotently)
+on every start, claims a range, searches it in-process against exactly that
+range, reports the result, and loops. If the search fails to even start (bad
+claim data, matches file not writable), it skips reporting completion and
+lets the range's lease expire so the server reassigns it - it won't report
+success or silently drop bad work.
 
 ### Canaries
 
@@ -757,31 +761,33 @@ Now and then (`CANARY_PROBABILITY` of claims, while there's real work), a
 claim gets a canary instead: a small range, a few seconds' worth at the
 client's measured rate (`CANARY_SECONDS`), of a virtual target named
 `virtual-canary` whose hashes are those of a filename planted in that range.
-To the client it's ordinary work, so finding it checks each volunteer's actual
-hardware, driver and build: bit flips (consumer GPUs have no ECC memory), a
-driver bug, a broken release, a modified client. The canary copies a real
-target's prefix, suffix, alphabet and pruning, so it's searched the way real
-work is; the planted candidate has only letters and digits, so no pruning rule
-skips it. When the client's first target by priority is a dictionary target,
-the canary copies that instead (once the client's dictionary rate has been
-measured): its word lists, separators, word counts, tails, prefix and suffix,
-at the word count its sweep is at, and - if it has an encryption key - a key
-made from the planted name's basename, so the client takes the same key-only
-path real work does (as well as `send_basenames`; the basenames sent for a
-canary aren't kept). It leaves out the target's bounds, which could leave
-out the planted name. When that first target is a junction target, the
-canary copies it instead: its alphabet, prefix, suffix, pruning rules and -
-so that it costs the client exactly what the real work does, within the
-memory that client declared - the same table length. Its junction is the
-state after a directory planted in the range, and its hashes are that
-directory's filename's, so finding it is finding that directory; it searches
-one length only, the planted directory's. Its result goes in the `canaries` table (`found` or `missed`; a missed
-one is also logged as a warning). Virtual targets (`targets.is_virtual`) are
-left out of everything else - other claims, the dashboard's targets and
-ranges, `/status`, the rate estimate, and a volunteer's candidates, ranges and
-names found - and the Volunteers tab shows them only as "Canaries
-found/total". A canary still being searched isn't counted yet; one given up on
-(released or reclaimed) counts as not found.
+To the client it's ordinary work, so finding it checks each volunteer's
+actual hardware, driver and build: bit flips (consumer GPUs have no ECC
+memory), a driver bug, a broken release, a modified client. The canary
+copies a real target's prefix, suffix, alphabet and pruning, so it's
+searched the way real work is; the planted candidate has only letters and
+digits, so no pruning rule skips it. When the client's first target by
+priority is a dictionary target, the canary copies that instead (once the
+client's dictionary rate has been measured): its word lists, separators,
+word counts, tails, prefix and suffix, at the word count its sweep is at,
+and - if it has an encryption key - a key made from the planted name's
+basename, so the client takes the same key-only path real work does (as well
+as `send_basenames`; the basenames sent for a canary aren't kept). It leaves
+out the target's bounds, which could leave out the planted name. When that
+first target is a meet-in-the-middle target, the canary copies it instead:
+its alphabet, prefix, suffix, pruning rules and - so that it costs the
+client exactly what the real work does, within the memory that client
+declared - the same table length. Its meeting point is the state after a
+directory planted in the range, and its hashes are that directory's
+filename's, so finding it is finding that directory; it searches one length
+only, the planted directory's. Its result goes in the `canaries` table
+(`found` or `missed`; a missed one is also logged as a warning). Virtual
+targets (`targets.is_virtual`) are left out of everything else - other
+claims, the dashboard's targets and ranges, `/status`, the rate estimate,
+and a volunteer's candidates, ranges and names found - and the Volunteers
+tab shows them only as "Canaries found/total". A canary still being searched
+isn't counted yet; one given up on (released or reclaimed) counts as not
+found.
 
 ## Server configuration (env vars)
 
@@ -793,7 +799,7 @@ found/total". A canary still being searched isn't counted yet; one given up on
 | `TARGET_CHUNK_SECONDS` | `900` | desired wall-clock time per range |
 | `DEFAULT_RATE_PER_SEC` | `500000000` | assumed candidates/sec until a user's first completed range refines it |
 | `DEFAULT_DICTIONARY_RATE_PER_SEC` | `1000000000` | the same for a dictionary target's ranges, measured apart |
-| `DEFAULT_JUNCTION_RATE_PER_SEC` | `1000000000` | the same for a junction target's ranges, in tails a second (a GPU rewinds about 2 billion, a CPU 0.07) |
+| `DEFAULT_MEET_IN_THE_MIDDLE_RATE_PER_SEC` | `1000000000` | the same for a meet-in-the-middle target's ranges, in tails a second (a GPU rewinds about 2 billion, a CPU 0.07) |
 | `MIN_CHUNK_CANDIDATES` / `MAX_CHUNK_CANDIDATES` | `1000000` / `100000000000000000` | clamp on carved chunk size |
 | `LEASE_SECONDS` | `21600` (6 hours) | how long a claimed range stays leased after the last sign of life from its client (the claim, then each heartbeat) |
 | `RECLAIM_INTERVAL_SECS` | `30` | how often expired leases are swept back to pending |

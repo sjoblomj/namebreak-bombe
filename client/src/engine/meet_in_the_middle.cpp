@@ -1,4 +1,4 @@
-#include "engine/junction.h"
+#include "engine/meet_in_the_middle.h"
 
 #include <algorithm>
 #include <utility>
@@ -27,7 +27,7 @@ uint64_t sumOrMax(uint64_t a, uint64_t b) {
 // 2^32 bits (512 MB), which is past where a table's keys themselves would
 // have run a machine out of memory.
 uint64_t filterBitsFor(uint64_t keys) {
-    const uint64_t wanted = keys > UINT64_MAX / JunctionTable::kFilterBitsPerKey ? UINT64_MAX : keys * JunctionTable::kFilterBitsPerKey;
+    const uint64_t wanted = keys > UINT64_MAX / MeetInTheMiddleTable::kFilterBitsPerKey ? UINT64_MAX : keys * MeetInTheMiddleTable::kFilterBitsPerKey;
     uint64_t bits = 64;
     while (bits < wanted && bits < ((uint64_t) 1 << 32))
         bits *= 2;
@@ -92,9 +92,9 @@ bool dirPasses(const PruneRules& rules, const std::string& prefix, const std::st
     return canReachMinBackslashes_CPU(rules, state, 0);
 }
 
-// --- JunctionSpace -----------------------------------------------------------
+// --- MeetInTheMiddleSpace -----------------------------------------------------------
 
-bool JunctionSpace::create(const std::string& alphabet, int minLength, int maxLength, int tableLength, JunctionSpace& out,
+bool MeetInTheMiddleSpace::create(const std::string& alphabet, int minLength, int maxLength, int tableLength, MeetInTheMiddleSpace& out,
                            std::string& error) {
     if (alphabet.empty()) {
         error = "the alphabet is empty";
@@ -129,7 +129,7 @@ bool JunctionSpace::create(const std::string& alphabet, int minLength, int maxLe
         return false;
     }
 
-    out = JunctionSpace();
+    out = MeetInTheMiddleSpace();
     out.alphabet_ = alphabet;
     out.minLength_ = minLength;
     out.maxLength_ = maxLength;
@@ -155,7 +155,7 @@ bool JunctionSpace::create(const std::string& alphabet, int minLength, int maxLe
     return true;
 }
 
-int JunctionSpace::tailLengthOf(uint64_t number) const {
+int MeetInTheMiddleSpace::tailLengthOf(uint64_t number) const {
     // At most MAX_CANDIDATE_LEN + 1 lengths, so a walk up them beats the
     // binary search it would take to be clever.
     for (int j = 0; j <= maxTailLength(); ++j) {
@@ -165,15 +165,15 @@ int JunctionSpace::tailLengthOf(uint64_t number) const {
     return maxTailLength();
 }
 
-uint64_t JunctionSpace::indexOf(uint64_t number) const {
+uint64_t MeetInTheMiddleSpace::indexOf(uint64_t number) const {
     return number - firsts_[tailLengthOf(number)];
 }
 
-uint64_t JunctionSpace::numberOf(int tailLength, uint64_t index) const {
+uint64_t MeetInTheMiddleSpace::numberOf(int tailLength, uint64_t index) const {
     return firsts_[tailLength] + index;
 }
 
-std::string JunctionSpace::tailOf(uint64_t number) const {
+std::string MeetInTheMiddleSpace::tailOf(uint64_t number) const {
     const int tailLength = tailLengthOf(number);
     // The index is the reversed tail's: the directory's last character is the
     // most significant digit, because it's the first the walk rewinds.
@@ -181,26 +181,26 @@ std::string JunctionSpace::tailOf(uint64_t number) const {
     return std::string(reversed.rbegin(), reversed.rend());
 }
 
-bool JunctionSpace::indexOfTail(const std::string& tail, uint64_t& out, std::string& error) const {
+bool MeetInTheMiddleSpace::indexOfTail(const std::string& tail, uint64_t& out, std::string& error) const {
     return stringToIndex(std::string(tail.rbegin(), tail.rend()), alphabet_, out, error);
 }
 
-uint64_t junctionTableCount(int alphabetSize, int tableLength) {
+uint64_t meetInTheMiddleTableCount(int alphabetSize, int tableLength) {
     return powerOrMax((uint64_t) alphabetSize, tableLength);
 }
 
-int junctionTableLengthForBytes(int alphabetSize, int maxLength, uint64_t bytes) {
+int meetInTheMiddleTableLengthForBytes(int alphabetSize, int maxLength, uint64_t bytes) {
     for (int tableLength = maxLength; tableLength > 0; --tableLength) {
-        if (JunctionTable::bytesFor(alphabetSize, tableLength) <= bytes)
+        if (MeetInTheMiddleTable::bytesFor(alphabetSize, tableLength) <= bytes)
             return tableLength;
     }
     return 0;
 }
 
-// --- JunctionTable -----------------------------------------------------------
+// --- MeetInTheMiddleTable -----------------------------------------------------------
 
-uint64_t JunctionTable::bytesFor(int alphabetSize, int tableLength) {
-    const uint64_t keys = junctionTableCount(alphabetSize, tableLength);
+uint64_t MeetInTheMiddleTable::bytesFor(int alphabetSize, int tableLength) {
+    const uint64_t keys = meetInTheMiddleTableCount(alphabetSize, tableLength);
     if (keys == UINT64_MAX || keys > UINT64_MAX / sizeof(uint64_t))
         return UINT64_MAX;
     return sumOrMax(keys * sizeof(uint64_t), filterBitsFor(keys) / 8);
@@ -212,17 +212,17 @@ namespace {
 // characters the rules allow, in alphabet order, with the hash state it
 // reaches. A plain recursion, at most MAX_CANDIDATE_LEN deep.
 struct TableBuilder {
-    const JunctionSpace& space;
+    const MeetInTheMiddleSpace& space;
     const uint32_t* table; // cryptTable + kHashAOffset
     const PruneRules& rules;
-    uint64_t wanted;                        // the junction's key, for the shorter directories
+    uint64_t wanted;                        // the meeting point's key, for the shorter directories
     std::vector<std::string>* shortMatches; // every shorter directory that has it
     std::vector<uint64_t>* keys;            // every full-length directory's key
     std::string dir;                        // the characters so far
 
     void walk(int depth, HashState state, const PruneState& prune) {
         if (depth == space.tableLength()) {
-            keys->push_back(junctionKey(state));
+            keys->push_back(meetingPointKey(state));
             return;
         }
         for (char c : space.alphabet()) {
@@ -235,7 +235,7 @@ struct TableBuilder {
             // in the search would ever look at it, so it's checked here. The
             // ones of exactly the table's length are the table's own, found
             // through it by the walk's empty tail.
-            if ((int) dir.size() < space.tableLength() && (int) dir.size() >= space.minLength() && junctionKey(stepped) == wanted)
+            if ((int) dir.size() < space.tableLength() && (int) dir.size() >= space.minLength() && meetingPointKey(stepped) == wanted)
                 shortMatches->push_back(dir);
             walk(depth + 1, stepped, next);
             dir.pop_back();
@@ -245,16 +245,16 @@ struct TableBuilder {
 
 } // namespace
 
-bool JunctionTable::build(const JunctionSpace& space, HashState startState, const PruneState& prefixEntry, const PruneRules& rules,
-                          const uint32_t* cryptTable, HashState junction, std::vector<std::string>& shortMatches, JunctionTable& out,
+bool MeetInTheMiddleTable::build(const MeetInTheMiddleSpace& space, HashState startState, const PruneState& prefixEntry, const PruneRules& rules,
+                          const uint32_t* cryptTable, HashState meetingPoint, std::vector<std::string>& shortMatches, MeetInTheMiddleTable& out,
                           std::string& error) {
-    const uint64_t room = junctionTableCount((int) space.alphabet().size(), space.tableLength());
+    const uint64_t room = meetInTheMiddleTableCount((int) space.alphabet().size(), space.tableLength());
     if (bytesFor((int) space.alphabet().size(), space.tableLength()) == UINT64_MAX) {
         error = "a table of " + std::to_string(space.tableLength()) + " characters is far too big for any machine's memory";
         return false;
     }
 
-    out = JunctionTable();
+    out = MeetInTheMiddleTable();
     out.space_ = space;
     out.startState_ = startState;
     out.prefixEntry_ = prefixEntry;
@@ -272,7 +272,7 @@ bool JunctionTable::build(const JunctionSpace& space, HashState startState, cons
         return false;
     }
 
-    TableBuilder builder{space, cryptTable + kHashAOffset, rules, junctionKey(junction), &shortMatches, &out.keys_, std::string()};
+    TableBuilder builder{space, cryptTable + kHashAOffset, rules, meetingPointKey(meetingPoint), &shortMatches, &out.keys_, std::string()};
     builder.dir.reserve(space.tableLength());
     builder.walk(0, startState, prefixEntry);
     std::sort(out.keys_.begin(), out.keys_.end());
@@ -295,11 +295,11 @@ bool JunctionTable::build(const JunctionSpace& space, HashState startState, cons
     return true;
 }
 
-bool JunctionTable::holds(uint64_t key) const {
+bool MeetInTheMiddleTable::holds(uint64_t key) const {
     return std::binary_search(keys_.begin(), keys_.end(), key);
 }
 
-void JunctionTable::prefixesFor(const std::vector<uint64_t>& keys, std::vector<std::vector<std::string>>& out) const {
+void MeetInTheMiddleTable::prefixesFor(const std::vector<uint64_t>& keys, std::vector<std::vector<std::string>>& out) const {
     out.assign(keys.size(), {});
     if (keys.empty())
         return;
@@ -315,7 +315,7 @@ void JunctionTable::prefixesFor(const std::vector<uint64_t>& keys, std::vector<s
     // The same walk the table was built by, reporting the directories whose
     // key is one of these instead of keeping every key.
     struct Resolver {
-        const JunctionSpace& space;
+        const MeetInTheMiddleSpace& space;
         const uint32_t* table;
         const PruneRules& rules;
         const std::vector<std::pair<uint64_t, size_t>>& wanted;
@@ -324,7 +324,7 @@ void JunctionTable::prefixesFor(const std::vector<uint64_t>& keys, std::vector<s
 
         void walk(int depth, HashState state, const PruneState& prune) {
             if (depth == space.tableLength()) {
-                const uint64_t key = junctionKey(state);
+                const uint64_t key = meetingPointKey(state);
                 auto it = std::lower_bound(wanted.begin(), wanted.end(), std::make_pair(key, (size_t) 0));
                 for (; it != wanted.end() && it->first == key; ++it)
                     out[it->second].push_back(dir);
@@ -345,15 +345,15 @@ void JunctionTable::prefixesFor(const std::vector<uint64_t>& keys, std::vector<s
     resolver.walk(0, startState_, prefixEntry_);
 }
 
-void JunctionTable::prefixesFor(uint64_t key, std::vector<std::string>& out) const {
+void MeetInTheMiddleTable::prefixesFor(uint64_t key, std::vector<std::string>& out) const {
     std::vector<std::vector<std::string>> all;
     prefixesFor(std::vector<uint64_t>{key}, all);
     out = std::move(all.front());
 }
 
-// --- JunctionWalk ------------------------------------------------------------
+// --- MeetInTheMiddleWalk ------------------------------------------------------------
 
-JunctionWalk::JunctionWalk(std::string alphabet, int tailLength, HashState junction, const uint32_t* table, const PruneRules& rules,
+MeetInTheMiddleWalk::MeetInTheMiddleWalk(std::string alphabet, int tailLength, HashState meetingPoint, const uint32_t* table, const PruneRules& rules,
                            const TailPruneState& entry)
     : alphabet_(std::move(alphabet)), table_(table), rules_(rules), tailLength_(tailLength) {
     tail_.assign(tailLength_, alphabet_.empty() ? '\0' : alphabet_[0]);
@@ -361,11 +361,11 @@ JunctionWalk::JunctionWalk(std::string alphabet, int tailLength, HashState junct
     place_.assign(tailLength_ + 1, 1);
     for (int k = tailLength_ - 1; k >= 0; --k)
         place_[k] = place_[k + 1] * alphabet_.size();
-    stack_.assign(tailLength_ + 1, junction);
+    stack_.assign(tailLength_ + 1, meetingPoint);
     prune_.assign(tailLength_ + 1, entry);
 }
 
-bool JunctionWalk::start(uint64_t from, uint64_t to) {
+bool MeetInTheMiddleWalk::start(uint64_t from, uint64_t to) {
     end_ = std::min(to, place_[0]);
     if (from >= end_)
         return false;
@@ -380,11 +380,11 @@ bool JunctionWalk::start(uint64_t from, uint64_t to) {
     return settle();
 }
 
-bool JunctionWalk::next() {
+bool MeetInTheMiddleWalk::next() {
     return skip(tailLength_) && settle();
 }
 
-bool JunctionWalk::settle() {
+bool MeetInTheMiddleWalk::settle() {
     for (;;) {
         const int reached = rebuildFrom(changedFrom_);
         if (reached == tailLength_)
@@ -396,7 +396,7 @@ bool JunctionWalk::settle() {
     }
 }
 
-bool JunctionWalk::stepInto(int depth) {
+bool MeetInTheMiddleWalk::stepInto(int depth) {
     const char c = alphabet_[digit_[depth]];
     prune_[depth + 1] = prune_[depth];
     if (rules_.any() && !tailPruneStep(rules_, prune_[depth + 1], c))
@@ -405,7 +405,7 @@ bool JunctionWalk::stepInto(int depth) {
     return true;
 }
 
-int JunctionWalk::rebuildFrom(int depth) {
+int MeetInTheMiddleWalk::rebuildFrom(int depth) {
     for (int k = depth; k < tailLength_; ++k) {
         if (!stepInto(k))
             return k;
@@ -413,7 +413,7 @@ int JunctionWalk::rebuildFrom(int depth) {
     return tailLength_;
 }
 
-bool JunctionWalk::skip(int depth) {
+bool MeetInTheMiddleWalk::skip(int depth) {
     // Past every tail that shares this one's first `depth` rewound
     // characters: place_[depth] of them, and the index is somewhere among
     // them.

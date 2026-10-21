@@ -11,7 +11,7 @@
 #include "engine/candidate.h"
 #include "engine/dictionary_search.h"
 #include "engine/hash_match.h"
-#include "engine/junction.h"
+#include "engine/meet_in_the_middle.h"
 #include "engine/limits.h"
 #include "engine/mpq_hash.h"
 
@@ -1133,13 +1133,13 @@ bool selfTestDictionaryBackend(SearchBackend& backend, std::string& error) {
     return true;
 }
 
-// --- Junction searches -------------------------------------------------------
+// --- Meet-in-the-middle searches -------------------------------------------------------
 
 namespace {
 
-// One junction self-test case: a name whose directory is planted as the one
-// the junction belongs to, and how much of it the table holds.
-struct JunctionCase {
+// One meet-in-the-middle self-test case: a name whose directory is planted as
+// the one the meeting point belongs to, and how much of it the table holds.
+struct MeetInTheMiddleCase {
     std::string alphabet;
     std::string prefix;
     std::string suffix;
@@ -1151,8 +1151,9 @@ struct JunctionCase {
 // What a batch must find: every tail of it that the rules allow (checked
 // from the right, a tail at a time, as the reference backend does) whose
 // state the table holds.
-void expectedJunctionBatch(const JunctionCase& c, const JunctionSpace& space, const JunctionTable& table, const HashState& junction,
-                           const JunctionBatch& batch, const uint32_t* cryptTable, std::vector<uint64_t>& hits, uint64_t& probed) {
+void expectedMeetInTheMiddleBatch(const MeetInTheMiddleCase& c, const MeetInTheMiddleSpace& space, const MeetInTheMiddleTable& table,
+                                  const HashState& meetingPoint, const MeetInTheMiddleBatch& batch, const uint32_t* cryptTable,
+                                  std::vector<uint64_t>& hits, uint64_t& probed) {
     hits.clear();
     probed = 0;
     for (uint64_t index = batch.start; index < batch.start + batch.count; ++index) {
@@ -1166,34 +1167,35 @@ void expectedJunctionBatch(const JunctionCase& c, const JunctionSpace& space, co
         if (pruned)
             continue;
         ++probed;
-        if (table.holds(junctionKey(rewindHash(junction, tail, kHashAOffset, cryptTable))))
+        if (table.holds(meetingPointKey(rewindHash(meetingPoint, tail, kHashAOffset, cryptTable))))
             hits.push_back(index);
     }
 }
 
-std::string junctionCaseName(const JunctionCase& c, const JunctionBatch& batch) {
+std::string meetInTheMiddleCaseName(const MeetInTheMiddleCase& c, const MeetInTheMiddleBatch& batch) {
     return "alphabet '" + c.alphabet + "', '" + c.prefix + "' + '" + c.dir + "' + '" + c.suffix + "', table " +
            std::to_string(c.tableLength) + ", tails of " + std::to_string(batch.tailLength) + " from " + std::to_string(batch.start) +
            " for " + std::to_string(batch.count);
 }
 
 // Runs one batch and compares what the backend found with the loop above.
-bool runJunctionBatch(SearchBackend& backend, const JunctionCase& c, const JunctionSpace& space, const JunctionTable& table,
-                      const HashState& junction, const JunctionBatch& batch, const uint32_t* cryptTable, std::string& error) {
+bool runMeetInTheMiddleBatch(SearchBackend& backend, const MeetInTheMiddleCase& c, const MeetInTheMiddleSpace& space,
+                             const MeetInTheMiddleTable& table, const HashState& meetingPoint, const MeetInTheMiddleBatch& batch,
+                             const uint32_t* cryptTable, std::string& error) {
     std::vector<uint64_t> wanted;
     uint64_t wantedProbed = 0;
-    expectedJunctionBatch(c, space, table, junction, batch, cryptTable, wanted, wantedProbed);
+    expectedMeetInTheMiddleBatch(c, space, table, meetingPoint, batch, cryptTable, wanted, wantedProbed);
 
-    const JunctionOutcome outcome = backend.runJunctionBatch(batch);
+    const MeetInTheMiddleOutcome outcome = backend.runMeetInTheMiddleBatch(batch);
     std::vector<uint64_t> got;
-    for (const JunctionHit& hit : outcome.hits) {
+    for (const MeetInTheMiddleHit& hit : outcome.hits) {
         if (hit.tailLength != batch.tailLength) {
             error = "reported a hit among tails of " + std::to_string(hit.tailLength) + " characters, not " +
-                    std::to_string(batch.tailLength) + " (" + junctionCaseName(c, batch) + ")";
+                    std::to_string(batch.tailLength) + " (" + meetInTheMiddleCaseName(c, batch) + ")";
             return false;
         }
         if (hit.index < batch.start || hit.index >= batch.start + batch.count) {
-            error = "reported a hit at index " + std::to_string(hit.index) + ", outside the batch (" + junctionCaseName(c, batch) + ")";
+            error = "reported a hit at index " + std::to_string(hit.index) + ", outside the batch (" + meetInTheMiddleCaseName(c, batch) + ")";
             return false;
         }
         got.push_back(hit.index);
@@ -1206,27 +1208,27 @@ bool runJunctionBatch(SearchBackend& backend, const JunctionCase& c, const Junct
         for (uint64_t index : wanted)
             wantedText += " " + std::to_string(index);
         error = "found tails" + (gotText.empty() ? std::string(" (none)") : gotText) + ", not" +
-                (wantedText.empty() ? std::string(" (none)") : wantedText) + " (" + junctionCaseName(c, batch) + ")";
+                (wantedText.empty() ? std::string(" (none)") : wantedText) + " (" + meetInTheMiddleCaseName(c, batch) + ")";
         return false;
     }
     if (outcome.probed != wantedProbed) {
         error = "looked up " + std::to_string(outcome.probed) + " tails in the table, not " + std::to_string(wantedProbed) + " (" +
-                junctionCaseName(c, batch) + ")";
+                meetInTheMiddleCaseName(c, batch) + ")";
         return false;
     }
     return true;
 }
 
-bool runJunctionCase(SearchBackend& backend, const JunctionCase& c, const uint32_t* cryptTable, std::string& error) {
+bool runMeetInTheMiddleCase(SearchBackend& backend, const MeetInTheMiddleCase& c, const uint32_t* cryptTable, std::string& error) {
     const int length = (int) c.dir.size();
-    JunctionSpace space;
-    if (!JunctionSpace::create(c.alphabet, 1, length, c.tableLength, space, error))
+    MeetInTheMiddleSpace space;
+    if (!MeetInTheMiddleSpace::create(c.alphabet, 1, length, c.tableLength, space, error))
         return false;
     const HashState startState = continueHash(kInitialHashState, c.prefix, kHashAOffset, cryptTable);
-    const HashState junction = continueHash(startState, c.dir, kHashAOffset, cryptTable);
+    const HashState meetingPoint = continueHash(startState, c.dir, kHashAOffset, cryptTable);
     std::vector<std::string> shortMatches;
-    JunctionTable table;
-    if (!JunctionTable::build(space, startState, dirPruneStart(c.prefix), c.rules, cryptTable, junction, shortMatches, table, error))
+    MeetInTheMiddleTable table;
+    if (!MeetInTheMiddleTable::build(space, startState, dirPruneStart(c.prefix), c.rules, cryptTable, meetingPoint, shortMatches, table, error))
         return false;
 
     // The planted directory's own tail, which the table's characters leave:
@@ -1244,7 +1246,7 @@ bool runJunctionCase(SearchBackend& backend, const JunctionCase& c, const uint32
         // the cases that have them.)
         std::vector<uint64_t> wanted;
         uint64_t probed = 0;
-        expectedJunctionBatch(c, space, table, junction, {plantedLength, plantedIndex, 1}, cryptTable, wanted, probed);
+        expectedMeetInTheMiddleBatch(c, space, table, meetingPoint, {plantedLength, plantedIndex, 1}, cryptTable, wanted, probed);
         if (!c.rules.any() && wanted.size() != 1) {
             error = "the planted directory '" + c.dir + "' isn't where the self-test put it (table " + std::to_string(c.tableLength) +
                     ", tail '" + plantedTail + "' at " + std::to_string(plantedIndex) + ") - the test itself is broken";
@@ -1252,16 +1254,16 @@ bool runJunctionCase(SearchBackend& backend, const JunctionCase& c, const uint32
         }
     }
 
-    JunctionConstants constants;
+    MeetInTheMiddleConstants constants;
     constants.alphabet = c.alphabet;
-    constants.junction = junction;
+    constants.meetingPoint = meetingPoint;
     constants.cryptTable = cryptTable;
     constants.table = &table;
     constants.rules = c.rules;
     constants.tailEntry = tailPruneStart(c.suffix);
-    backend.beginJunctionSearch(constants);
+    backend.beginMeetInTheMiddleSearch(constants);
 
-    std::vector<JunctionBatch> batches;
+    std::vector<MeetInTheMiddleBatch> batches;
     // Every tail length as one batch - the planted one among them, and the
     // others, which have nothing to find.
     for (int tailLength = 0; tailLength <= space.maxTailLength(); ++tailLength)
@@ -1287,23 +1289,23 @@ bool runJunctionCase(SearchBackend& backend, const JunctionCase& c, const uint32
             batches.push_back({plantedLength, from, std::min(piece, count - from)});
     }
 
-    for (const JunctionBatch& batch : batches) {
+    for (const MeetInTheMiddleBatch& batch : batches) {
         if (batch.count == 0)
             continue;
-        if (!runJunctionBatch(backend, c, space, table, junction, batch, cryptTable, error)) {
-            backend.endJunctionSearch();
+        if (!runMeetInTheMiddleBatch(backend, c, space, table, meetingPoint, batch, cryptTable, error)) {
+            backend.endMeetInTheMiddleSearch();
             return false;
         }
     }
-    backend.endJunctionSearch();
+    backend.endMeetInTheMiddleSearch();
     return true;
 }
 
 } // namespace
 
-bool selfTestJunctionBackend(SearchBackend& backend, std::string& error) {
-    if (!backend.supportsJunction()) {
-        error = std::string("the ") + backend.name() + " backend can't search junctions";
+bool selfTestMeetInTheMiddleBackend(SearchBackend& backend, std::string& error) {
+    if (!backend.supportsMeetInTheMiddle()) {
+        error = std::string("the ") + backend.name() + " backend can't search meet-in-the-middle targets";
         return false;
     }
     uint32_t cryptTable[0x500];
@@ -1315,7 +1317,7 @@ bool selfTestJunctionBackend(SearchBackend& backend, std::string& error) {
     rules.adjacentBackslashes = true;
     rules.maxBackslashCount = 1;
 
-    std::vector<JunctionCase> cases;
+    std::vector<MeetInTheMiddleCase> cases;
     // Every split of a four-character directory between the table and the
     // walk, from all of it in the table (nothing but the empty tail to walk)
     // to none of it (the whole directory rewound).
@@ -1350,9 +1352,9 @@ bool selfTestJunctionBackend(SearchBackend& backend, std::string& error) {
     cases.push_back({"AB-\\", "", "\\X.Y", "B", 0, {}});
     cases.push_back({"AB-\\", "Q\\", "\\X.Y", "B", 1, {}});
 
-    for (const JunctionCase& c : cases) {
-        if (!runJunctionCase(backend, c, cryptTable, error)) {
-            error = "junction search: " + error;
+    for (const MeetInTheMiddleCase& c : cases) {
+        if (!runMeetInTheMiddleCase(backend, c, cryptTable, error)) {
+            error = "meet-in-the-middle search: " + error;
             return false;
         }
     }

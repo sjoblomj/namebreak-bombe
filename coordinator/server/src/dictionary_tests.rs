@@ -24,7 +24,7 @@ fn config(chunk: f64) -> RangeConfig {
         target_chunk_seconds: chunk,
         default_rate_per_sec: 1.0,
         default_dictionary_rate_per_sec: 1.0,
-        default_junction_rate_per_sec: 1.0,
+        default_meet_in_the_middle_rate_per_sec: 1.0,
         min_chunk_candidates: 1,
         max_chunk_candidates: 1_000_000_000_000,
         lease_seconds: 60,

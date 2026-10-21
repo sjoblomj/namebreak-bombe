@@ -233,23 +233,24 @@ pub struct DashboardTarget {
     /// start ("" once everything has been handed out).
     pub kind: String,
     pub dictionary: Option<DashboardDictionary>,
-    /// Set for a `"junction"` target - one whose unknown part is a
-    /// directory, searched from both ends at once (see `junction.rs`). Its
-    /// ranges' `candidate_len` is the directory's length and their
-    /// candidates are tails, shown with the table's characters as '?'; it
-    /// has an alphabet and pruning rules like an alphabet target, but no
-    /// bounds, insertions, priority or skip ranges.
-    pub junction: Option<DashboardJunction>,
+    /// Set for a `"meet-in-the-middle"` target - one whose unknown part is a
+    /// directory, searched from both ends at once (see
+    /// `meet_in_the_middle.rs`). Its ranges' `candidate_len` is the
+    /// directory's length and their candidates are tails, shown with the
+    /// table's characters as '?'; it has an alphabet and pruning rules like
+    /// an alphabet target, but no bounds, insertions, priority or skip
+    /// ranges.
+    pub meet_in_the_middle: Option<DashboardMeetInTheMiddle>,
 }
 
-/// What a junction target searches, and what its table costs - see
-/// `AdminCreateTargetRequest::junction`.
+/// What a meet-in-the-middle target searches, and what its table costs - see
+/// `AdminCreateTargetRequest::meet_in_the_middle`.
 #[derive(Serialize)]
-pub struct DashboardJunction {
+pub struct DashboardMeetInTheMiddle {
     /// The hash state after the directory, `"seed1 seed2"` in hex: hashA's,
     /// then hashB's.
-    pub junction_a: String,
-    pub junction_b: String,
+    pub meeting_point_a: String,
+    pub meeting_point_b: String,
     pub min_length: i64,
     pub max_length: i64,
     /// How many of a directory's first characters the client's table holds,
@@ -704,10 +705,10 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
         // Deleted since target_rows was read - leave it out, as the next refresh will.
         let Some(settings) = settings_by_target.remove(&id) else { continue };
         let range_rows = ranges_by_target.remove(&id).unwrap_or_default();
-        if settings.is_junction() {
+        if settings.is_meet_in_the_middle() {
             let (cursor_candidate_len, cursor_index) = progress_by_target.get(&id).map_or((0, 0), |p| (p.0, p.1));
-            let junction = crate::junction::of_target(&settings)?;
-            targets.push(junction_target(settings, &junction, range_rows, cursor_candidate_len, cursor_index as i64, found_by, found_by_backend, found_at));
+            let meet_in_the_middle = crate::meet_in_the_middle::of_target(&settings)?;
+            targets.push(meet_in_the_middle_target(settings, &meet_in_the_middle, range_rows, cursor_candidate_len, cursor_index as i64, found_by, found_by_backend, found_at));
             continue;
         }
         if let Some(dictionary) = dictionaries.get(&id) {
@@ -850,7 +851,7 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
             gaps,
             kind: "alphabet".into(),
             dictionary: None,
-            junction: None,
+            meet_in_the_middle: None,
         });
     }
 
@@ -862,15 +863,15 @@ pub async fn dashboard_data(State(state): State<AppState>) -> Result<Json<Dashbo
     Ok(Json(DashboardResponse { targets, volunteers: volunteers(&state.pool).await?, active_ranges, low_disk: state.disk.warning() }))
 }
 
-/// A junction target's `DashboardTarget` (see `DashboardTarget::junction`):
-/// its ranges are one directory length's tails, shown as directories with
-/// the table's characters - which aren't searched one at a time - as '?'.
-/// Each length is its own stretch of tails, so its gaps are worked out
-/// within a length, never across two.
+/// A meet-in-the-middle target's `DashboardTarget` (see
+/// `DashboardTarget::meet_in_the_middle`): its ranges are one directory
+/// length's tails, shown as directories with the table's characters - which
+/// aren't searched one at a time - as '?'. Each length is its own stretch of
+/// tails, so its gaps are worked out within a length, never across two.
 #[allow(clippy::too_many_arguments)]
-fn junction_target(
+fn meet_in_the_middle_target(
     target: Target,
-    junction: &crate::junction::JunctionTarget,
+    meet_in_the_middle: &crate::meet_in_the_middle::MeetInTheMiddleTarget,
     range_rows: Vec<RangeRow>,
     cursor_candidate_len: i64,
     cursor_index: i64,
@@ -878,7 +879,7 @@ fn junction_target(
     found_by_backend: Option<String>,
     found_at: Option<i64>,
 ) -> DashboardTarget {
-    let space = &junction.space;
+    let space = &meet_in_the_middle.space;
     let hex = |state: (u32, u32)| format!("{:08X} {:08X}", state.0, state.1);
     // Already in length and index order, as the query sorts them.
     let ranges: Vec<(i64, i64, i64, DashboardRange)> = range_rows
@@ -983,11 +984,11 @@ fn junction_target(
         skip_ranges: Vec::new(),
         ranges: ranges.into_iter().map(|r| r.3).collect(),
         gaps,
-        kind: "junction".into(),
+        kind: "meet-in-the-middle".into(),
         dictionary: None,
-        junction: Some(DashboardJunction {
-            junction_a: hex(junction.junction_a),
-            junction_b: hex(junction.junction_b),
+        meet_in_the_middle: Some(DashboardMeetInTheMiddle {
+            meeting_point_a: hex(meet_in_the_middle.meeting_point_a),
+            meeting_point_b: hex(meet_in_the_middle.meeting_point_b),
             min_length: space.min_length(),
             max_length: space.max_length(),
             table_length: space.table_length(),
@@ -1118,7 +1119,7 @@ fn dictionary_target(
         ranges: ranges.into_iter().map(|r| r.2).collect(),
         gaps,
         kind: "dictionary".into(),
-        junction: None,
+        meet_in_the_middle: None,
         dictionary: Some(DashboardDictionary {
             word_lists: dictionary.word_lists.clone(),
             word_list_word_counts: dictionary.word_lists.iter().map(|name| word_list_word_counts.get(name).copied().unwrap_or(0)).collect(),

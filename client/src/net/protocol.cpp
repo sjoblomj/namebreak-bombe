@@ -259,21 +259,21 @@ bool getOptionalStringArray(const std::map<std::string, JsonValue>& obj, const s
 
 // A dictionary claim's fields (see ClaimResponse::dictionary) - every one
 // of them needed once `dictionary` is true, none of them before.
-// A junction target's claim (see ClaimResponse::junction): its junction,
-// the directory's length, how much of it the table holds, and the tails to
-// rewind. Absent from any other claim.
-bool getJunctionClaim(const std::map<std::string, JsonValue>& obj, ClaimResponse& out) {
-    if (!getOptionalBool(obj, "junction", out.junction)) return false;
-    if (!out.junction) return true;
-    return getString(obj, "junction_a_seed1_hex", out.junctionASeed1Hex) &&
-           getString(obj, "junction_a_seed2_hex", out.junctionASeed2Hex) &&
-           getString(obj, "junction_b_seed1_hex", out.junctionBSeed1Hex) &&
-           getString(obj, "junction_b_seed2_hex", out.junctionBSeed2Hex) &&
+// A meet-in-the-middle target's claim (see ClaimResponse::meetInTheMiddle):
+// its meeting point, the directory's length, how much of it the table holds,
+// and the tails to rewind. Absent from any other claim.
+bool getMeetInTheMiddleClaim(const std::map<std::string, JsonValue>& obj, ClaimResponse& out) {
+    if (!getOptionalBool(obj, "meet_in_the_middle", out.meetInTheMiddle)) return false;
+    if (!out.meetInTheMiddle) return true;
+    return getString(obj, "meeting_point_a_seed1_hex", out.meetingPointASeed1Hex) &&
+           getString(obj, "meeting_point_a_seed2_hex", out.meetingPointASeed2Hex) &&
+           getString(obj, "meeting_point_b_seed1_hex", out.meetingPointBSeed1Hex) &&
+           getString(obj, "meeting_point_b_seed2_hex", out.meetingPointBSeed2Hex) &&
            getInt64(obj, "directory_length", out.directoryLength) &&
-           getInt64(obj, "junction_table_length", out.junctionTableLength) &&
+           getInt64(obj, "meet_in_the_middle_table_length", out.meetInTheMiddleTableLength) &&
            getInt64(obj, "first_tail_index", out.firstTailIndex) &&
            getInt64(obj, "end_tail_index", out.endTailIndex) &&
-           out.junctionTableLength >= 0 && out.junctionTableLength <= out.directoryLength &&
+           out.meetInTheMiddleTableLength >= 0 && out.meetInTheMiddleTableLength <= out.directoryLength &&
            out.firstTailIndex >= 0 && out.endTailIndex >= out.firstTailIndex;
 }
 
@@ -344,7 +344,7 @@ std::string toJson(const RegisterRequest& req) {
     return "{\"username\":" + escapeJsonString(req.username) + ",\"hostname\":" + escapeJsonString(req.hostname) +
            ",\"backend\":" + escapeJsonString(req.backend) + ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) +
            ",\"client_release\":" + escapeJsonString(req.clientRelease) +
-           ",\"junction_table_bytes\":" + (req.junctionTableBytes ? std::to_string(*req.junctionTableBytes) : "null") + "}";
+           ",\"meet_in_the_middle_table_bytes\":" + (req.meetInTheMiddleTableBytes ? std::to_string(*req.meetInTheMiddleTableBytes) : "null") + "}";
 }
 
 std::string toJson(const HeartbeatRequest& req) {
@@ -407,7 +407,7 @@ bool parseClaimResponse(const std::string& body, ClaimResponse& out) {
            getInt64( obj, "candidate_count", out.candidateCount) &&
            getInt64( obj, "lease_seconds", out.leaseSeconds) &&
            getDictionaryClaim(obj, out) &&
-           getJunctionClaim(obj, out);
+           getMeetInTheMiddleClaim(obj, out);
 }
 
 bool parseHeartbeatResponse(const std::string& body, HeartbeatResponse& out) {

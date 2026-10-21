@@ -1,4 +1,4 @@
-#include "engine/junction_search.h"
+#include "engine/meet_in_the_middle_search.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -14,21 +14,21 @@
 #include "engine/mpq_hash.h"
 #include "engine/wordlist.h"
 
-// The most tails one runJunctionBatch() call gets, whatever the backend asks
-// for - set small at compile time by the tests (see CMakeLists.txt), so that
-// even their small searches are split into many calls, and a tail length
-// across several of them.
-#ifndef NAMEBREAK_JUNCTION_TAILS_PER_CALL
-#define NAMEBREAK_JUNCTION_TAILS_PER_CALL UINT64_MAX
+// The most tails one runMeetInTheMiddleBatch() call gets, whatever the
+// backend asks for - set small at compile time by the tests (see
+// CMakeLists.txt), so that even their small searches are split into many
+// calls, and a tail length across several of them.
+#ifndef NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_CALL
+#define NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_CALL UINT64_MAX
 #endif
 
-void SearchBackend::beginJunctionSearch(const JunctionConstants&) {
-    fprintf(stderr, "BUG: the %s backend can't search junctions - check supportsJunction() first\n", name());
+void SearchBackend::beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants&) {
+    fprintf(stderr, "BUG: the %s backend can't search meet-in-the-middle targets - check supportsMeetInTheMiddle() first\n", name());
     std::abort();
 }
 
-JunctionOutcome SearchBackend::runJunctionBatch(const JunctionBatch&) {
-    fprintf(stderr, "BUG: the %s backend can't search junctions - check supportsJunction() first\n", name());
+MeetInTheMiddleOutcome SearchBackend::runMeetInTheMiddleBatch(const MeetInTheMiddleBatch&) {
+    fprintf(stderr, "BUG: the %s backend can't search meet-in-the-middle targets - check supportsMeetInTheMiddle() first\n", name());
     std::abort();
 }
 
@@ -60,36 +60,36 @@ std::string stateText(HashState state) {
 
 } // namespace
 
-bool junctionFitsHashes(const JunctionRequest& req, const uint32_t* cryptTable, std::string& error) {
-    const uint32_t hashA = continueHash(req.junctionA, req.suffix, kHashAOffset, cryptTable).first;
-    const uint32_t hashB = continueHash(req.junctionB, req.suffix, kHashBOffset, cryptTable).first;
+bool meetingPointFitsHashes(const MeetInTheMiddleRequest& req, const uint32_t* cryptTable, std::string& error) {
+    const uint32_t hashA = continueHash(req.meetingPointA, req.suffix, kHashAOffset, cryptTable).first;
+    const uint32_t hashB = continueHash(req.meetingPointB, req.suffix, kHashBOffset, cryptTable).first;
     if (hashA == req.targetHashA && hashB == req.targetHashB)
         return true;
     // Whichever of the two doesn't fit - hashA first, if both don't.
     const bool aFits = hashA == req.targetHashA;
     const char* which = aFits ? "hashB" : "hashA";
-    error = std::string("the junction state for ") + which + " (" + stateText(aFits ? req.junctionB : req.junctionA) +
+    error = std::string("the meeting point for ") + which + " (" + stateText(aFits ? req.meetingPointB : req.meetingPointA) +
             ") doesn't fit the file: hashing the suffix '" + req.suffix + "' onto it gives " + hex32(aFits ? hashB : hashA) + ", not the " +
             which + " of " + hex32(aFits ? req.targetHashB : req.targetHashA) +
-            " this search is for - the junction must be the state after the directory, right where the suffix begins";
+            " this search is for - the meeting point must be the state after the directory, right where the suffix begins";
     return false;
 }
 
-uint64_t junctionTailsToWalk(int alphabetSize, int maxLength, int tableLength) {
-    JunctionSpace space;
+uint64_t meetInTheMiddleTailsToWalk(int alphabetSize, int maxLength, int tableLength) {
+    MeetInTheMiddleSpace space;
     std::string error;
-    if (!JunctionSpace::create(std::string(alphabetSize, 'x'), 1, maxLength, tableLength, space, error))
+    if (!MeetInTheMiddleSpace::create(std::string(alphabetSize, 'x'), 1, maxLength, tableLength, space, error))
         return UINT64_MAX;
     return space.size();
 }
 
-std::string junctionFingerprint(const JunctionRequest& req) {
-    std::string text = "namebreak junction search 1\n";
+std::string meetInTheMiddleFingerprint(const MeetInTheMiddleRequest& req) {
+    std::string text = "namebreak meet-in-the-middle search 1\n";
     text += field("alphabet", req.alphabet);
     text += field("prefix", req.prefix);
     text += field("suffix", req.suffix);
-    text += field("junction_a", stateText(req.junctionA));
-    text += field("junction_b", stateText(req.junctionB));
+    text += field("meeting_point_a", stateText(req.meetingPointA));
+    text += field("meeting_point_b", stateText(req.meetingPointB));
     text += field("hashes", std::to_string(req.targetHashA) + " " + std::to_string(req.targetHashB));
     text += field("lengths", std::to_string(req.minLength) + "-" + std::to_string(req.maxLength));
     // The table's length is part of it: it decides where the walk's nodes
@@ -102,9 +102,9 @@ std::string junctionFingerprint(const JunctionRequest& req) {
     return hex64(fnv1a64(text));
 }
 
-bool writeJunctionProgress(const std::string& path, const JunctionProgress& progress, uint64_t total, const std::string& tail,
+bool writeMeetInTheMiddleProgress(const std::string& path, const MeetInTheMiddleProgress& progress, uint64_t total, const std::string& tail,
                            std::string& error) {
-    std::string text = "# namebreak junction search progress - every node numbered below `next` has been searched\n";
+    std::string text = "# namebreak meet-in-the-middle search progress - every node numbered below `next` has been searched\n";
     text += "fingerprint = " + progress.fingerprint + "\n";
     text += "next = " + std::to_string(progress.next) + "\n";
     text += "total = " + std::to_string(total) + "\n";
@@ -112,7 +112,7 @@ bool writeJunctionProgress(const std::string& path, const JunctionProgress& prog
     return replaceFileContents(path, text, error);
 }
 
-bool readJunctionProgress(const std::string& path, JunctionProgress& out, bool& exists, std::string& error) {
+bool readMeetInTheMiddleProgress(const std::string& path, MeetInTheMiddleProgress& out, bool& exists, std::string& error) {
     std::error_code ec;
     exists = std::filesystem::exists(path, ec);
     if (!exists)
@@ -156,35 +156,35 @@ bool readJunctionProgress(const std::string& path, JunctionProgress& out, bool& 
         }
     }
     if (!hasFingerprint || !hasNext) {
-        error = path + " isn't a junction search's progress file - it has no " + (hasFingerprint ? "'next'" : "'fingerprint'");
+        error = path + " isn't a meet-in-the-middle search's progress file - it has no " + (hasFingerprint ? "'next'" : "'fingerprint'");
         return false;
     }
     return true;
 }
 
-JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& req, std::atomic<bool>* abortRequested,
+MeetInTheMiddleResult runMeetInTheMiddleSearch(SearchBackend& backend, const MeetInTheMiddleRequest& req, std::atomic<bool>* abortRequested,
                                  std::function<void(const std::string&)> onPartialMatch, const std::atomic<bool>* pauseRequested) {
-    JunctionSearchHooks hooks;
+    MeetInTheMiddleSearchHooks hooks;
     hooks.onPartialMatch = std::move(onPartialMatch);
-    return runJunctionSearch(backend, req, abortRequested, hooks, pauseRequested);
+    return runMeetInTheMiddleSearch(backend, req, abortRequested, hooks, pauseRequested);
 }
 
-JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& req, std::atomic<bool>* abortRequested,
-                                 const JunctionSearchHooks& hooks, const std::atomic<bool>* pauseRequested) {
-    JunctionResult result;
+MeetInTheMiddleResult runMeetInTheMiddleSearch(SearchBackend& backend, const MeetInTheMiddleRequest& req, std::atomic<bool>* abortRequested,
+                                 const MeetInTheMiddleSearchHooks& hooks, const std::atomic<bool>* pauseRequested) {
+    MeetInTheMiddleResult result;
     auto fail = [&](const std::string& error) {
         result.ok = false;
         result.error = error;
         return result;
     };
-    if (!backend.supportsJunction())
-        return fail(std::string("the ") + backend.name() + " backend can't search junctions yet - use the cpu backend");
+    if (!backend.supportsMeetInTheMiddle())
+        return fail(std::string("the ") + backend.name() + " backend can't search meet-in-the-middle targets yet - use the cpu backend");
 
     uint32_t cryptTable[0x500];
     prepareCryptTable(cryptTable);
 
     std::string error;
-    if (!junctionFitsHashes(req, cryptTable, error))
+    if (!meetingPointFitsHashes(req, cryptTable, error))
         return fail(error);
     if ((int) (req.prefix.size() + req.maxLength + req.suffix.size()) > MAX_FILENAME_LEN)
         return fail("the longest filename (" + std::to_string(req.prefix.size() + req.maxLength + req.suffix.size()) +
@@ -193,22 +193,22 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
     // The table's length: as asked for, or as much as its memory allows.
     int tableLength = req.tableLength;
     if (tableLength < 0) {
-        tableLength = junctionTableLengthForBytes((int) req.alphabet.size(), req.maxLength, req.tableBytes);
+        tableLength = meetInTheMiddleTableLengthForBytes((int) req.alphabet.size(), req.maxLength, req.tableBytes);
     } else if (tableLength > req.maxLength) {
         printf("the table's %d characters are more than the longest directory's %d - using %d\n", tableLength, req.maxLength,
                req.maxLength);
         tableLength = req.maxLength;
     }
 
-    JunctionSpace space;
-    if (!JunctionSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error))
+    MeetInTheMiddleSpace space;
+    if (!MeetInTheMiddleSpace::create(req.alphabet, req.minLength, req.maxLength, tableLength, space, error))
         return fail(error);
 
     MatchWriter matches;
     if (!matches.open(req.outputFilePath, error))
         return fail(error);
 
-    const std::string fingerprint = junctionFingerprint(req);
+    const std::string fingerprint = meetInTheMiddleFingerprint(req);
     const uint64_t end = std::min(req.endNumber, space.size());
     const uint64_t start = std::min(req.startNumber, end);
     const HashState startState = continueHash(kInitialHashState, req.prefix, kHashAOffset, cryptTable);
@@ -219,17 +219,17 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
         return number < space.size() ? std::string(space.tableLength(), '?') + space.tailOf(number) : std::string();
     };
 
-    printf("junction search, backend: %s\n", backend.name());
+    printf("meet-in-the-middle search, backend: %s\n", backend.name());
     printf("prefix: '%s'\n", req.prefix.c_str());
     printf("suffix: '%s'\n", req.suffix.c_str());
     printf("alphabet: '%s' (%zu characters)\n", req.alphabet.c_str(), req.alphabet.size());
     printf("directory: %d to %d characters\n", space.minLength(), space.maxLength());
-    printf("junction after the directory: hashA %s, hashB %s\n", stateText(req.junctionA).c_str(), stateText(req.junctionB).c_str());
+    printf("meeting point after the directory: hashA %s, hashB %s\n", stateText(req.meetingPointA).c_str(), stateText(req.meetingPointB).c_str());
     printf("hashA: '%X'\n", req.targetHashA);
     printf("hashB: '%X'\n", req.targetHashB);
     printf("table: the first %d characters of a directory, %llu of them at most, %llu MB\n", space.tableLength(),
-           (unsigned long long) junctionTableCount((int) req.alphabet.size(), space.tableLength()),
-           (unsigned long long) JunctionTable::bytesFor((int) req.alphabet.size(), space.tableLength()) / (1024 * 1024));
+           (unsigned long long) meetInTheMiddleTableCount((int) req.alphabet.size(), space.tableLength()),
+           (unsigned long long) MeetInTheMiddleTable::bytesFor((int) req.alphabet.size(), space.tableLength()) / (1024 * 1024));
     printf("walk: the other %d characters, %llu tails in all, numbered 0 to %llu\n", space.maxTailLength(),
            (unsigned long long) space.size(), (unsigned long long) (space.size() - 1));
     if (end < space.size() || start > 0)
@@ -243,8 +243,8 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
     // full-length prefix.
     const auto buildStart = std::chrono::steady_clock::now();
     std::vector<std::string> shortMatches;
-    JunctionTable table;
-    if (!JunctionTable::build(space, startState, prefixEntry, req.rules, cryptTable, req.junctionA, shortMatches, table, error))
+    MeetInTheMiddleTable table;
+    if (!MeetInTheMiddleTable::build(space, startState, prefixEntry, req.rules, cryptTable, req.meetingPointA, shortMatches, table, error))
         return fail(error);
     result.tableLength = space.tableLength();
     result.tableEntries = table.size();
@@ -252,17 +252,17 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
     printf("table built in %s: %llu directories, %llu MB\n",
            formatDuration(std::chrono::duration<double>(std::chrono::steady_clock::now() - buildStart).count()).c_str(),
            (unsigned long long) table.size(), (unsigned long long) (table.bytes() / (1024 * 1024)));
-    // How many directories are expected to match the junction without being
-    // the file: one in 2^64 of the prefix-and-tail pairs the search compares
-    // (fewer bits in the tests' dense-hit builds - see
-    // NAMEBREAK_JUNCTION_MATCH_BITS, hash_match.h).
+    // How many directories are expected to match the meeting point without
+    // being the file: one in 2^64 of the prefix-and-tail pairs the search
+    // compares (fewer bits in the tests' dense-hit builds - see
+    // NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS, hash_match.h).
     const double pairs = (double) table.size() * (double) (end - start);
-    printf("directories expected to match the junction by chance: %.3g\n", pairs / std::ldexp(1.0, 2 * NAMEBREAK_JUNCTION_MATCH_BITS));
+    printf("directories expected to match the meeting point by chance: %.3g\n", pairs / std::ldexp(1.0, 2 * NAMEBREAK_MEET_IN_THE_MIDDLE_MATCH_BITS));
     fflush(stdout);
 
-    JunctionConstants constants;
+    MeetInTheMiddleConstants constants;
     constants.alphabet = req.alphabet;
-    constants.junction = req.junctionA;
+    constants.meetingPoint = req.meetingPointA;
     constants.cryptTable = cryptTable;
     constants.table = &table;
     constants.rules = req.rules;
@@ -276,7 +276,7 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
         if (req.progressFilePath.empty())
             return;
         std::string writeError;
-        if (writeJunctionProgress(req.progressFilePath, {fingerprint, result.nextNumber}, space.size(), describeNumber(result.nextNumber),
+        if (writeMeetInTheMiddleProgress(req.progressFilePath, {fingerprint, result.nextNumber}, space.size(), describeNumber(result.nextNumber),
                                   writeError)) {
             progressWarned = false;
         } else if (!progressWarned) {
@@ -299,7 +299,7 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
         lastStatus = std::chrono::steady_clock::now();
     };
 
-    // One directory that matched the junction: checked in full, reported,
+    // One directory that matched the meeting point: checked in full, reported,
     // and - if it's the file - the end of the search. False to stop.
     auto checkDir = [&](const std::string& dir) {
         // Within the lengths the search is for: the table holds directories
@@ -316,9 +316,9 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
         // rewinds wrongly, or a table that holds the wrong directory, is
         // caught here rather than reported as a match.
         const HashState afterDir = continueHash(kInitialHashState, req.prefix + dir, kHashAOffset, cryptTable);
-        if (junctionKey(afterDir) != junctionKey(req.junctionA)) {
-            printf("WARNING: '%s' doesn't reach the junction after all - hashA's state after '%s%s' is %s, not %s\n", filename.c_str(),
-                   req.prefix.c_str(), dir.c_str(), stateText(afterDir).c_str(), stateText(req.junctionA).c_str());
+        if (meetingPointKey(afterDir) != meetingPointKey(req.meetingPointA)) {
+            printf("WARNING: '%s' doesn't reach the meeting point after all - hashA's state after '%s%s' is %s, not %s\n", filename.c_str(),
+                   req.prefix.c_str(), dir.c_str(), stateText(afterDir).c_str(), stateText(req.meetingPointA).c_str());
             return true;
         }
         ++result.hits;
@@ -341,14 +341,14 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
 
     // One call's hits: which directories of the table's length end up where
     // each tail begins, and whether any of them is the file.
-    auto checkHits = [&](const std::vector<JunctionHit>& hits) {
+    auto checkHits = [&](const std::vector<MeetInTheMiddleHit>& hits) {
         std::vector<uint64_t> keys;
         std::vector<std::string> tails;
         keys.reserve(hits.size());
         tails.reserve(hits.size());
-        for (const JunctionHit& hit : hits) {
+        for (const MeetInTheMiddleHit& hit : hits) {
             tails.push_back(space.tailOf(space.numberOf(hit.tailLength, hit.index)));
-            keys.push_back(junctionKey(rewindHash(req.junctionA, tails.back(), kHashAOffset, cryptTable)));
+            keys.push_back(meetingPointKey(rewindHash(req.meetingPointA, tails.back(), kHashAOffset, cryptTable)));
         }
         // One walk of the table's space answers for every hit of the call.
         std::vector<std::vector<std::string>> prefixes;
@@ -381,8 +381,9 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
     // Nothing to walk if one of those was the file: a backend would upload
     // the whole table for a search that's already over.
     if (!stop)
-        backend.beginJunctionSearch(constants);
-    const uint64_t perCall = std::max<uint64_t>(1, std::min<uint64_t>(backend.junctionTailsPerCall(), NAMEBREAK_JUNCTION_TAILS_PER_CALL));
+        backend.beginMeetInTheMiddleSearch(constants);
+    const uint64_t perCall =
+        std::max<uint64_t>(1, std::min<uint64_t>(backend.meetInTheMiddleTailsPerCall(), NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_CALL));
     uint64_t number = start;
     while (!stop && number < end) {
         if (abortRequested && abortRequested->load(std::memory_order_relaxed)) {
@@ -407,18 +408,18 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
 
         // One call: tails of one length only, since a batch is a range of
         // one length's indices.
-        JunctionBatch batch;
+        MeetInTheMiddleBatch batch;
         batch.tailLength = space.tailLengthOf(number);
         batch.start = space.indexOf(number);
         batch.count = std::min(std::min(end - number, space.countOf(batch.tailLength) - batch.start), perCall);
-        JunctionOutcome outcome = backend.runJunctionBatch(batch);
+        MeetInTheMiddleOutcome outcome = backend.runMeetInTheMiddleBatch(batch);
         number += batch.count;
         result.nextNumber = number;
         result.tailsProbed += outcome.probed;
 
         // In the order the walk reached them, whichever order the backend
         // reports them in.
-        std::sort(outcome.hits.begin(), outcome.hits.end(), [](const JunctionHit& a, const JunctionHit& b) {
+        std::sort(outcome.hits.begin(), outcome.hits.end(), [](const MeetInTheMiddleHit& a, const MeetInTheMiddleHit& b) {
             return a.tailLength != b.tailLength ? a.tailLength < b.tailLength : a.index < b.index;
         });
         if (!checkHits(outcome.hits))
@@ -436,7 +437,7 @@ JunctionResult runJunctionSearch(SearchBackend& backend, const JunctionRequest& 
             printStatus();
     }
     if (!stop)
-        backend.endJunctionSearch();
+        backend.endMeetInTheMiddleSearch();
 
     if (!result.found && !result.aborted) {
         result.nextNumber = end;

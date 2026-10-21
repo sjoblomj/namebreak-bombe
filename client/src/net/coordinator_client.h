@@ -24,10 +24,11 @@ public:
     // retrievable via token()) and returns true, with `out` holding the
     // server's response - notably its protocol version (purely
     // informational, worth logging).
-    // `junctionTableBytes` is how much memory this client will give a
-    // junction target's table (CoordinatorArgs::junctionTableBytes); 0 sends
-    // none, and the server then hands out no junction work.
-    bool registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t junctionTableBytes,
+    // `meetInTheMiddleTableBytes` is how much memory this client will give a
+    // meet-in-the-middle target's table
+    // (CoordinatorArgs::meetInTheMiddleTableBytes); 0 sends none, and the
+    // server then hands out no meet-in-the-middle work.
+    bool registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t meetInTheMiddleTableBytes,
                         RegisterResponse& out,
                         std::string& error);
 
