@@ -164,6 +164,19 @@ bool appendKeyToConfigSection(const std::string& path, const std::string& sectio
 bool ensureConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
                          const std::vector<std::pair<std::string, std::string>>& keys, std::string& error);
 
+// The same, as the settings the caller now wants rather than only what the
+// file was missing: `mode` and the [sectionName] section are set up just as
+// ensureConfigForMode does, but every non-empty `keys` entry *replaces*
+// whatever that key was set to, and every empty one takes its line out
+// altogether - so a field cleared in the Windows GUI's settings really
+// stops being set (see gui/win32/app_config.cpp's editSettings). Lines the
+// keys don't name - comments, blank lines, other sections, keys this caller
+// knows nothing about - are left exactly where they are. A file that
+// doesn't exist yet is written from scratch, exactly as ensureConfigForMode
+// writes it.
+bool updateConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
+                         const std::vector<std::pair<std::string, std::string>>& keys, std::string& error);
+
 // Small helper for reading a config section by known key names while
 // catching typos: tracks which keys were actually looked up, so a caller
 // can report any left over as "unknown key" once done. Shared with

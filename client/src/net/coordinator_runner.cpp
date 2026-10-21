@@ -951,6 +951,11 @@ bool runMeetInTheMiddleRange(MeetInTheMiddleBackend& backends, const Coordinator
             std::lock_guard<std::mutex> lock(progressMutex);
             reached = (int64_t) (next - base);
         };
+        if (callbacks) {
+            hooks.onCount = callbacks->onMeetInTheMiddleCount;
+            hooks.onStatus = callbacks->onMeetInTheMiddleStatus;
+            hooks.onPartialMatch = callbacks->onMeetInTheMiddleMatch;
+        }
         MeetInTheMiddleResult found = runMeetInTheMiddleSearch(*backend, req, &abort, hooks, pauseRequested);
         return RangeResult{found.ok, found.error, found.found, found.filename, found.aborted};
     };

@@ -87,6 +87,15 @@ struct CoordinatorCallbacks {
     std::function<void(uint64_t searched, uint64_t toSearch)> onDictionaryCount;
     std::function<void(const std::string& filename)> onDictionaryStatus;
     std::function<void(const std::string& basename)> onDictionaryBasename;
+    // A meet-in-the-middle range's search as it goes, the same way - as
+    // MeetInTheMiddleSearchHooks' onCount, onStatus and onPartialMatch: how
+    // many of the range's tails have been walked of how many there are (a
+    // meet-in-the-middle range has no candidate order to measure against,
+    // so this is the only thing that says how far it has got), the tail it
+    // has reached, and every directory that matched the meeting point.
+    std::function<void(uint64_t searched, uint64_t toSearch)> onMeetInTheMiddleCount;
+    std::function<void(const std::string& tail)> onMeetInTheMiddleStatus;
+    std::function<void(const std::string& filename)> onMeetInTheMiddleMatch;
     // Outer-loop lifecycle text only (registered, registration failed,
     // claim retry/backoff, no work available) - mirrors the printf/fprintf
     // already at those call sites in runCoordinator(). Does NOT cover

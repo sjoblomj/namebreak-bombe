@@ -825,3 +825,102 @@ bool ensureConfigForMode(const std::string& path, const std::string& mode, const
     }
     return true;
 }
+
+bool updateConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
+                          const std::vector<std::pair<std::string, std::string>>& keys, std::string& error) {
+    std::ifstream probe(path);
+    const bool fileExists = probe.good();
+    probe.close();
+    // Nothing to replace in a file that isn't there at all - writing one
+    // from scratch is the same job either way.
+    if (!fileExists)
+        return ensureConfigForMode(path, mode, sectionName, keys, error);
+
+    if (!setModeKey(path, mode, error))
+        return false;
+    if (!ensureSectionExists(path, sectionName, error))
+        return false;
+
+    std::ifstream in(path);
+    if (!in) {
+        error = "cannot open " + path;
+        return false;
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+        lines.push_back(line);
+    in.close();
+
+    // The section's own lines: everything between its header and the next
+    // section's (or the end of the file).
+    size_t header = lines.size();
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (trim(lines[i]) == "[" + sectionName + "]") {
+            header = i;
+            break;
+        }
+    }
+    if (header == lines.size()) { // ensureSectionExists just put one there
+        error = "no [" + sectionName + "] section in " + path;
+        return false;
+    }
+    size_t end = lines.size();
+    for (size_t i = header + 1; i < lines.size(); ++i) {
+        const std::string trimmed = trim(lines[i]);
+        if (!trimmed.empty() && trimmed.front() == '[') {
+            end = i;
+            break;
+        }
+    }
+    std::vector<std::string> body(lines.begin() + header + 1, lines.begin() + end);
+
+    // Which of the section's own lines sets `key` - a commented-out one
+    // doesn't count, and is left alone as the comment it is.
+    auto lineSetting = [&body](const std::string& key) {
+        for (size_t i = 0; i < body.size(); ++i) {
+            const std::string trimmed = trim(body[i]);
+            if (trimmed.empty() || trimmed.front() == '#')
+                continue;
+            const size_t eq = trimmed.find('=');
+            if (eq != std::string::npos && trim(trimmed.substr(0, eq)) == key)
+                return i;
+        }
+        return body.size();
+    };
+
+    for (const auto& kv : keys) {
+        const size_t at = lineSetting(kv.first);
+        if (kv.second.empty()) {
+            if (at != body.size())
+                body.erase(body.begin() + at);
+            continue;
+        }
+        const std::string written = kv.first + " = " + quoteIfNeeded(sanitizeForConfigLine(kv.second));
+        if (at != body.size()) {
+            body[at] = written;
+            continue;
+        }
+        // A key the section didn't have goes after its last line that holds
+        // anything, so it joins the other keys instead of landing past the
+        // blank line that separates this section from the next.
+        size_t after = 0;
+        for (size_t i = 0; i < body.size(); ++i)
+            if (!trim(body[i]).empty())
+                after = i + 1;
+        body.insert(body.begin() + after, written);
+    }
+
+    std::vector<std::string> rewritten(lines.begin(), lines.begin() + header + 1);
+    rewritten.insert(rewritten.end(), body.begin(), body.end());
+    rewritten.insert(rewritten.end(), lines.begin() + end, lines.end());
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) {
+        error = "cannot rewrite " + path;
+        return false;
+    }
+    for (const auto& l : rewritten)
+        out << l << "\n";
+    return true;
+}

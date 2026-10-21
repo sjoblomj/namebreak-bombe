@@ -49,11 +49,11 @@ struct SharedStatus {
     std::string lowerBound; // candidate-only (no prefix/suffix)
     std::string upperBound; // candidate-only
     // How far a search that counts its own work has got, from 0 to 1: a
-    // dictionary one (local, or a coordinator's dictionary range) counts
-    // candidates and a meet-in-the-middle one tails
+    // dictionary one counts candidates and a meet-in-the-middle one tails
     // (DictionarySearchHooks::onCount, MeetInTheMiddleSearchHooks::onCount),
-    // so this is used as it is, rather than worked out from the matches
-    // file. -1 for any other search.
+    // local or a coordinator's range of either kind, so this is used as it
+    // is, rather than worked out from the matches file - neither has a
+    // candidate order for that to mean anything. -1 for any other search.
     double progressFraction = -1;
     bool hasActiveRange = false;
     // Set true by onRangeFinished, consumed (cleared back to false) the next

@@ -31,6 +31,16 @@ struct AppConfig {
 // setup or a config error couldn't be resolved.
 bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig& outConfig);
 
+// Shows that same form again for a config that's already running - the tray
+// menu's Settings... (main_window.cpp) - pre-filled from `configPath` as it
+// now stands, and writes whatever the user accepts back over it: every
+// value of the tab they used, not only the keys that happened to be missing
+// (see updateConfigForMode, common/config.h). True once the file has been
+// changed, false if they cancelled or it couldn't be read or written -
+// having already said why, via MessageBox owned by `owner`. The running
+// search is left alone; nothing reads the file again until the next start.
+bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner);
+
 } // namespace gui
 
 #endif // NAMEBREAK_GUI_WIN32_APP_CONFIG_H

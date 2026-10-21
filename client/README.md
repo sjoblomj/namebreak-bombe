@@ -108,7 +108,11 @@ pause/resume the search.` on startup when it is.
 `namebreak` reads `config.conf` from the current working directory, or the
 file given with `--config <file>`, every time it starts; without one it
 stops and says what the smallest working one looks like (the Windows GUI
-runs its setup dialog instead, and writes one). It's a flat `key = value`
+runs its setup dialog instead, and writes one; its tray menu's
+`Settings...` brings that dialog back later, and what you accept there
+replaces what the file said - a field left blank takes its key out
+altogether. The run in progress carries on with the settings it started
+with, since the file is only read at startup). It's a flat `key = value`
 file with up to four `[section]` blocks; `#`-led lines and blank lines are
 ignored, and a value only needs `"..."` quoting if it has meaningful
 leading/trailing whitespace (a literal `\` needs no escaping).
@@ -595,7 +599,10 @@ and, under it, how long a table the chosen size holds.
 The table is built afresh for every range claimed (a few seconds for four
 characters of 43, a quarter of a minute for five), and progress is reported
 as the tail the walk has got to, so a range taken over by someone else
-resumes exactly there.
+resumes exactly there. A range's own percentage is how many of its tails
+have been walked - the Windows GUI shows it the same way it does for a
+local meet-in-the-middle search, since neither has a candidate order for
+the matches file to be measured against.
 
 ### Progress, resuming and ranges
 
@@ -610,8 +617,8 @@ carries on exactly where the last run stopped.
 Note that the node order is not the order the directories themselves sort
 in, as the other modes' candidates are searched - the search reports a
 directory when the walk reaches *its tail*, and the tails of one length come
-before every longer one. The coordinator can't hand out meet-in-the-middle
-ranges yet; the numbering is what it will use when it can.
+before every longer one. It is also the numbering the coordinator hands out
+ranges in (see "In coordinator mode" above).
 
 ## Compiling
 
