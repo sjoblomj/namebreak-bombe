@@ -46,6 +46,7 @@
 namespace {
 
 using gui::DictionaryFields;
+using gui::HashTableFields;
 using gui::MeetInTheMiddleFields;
 using gui::SetupDialogFields;
 using gui::kTabCoordinator;
@@ -74,6 +75,12 @@ constexpr int kIdSetupTableMemory = 312;
 constexpr LONG_PTR kHelpMarker = 0x4E42484C;
 constexpr const char* kSetupPageClassName = "NamebreakSetupPage";
 
+// A tab's hash table size field and its two start slot fields - see
+// HashTableFields.
+struct HashTableControls {
+    HWND tableSize = nullptr, firstStartSlot = nullptr, lastStartSlot = nullptr;
+};
+
 struct SetupDialogState {
     HWND hwndTab = nullptr;
     HWND hwndTooltip = nullptr;
@@ -93,19 +100,22 @@ struct SetupDialogState {
          hwndPruneWhole = nullptr, hwndPruneAdjacent = nullptr;
     HWND hwndInsertFromStart = nullptr, hwndInsertFromEnd = nullptr;
     HWND hwndAlphabet = nullptr, hwndMaxBackslash = nullptr, hwndMinBackslash = nullptr, hwndPrefix = nullptr, hwndSuffix = nullptr, hwndStartCandidate = nullptr,
-         hwndLowerBound = nullptr, hwndUpperBound = nullptr, hwndHashA = nullptr, hwndHashB = nullptr;
+         hwndLowerBound = nullptr, hwndUpperBound = nullptr, hwndHashA = nullptr, hwndHashB = nullptr, hwndKey = nullptr;
+    HashTableControls searchHashTable;
     // The Local Dictionary tab's.
     HWND hwndDictBuiltin = nullptr, hwndDictLists = nullptr, hwndDictMinWords = nullptr, hwndDictMaxWords = nullptr,
          hwndDictSeparators = nullptr, hwndDictTails = nullptr, hwndDictPrefix = nullptr, hwndDictSuffix = nullptr,
          hwndDictLowerBound = nullptr, hwndDictUpperBound = nullptr, hwndDictHashA = nullptr, hwndDictHashB = nullptr,
          hwndDictKey = nullptr, hwndDictMatchesName = nullptr, hwndDictRecordBasenames = nullptr, hwndDictRecordHashA = nullptr,
          hwndDictResume = nullptr;
+    HashTableControls dictHashTable;
     // The Meet in the Middle tab's.
     HWND hwndMitmAlphabet = nullptr, hwndMitmPrefix = nullptr, hwndMitmSuffix = nullptr, hwndMitmASeed1 = nullptr,
          hwndMitmASeed2 = nullptr, hwndMitmBSeed1 = nullptr, hwndMitmBSeed2 = nullptr, hwndMitmHashA = nullptr, hwndMitmHashB = nullptr,
          hwndMitmMinLength = nullptr, hwndMitmMaxLength = nullptr, hwndMitmTableLength = nullptr, hwndMitmTableMemory = nullptr,
          hwndMitmMinBackslash = nullptr, hwndMitmMaxBackslash = nullptr, hwndMitmPrune = nullptr, hwndMitmPruneBrackets = nullptr,
-         hwndMitmPruneAdjacent = nullptr, hwndMitmMatchesName = nullptr, hwndMitmResume = nullptr;
+         hwndMitmPruneAdjacent = nullptr, hwndMitmMatchesName = nullptr, hwndMitmResume = nullptr, hwndMitmKey = nullptr;
+    HashTableControls mitmHashTable;
     // Tooltip strings must outlive the tooltip (it keeps pointers, not
     // copies); a deque never moves existing elements as it grows.
     std::deque<std::string> helpTexts;
@@ -227,11 +237,30 @@ void syncTableMemoryText(SetupDialogState* state) {
     SetWindowTextA(state->hwndTableMemoryText, tableMemoryLabel(bytes, state->availablePhysicalBytes).c_str());
 }
 
+// What `controls` say, trimmed.
+HashTableFields readHashTable(const HashTableControls& controls) {
+    HashTableFields fields;
+    fields.tableSize = trim(windowText(controls.tableSize));
+    fields.firstStartSlot = trim(windowText(controls.firstStartSlot));
+    fields.lastStartSlot = trim(windowText(controls.lastStartSlot));
+    return fields;
+}
+
+// The hash table keys for `fields`, unquoted - empty for a key to leave out,
+// which a blank field is.
+std::vector<std::pair<std::string, std::string>> hashTableValues(const HashTableFields& fields) {
+    return {
+        {"hash_table_size", fields.tableSize},
+        {"hash_table_first_start_slot", fields.firstStartSlot},
+        {"hash_table_last_start_slot", fields.lastStartSlot},
+    };
+}
+
 // Every [meet-in-the-middle] key for `fields`, with the values as a loaded
 // ConfigFile's own map holds them - unquoted. Empty for a key to leave out.
 // gui::meetInTheMiddleConfigKeys adds the quoting the file itself needs.
 std::vector<std::pair<std::string, std::string>> meetInTheMiddleValues(const MeetInTheMiddleFields& f) {
-    return {
+    std::vector<std::pair<std::string, std::string>> values = {
         {"alphabet", f.alphabet},
         {"prefix", f.prefix},
         {"suffix", f.suffix},
@@ -251,9 +280,13 @@ std::vector<std::pair<std::string, std::string>> meetInTheMiddleValues(const Mee
         {"prune_symbol_runs", f.pruneSymbolRuns ? "true" : "false"},
         {"prune_unopened_brackets", f.pruneUnopenedBrackets ? "true" : "false"},
         {"prune_adjacent_backslashes", f.pruneAdjacentBackslashes ? "true" : "false"},
+        {"encryption_key", f.encryptionKey},
         {"matches_name", f.matchesName},
         {"resume_from_last_candidate", f.resume ? "true" : "false"},
     };
+    for (const auto& kv : hashTableValues(f.hashTable))
+        values.push_back(kv);
+    return values;
 }
 
 // Recording basenames means something only with a key to compare them to.
@@ -394,6 +427,7 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         d.encryptionKey = getField(state->hwndDictKey);
                         d.recordBasenames = isChecked(state->hwndDictRecordBasenames);
                         d.recordHashAMatches = isChecked(state->hwndDictRecordHashA);
+                        d.hashTable = readHashTable(state->dictHashTable);
                         d.matchesName = getField(state->hwndDictMatchesName);
                         d.resume = isChecked(state->hwndDictResume);
                         if (d.maxWords.empty() || d.hashA.empty() || d.hashB.empty()) {
@@ -443,6 +477,8 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         m.pruneSymbolRuns = isChecked(state->hwndMitmPrune);
                         m.pruneUnopenedBrackets = isChecked(state->hwndMitmPruneBrackets);
                         m.pruneAdjacentBackslashes = isChecked(state->hwndMitmPruneAdjacent);
+                        m.encryptionKey = getField(state->hwndMitmKey);
+                        m.hashTable = readHashTable(state->mitmHashTable);
                         m.matchesName = getField(state->hwndMitmMatchesName);
                         m.resume = isChecked(state->hwndMitmResume);
                         // The same required-key list as
@@ -483,43 +519,52 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         state->fields->meetInTheMiddle = m;
                         state->fields->mode = "meet-in-the-middle";
                     } else {
-                        std::string alphabet = getField(state->hwndAlphabet);
-                        std::string maxBackslash = getField(state->hwndMaxBackslash);
-                        std::string minBackslash = getField(state->hwndMinBackslash);
-                        std::string prefix = getField(state->hwndPrefix);
-                        std::string suffix = getField(state->hwndSuffix);
-                        std::string startCandidate = getField(state->hwndStartCandidate);
-                        std::string lowerBound = getField(state->hwndLowerBound);
-                        std::string upperBound = getField(state->hwndUpperBound);
-                        std::string hashA = getField(state->hwndHashA);
-                        std::string hashB = getField(state->hwndHashB);
+                        SetupDialogFields f = *state->fields;
+                        f.alphabet = getField(state->hwndAlphabet);
+                        f.maxBackslashCount = getField(state->hwndMaxBackslash);
+                        const std::string minBackslash = getField(state->hwndMinBackslash);
+                        f.minBackslashCount = minBackslash.empty() ? "0" : minBackslash;
+                        f.prefix = getField(state->hwndPrefix);
+                        f.suffix = getField(state->hwndSuffix);
+                        f.startCandidate = getField(state->hwndStartCandidate);
+                        f.lowerBound = getField(state->hwndLowerBound);
+                        f.upperBound = getField(state->hwndUpperBound);
+                        f.hashA = getField(state->hwndHashA);
+                        f.hashB = getField(state->hwndHashB);
+                        f.pruneSymbolRuns = isChecked(state->hwndPrune);
+                        f.pruneUnopenedBrackets = isChecked(state->hwndPruneBrackets);
+                        f.pruneWholeCandidate = isChecked(state->hwndPruneWhole);
+                        f.pruneAdjacentBackslashes = isChecked(state->hwndPruneAdjacent);
+                        f.insertFromStart = getField(state->hwndInsertFromStart);
+                        f.insertFromEnd = getField(state->hwndInsertFromEnd);
+                        f.encryptionKey = getField(state->hwndKey);
+                        f.hashTable = readHashTable(state->searchHashTable);
+                        const bool continuous = isChecked(state->hwndContinuousRadio);
                         // Same required-key list as buildSearchRequest (config.cpp)
                         // - checked here too so a missing field is caught right
                         // where it was left blank, rather than only after
                         // writing+reloading the file.
-                        if (alphabet.empty() || maxBackslash.empty() || prefix.empty() || suffix.empty() || lowerBound.empty() ||
-                            upperBound.empty() || hashA.empty() || hashB.empty()) {
-                            MessageBoxA(hwnd, "All Local Search fields except Start candidate are required.", "namebreak setup",
-                                        MB_OK | MB_ICONWARNING);
+                        if (f.alphabet.empty() || f.maxBackslashCount.empty() || f.prefix.empty() || f.suffix.empty() ||
+                            f.lowerBound.empty() || f.upperBound.empty() || f.hashA.empty() || f.hashB.empty()) {
+                            MessageBoxA(hwnd, "Alphabet, Prefix, Suffix, both bounds, both hashes and Max backslash are required.",
+                                        "namebreak setup", MB_OK | MB_ICONWARNING);
                             return 0;
                         }
-                        state->fields->alphabet = alphabet;
-                        state->fields->maxBackslashCount = maxBackslash;
-                        state->fields->minBackslashCount = minBackslash.empty() ? "0" : minBackslash;
-                        state->fields->prefix = prefix;
-                        state->fields->suffix = suffix;
-                        state->fields->startCandidate = startCandidate;
-                        state->fields->lowerBound = lowerBound;
-                        state->fields->upperBound = upperBound;
-                        state->fields->hashA = hashA;
-                        state->fields->hashB = hashB;
-                        state->fields->pruneSymbolRuns = SendMessage(state->hwndPrune, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                        state->fields->pruneUnopenedBrackets = SendMessage(state->hwndPruneBrackets, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                        state->fields->pruneWholeCandidate = SendMessage(state->hwndPruneWhole, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                        state->fields->pruneAdjacentBackslashes = SendMessage(state->hwndPruneAdjacent, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                        state->fields->insertFromStart = getField(state->hwndInsertFromStart);
-                        state->fields->insertFromEnd = getField(state->hwndInsertFromEnd);
-                        bool continuous = SendMessage(state->hwndContinuousRadio, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                        // And the values themselves - the encryption key and
+                        // the hash table among them - as the search will check
+                        // them, while they can still be put right.
+                        ConfigFile probe;
+                        probe.matchesDir = f.matchesDir;
+                        for (const auto& kv : gui::searchConfigKeys(f))
+                            if (!kv.second.empty())
+                                probe.search[kv.first] = kv.second;
+                        SearchRequest request;
+                        std::string error;
+                        if (!buildSearchRequest(probe, continuous, request, error)) {
+                            MessageBoxA(hwnd, ("Local Search: " + error).c_str(), "namebreak setup", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
+                        *state->fields = f;
                         state->fields->mode = continuous ? "continuous" : "bounded";
                     }
                     state->accepted = true;
@@ -578,7 +623,7 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
 
     constexpr DWORD kStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     constexpr DWORD kExStyle = WS_EX_DLGMODALFRAME;
-    RECT rect = {0, 0, 620, 640}; // desired client area
+    RECT rect = {0, 0, 620, 670}; // desired client area
     AdjustWindowRectEx(&rect, kStyle, FALSE, kExStyle);
     HWND hwndDialog = CreateWindowExA(kExStyle, kSetupClassName, reopened ? "namebreak - settings" : "namebreak - first-run setup",
                                        kStyle, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr,
@@ -600,7 +645,7 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
                      WS_CHILD | WS_VISIBLE, 150, 46, 455, 46, hwndDialog, nullptr, hInstance, nullptr);
 
     // --- Tabs, each with a page window over the tab body ---
-    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE, 10, 100, 600, 490, hwndDialog, nullptr, hInstance, nullptr);
+    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE, 10, 100, 600, 520, hwndDialog, nullptr, hInstance, nullptr);
     TCITEMA tie{};
     tie.mask = TCIF_TEXT;
     tie.pszText = (LPSTR) "Coordinator";
@@ -611,7 +656,7 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabDictionary, (LPARAM) &tie);
     tie.pszText = (LPSTR) "Meet in the Middle";
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabMeetInTheMiddle, (LPARAM) &tie);
-    constexpr int kPageWidth = 592, kPageHeight = 454;
+    constexpr int kPageWidth = 592, kPageHeight = 484;
     state.hwndPageCoordinator =
         CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
     state.hwndPageSearch =
@@ -757,6 +802,34 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     constexpr int kL1 = 8, kE1 = 112, kH1 = 270, kL2 = 306, kE2 = 420, kH2 = 548;
     auto row = [&](int n) { return kSearchRow0 + n * kRowStep; };
 
+    // What a match of both hashes is checked against before it's taken for
+    // the file (see MatchCheck, engine/match_check.h) - the same on Local
+    // Search and Meet in the Middle, so the same words. (The dictionary's key
+    // is its own: only basenames with it are compared to the hashes at all.)
+    const char* keyHelp =
+        "Optional. The file's raw encryption key, in hex - the hash of its basename (what follows the last \\). A name that matches "
+        "both hashes but whose basename doesn't have this key isn't the file: it's a false match, written to false_matches.txt, and "
+        "the search carries on.";
+    // The hash table row: its size in the left column, the start slots -
+    // two numbers, as Words on the dictionary tab - in the right.
+    auto makeHashTableRow = [&](HWND page, int y, const HashTableFields& values, HashTableControls& controls) {
+        makeLabel(page, "Hash table size:", kL1, y + 3, 104);
+        controls.tableSize = makeEdit(page, values.tableSize, kE1, y, 150);
+        addHelp(page, kH1, y + 2,
+                "Optional, with Start slots: how many slots the hash table of the file's archive has - a power of two. A name that "
+                "matches both hashes but that a lookup in that table wouldn't find the file's entry by isn't the file: it's a false "
+                "match, written to false_matches.txt, and the search carries on. Two hashes match by chance about once in 2^64 "
+                "names, which a long search does get to.");
+        makeLabel(page, "Start slots:", kL2, y + 3, 110);
+        controls.firstStartSlot = makeEdit(page, values.firstStartSlot, kE2, y, 54);
+        makeLabel(page, "to", kE2 + 58, y + 3, 12);
+        controls.lastStartSlot = makeEdit(page, values.lastStartSlot, kE2 + 72, y, 54);
+        addHelp(page, kH2, y + 2,
+                "Optional, with Hash table size: the slots a lookup can start at and still reach the file's entry - from the one "
+                "just after the nearest never-used slot before the entry, to the entry's own slot. The first is larger than the "
+                "second if they wrap past the end of the table.");
+    };
+
     makeLabel(ps, "Search type:", kL1, row(0) + 3, 100);
     state.hwndBoundedRadio = makeRadio(ps, "Bounded", kE1, row(0) + 1, 90, kIdSetupBoundedRadio, true);
     state.hwndContinuousRadio = makeRadio(ps, "Continuous", kE1 + 100, row(0) + 1, 100, kIdSetupContinuousRadio, false);
@@ -820,25 +893,30 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
             "The most backslashes a candidate may contain before it is skipped. 0 means no limit (to forbid backslashes entirely, leave "
             "them out of the alphabet instead).");
 
+    makeLabel(ps, "Encryption key:", kL1, row(7) + 3, 104);
+    state.hwndKey = makeEdit(ps, fields.encryptionKey, kE1, row(7), 150);
+    addHelp(ps, kH1, row(7) + 2, keyHelp);
+    makeHashTableRow(ps, row(8), fields.hashTable, state.searchHashTable);
+
     // Checkboxes go beneath all the input fields, one per column.
-    state.hwndPrune = makeCheckbox(ps, "Prune symbol runs", kL1, row(7) + 1, 150, kIdSetupPruneCheckbox, fields.pruneSymbolRuns);
-    addHelp(ps, kH1, row(7) + 2,
+    state.hwndPrune = makeCheckbox(ps, "Prune symbol runs", kL1, row(9) + 1, 150, kIdSetupPruneCheckbox, fields.pruneSymbolRuns);
+    addHelp(ps, kH1, row(9) + 2,
             "Skip candidates containing three or more symbols in a row that are neither letters, digits nor spaces - real filenames "
             "practically never have those. Makes the search faster.");
     state.hwndPruneBrackets =
-        makeCheckbox(ps, "Prune unopened brackets", kL2, row(7) + 1, 170, kIdSetupPruneBracketsCheckbox, fields.pruneUnopenedBrackets);
-    addHelp(ps, kH2, row(7) + 2,
+        makeCheckbox(ps, "Prune unopened brackets", kL2, row(9) + 1, 170, kIdSetupPruneBracketsCheckbox, fields.pruneUnopenedBrackets);
+    addHelp(ps, kH2, row(9) + 2,
             "Skip candidates that close a bracket that was never opened - a ) with no ( before it, or a ] with no [ before it "
             "(brackets opened in the prefix count). Real filenames practically never have those. Makes the search faster.");
     state.hwndPruneWhole =
-        makeCheckbox(ps, "Prune the whole candidate", kL1, row(8) + 1, 190, kIdSetupPruneWholeCheckbox, fields.pruneWholeCandidate);
-    addHelp(ps, kH1, row(8) + 2,
+        makeCheckbox(ps, "Prune the whole candidate", kL1, row(10) + 1, 190, kIdSetupPruneWholeCheckbox, fields.pruneWholeCandidate);
+    addHelp(ps, kH1, row(10) + 2,
             "Apply the pruning rules, and Max and Min backslash, to every character of a candidate but the last - not only to the "
             "characters before the last five or so, which the CPU goes through. About a fifth fewer candidates are searched, and "
             "the search is about 10% faster on a GPU.");
-    state.hwndPruneAdjacent = makeCheckbox(ps, "Prune adjacent backslashes", kL2, row(8) + 1, 190, kIdSetupPruneAdjacentCheckbox,
+    state.hwndPruneAdjacent = makeCheckbox(ps, "Prune adjacent backslashes", kL2, row(10) + 1, 190, kIdSetupPruneAdjacentCheckbox,
                                            fields.pruneAdjacentBackslashes);
-    addHelp(ps, kH2, row(8) + 2,
+    addHelp(ps, kH2, row(10) + 2,
             "Skip candidates with two backslashes next to each other - counting one the prefix ends with. Real filenames never have "
             "those. Makes the search faster.");
 
@@ -918,17 +996,19 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
             "Optional. Names the files the search writes - matches-<name>.txt, basenames-<name>.txt and wordnumber-<name>.txt - so "
             "searches for different files keep theirs apart. Blank: matches.txt and so on.");
 
-    state.hwndDictRecordBasenames = makeCheckbox(pd, "Record basenames", kL1, row(7) + 1, 150, 0, dict.recordBasenames);
-    addHelp(pd, kH1, row(7) + 2,
+    makeHashTableRow(pd, row(7), dict.hashTable, state.dictHashTable);
+
+    state.hwndDictRecordBasenames = makeCheckbox(pd, "Record basenames", kL1, row(8) + 1, 150, 0, dict.recordBasenames);
+    addHelp(pd, kH1, row(8) + 2,
             "With an encryption key: write every basename that matches it to basenames.txt - the file's basename is among them, "
             "even when its directory is wrong.");
-    state.hwndDictRecordHashA = makeCheckbox(pd, "Compare every candidate", kL2, row(7) + 1, 190, 0, dict.recordHashAMatches);
-    addHelp(pd, kH2, row(7) + 2,
+    state.hwndDictRecordHashA = makeCheckbox(pd, "Compare every candidate", kL2, row(8) + 1, 190, 0, dict.recordHashAMatches);
+    addHelp(pd, kH2, row(8) + 2,
             "With an encryption key: compare every candidate to the hashes all the same, as if the key weren't known, recording every "
             "Hash A match - but the search is about a third slower.");
 
-    state.hwndDictResume = makeCheckbox(pd, "Resume from last candidate", kL1, row(8) + 1, 190, 0, dict.resume);
-    addHelp(pd, kH1, row(8) + 2,
+    state.hwndDictResume = makeCheckbox(pd, "Resume from last candidate", kL1, row(9) + 1, 190, 0, dict.resume);
+    addHelp(pd, kH1, row(9) + 2,
             "Carry on where the last search with these settings stopped - its progress is saved in wordnumber.txt every 30 seconds "
             "and when you quit - instead of starting from the beginning.");
     syncRecordBasenames(&state);
@@ -948,9 +1028,9 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
               "characters, 1.4 GB for 5 and 59 GB for 6 - Table memory below is the cap, and on a GPU the table has to fit in the "
               "card's own memory as well.",
               8, 88, 570, 46);
-    // Ten rows of fields, so this page's rows sit a little closer together
-    // than the other pages' (kRowStep).
-    constexpr int kMitmRow0 = 140, kMitmRowStep = 30;
+    // Twelve rows of fields, so this page's rows sit a little closer
+    // together than the other pages' (kRowStep).
+    constexpr int kMitmRow0 = 140, kMitmRowStep = 28;
     auto rowM = [&](int n) { return kMitmRow0 + n * kMitmRowStep; };
     // Every field in a column is the same width, and every "?" sits in that
     // column's own help position - so the whole page reads as two columns,
@@ -1052,25 +1132,30 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
             "The most backslashes the directory may contain before it is skipped. 0 means no limit (to forbid them entirely, leave "
             "the backslash out of the alphabet instead).");
 
-    state.hwndMitmPrune = makeCheckbox(pm, "Prune symbol runs", kL1, rowM(8) + 1, 150, 0, mitm.pruneSymbolRuns);
-    addHelp(pm, kH1, rowM(8) + 2,
+    makeLabel(pm, "Encryption key:", kL1, rowM(8) + 3, 104);
+    state.hwndMitmKey = makeEdit(pm, mitm.encryptionKey, kE1, rowM(8), kMitmEdit1);
+    addHelp(pm, kH1, rowM(8) + 2, keyHelp);
+    makeHashTableRow(pm, rowM(9), mitm.hashTable, state.mitmHashTable);
+
+    state.hwndMitmPrune = makeCheckbox(pm, "Prune symbol runs", kL1, rowM(10) + 1, 150, 0, mitm.pruneSymbolRuns);
+    addHelp(pm, kH1, rowM(10) + 2,
             "Skip directories containing three or more symbols in a row that are neither letters, digits nor spaces - real names "
             "practically never have those. Applies to every character of the directory, and makes the search faster.");
-    state.hwndMitmPruneBrackets = makeCheckbox(pm, "Prune unopened brackets", kL2, rowM(8) + 1, 170, 0, mitm.pruneUnopenedBrackets);
-    addHelp(pm, kH2, rowM(8) + 2,
+    state.hwndMitmPruneBrackets = makeCheckbox(pm, "Prune unopened brackets", kL2, rowM(10) + 1, 170, 0, mitm.pruneUnopenedBrackets);
+    addHelp(pm, kH2, rowM(10) + 2,
             "Skip directories that close a bracket that was never opened - a ) with no ( before it, or a ] with no [ (brackets "
             "opened in the prefix count).");
-    state.hwndMitmPruneAdjacent = makeCheckbox(pm, "Prune adjacent backslashes", kL1, rowM(9) + 1, 190, 0, mitm.pruneAdjacentBackslashes);
-    addHelp(pm, kH1, rowM(9) + 2,
+    state.hwndMitmPruneAdjacent = makeCheckbox(pm, "Prune adjacent backslashes", kL1, rowM(11) + 1, 190, 0, mitm.pruneAdjacentBackslashes);
+    addHelp(pm, kH1, rowM(11) + 2,
             "Skip directories with two backslashes next to each other - counting one the prefix ends with, and one the suffix begins "
             "with. Real names never have those.");
-    state.hwndMitmResume = makeCheckbox(pm, "Resume from last candidate", kL2, rowM(9) + 1, 190, 0, mitm.resume);
-    addHelp(pm, kH2, rowM(9) + 2,
+    state.hwndMitmResume = makeCheckbox(pm, "Resume from last candidate", kL2, rowM(11) + 1, 190, 0, mitm.resume);
+    addHelp(pm, kH2, rowM(11) + 2,
             "Carry on where the last search with these settings stopped - its progress is saved in meet-in-the-middle.txt every 30 "
             "seconds and when you quit - instead of starting from the beginning.");
 
     // --- Buttons ---
-    constexpr int kButtonY = 602;
+    constexpr int kButtonY = 632;
     CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, kButtonY, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout,
                      hInstance, nullptr);
     CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, kButtonY, 80, 26, hwndDialog,
@@ -1121,10 +1206,35 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     return state.accepted;
 }
 
+std::vector<std::pair<std::string, std::string>> searchConfigKeys(const SetupDialogFields& fields) {
+    std::vector<std::pair<std::string, std::string>> keys = {
+        {"alphabet", fields.alphabet},
+        {"max_backslash_count", fields.maxBackslashCount},
+        {"min_backslash_count", fields.minBackslashCount},
+        {"prefix", fields.prefix},
+        {"suffix", fields.suffix},
+        {"start_candidate", fields.startCandidate},
+        {"lower_bound", fields.lowerBound},
+        {"upper_bound", fields.upperBound},
+        {"hash_a", fields.hashA},
+        {"hash_b", fields.hashB},
+        {"prune_symbol_runs", fields.pruneSymbolRuns ? "true" : "false"},
+        {"prune_unopened_brackets", fields.pruneUnopenedBrackets ? "true" : "false"},
+        {"prune_whole_candidate", fields.pruneWholeCandidate ? "true" : "false"},
+        {"prune_adjacent_backslashes", fields.pruneAdjacentBackslashes ? "true" : "false"},
+        {"insert_from_start", fields.insertFromStart},
+        {"insert_from_end", fields.insertFromEnd},
+        {"encryption_key", fields.encryptionKey},
+    };
+    for (const auto& kv : hashTableValues(fields.hashTable))
+        keys.push_back(kv);
+    return keys;
+}
+
 std::vector<std::pair<std::string, std::string>> dictionaryConfigKeys(const DictionaryFields& fields) {
     auto optional = [](const std::string& text) { return text.empty() ? text : quoteDictionaryValue(text); };
     const bool hasKey = !fields.encryptionKey.empty();
-    return {
+    std::vector<std::pair<std::string, std::string>> keys = {
         {"builtin_dictionary", fields.builtinDictionary ? "english-1" : "none"},
         {"dictionaries", fields.dictionaries},
         {"min_words", optional(fields.minWords)},
@@ -1146,6 +1256,9 @@ std::vector<std::pair<std::string, std::string>> dictionaryConfigKeys(const Dict
         {"matches_name", optional(fields.matchesName)},
         {"resume_from_last_candidate", fields.resume ? "true" : "false"},
     };
+    for (const auto& kv : hashTableValues(fields.hashTable))
+        keys.emplace_back(kv.first, optional(kv.second));
+    return keys;
 }
 
 std::vector<std::pair<std::string, std::string>> meetInTheMiddleConfigKeys(const MeetInTheMiddleFields& fields) {

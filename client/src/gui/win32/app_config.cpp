@@ -101,6 +101,18 @@ SetupDialogFields fieldsFromConfig(const ConfigFile& config, bool loaded) {
     fields.pruneAdjacentBackslashes = get(config.search, "prune_adjacent_backslashes", "false") == "true";
     fields.insertFromStart = get(config.search, "insert_from_start", "");
     fields.insertFromEnd = get(config.search, "insert_from_end", "");
+    // What a match of both hashes is checked against (see MatchCheck,
+    // engine/match_check.h) - the same keys in every section; `value` reads
+    // one of them the way its section is read.
+    auto getHashTable = [](auto value) {
+        gui::HashTableFields hashTable;
+        hashTable.tableSize = value("hash_table_size");
+        hashTable.firstStartSlot = value("hash_table_first_start_slot");
+        hashTable.lastStartSlot = value("hash_table_last_start_slot");
+        return hashTable;
+    };
+    fields.encryptionKey = get(config.search, "encryption_key", "");
+    fields.hashTable = getHashTable([&](const char* key) { return get(config.search, key, ""); });
     // The lists as written, list syntax and all; the rest without quotes.
     auto getDict = [&](const std::string& key, const std::string& fallback) {
         const std::string value = get(config.dictionary, key, fallback);
@@ -122,6 +134,7 @@ SetupDialogFields fieldsFromConfig(const ConfigFile& config, bool loaded) {
     dict.encryptionKey = getDict("encryption_key", "");
     dict.recordBasenames = getDict("record_basenames", "true") == "true";
     dict.recordHashAMatches = getDict("record_hasha_matches", "false") == "true";
+    dict.hashTable = getHashTable([&](const char* key) { return getDict(key, ""); });
     dict.matchesName = getDict("matches_name", "");
     dict.resume = getDict("resume_from_last_candidate", "true") == "true";
     // [meet-in-the-middle]'s values are unquoted on the way in, as every
@@ -145,6 +158,8 @@ SetupDialogFields fieldsFromConfig(const ConfigFile& config, bool loaded) {
     mitm.pruneSymbolRuns = get(config.meetInTheMiddle, "prune_symbol_runs", "false") == "true";
     mitm.pruneUnopenedBrackets = get(config.meetInTheMiddle, "prune_unopened_brackets", "false") == "true";
     mitm.pruneAdjacentBackslashes = get(config.meetInTheMiddle, "prune_adjacent_backslashes", "false") == "true";
+    mitm.encryptionKey = get(config.meetInTheMiddle, "encryption_key", "");
+    mitm.hashTable = getHashTable([&](const char* key) { return get(config.meetInTheMiddle, key, ""); });
     mitm.matchesName = get(config.meetInTheMiddle, "matches_name", "");
     mitm.resume = get(config.meetInTheMiddle, "resume_from_last_candidate", "true") == "true";
     fields.matchesDir = loaded ? config.matchesDir : kDefaultMatchesDir;
@@ -181,23 +196,7 @@ bool writeConfigForFields(const std::string& path, const SetupDialogFields& fiel
         return write("dictionary", "dictionary", gui::dictionaryConfigKeys(fields.dictionary));
     if (fields.mode == "meet-in-the-middle")
         return write("meet-in-the-middle", "meet-in-the-middle", gui::meetInTheMiddleConfigKeys(fields.meetInTheMiddle));
-    return write(fields.mode, "search",
-                 {{"alphabet", fields.alphabet},
-                  {"max_backslash_count", fields.maxBackslashCount},
-                  {"min_backslash_count", fields.minBackslashCount},
-                  {"prefix", fields.prefix},
-                  {"suffix", fields.suffix},
-                  {"start_candidate", fields.startCandidate},
-                  {"lower_bound", fields.lowerBound},
-                  {"upper_bound", fields.upperBound},
-                  {"hash_a", fields.hashA},
-                  {"hash_b", fields.hashB},
-                  {"prune_symbol_runs", fields.pruneSymbolRuns ? "true" : "false"},
-                  {"prune_unopened_brackets", fields.pruneUnopenedBrackets ? "true" : "false"},
-                  {"prune_whole_candidate", fields.pruneWholeCandidate ? "true" : "false"},
-                  {"prune_adjacent_backslashes", fields.pruneAdjacentBackslashes ? "true" : "false"},
-                  {"insert_from_start", fields.insertFromStart},
-                  {"insert_from_end", fields.insertFromEnd}});
+    return write(fields.mode, "search", gui::searchConfigKeys(fields));
 }
 
 } // namespace

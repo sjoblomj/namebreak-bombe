@@ -17,6 +17,16 @@ constexpr int kTabLocalSearch = 1;
 constexpr int kTabDictionary = 2;
 constexpr int kTabMeetInTheMiddle = 3;
 
+// Where the file's entry is in its archive's hash table - the
+// hash_table_size, hash_table_first_start_slot and hash_table_last_start_slot
+// keys (see MatchCheck, engine/match_check.h), as the user typed them: all
+// three or none.
+struct HashTableFields {
+    std::string tableSize;
+    std::string firstStartSlot;
+    std::string lastStartSlot;
+};
+
 // The Local Dictionary tab - see DictionaryRequest/buildDictionaryRequest. Each
 // as the user typed it: the lists (dictionaries, separators, tails) in
 // config.conf's own list syntax, everything else as plain text.
@@ -36,6 +46,7 @@ struct DictionaryFields {
     std::string encryptionKey;
     bool recordBasenames = true; // only written with an encryption key
     bool recordHashAMatches = false;
+    HashTableFields hashTable;
     std::string matchesName;
     bool resume = true;
 };
@@ -65,6 +76,8 @@ struct MeetInTheMiddleFields {
     bool pruneSymbolRuns = false;
     bool pruneUnopenedBrackets = false;
     bool pruneAdjacentBackslashes = false;
+    std::string encryptionKey;
+    HashTableFields hashTable;
     std::string matchesName;
     bool resume = true;
 };
@@ -105,6 +118,8 @@ struct SetupDialogFields {
     bool pruneAdjacentBackslashes = false;
     std::string insertFromStart; // "text, position", or empty
     std::string insertFromEnd;
+    std::string encryptionKey;
+    HashTableFields hashTable;
 
     DictionaryFields dictionary;
     MeetInTheMiddleFields meetInTheMiddle;
@@ -117,6 +132,10 @@ struct SetupDialogFields {
     // showSetupDialog's return value).
     std::string mode;
 };
+
+// The [search] section's keys for the Local Search tab's `fields` - empty for
+// a key to leave out.
+std::vector<std::pair<std::string, std::string>> searchConfigKeys(const SetupDialogFields& fields);
 
 // The [dictionary] section's keys for `fields`, each value as config.conf
 // has it (see quoteDictionaryValue) - empty for a key to leave out.
