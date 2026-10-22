@@ -69,11 +69,23 @@ constexpr int kIdSetupPruneAdjacentCheckbox = 309;
 constexpr int kIdSetupBrowseWordLists = 310;
 constexpr int kIdSetupEncryptionKey = 311;
 constexpr int kIdSetupTableMemory = 312;
+constexpr int kIdSetupVerification = 313;
+
+// The dialog's geometry: everything but the buttons is kContentHeight of a
+// scroll view, and the buttons sit in a strip of their own under it. The
+// pages have room for the Verification sections whether they're shown or
+// not (they're kVerificationHeight of it), so that opening them never
+// resizes the dialog - see layoutDialog.
+constexpr int kDialogWidth = 620, kContentHeight = 642, kButtonStripHeight = 44, kButtonGap = 6;
+constexpr int kTabWidth = 600, kTabHeight = 536;
+constexpr int kPageWidth = 592, kPageHeight = 500;
+constexpr int kVerificationHeight = 46;
 
 // Marker stored in a help "?" control's GWLP_USERDATA so SetupPageWndProc can
 // tell it apart from an ordinary label when coloring it.
 constexpr LONG_PTR kHelpMarker = 0x4E42484C;
 constexpr const char* kSetupPageClassName = "NamebreakSetupPage";
+constexpr const char* kSetupScrollClassName = "NamebreakSetupScroll";
 
 // A tab's hash table size field and its two start slot fields - see
 // HashTableFields.
@@ -82,7 +94,13 @@ struct HashTableControls {
 };
 
 struct SetupDialogState {
+    HWND hwndDialog = nullptr;
+    // Holds everything but the buttons, and scrolls it when the screen is too
+    // short for all of it - see layoutDialog. scrollPos is how far down.
+    HWND hwndScroll = nullptr;
+    int scrollPos = 0;
     HWND hwndTab = nullptr;
+    HWND hwndAbout = nullptr, hwndOk = nullptr, hwndCancel = nullptr;
     HWND hwndTooltip = nullptr;
     // One plain child window per tab, covering the tab control's body and
     // holding that tab's controls; showTabPage shows exactly one at a time.
@@ -116,6 +134,11 @@ struct SetupDialogState {
          hwndMitmMinBackslash = nullptr, hwndMitmMaxBackslash = nullptr, hwndMitmPrune = nullptr, hwndMitmPruneBrackets = nullptr,
          hwndMitmPruneAdjacent = nullptr, hwndMitmMatchesName = nullptr, hwndMitmResume = nullptr, hwndMitmKey = nullptr;
     HashTableControls mitmHashTable;
+    // Every tab's Verification chevron, and the controls they show and hide -
+    // one switch for all the tabs, so the dialog stays the same size whichever
+    // tab is shown.
+    std::vector<HWND> verificationChevrons, verificationControls;
+    bool verificationShown = false;
     // Tooltip strings must outlive the tooltip (it keeps pointers, not
     // copies); a deque never moves existing elements as it grows.
     std::deque<std::string> helpTexts;
@@ -129,6 +152,79 @@ void showTabPage(SetupDialogState* state, int sel) {
     ShowWindow(state->hwndPageSearch, sel == kTabLocalSearch ? SW_SHOW : SW_HIDE);
     ShowWindow(state->hwndPageDictionary, sel == kTabDictionary ? SW_SHOW : SW_HIDE);
     ShowWindow(state->hwndPageMeetInTheMiddle, sel == kTabMeetInTheMiddle ? SW_SHOW : SW_HIDE);
+}
+
+// Scrolls the scroll view to `pos`, as far as its range goes, moving its
+// children with it.
+void scrollContentTo(SetupDialogState* state, int pos) {
+    SCROLLINFO si{};
+    si.cbSize = sizeof si;
+    si.fMask = SIF_RANGE | SIF_PAGE;
+    GetScrollInfo(state->hwndScroll, SB_VERT, &si);
+    pos = (std::max) (0, (std::min) (pos, si.nMax + 1 - (int) si.nPage));
+    if (pos != state->scrollPos)
+        ScrollWindowEx(state->hwndScroll, 0, state->scrollPos - pos, nullptr, nullptr, nullptr, nullptr,
+                       SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+    state->scrollPos = pos;
+    si.fMask = SIF_POS;
+    si.nPos = pos;
+    SetScrollInfo(state->hwndScroll, SB_VERT, &si, TRUE);
+}
+
+// Sizes the dialog, before it's shown, to its content - as tall as the
+// screen's work area lets it be, and no taller: what doesn't fit then
+// scrolls, in the scroll view that holds everything but the buttons, so that
+// the buttons are always on screen.
+void layoutDialog(SetupDialogState* state) {
+        RECT frame = {0, 0, 0, 0};
+    AdjustWindowRectEx(&frame, (DWORD) GetWindowLongPtr(state->hwndDialog, GWL_STYLE), FALSE,
+                       (DWORD) GetWindowLongPtr(state->hwndDialog, GWL_EXSTYLE));
+    const int frameWidth = frame.right - frame.left, frameHeight = frame.bottom - frame.top;
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof monitor;
+    GetMonitorInfoA(MonitorFromWindow(state->hwndDialog, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT& work = monitor.rcWork;
+    const int viewHeight =
+        (std::max) (kButtonStripHeight, (std::min) (kContentHeight, (int) (work.bottom - work.top) - frameHeight - kButtonStripHeight));
+    const int scrollbar = viewHeight < kContentHeight ? GetSystemMetrics(SM_CXVSCROLL) : 0;
+    const int width = kDialogWidth + scrollbar + frameWidth, height = viewHeight + kButtonStripHeight + frameHeight;
+    // Moved up, if it has to be, to keep the bottom - and the buttons - on
+    // screen.
+    RECT window;
+    GetWindowRect(state->hwndDialog, &window);
+    const int top = (std::max) ((int) work.top, (std::min) ((int) window.top, (int) work.bottom - height));
+    SetWindowPos(state->hwndDialog, nullptr, window.left, top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+
+    SetWindowPos(state->hwndScroll, nullptr, 0, 0, kDialogWidth + scrollbar, viewHeight, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SCROLLINFO si{};
+    si.cbSize = sizeof si;
+    si.fMask = SIF_RANGE | SIF_PAGE;
+    si.nMax = kContentHeight - 1;
+    si.nPage = (UINT) viewHeight;
+    SetScrollInfo(state->hwndScroll, SB_VERT, &si, TRUE);
+    scrollContentTo(state, state->scrollPos);
+
+    const int buttonY = viewHeight + kButtonGap;
+    SetWindowPos(state->hwndAbout, nullptr, 12, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->hwndOk, nullptr, 430 + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->hwndCancel, nullptr, 520 + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Shows or hides every tab's Verification fields, in the room the pages keep
+// for them. Win32 has no expander control, so this is
+// the one Windows' own dialogs draw (a task dialog's "See details"): a
+// chevron - Marlett's 4 points right, its 6 down - beside a heading, both
+// clickable.
+void showVerification(SetupDialogState* state, bool shown) {
+    state->verificationShown = shown;
+    for (HWND h : state->verificationChevrons)
+        SetWindowTextA(h, shown ? "6" : "4");
+    for (HWND h : state->verificationControls)
+        ShowWindow(h, shown ? SW_SHOW : SW_HIDE);
+    // On a screen too short for them, the fields just opened are below the
+    // bottom of the view: bring them up into it.
+    if (shown)
+        scrollContentTo(state, state->scrollPos + kVerificationHeight);
 }
 
 bool isChecked(HWND h) {
@@ -351,11 +447,56 @@ LRESULT CALLBACK SetupPageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     // parent - this page - the same way a button's WM_COMMAND does.
     if (msg == WM_COMMAND || msg == WM_HSCROLL)
         return SendMessage(GetParent(hwnd), msg, wParam, lParam);
+    // The Verification heading is clicked like a link, so it points like one.
+    if (msg == WM_SETCURSOR && GetDlgCtrlID((HWND) wParam) == kIdSetupVerification) {
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        return TRUE;
+    }
     if (msg == WM_CTLCOLORSTATIC && GetWindowLongPtr((HWND) lParam, GWLP_USERDATA) == kHelpMarker) {
         HDC hdc = (HDC) wParam;
         SetTextColor(hdc, RGB(0, 70, 200));
         SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
         return (LRESULT) GetSysColorBrush(COLOR_BTNFACE);
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// The scroll view (see layoutDialog): scrolls with its scrollbar and the
+// mouse wheel - which a control that doesn't use it hands on up to here -
+// and hands everything its children report on to the dialog, as a page does.
+LRESULT CALLBACK SetupScrollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<SetupDialogState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_COMMAND:
+        case WM_HSCROLL:
+        case WM_NOTIFY:
+            return SendMessage(GetParent(hwnd), msg, wParam, lParam);
+        case WM_VSCROLL: {
+            if (!state)
+                break;
+            SCROLLINFO si{};
+            si.cbSize = sizeof si;
+            si.fMask = SIF_ALL;
+            GetScrollInfo(hwnd, SB_VERT, &si);
+            int pos = state->scrollPos;
+            switch (LOWORD(wParam)) {
+                case SB_LINEUP: pos -= 20; break;
+                case SB_LINEDOWN: pos += 20; break;
+                case SB_PAGEUP: pos -= (int) si.nPage; break;
+                case SB_PAGEDOWN: pos += (int) si.nPage; break;
+                case SB_THUMBTRACK:
+                case SB_THUMBPOSITION: pos = si.nTrackPos; break;
+                case SB_TOP: pos = 0; break;
+                case SB_BOTTOM: pos = si.nMax; break;
+            }
+            scrollContentTo(state, pos);
+            return 0;
+        }
+        case WM_MOUSEWHEEL:
+            if (!state)
+                break;
+            scrollContentTo(state, state->scrollPos - GET_WHEEL_DELTA_WPARAM(wParam) * 60 / WHEEL_DELTA);
+            return 0;
     }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
@@ -388,6 +529,11 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 case kIdSetupEncryptionKey:
                     if (HIWORD(wParam) == EN_CHANGE)
                         syncRecordBasenames(state);
+                    return 0;
+                case kIdSetupVerification:
+                    // A quick second click is a double-click to a static.
+                    if (HIWORD(wParam) == STN_CLICKED || HIWORD(wParam) == STN_DBLCLK)
+                        showVerification(state, !state->verificationShown);
                     return 0;
                 case kIdSetupOk: {
                     char buf[512];
@@ -615,15 +761,21 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
         wc.lpfnWndProc = SetupPageWndProc;
         wc.lpszClassName = kSetupPageClassName;
         RegisterClassExA(&wc);
+        wc.lpfnWndProc = SetupScrollWndProc;
+        wc.lpszClassName = kSetupScrollClassName;
+        RegisterClassExA(&wc);
         classRegistered = true;
     }
 
     SetupDialogState state;
     state.fields = &fields;
 
-    constexpr DWORD kStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    // WS_CLIPCHILDREN here and on the scroll view: each would otherwise
+    // paint its background over its children - the buttons, the pages - as
+    // it's resized or scrolled, and leave them blank.
+    constexpr DWORD kStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
     constexpr DWORD kExStyle = WS_EX_DLGMODALFRAME;
-    RECT rect = {0, 0, 620, 670}; // desired client area
+    RECT rect = {0, 0, kDialogWidth, kContentHeight + kButtonStripHeight}; // desired client area; see layoutDialog
     AdjustWindowRectEx(&rect, kStyle, FALSE, kExStyle);
     HWND hwndDialog = CreateWindowExA(kExStyle, kSetupClassName, reopened ? "namebreak - settings" : "namebreak - first-run setup",
                                        kStyle, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr,
@@ -631,21 +783,30 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     if (!hwndDialog)
         return false;
     SetWindowLongPtr(hwndDialog, GWLP_USERDATA, (LONG_PTR) &state);
+    state.hwndDialog = hwndDialog;
+    state.hwndScroll = CreateWindowExA(0, kSetupScrollClassName, "", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN, 0, 0, kDialogWidth,
+                                       kContentHeight, hwndDialog, nullptr, hInstance, nullptr);
+    SetWindowLongPtr(state.hwndScroll, GWLP_USERDATA, (LONG_PTR) &state);
+    // Everything but the buttons goes in it.
+    HWND content = state.hwndScroll;
 
     // --- Header: logo + what this window is for ---
     HBITMAP logo = makeLogoBitmap(120, 80);
-    HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 12, 10, 120, 80, hwndDialog, nullptr, hInstance, nullptr);
+    HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 12, 10, 120, 80, content, nullptr, hInstance, nullptr);
     SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
-    HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 150, 14, 450, 28, hwndDialog, nullptr, hInstance, nullptr);
+    HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 150, 14, 450, 28, content, nullptr, hInstance, nullptr);
     CreateWindowExA(0, "STATIC",
                      reopened ? "Settings. Change how this machine searches, then press OK - your choices replace what the configuration "
                                 "file says, and are used the next time namebreak starts. Hover over a blue ? for help with any option."
                               : "First-run setup. Choose how this machine should search, then press OK - your choices are saved to the "
                                 "configuration file and used on every later start. Hover over a blue ? for help with any option.",
-                     WS_CHILD | WS_VISIBLE, 150, 46, 455, 46, hwndDialog, nullptr, hInstance, nullptr);
+                     WS_CHILD | WS_VISIBLE, 150, 46, 455, 46, content, nullptr, hInstance, nullptr);
 
     // --- Tabs, each with a page window over the tab body ---
-    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE, 10, 100, 600, 520, hwndDialog, nullptr, hInstance, nullptr);
+    // WS_CLIPSIBLINGS, and the pages put above it below: the tab control
+    // never paints over the page that lies over its body.
+    state.hwndTab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 10, 100, kTabWidth, kTabHeight,
+                                    content, nullptr, hInstance, nullptr);
     TCITEMA tie{};
     tie.mask = TCIF_TEXT;
     tie.pszText = (LPSTR) "Coordinator";
@@ -656,15 +817,16 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabDictionary, (LPARAM) &tie);
     tie.pszText = (LPSTR) "Meet in the Middle";
     SendMessage(state.hwndTab, TCM_INSERTITEMA, kTabMeetInTheMiddle, (LPARAM) &tie);
-    constexpr int kPageWidth = 592, kPageHeight = 484;
     state.hwndPageCoordinator =
-        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, content, nullptr, hInstance, nullptr);
     state.hwndPageSearch =
-        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, content, nullptr, hInstance, nullptr);
     state.hwndPageDictionary =
-        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, content, nullptr, hInstance, nullptr);
     state.hwndPageMeetInTheMiddle =
-        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, hwndDialog, nullptr, hInstance, nullptr);
+        CreateWindowExA(0, kSetupPageClassName, "", WS_CHILD, 14, 130, kPageWidth, kPageHeight, content, nullptr, hInstance, nullptr);
+    for (HWND page : {state.hwndPageCoordinator, state.hwndPageSearch, state.hwndPageDictionary, state.hwndPageMeetInTheMiddle})
+        SetWindowPos(page, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     // One tooltip window serves every help "?" mark. Long delay before it
     // disappears (the texts are a few lines) and a max width so they wrap.
@@ -810,24 +972,42 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
         "Optional. The file's raw encryption key, in hex - the hash of its basename (what follows the last \\). A name that matches "
         "both hashes but whose basename doesn't have this key isn't the file: it's a false match, written to false_matches.txt, and "
         "the search carries on.";
+    // Everything below a tab's Verification toggle is hidden with it.
+    auto verification = [&](HWND h) {
+        state.verificationControls.push_back(h);
+        return h;
+    };
+    // The heading that shows and hides them (see showVerification): the
+    // chevron and the text, SS_NOTIFY so that a click on either reaches the
+    // dialog, then an etched line to the edge of the page, so that what it
+    // opens reads as a section of its own.
+    auto makeVerificationToggle = [&](HWND page, int y) {
+        constexpr DWORD kStyle = WS_CHILD | WS_VISIBLE | SS_NOTIFY;
+        state.verificationChevrons.push_back(CreateWindowExA(0, "STATIC", "", kStyle, kL1, y + 3, 14, 16, page,
+                                                             (HMENU) (INT_PTR) kIdSetupVerification, hInstance, nullptr));
+        CreateWindowExA(0, "STATIC", "Verification (Optional)", kStyle, kL1 + 16, y + 3, 124, 18, page,
+                         (HMENU) (INT_PTR) kIdSetupVerification, hInstance, nullptr);
+        CreateWindowExA(0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, kL1 + 146, y + 11, kH2 + 18 - kL1 - 146, 2, page,
+                         nullptr, hInstance, nullptr);
+    };
     // The hash table row: its size in the left column, the start slots -
     // two numbers, as Words on the dictionary tab - in the right.
     auto makeHashTableRow = [&](HWND page, int y, const HashTableFields& values, HashTableControls& controls) {
-        makeLabel(page, "Hash table size:", kL1, y + 3, 104);
-        controls.tableSize = makeEdit(page, values.tableSize, kE1, y, 150);
-        addHelp(page, kH1, y + 2,
-                "Optional, with Start slots: how many slots the hash table of the file's archive has - a power of two. A name that "
-                "matches both hashes but that a lookup in that table wouldn't find the file's entry by isn't the file: it's a false "
-                "match, written to false_matches.txt, and the search carries on. Two hashes match by chance about once in 2^64 "
-                "names, which a long search does get to.");
-        makeLabel(page, "Start slots:", kL2, y + 3, 110);
-        controls.firstStartSlot = makeEdit(page, values.firstStartSlot, kE2, y, 54);
-        makeLabel(page, "to", kE2 + 58, y + 3, 12);
-        controls.lastStartSlot = makeEdit(page, values.lastStartSlot, kE2 + 72, y, 54);
-        addHelp(page, kH2, y + 2,
-                "Optional, with Hash table size: the slots a lookup can start at and still reach the file's entry - from the one "
-                "just after the nearest never-used slot before the entry, to the entry's own slot. The first is larger than the "
-                "second if they wrap past the end of the table.");
+        verification(makeLabel(page, "Hash table size:", kL1, y + 3, 104));
+        controls.tableSize = verification(makeEdit(page, values.tableSize, kE1, y, 150));
+        verification(addHelp(page, kH1, y + 2,
+                             "Optional, with Start slots: how many slots the hash table of the file's archive has - a power of "
+                             "two. A name that matches both hashes but that a lookup in that table wouldn't find the file's entry "
+                             "by isn't the file: it's a false match, written to false_matches.txt, and the search carries on. Two "
+                             "hashes match by chance about once in 2^64 names, which a long search does get to."));
+        verification(makeLabel(page, "Start slots:", kL2, y + 3, 110));
+        controls.firstStartSlot = verification(makeEdit(page, values.firstStartSlot, kE2, y, 54));
+        verification(makeLabel(page, "to", kE2 + 58, y + 3, 12));
+        controls.lastStartSlot = verification(makeEdit(page, values.lastStartSlot, kE2 + 72, y, 54));
+        verification(addHelp(page, kH2, y + 2,
+                             "Optional, with Hash table size: the slots a lookup can start at and still reach the file's entry - "
+                             "from the one just after the nearest never-used slot before the entry, to the entry's own slot. The "
+                             "first is larger than the second if they wrap past the end of the table."));
     };
 
     makeLabel(ps, "Search type:", kL1, row(0) + 3, 100);
@@ -893,32 +1073,33 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
             "The most backslashes a candidate may contain before it is skipped. 0 means no limit (to forbid backslashes entirely, leave "
             "them out of the alphabet instead).");
 
-    makeLabel(ps, "Encryption key:", kL1, row(7) + 3, 104);
-    state.hwndKey = makeEdit(ps, fields.encryptionKey, kE1, row(7), 150);
-    addHelp(ps, kH1, row(7) + 2, keyHelp);
-    makeHashTableRow(ps, row(8), fields.hashTable, state.searchHashTable);
-
     // Checkboxes go beneath all the input fields, one per column.
-    state.hwndPrune = makeCheckbox(ps, "Prune symbol runs", kL1, row(9) + 1, 150, kIdSetupPruneCheckbox, fields.pruneSymbolRuns);
-    addHelp(ps, kH1, row(9) + 2,
+    state.hwndPrune = makeCheckbox(ps, "Prune symbol runs", kL1, row(7) + 1, 150, kIdSetupPruneCheckbox, fields.pruneSymbolRuns);
+    addHelp(ps, kH1, row(7) + 2,
             "Skip candidates containing three or more symbols in a row that are neither letters, digits nor spaces - real filenames "
             "practically never have those. Makes the search faster.");
     state.hwndPruneBrackets =
-        makeCheckbox(ps, "Prune unopened brackets", kL2, row(9) + 1, 170, kIdSetupPruneBracketsCheckbox, fields.pruneUnopenedBrackets);
-    addHelp(ps, kH2, row(9) + 2,
+        makeCheckbox(ps, "Prune unopened brackets", kL2, row(7) + 1, 170, kIdSetupPruneBracketsCheckbox, fields.pruneUnopenedBrackets);
+    addHelp(ps, kH2, row(7) + 2,
             "Skip candidates that close a bracket that was never opened - a ) with no ( before it, or a ] with no [ before it "
             "(brackets opened in the prefix count). Real filenames practically never have those. Makes the search faster.");
     state.hwndPruneWhole =
-        makeCheckbox(ps, "Prune the whole candidate", kL1, row(10) + 1, 190, kIdSetupPruneWholeCheckbox, fields.pruneWholeCandidate);
-    addHelp(ps, kH1, row(10) + 2,
+        makeCheckbox(ps, "Prune the whole candidate", kL1, row(8) + 1, 190, kIdSetupPruneWholeCheckbox, fields.pruneWholeCandidate);
+    addHelp(ps, kH1, row(8) + 2,
             "Apply the pruning rules, and Max and Min backslash, to every character of a candidate but the last - not only to the "
             "characters before the last five or so, which the CPU goes through. About a fifth fewer candidates are searched, and "
             "the search is about 10% faster on a GPU.");
-    state.hwndPruneAdjacent = makeCheckbox(ps, "Prune adjacent backslashes", kL2, row(10) + 1, 190, kIdSetupPruneAdjacentCheckbox,
+    state.hwndPruneAdjacent = makeCheckbox(ps, "Prune adjacent backslashes", kL2, row(8) + 1, 190, kIdSetupPruneAdjacentCheckbox,
                                            fields.pruneAdjacentBackslashes);
-    addHelp(ps, kH2, row(10) + 2,
+    addHelp(ps, kH2, row(8) + 2,
             "Skip candidates with two backslashes next to each other - counting one the prefix ends with. Real filenames never have "
             "those. Makes the search faster.");
+
+    makeVerificationToggle(ps, row(9));
+    verification(makeLabel(ps, "Encryption key:", kL1, row(10) + 3, 104));
+    state.hwndKey = verification(makeEdit(ps, fields.encryptionKey, kE1, row(10), 150));
+    verification(addHelp(ps, kH1, row(10) + 2, keyHelp));
+    makeHashTableRow(ps, row(11), fields.hashTable, state.searchHashTable);
 
     // --- Dictionary page (two columns, as Local Search) ---
     HWND pd = state.hwndPageDictionary;
@@ -996,21 +1177,22 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
             "Optional. Names the files the search writes - matches-<name>.txt, basenames-<name>.txt and wordnumber-<name>.txt - so "
             "searches for different files keep theirs apart. Blank: matches.txt and so on.");
 
-    makeHashTableRow(pd, row(7), dict.hashTable, state.dictHashTable);
-
-    state.hwndDictRecordBasenames = makeCheckbox(pd, "Record basenames", kL1, row(8) + 1, 150, 0, dict.recordBasenames);
-    addHelp(pd, kH1, row(8) + 2,
+    state.hwndDictRecordBasenames = makeCheckbox(pd, "Record basenames", kL1, row(7) + 1, 150, 0, dict.recordBasenames);
+    addHelp(pd, kH1, row(7) + 2,
             "With an encryption key: write every basename that matches it to basenames.txt - the file's basename is among them, "
             "even when its directory is wrong.");
-    state.hwndDictRecordHashA = makeCheckbox(pd, "Compare every candidate", kL2, row(8) + 1, 190, 0, dict.recordHashAMatches);
-    addHelp(pd, kH2, row(8) + 2,
+    state.hwndDictRecordHashA = makeCheckbox(pd, "Compare every candidate", kL2, row(7) + 1, 190, 0, dict.recordHashAMatches);
+    addHelp(pd, kH2, row(7) + 2,
             "With an encryption key: compare every candidate to the hashes all the same, as if the key weren't known, recording every "
             "Hash A match - but the search is about a third slower.");
 
-    state.hwndDictResume = makeCheckbox(pd, "Resume from last candidate", kL1, row(9) + 1, 190, 0, dict.resume);
-    addHelp(pd, kH1, row(9) + 2,
+    state.hwndDictResume = makeCheckbox(pd, "Resume from last candidate", kL1, row(8) + 1, 190, 0, dict.resume);
+    addHelp(pd, kH1, row(8) + 2,
             "Carry on where the last search with these settings stopped - its progress is saved in wordnumber.txt every 30 seconds "
             "and when you quit - instead of starting from the beginning.");
+
+    makeVerificationToggle(pd, row(9));
+    makeHashTableRow(pd, row(10), dict.hashTable, state.dictHashTable);
     syncRecordBasenames(&state);
 
     // --- Meet in the Middle page (two columns, as Local Search) ---
@@ -1028,8 +1210,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
               "characters, 1.4 GB for 5 and 59 GB for 6 - Table memory below is the cap, and on a GPU the table has to fit in the "
               "card's own memory as well.",
               8, 88, 570, 46);
-    // Twelve rows of fields, so this page's rows sit a little closer
-    // together than the other pages' (kRowStep).
+    // Ten rows of fields and the Verification toggle, so this page's rows sit
+    // a little closer together than the other pages' (kRowStep).
     constexpr int kMitmRow0 = 140, kMitmRowStep = 28;
     auto rowM = [&](int n) { return kMitmRow0 + n * kMitmRowStep; };
     // Every field in a column is the same width, and every "?" sits in that
@@ -1132,45 +1314,57 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
             "The most backslashes the directory may contain before it is skipped. 0 means no limit (to forbid them entirely, leave "
             "the backslash out of the alphabet instead).");
 
-    makeLabel(pm, "Encryption key:", kL1, rowM(8) + 3, 104);
-    state.hwndMitmKey = makeEdit(pm, mitm.encryptionKey, kE1, rowM(8), kMitmEdit1);
-    addHelp(pm, kH1, rowM(8) + 2, keyHelp);
-    makeHashTableRow(pm, rowM(9), mitm.hashTable, state.mitmHashTable);
-
-    state.hwndMitmPrune = makeCheckbox(pm, "Prune symbol runs", kL1, rowM(10) + 1, 150, 0, mitm.pruneSymbolRuns);
-    addHelp(pm, kH1, rowM(10) + 2,
+    state.hwndMitmPrune = makeCheckbox(pm, "Prune symbol runs", kL1, rowM(8) + 1, 150, 0, mitm.pruneSymbolRuns);
+    addHelp(pm, kH1, rowM(8) + 2,
             "Skip directories containing three or more symbols in a row that are neither letters, digits nor spaces - real names "
             "practically never have those. Applies to every character of the directory, and makes the search faster.");
-    state.hwndMitmPruneBrackets = makeCheckbox(pm, "Prune unopened brackets", kL2, rowM(10) + 1, 170, 0, mitm.pruneUnopenedBrackets);
-    addHelp(pm, kH2, rowM(10) + 2,
+    state.hwndMitmPruneBrackets = makeCheckbox(pm, "Prune unopened brackets", kL2, rowM(8) + 1, 170, 0, mitm.pruneUnopenedBrackets);
+    addHelp(pm, kH2, rowM(8) + 2,
             "Skip directories that close a bracket that was never opened - a ) with no ( before it, or a ] with no [ (brackets "
             "opened in the prefix count).");
-    state.hwndMitmPruneAdjacent = makeCheckbox(pm, "Prune adjacent backslashes", kL1, rowM(11) + 1, 190, 0, mitm.pruneAdjacentBackslashes);
-    addHelp(pm, kH1, rowM(11) + 2,
+    state.hwndMitmPruneAdjacent = makeCheckbox(pm, "Prune adjacent backslashes", kL1, rowM(9) + 1, 190, 0, mitm.pruneAdjacentBackslashes);
+    addHelp(pm, kH1, rowM(9) + 2,
             "Skip directories with two backslashes next to each other - counting one the prefix ends with, and one the suffix begins "
             "with. Real names never have those.");
-    state.hwndMitmResume = makeCheckbox(pm, "Resume from last candidate", kL2, rowM(11) + 1, 190, 0, mitm.resume);
-    addHelp(pm, kH2, rowM(11) + 2,
+    state.hwndMitmResume = makeCheckbox(pm, "Resume from last candidate", kL2, rowM(9) + 1, 190, 0, mitm.resume);
+    addHelp(pm, kH2, rowM(9) + 2,
             "Carry on where the last search with these settings stopped - its progress is saved in meet-in-the-middle.txt every 30 "
             "seconds and when you quit - instead of starting from the beginning.");
 
-    // --- Buttons ---
-    constexpr int kButtonY = 632;
-    CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, kButtonY, 90, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupAbout,
-                     hInstance, nullptr);
-    CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, kButtonY, 80, 26, hwndDialog,
-                     (HMENU) (INT_PTR) kIdSetupOk, hInstance, nullptr);
-    CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 520, kButtonY, 80, 26, hwndDialog, (HMENU) (INT_PTR) kIdSetupCancel,
-                     hInstance, nullptr);
+    makeVerificationToggle(pm, rowM(10));
+    verification(makeLabel(pm, "Encryption key:", kL1, rowM(11) + 3, 104));
+    state.hwndMitmKey = verification(makeEdit(pm, mitm.encryptionKey, kE1, rowM(11), kMitmEdit1));
+    verification(addHelp(pm, kH1, rowM(11) + 2, keyHelp));
+    makeHashTableRow(pm, rowM(12), mitm.hashTable, state.mitmHashTable);
+
+    // --- Buttons, under the scroll view (placed by layoutDialog) ---
+    state.hwndAbout = CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 0, 90, 26, hwndDialog,
+                                      (HMENU) (INT_PTR) kIdSetupAbout, hInstance, nullptr);
+    state.hwndOk = CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, 0, 80, 26, hwndDialog,
+                                   (HMENU) (INT_PTR) kIdSetupOk, hInstance, nullptr);
+    state.hwndCancel = CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 520, 0, 80, 26, hwndDialog,
+                                       (HMENU) (INT_PTR) kIdSetupCancel, hInstance, nullptr);
 
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
     HFONT titleFont = CreateFontA(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     EnumChildWindows(hwndDialog, setFontEnumProc, (LPARAM) font);
     SendMessage(title, WM_SETFONT, (WPARAM) titleFont, TRUE);
+    HFONT chevronFont = CreateFontA(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SYMBOL_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Marlett");
+    for (HWND h : state.verificationChevrons)
+        SendMessage(h, WM_SETFONT, (WPARAM) chevronFont, TRUE);
 
     SendMessage(state.hwndTab, TCM_SETCURSEL, fields.initialTab, 0);
     showTabPage(&state, fields.initialTab);
+    // Shown from the start if config.conf already says any of it, so that
+    // nothing that applies is out of sight.
+    auto anyHashTable = [](const HashTableFields& h) {
+        return !h.tableSize.empty() || !h.firstStartSlot.empty() || !h.lastStartSlot.empty();
+    };
+    layoutDialog(&state);
+    showVerification(&state, !fields.encryptionKey.empty() || anyHashTable(fields.hashTable) || anyHashTable(fields.dictionary.hashTable) ||
+                                 !fields.meetInTheMiddle.encryptionKey.empty() || anyHashTable(fields.meetInTheMiddle.hashTable));
 
     ShowWindow(hwndDialog, SW_SHOW);
     UpdateWindow(hwndDialog);
@@ -1203,6 +1397,7 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
 
     DeleteObject(logo);
     DeleteObject(titleFont);
+    DeleteObject(chevronFont);
     return state.accepted;
 }
 
