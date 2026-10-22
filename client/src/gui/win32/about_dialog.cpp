@@ -4,6 +4,7 @@
 
 #include "common/version.h"
 #include "gui/win32/app_icons.h"
+#include "gui/win32/dpi.h"
 #include "net/protocol.h"
 
 namespace {
@@ -59,7 +60,7 @@ void showAboutDialog(HWND owner) {
 
     constexpr DWORD kStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     constexpr DWORD kExStyle = WS_EX_DLGMODALFRAME;
-    RECT rect = {0, 0, 450, 210}; // desired client area
+    RECT rect = {0, 0, scaled(450), scaled(210)}; // desired client area
     AdjustWindowRectEx(&rect, kStyle, FALSE, kExStyle);
     int width = rect.right - rect.left, height = rect.bottom - rect.top;
 
@@ -79,10 +80,8 @@ void showAboutDialog(HWND owner) {
         return;
     SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR) &state);
 
-    HBITMAP logo = makeLogoBitmap(192, 128);
+    // Its image is set once the controls are scaled, as the setup dialog's.
     HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 16, 16, 192, 128, hwnd, nullptr, hInstance, nullptr);
-    SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
-
     // Short enough for the 210px label: "v2026-09-26 (protocol 1.1.0)".
     std::string protocolLine = std::string(namebreakVersion()) + " (protocol " + kProtocolVersion + ")";
     HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 226, 16, 210, 28, hwnd, nullptr, hInstance, nullptr);
@@ -102,11 +101,14 @@ void showAboutDialog(HWND owner) {
                                hInstance, nullptr);
 
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
-    HFONT titleFont = CreateFontA(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    HFONT titleFont = CreateFontA(-scaled(22), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     for (HWND h : {byline, body, protocol, link, ok})
         SendMessage(h, WM_SETFONT, (WPARAM) font, TRUE);
     SendMessage(title, WM_SETFONT, (WPARAM) titleFont, TRUE);
+    scaleChildWindows(hwnd);
+    HBITMAP logo = makeLogoBitmap(scaled(192), scaled(128));
+    SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
 
     if (owner)
         EnableWindow(owner, FALSE);

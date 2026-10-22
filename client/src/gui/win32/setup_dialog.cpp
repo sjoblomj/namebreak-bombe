@@ -40,6 +40,7 @@
 #include "engine/mpq_hash.h"
 #include "gui/win32/about_dialog.h"
 #include "gui/win32/app_icons.h"
+#include "gui/win32/dpi.h"
 
 #pragma comment(lib, "comdlg32.lib")
 
@@ -53,6 +54,7 @@ using gui::kTabCoordinator;
 using gui::kTabDictionary;
 using gui::kTabLocalSearch;
 using gui::kTabMeetInTheMiddle;
+using gui::scaled;
 using gui::showAboutDialog;
 
 constexpr const char* kSetupClassName = "NamebreakSetupDialog";
@@ -75,7 +77,8 @@ constexpr int kIdSetupVerification = 313;
 // scroll view, and the buttons sit in a strip of their own under it. The
 // pages have room for the Verification sections whether they're shown or
 // not (they're kVerificationHeight of it), so that opening them never
-// resizes the dialog - see layoutDialog.
+// resizes the dialog - see layoutDialog. All of it in 96-DPI pixels, as every
+// control is placed - see scaled() (dpi.h).
 constexpr int kDialogWidth = 620, kContentHeight = 642, kButtonStripHeight = 44, kButtonGap = 6;
 constexpr int kTabWidth = 600, kTabHeight = 536;
 constexpr int kPageWidth = 592, kPageHeight = 500;
@@ -176,7 +179,8 @@ void scrollContentTo(SetupDialogState* state, int pos) {
 // scrolls, in the scroll view that holds everything but the buttons, so that
 // the buttons are always on screen.
 void layoutDialog(SetupDialogState* state) {
-        RECT frame = {0, 0, 0, 0};
+    const int dialogWidth = scaled(kDialogWidth), contentHeight = scaled(kContentHeight), buttonStripHeight = scaled(kButtonStripHeight);
+    RECT frame = {0, 0, 0, 0};
     AdjustWindowRectEx(&frame, (DWORD) GetWindowLongPtr(state->hwndDialog, GWL_STYLE), FALSE,
                        (DWORD) GetWindowLongPtr(state->hwndDialog, GWL_EXSTYLE));
     const int frameWidth = frame.right - frame.left, frameHeight = frame.bottom - frame.top;
@@ -185,9 +189,9 @@ void layoutDialog(SetupDialogState* state) {
     GetMonitorInfoA(MonitorFromWindow(state->hwndDialog, MONITOR_DEFAULTTONEAREST), &monitor);
     const RECT& work = monitor.rcWork;
     const int viewHeight =
-        (std::max) (kButtonStripHeight, (std::min) (kContentHeight, (int) (work.bottom - work.top) - frameHeight - kButtonStripHeight));
-    const int scrollbar = viewHeight < kContentHeight ? GetSystemMetrics(SM_CXVSCROLL) : 0;
-    const int width = kDialogWidth + scrollbar + frameWidth, height = viewHeight + kButtonStripHeight + frameHeight;
+        (std::max) (buttonStripHeight, (std::min) (contentHeight, (int) (work.bottom - work.top) - frameHeight - buttonStripHeight));
+    const int scrollbar = viewHeight < contentHeight ? GetSystemMetrics(SM_CXVSCROLL) : 0;
+    const int width = dialogWidth + scrollbar + frameWidth, height = viewHeight + buttonStripHeight + frameHeight;
     // Moved up, if it has to be, to keep the bottom - and the buttons - on
     // screen.
     RECT window;
@@ -195,19 +199,19 @@ void layoutDialog(SetupDialogState* state) {
     const int top = (std::max) ((int) work.top, (std::min) ((int) window.top, (int) work.bottom - height));
     SetWindowPos(state->hwndDialog, nullptr, window.left, top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
 
-    SetWindowPos(state->hwndScroll, nullptr, 0, 0, kDialogWidth + scrollbar, viewHeight, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->hwndScroll, nullptr, 0, 0, dialogWidth + scrollbar, viewHeight, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     SCROLLINFO si{};
     si.cbSize = sizeof si;
     si.fMask = SIF_RANGE | SIF_PAGE;
-    si.nMax = kContentHeight - 1;
+    si.nMax = contentHeight - 1;
     si.nPage = (UINT) viewHeight;
     SetScrollInfo(state->hwndScroll, SB_VERT, &si, TRUE);
     scrollContentTo(state, state->scrollPos);
 
-    const int buttonY = viewHeight + kButtonGap;
-    SetWindowPos(state->hwndAbout, nullptr, 12, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(state->hwndOk, nullptr, 430 + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(state->hwndCancel, nullptr, 520 + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const int buttonY = viewHeight + scaled(kButtonGap);
+    SetWindowPos(state->hwndAbout, nullptr, scaled(12), buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->hwndOk, nullptr, scaled(430) + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->hwndCancel, nullptr, scaled(520) + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // Shows or hides every tab's Verification fields, in the room the pages keep
@@ -224,7 +228,7 @@ void showVerification(SetupDialogState* state, bool shown) {
     // On a screen too short for them, the fields just opened are below the
     // bottom of the view: bring them up into it.
     if (shown)
-        scrollContentTo(state, state->scrollPos + kVerificationHeight);
+        scrollContentTo(state, state->scrollPos + scaled(kVerificationHeight));
 }
 
 bool isChecked(HWND h) {
@@ -480,8 +484,8 @@ LRESULT CALLBACK SetupScrollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             GetScrollInfo(hwnd, SB_VERT, &si);
             int pos = state->scrollPos;
             switch (LOWORD(wParam)) {
-                case SB_LINEUP: pos -= 20; break;
-                case SB_LINEDOWN: pos += 20; break;
+                case SB_LINEUP: pos -= scaled(20); break;
+                case SB_LINEDOWN: pos += scaled(20); break;
                 case SB_PAGEUP: pos -= (int) si.nPage; break;
                 case SB_PAGEDOWN: pos += (int) si.nPage; break;
                 case SB_THUMBTRACK:
@@ -495,7 +499,7 @@ LRESULT CALLBACK SetupScrollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_MOUSEWHEEL:
             if (!state)
                 break;
-            scrollContentTo(state, state->scrollPos - GET_WHEEL_DELTA_WPARAM(wParam) * 60 / WHEEL_DELTA);
+            scrollContentTo(state, state->scrollPos - GET_WHEEL_DELTA_WPARAM(wParam) * scaled(60) / WHEEL_DELTA);
             return 0;
     }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
@@ -791,9 +795,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     HWND content = state.hwndScroll;
 
     // --- Header: logo + what this window is for ---
-    HBITMAP logo = makeLogoBitmap(120, 80);
+    // Its image is set once the controls are scaled - see below.
     HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 12, 10, 120, 80, content, nullptr, hInstance, nullptr);
-    SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
     HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 150, 14, 450, 28, content, nullptr, hInstance, nullptr);
     CreateWindowExA(0, "STATIC",
                      reopened ? "Settings. Change how this machine searches, then press OK - your choices replace what the configuration "
@@ -832,7 +835,7 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     // disappears (the texts are a few lines) and a max width so they wrap.
     state.hwndTooltip = CreateWindowExA(WS_EX_TOPMOST, TOOLTIPS_CLASSA, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT,
                                          CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hwndDialog, nullptr, hInstance, nullptr);
-    SendMessage(state.hwndTooltip, TTM_SETMAXTIPWIDTH, 0, 340);
+    SendMessage(state.hwndTooltip, TTM_SETMAXTIPWIDTH, 0, scaled(340));
     SendMessage(state.hwndTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 250);
     SendMessage(state.hwndTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
 
@@ -1346,14 +1349,21 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
                                        (HMENU) (INT_PTR) kIdSetupCancel, hInstance, nullptr);
 
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
-    HFONT titleFont = CreateFontA(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    HFONT titleFont = CreateFontA(-scaled(24), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     EnumChildWindows(hwndDialog, setFontEnumProc, (LPARAM) font);
     SendMessage(title, WM_SETFONT, (WPARAM) titleFont, TRUE);
-    HFONT chevronFont = CreateFontA(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SYMBOL_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    HFONT chevronFont = CreateFontA(-scaled(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SYMBOL_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                      CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Marlett");
     for (HWND h : state.verificationChevrons)
         SendMessage(h, WM_SETFONT, (WPARAM) chevronFont, TRUE);
+
+    // Everything above is placed in 96-DPI pixels; to the screen's now.
+    // The logo's image only after: a bitmap static takes the bitmap's own
+    // size, which is then already the scaled one.
+    gui::scaleChildWindows(hwndDialog);
+    HBITMAP logo = makeLogoBitmap(scaled(120), scaled(80));
+    SendMessage(logoCtl, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) logo);
 
     SendMessage(state.hwndTab, TCM_SETCURSEL, fields.initialTab, 0);
     showTabPage(&state, fields.initialTab);

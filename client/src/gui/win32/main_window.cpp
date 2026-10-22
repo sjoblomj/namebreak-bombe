@@ -49,6 +49,7 @@
 #include "gui/win32/about_dialog.h"
 #include "gui/win32/app_config.h"
 #include "gui/win32/app_icons.h"
+#include "gui/win32/dpi.h"
 #include "gui/win32/worker.h"
 
 namespace gui {
@@ -453,6 +454,7 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
                                                 hwnd, (HMENU) (INT_PTR) kIdFinishCheckbox, hInstance, nullptr);
         setFont(g_hwndFinishCheckbox);
     }
+    scaleChildWindows(hwnd);
 }
 
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -575,6 +577,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    enableDpiAwareness();
     HINSTANCE hInstance = GetModuleHandleA(nullptr);
     g_hInstance = hInstance;
     g_configPath = configPath;
@@ -603,7 +606,7 @@ int main(int argc, char* argv[]) {
 
     std::string windowTitle = std::string(kWindowTitle) + " (" + g_activeMode + ")";
     g_hwndMain = CreateWindowExA(0, kWindowClassName, windowTitle.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth, kWindowHeight, nullptr, nullptr, hInstance, nullptr);
+                                  CW_USEDEFAULT, CW_USEDEFAULT, scaled(kWindowWidth), scaled(kWindowHeight), nullptr, nullptr, hInstance, nullptr);
     if (!g_hwndMain) {
         MessageBoxA(nullptr, "Failed to create the main window", kWindowTitle, MB_OK | MB_ICONERROR);
         return 1;
