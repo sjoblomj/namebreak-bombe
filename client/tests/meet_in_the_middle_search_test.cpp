@@ -436,15 +436,20 @@ static void testFindsItAndWritesIt(SearchBackend& backend) {
           "an eight-character directory is recovered from its meeting point: " + got.result.filename);
     check(got.result.tableLength == 5 && got.result.tableEntries == 16807, "with the first five characters of it in the table");
 
-    // The matches file ends with the name, and found.txt has it too.
-    std::vector<std::string> lines;
-    std::ifstream in(kDir + "/matches.txt");
-    for (std::string line; std::getline(in, line);)
-        lines.push_back(line);
-    check(!lines.empty() && lines.back() == "SETUPDAT\\BWUNIN.PIF", "the matches file ends with it");
-    std::ifstream found(kDir + "/found.txt");
-    std::string foundLine;
-    check(std::getline(found, foundLine) && foundLine.find("SETUPDAT\\BWUNIN.PIF") != std::string::npos, "and found.txt has it");
+    // The matches file ends with the name, and found.txt has it too - read
+    // in a block of their own, so that both are closed again before the
+    // searches below write them, or remove them: Windows can't delete a file
+    // that is still open.
+    {
+        std::vector<std::string> lines;
+        std::ifstream in(kDir + "/matches.txt");
+        for (std::string line; std::getline(in, line);)
+            lines.push_back(line);
+        check(!lines.empty() && lines.back() == "SETUPDAT\\BWUNIN.PIF", "the matches file ends with it");
+        std::ifstream found(kDir + "/found.txt");
+        std::string foundLine;
+        check(std::getline(found, foundLine) && foundLine.find("SETUPDAT\\BWUNIN.PIF") != std::string::npos, "and found.txt has it");
+    }
 
     // The progress file is this search's, and says it got to the end.
     MeetInTheMiddleProgress progress;

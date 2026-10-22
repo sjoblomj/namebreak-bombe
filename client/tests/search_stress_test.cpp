@@ -494,7 +494,7 @@ static long runCase(Case c, std::mt19937_64& rng) {
     if (!falseHit.empty() && (falseMatches.size() != 1 || falseMatches[0].filename != falseHit || falseMatches[0].reason.empty()))
         fail("runSearch() didn't report '" + falseHit + "' as a false match, with why, exactly once (it reported " + std::to_string(falseMatches.size()) +
              ")");
-    if (falseHit.empty() ? !falseMatchesFile.empty() : falseMatchesFile.rfind(falseHit + "\t", 0) != 0)
+    if (falseHit.empty() ? !falseMatchesFile.empty() : falseMatchesFile.rfind(asWritten(falseHit) + "\t", 0) != 0)
         fail("false_matches.txt holds '" + falseMatchesFile + "'" + (falseHit.empty() ? ", though there's no false match" : ", not '" + falseHit + "'"));
     std::sort(reported.begin(), reported.end());
     if (std::adjacent_find(reported.begin(), reported.end()) != reported.end())

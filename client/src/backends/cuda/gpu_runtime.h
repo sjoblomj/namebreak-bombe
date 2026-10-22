@@ -21,6 +21,7 @@
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemGetInfo hipMemGetInfo
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaFreeHost hipHostFree
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
