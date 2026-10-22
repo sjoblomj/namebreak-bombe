@@ -731,8 +731,12 @@ The target's `alphabet` (predefined or custom), `prefix`, `suffix` and
 pruning rules work as an alphabet target's, except that the rules always
 apply to the whole directory - `prune_whole_candidate` isn't a meeting point
 target's, nor are the bounds, the inserted text, `start_len`,
-`auto_priority`, `send_basenames`, an encryption key, or priority and skip
-ranges (what it hands out is tails, not candidates a pattern can pin down).
+`auto_priority`, `send_basenames`, or priority and skip ranges (what it
+hands out is tails, not candidates a pattern can pin down). An
+`encryption_key_hex` and a `hash_table_position` are, as for any target: a
+match of both hashes is checked against them (see **False matches**). The
+key is made from the basename, which is the suffix's here, so it can't tell
+one directory from another - the hash table position is what can.
 `PATCH` can change its priority, description, status and pruning rules, but
 not its alphabet or lengths: those are what its tails are numbered by, so
 searching the same file another way means another target.

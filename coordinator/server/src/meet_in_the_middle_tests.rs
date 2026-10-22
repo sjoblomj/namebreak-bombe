@@ -14,7 +14,7 @@ use crate::error::AppError;
 use crate::handlers;
 use crate::meet_in_the_middle;
 use crate::models::{Range, Target, User};
-use crate::mpq::{continue_hash, mpq_hash, HASH_A_OFFSET, HASH_B_OFFSET, INITIAL_STATE};
+use crate::mpq::{continue_hash, mpq_hash, FILE_KEY_OFFSET, HASH_A_OFFSET, HASH_B_OFFSET, INITIAL_STATE};
 use crate::ranges;
 use crate::state::{now_unix, AppState, Inner, RangeConfig};
 
@@ -200,7 +200,6 @@ async fn a_target_refuses_what_isnt_a_meet_in_the_middle_targets() {
         serde_json::json!({"start_len": 3}),
         serde_json::json!({"auto_priority": true}),
         serde_json::json!({"send_basenames": true}),
-        serde_json::json!({"encryption_key_hex": "0x1D5AD26C"}),
     ] {
         let err = create(&state, extra.clone()).await.unwrap_err();
         assert!(matches!(&err, AppError::BadRequest(m) if m.contains("isn't for a meet-in-the-middle target")), "{extra} gave {err:?}");
@@ -394,6 +393,32 @@ async fn a_find_solves_the_target() {
     let target = target(&state, id).await;
     assert_eq!((target.status.as_str(), target.found_filename.as_deref()), ("solved", Some("SETUPDAT\\B-A\\BWUNIN.PIF")));
     assert!(claim_work(&state, &client).await.is_none(), "a solved target hands out nothing more");
+}
+
+#[tokio::test]
+async fn a_find_is_checked_against_the_key() {
+    let state = state(100.0).await;
+    // The file's own key, from its basename: what an archive lists for it.
+    let key = format!("0x{:08X}", mpq_hash("BWUNIN.PIF", FILE_KEY_OFFSET));
+    let id = create(&state, serde_json::json!({"encryption_key_hex": key})).await.unwrap();
+    assert_eq!(target(&state, id).await.encryption_key.map(crate::models::i64_to_u32), Some(mpq_hash("BWUNIN.PIF", FILE_KEY_OFFSET)));
+
+    // A client that checks matches is given the key; one older than
+    // protocol 1.7 isn't, as for any target.
+    let older = client(&state, "older").await;
+    assert_eq!(claim_work(&state, &older).await.unwrap().encryption_key_hex, None);
+    let newer = user(&state, "newer", "1.7.0", Some(1 << 30)).await;
+    let claim = claim_work(&state, &newer).await.unwrap();
+    assert_eq!(claim.encryption_key_hex, Some(key));
+    complete(&state, &newer, claim.range_id, Some("SETUPDAT\\B-A\\BWUNIN.PIF"), 1.0, 9).await.unwrap();
+    assert_eq!(target(&state, id).await.status, "solved", "the right name passes the key");
+
+    // A key the name doesn't have makes the same find a false match.
+    let other = create(&state, serde_json::json!({"name": "wrong-key", "encryption_key_hex": "0x12345678"})).await.unwrap();
+    let claim = claim_work(&state, &newer).await.unwrap();
+    assert_eq!(claim.target_id, other);
+    complete(&state, &newer, claim.range_id, Some("SETUPDAT\\B-A\\BWUNIN.PIF"), 1.0, 9).await.unwrap();
+    assert_ne!(target(&state, other).await.status, "solved");
 }
 
 #[tokio::test]

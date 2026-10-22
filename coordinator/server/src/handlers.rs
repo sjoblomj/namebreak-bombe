@@ -551,7 +551,8 @@ async fn create_dictionary_target(state: &AppState, req: &AdminCreateTargetReque
 /// The settings an alphabet target has that a meet-in-the-middle target
 /// doesn't: it searches a directory of a known length range, with no bounds,
 /// no inserted text and no basenames, and its pruning rules always look at
-/// the whole directory. `start_len` is `meet_in_the_middle.min_length`
+/// the whole directory. An encryption key is: a match of both hashes is
+/// checked against it, as any target's is (see `false_matches`). `start_len` is `meet_in_the_middle.min_length`
 /// instead, and priority and skip ranges (patterns over candidate indices)
 /// aren't a meet-in-the-middle target's either - the admin endpoints that
 /// make them refuse one.
@@ -565,7 +566,6 @@ fn meet_in_the_middle_settings_not_given(req: &AdminCreateTargetRequest) -> Vec<
         ("start_len", req.start_len != 1),
         ("auto_priority", req.auto_priority),
         ("send_basenames", req.send_basenames),
-        ("encryption_key_hex", req.encryption_key_hex.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, given)| given.then_some(name))
@@ -592,6 +592,7 @@ async fn create_meet_in_the_middle_target(state: &AppState, req: &AdminCreateTar
         false_matches::validate_hash_table_position(position)?;
     }
     validate_backslash_counts(req.max_backslash_count, req.min_backslash_count)?;
+    let encryption_key = req.encryption_key_hex.as_deref().map(parse_encryption_key).transpose()?;
     let hash_a = parse_hash_hex(&req.hash_a_hex).map_err(|_| AppError::BadRequest("invalid hash_a_hex".into()))?;
     let hash_b = parse_hash_hex(&req.hash_b_hex).map_err(|_| AppError::BadRequest("invalid hash_b_hex".into()))?;
     let seed = |what: &str, hex: &str| parse_hash_hex(hex).map_err(|_| AppError::BadRequest(format!("invalid {what}")));
@@ -613,9 +614,9 @@ async fn create_meet_in_the_middle_target(state: &AppState, req: &AdminCreateTar
     let target_id: i64 = sqlx::query_scalar(
         "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, prune_unopened_brackets, \
          prune_whole_candidate, max_backslash_count, min_backslash_count, prune_adjacent_backslashes, alphabet_name, alphabet, status, \
-         priority, description, start_len, base_file_name, kind, meeting_point_a_seed1, meeting_point_a_seed2, meeting_point_b_seed1, meeting_point_b_seed2, \
+         priority, description, start_len, encryption_key, base_file_name, kind, meeting_point_a_seed1, meeting_point_a_seed2, meeting_point_b_seed1, meeting_point_b_seed2, \
          meet_in_the_middle_max_length, meet_in_the_middle_table_length, created_at) \
-         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 'meet-in-the-middle', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, 'meet-in-the-middle', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&req.name)
     .bind(&req.prefix)
@@ -632,6 +633,7 @@ async fn create_meet_in_the_middle_target(state: &AppState, req: &AdminCreateTar
     .bind(req.priority)
     .bind(&req.description)
     .bind(space.min_length())
+    .bind(encryption_key.map(u32_to_i64))
     .bind(&req.base_file_name)
     .bind(u32_to_i64(meeting_point_a.0))
     .bind(u32_to_i64(meeting_point_a.1))
