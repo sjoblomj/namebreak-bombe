@@ -275,6 +275,8 @@ public:
 
     // Short lowercase name, as in --backend <name>.
     virtual const char* name() const = 0;
+    // The device it searches on, for a GPU backend - "" if it doesn't say.
+    virtual std::string deviceName() const { return ""; }
 
     // How many trailing characters the backend should enumerate per batch -
     // the engine uses more only when a candidate is too long for the leading

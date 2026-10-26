@@ -196,6 +196,7 @@ public:
     }
 
     const char* name() const override { return "opencl"; }
+    std::string deviceName() const override { return deviceInfoString(device_, CL_DEVICE_NAME); }
     int windowChars() const override { return windowChars_; }
     // Row indices are 32-bit in the kernel: 63^5 < 2^32 <= 63^6.
     int maxTrailingLen() const override { return 6; }

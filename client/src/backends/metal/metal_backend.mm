@@ -138,6 +138,7 @@ public:
     }
 
     const char* name() const override { return "metal"; }
+    std::string deviceName() const override { return device_.name.UTF8String; }
     int windowChars() const override { return windowChars_; }
     // Row indices are 32-bit in the kernel: 63^5 < 2^32 <= 63^6.
     int maxTrailingLen() const override { return 6; }

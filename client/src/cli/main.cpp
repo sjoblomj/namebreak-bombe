@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include "backends/backends.h"
+#include "common/autotune.h"
 #include "common/config.h"
 #include "common/platform.h"
 #include "common/version.h"
@@ -168,14 +169,17 @@ void printUsage(const char* argv0) {
     for (const std::string& name : backendNames())
         backends += (backends.empty() ? "" : "|") + name;
     fprintf(stderr, "Usage: %s [--mode <mode>] [--config <file>] [--backend %s]\n"
+                     "       %s --autotune [--config <file>] [--backend opencl|metal]\n"
                      "       %s -v|--version\n"
                      "<mode> is continuous, bounded, coordinator, dictionary or meet-in-the-middle.\n"
                      "Reads the given --config file (default: %s, in the current directory) for\n"
                      "everything else; --mode and --backend, if given, override that file's own\n"
                      "'mode = ...'/'backend = ...'. Without either, the first backend listed that\n"
                      "can run on this machine is used (in dictionary or meet-in-the-middle mode,\n"
-                     "that can search those). -v/--version prints this build's version.\n",
-            argv0, backends.c_str(), argv0, kDefaultConfigPath);
+                     "that can search those). --autotune measures the OpenCL or Metal backend's\n"
+                     "launch settings on this GPU and writes the fastest to the config file's\n"
+                     "[opencl] or [metal] section. -v/--version prints this build's version.\n",
+            argv0, backends.c_str(), argv0, argv0, kDefaultConfigPath);
 }
 
 // For a first run: where the config file was looked for, and the smallest
@@ -211,6 +215,7 @@ int main(int argc, char* argv[]) {
     std::string modeOverride;
     std::string backendOverride;
     std::string configPath = kDefaultConfigPath;
+    bool autotune = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--version") {
@@ -223,6 +228,8 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             configPath = argv[++i];
+        } else if (arg == "--autotune") {
+            autotune = true;
         } else if (arg == "--backend") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--backend requires a backend name\n");
@@ -248,14 +255,16 @@ int main(int argc, char* argv[]) {
     }
 
     std::error_code existsError;
-    if (!std::filesystem::exists(configPath, existsError)) {
+    const bool configExists = std::filesystem::exists(configPath, existsError);
+    if (!configExists && !autotune) {
         printMissingConfigHelp(configPath);
         return 1;
     }
 
     ConfigFile config;
     std::string error;
-    if (!loadConfigFile(configPath, config, error)) {
+    // --autotune writes its section into a file it creates if need be.
+    if (configExists && !loadConfigFile(configPath, config, error)) {
         fprintf(stderr, "%s\n", error.c_str());
         return 1;
     }
@@ -269,6 +278,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     setBackendTunings(tunings);
+
+    if (autotune) {
+        // Ctrl+C stops the tuning between trials, without writing anything,
+        // and lets it remove its temporary files.
+        std::signal(SIGINT, [](int) { g_quitRequested = true; });
+        return runAutotune(configPath, config.backend, 2.0, &g_quitRequested);
+    }
 
     std::string mode = !modeOverride.empty() ? modeOverride : config.mode;
     if (mode != "continuous" && mode != "bounded" && mode != "coordinator" && mode != "dictionary" && mode != "meet-in-the-middle") {

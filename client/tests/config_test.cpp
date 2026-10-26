@@ -2,8 +2,8 @@
 // search: where buildSearchRequest starts one - start_candidate, which is
 // optional, and resume_from_last_candidate, which may move the start to the
 // last line of the matches file - and the [dictionary], [meet-in-the-middle],
-// [opencl] and [metal] sections, every key of them and what they refuse.
-// Pure CPU.
+// [opencl] and [metal] sections, every key of them and what they refuse, and
+// how --autotune picks its values (tuneAxes, common/autotune.h). Pure CPU.
 //
 // Writes matches files under ./config_test/ - ctest runs this from its own
 // directory under build/testrun/.
@@ -13,6 +13,7 @@
 #include <fstream>
 #include <string>
 
+#include "common/autotune.h"
 #include "common/config.h"
 
 static int g_failures = 0;
@@ -440,6 +441,30 @@ static void testUpdateConfig() {
           "another mode: its own section is written, the mode set, the rest kept");
 }
 
+static void testUpdateConfigSection() {
+    printf("--- updateConfigSection ---\n");
+    const std::string path = kDir + "/section.conf";
+    writeFile(path, "mode = coordinator\n\n[coordinator]\nserver_url = https://example.com\n\n[opencl]\n# tuned by hand\nrows_per_thread = 7\n"
+                    "window_chars = 6\n");
+    std::string error;
+    ConfigFile config;
+    check(updateConfigSection(path, "opencl", {{"rows_per_thread", "25"}, {"window_chars", ""}, {"batches_per_launch", "32"}}, error) &&
+              loadConfigFile(path, config, error),
+          "writes and reads back (" + error + ")");
+    check(config.mode == "coordinator" && config.coordinator["server_url"] == "https://example.com", "the mode and the other section untouched");
+    check(config.opencl["rows_per_thread"] == "25" && config.opencl.count("window_chars") == 0 && config.opencl["batches_per_launch"] == "32",
+          "replaced, taken out and added");
+    check(updateConfigSection(path, "metal", {{"rows_per_thread", "13"}}, error) && loadConfigFile(path, config, error) &&
+              config.metal["rows_per_thread"] == "13" && config.opencl["rows_per_thread"] == "25",
+          "a section the file didn't have: added");
+    const std::string fresh = kDir + "/fresh.conf";
+    std::filesystem::remove(fresh);
+    ConfigFile freshConfig;
+    check(updateConfigSection(fresh, "opencl", {{"work_group_size", "128"}}, error) && loadConfigFile(fresh, freshConfig, error) &&
+              freshConfig.opencl["work_group_size"] == "128" && freshConfig.mode.empty(),
+          "a file that doesn't exist: created, with only the section");
+}
+
 // What buildBackendTunings says about `config`: "" if it accepts it.
 static std::string tuningErrorOf(const ConfigFile& config, BackendTunings& out) {
     std::string error;
@@ -486,6 +511,44 @@ static void testBackendTunings() {
     std::string error;
     check(loadConfigFile(path, config, error) && config.opencl["window_chars"] == "4" && config.metal["rows_per_thread"] == "7",
           "loadConfigFile knows both sections (" + error + ")");
+}
+
+static void testTuneAxes() {
+    printf("--- tuneAxes ---\n");
+    const GpuTuningKey rows = {"rows_per_thread", &GpuTuning::rowsPerThread, 1, 64};
+    const GpuTuningKey window = {"window_chars", &GpuTuning::windowChars, 1, 6};
+    GpuTuning start;
+    start.rowsPerThread = 64;
+    start.windowChars = 5;
+    // Fastest at 13 rows and window 6, rows mattering more; 7 rows can't be
+    // used.
+    int measured = 0;
+    auto measure = [&](const GpuTuning& t) {
+        ++measured;
+        if (*t.rowsPerThread == 7)
+            return 0.0;
+        return 1000.0 - 5.0 * (*t.rowsPerThread - 13) * (*t.rowsPerThread - 13) / 10 + (*t.windowChars == 6 ? 50.0 : 0.0);
+    };
+    const std::vector<TuningAxis> axes = {{rows, {7, 13, 25, 64}}, {window, {4, 5, 6}}};
+    const GpuTuning tuned = tuneAxes(start, axes, 0.02, 2, measure);
+    check(tuned.rowsPerThread == 13 && tuned.windowChars == 6, "each axis goes to its fastest value, never the one that can't be used");
+    // Round one: 4 + 1 and 3 + 1 - something changed, so round two, the
+    // same again - and no more.
+    check(measured == 18, "two rounds of each value and the first once more (" + std::to_string(measured) + " measured)");
+
+    // Less than minGain faster than where it stands: left as it is.
+    auto flat = [](const GpuTuning& t) { return *t.windowChars == 6 ? 1010.0 : 1000.0; };
+    check(tuneAxes(start, {{window, {4, 5, 6}}}, 0.02, 2, flat).windowChars == 5, "a gain under minGain isn't taken");
+
+    // A GPU that slows down as it goes: the value it stands at is timed
+    // first and last, and the two averaged, so a value tried in between
+    // doesn't win by drift alone.
+    double clock = 1000.0;
+    auto warming = [&](const GpuTuning&) {
+        clock -= 10;
+        return clock;
+    };
+    check(tuneAxes(start, {{window, {4, 5, 6}}}, 0.02, 2, warming).windowChars == 5, "drift alone doesn't move a value");
 }
 
 // A valid [meet-in-the-middle] section: the directory of SETUPDAT\BWUNIN.PIF,
@@ -828,7 +891,9 @@ int main() {
     testDictionaryResume();
     testEnsureDictionaryConfig();
     testUpdateConfig();
+    testUpdateConfigSection();
     testBackendTunings();
+    testTuneAxes();
     testMeetInTheMiddleRequest();
     testMeetInTheMiddleResume();
 

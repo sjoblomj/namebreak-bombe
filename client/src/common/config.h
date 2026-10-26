@@ -206,6 +206,14 @@ bool ensureConfigForMode(const std::string& path, const std::string& mode, const
 bool updateConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
                          const std::vector<std::pair<std::string, std::string>>& keys, std::string& error);
 
+// updateConfigForMode's work on the [sectionName] section alone, leaving
+// `mode` - and every other line - as it is: the section is added if the file
+// doesn't have it (and the file created if it doesn't exist), every
+// non-empty `keys` entry replaces that key's value or is added, and every
+// empty one takes its line out. What `namebreak --autotune` writes its
+// results with.
+bool updateConfigSection(const std::string& path, const std::string& sectionName, const std::vector<std::pair<std::string, std::string>>& keys,
+                         std::string& error);
 
 // Small helper for reading a config section by known key names while
 // catching typos: tracks which keys were actually looked up, so a caller

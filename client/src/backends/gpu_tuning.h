@@ -7,11 +7,12 @@
 
 // The launch geometry of a GPU backend that compiles its kernels at runtime
 // (OpenCL, Metal), which config.conf's [opencl] and [metal] sections can set
-// (see buildBackendTunings, common/config.h). None of it changes what a
-// search finds, only how its work is cut up - every backend still has to
-// pass its self-tests with it. The CUDA backend compiles its kernels ahead
-// of time, with these as template arguments and launch bounds (see its
-// tuning.h), so it takes none of them.
+// (see buildBackendTunings, common/config.h) and `namebreak --autotune`
+// measures (common/autotune.h). None of it changes what a search finds, only
+// how its work is cut up - every backend still has to pass its self-tests
+// with it. The CUDA backend compiles its kernels ahead of time, with these
+// as template arguments and launch bounds (see its tuning.h), so it takes
+// none of them.
 //
 // Unset is the backend's own default: what it was measured best with on
 // the RTX 3080 Ti Laptop, or what the build's -DNAMEBREAK_... overrides say
@@ -47,7 +48,7 @@ struct GpuTuningKey {
 };
 
 // The keys `backend` ("opencl" or "metal") takes, in the order the config
-// lists them. Empty for any other backend.
+// and --autotune list them. Empty for any other backend.
 const std::vector<GpuTuningKey>& gpuTuningKeys(const std::string& backend);
 
 // `tuning` with every value it leaves unset taken from `defaults`.

@@ -226,6 +226,27 @@ rows_per_thread = 25
 window_chars = 6
 ```
 
+Rather than trying values by hand, `namebreak --autotune` (with
+`--config <file>` and `--backend opencl|metal` if need be) measures them
+on the machine's GPU and writes the fastest to that section. It times a
+search like `search_bench`'s (the real 49-character alphabet, nothing
+pruned) for the row search keys, and one like `dictionary_bench`'s
+(english-1, with a key) for the dictionary ones, about two seconds a trial
+once half a minute of searching has heated the GPU up (a laptop's searches
+up to three times as fast while it's cool), each key in turn from the
+defaults. It then times the defaults and its result again, and writes only
+if the result was more than 2% faster: the keys that
+differ from the defaults, taking out any equal to them, so a later
+release's defaults still apply. It doesn't touch `dictionary_tails_per_cell`,
+which only searches with tails would show, or any other line of the file.
+It takes a few minutes; anything else on the GPU meanwhile - a running
+namebreak, a game - makes its measurements meaningless. Ctrl+C stops it
+without writing anything. Two caveats: it measures the window without
+pruning, though a wider one leaves the CPU less to prune (see
+[`prune_symbol_runs`, ...](#prune_symbol_runs-prune_unopened_brackets-and-max_backslash_count-only-run-on-the-cpu)),
+and a work-group size beyond what the device allows runs as the largest it
+does.
+
 ## Dictionary mode
 
 Instead of every string of an alphabet, `mode = dictionary` searches

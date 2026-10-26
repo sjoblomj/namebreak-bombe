@@ -242,6 +242,7 @@ namebreak_search_library(namebreak_search)
 # the pause key (used in every mode), alongside the hostname/username lookups
 # the coordinator client wants.
 add_library(namebreak_common STATIC
+    src/common/autotune.cpp
     src/common/config.cpp
     src/common/matches_file.cpp
     src/common/platform.cpp

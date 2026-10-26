@@ -941,6 +941,19 @@ bool updateConfigForMode(const std::string& path, const std::string& mode, const
 
     if (!setModeKey(path, mode, error))
         return false;
+    return updateConfigSection(path, sectionName, keys, error);
+}
+
+bool updateConfigSection(const std::string& path, const std::string& sectionName, const std::vector<std::pair<std::string, std::string>>& keys,
+                         std::string& error) {
+    {
+        // ensureSectionExists appends to the file, which needs to be there.
+        std::ofstream create(path, std::ios::app);
+        if (!create) {
+            error = "cannot write " + path;
+            return false;
+        }
+    }
     if (!ensureSectionExists(path, sectionName, error))
         return false;
 
