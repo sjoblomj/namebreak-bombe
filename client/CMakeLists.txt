@@ -233,7 +233,16 @@ function(namebreak_search_library name)
     target_link_libraries(${name} PUBLIC Threads::Threads)
 endfunction()
 
-namebreak_search_library(namebreak_search)
+# The CUDA/HIP backend's tuning values are compile-time macros (see
+# src/backends/cuda/tuning.h); NAMEBREAK_TUNING sets them for the program's
+# own search library (and the tests built against it), e.g.
+# -DNAMEBREAK_TUNING="NAMEBREAK_ROWS_PER_THREAD=25;NAMEBREAK_GPU_WINDOW_CHARS=6".
+# scripts/autotune/autotune.py finds the fastest for a GPU this way. The
+# overflow and stress tests' libraries get them too; the tests' other
+# configurations (NAMEBREAK_TEST_VARIANTS), which set some of them
+# themselves, keep theirs.
+set(NAMEBREAK_TUNING "" CACHE STRING "Tuning macros for the search library, ;-separated NAME=VALUE (see src/backends/cuda/tuning.h)")
+namebreak_search_library(namebreak_search ${NAMEBREAK_TUNING})
 
 # --- The program -------------------------------------------------------------
 
@@ -662,7 +671,7 @@ namebreak_test(listfile-reference listfile_test --backend reference --listfile $
 
 # What runSearch() does when a batch has more hashA hits than MAX_MATCHES can
 # record - built with MAX_MATCHES=1 so a single hashA collision pair overflows it.
-namebreak_search_library(namebreak_search_overflow MAX_MATCHES=1)
+namebreak_search_library(namebreak_search_overflow MAX_MATCHES=1 ${NAMEBREAK_TUNING})
 namebreak_test_executable(search_overflow_test tests/search_overflow_test.cpp namebreak_search_overflow)
 foreach(backend IN LISTS ROW_BACKENDS ITEMS reference)
     namebreak_test(overflow-${backend} search_overflow_test --backend ${backend})
@@ -684,7 +693,7 @@ endforeach()
 # hits the host would have dropped too.
 set(STRESS_BACKENDS ${ROW_BACKENDS})
 set(STRESS_DEFINITIONS NAMEBREAK_HASHA_MATCH_BITS=12)
-namebreak_search_library(namebreak_search_stress ${STRESS_DEFINITIONS})
+namebreak_search_library(namebreak_search_stress ${STRESS_DEFINITIONS} ${NAMEBREAK_TUNING})
 namebreak_test_executable(search_stress_test tests/search_stress_test.cpp namebreak_search_stress)
 foreach(backend IN LISTS STRESS_BACKENDS ITEMS reference)
     namebreak_test(stress-${backend} search_stress_test --backend ${backend})

@@ -236,23 +236,40 @@ int runAutotune(const std::string& configPath, const std::string& requestedBacke
     const std::vector<std::string> names = backendNames();
     std::string backend = requestedBackend;
     if (backend.empty()) {
-        for (const char* candidate : {"opencl", "metal"}) {
-            if (std::find(names.begin(), names.end(), candidate) != names.end()) {
-                backend = candidate;
-                break;
-            }
+        // The backend this machine's searches run on - a CUDA build with
+        // OpenCL too searches with CUDA, which tuning OpenCL wouldn't speed
+        // up.
+        std::string why;
+        std::unique_ptr<SearchBackend> searching;
+        {
+            SilencedStdout silenced;
+            searching = createBackend("", why);
         }
-        if (backend.empty()) {
-            fprintf(stderr, "--autotune tunes the OpenCL and Metal backends, and this build has neither (it has the CUDA backend's values "
-                            "compiled in - see src/backends/cuda/tuning.h)\n");
+        if (!searching) {
+            fprintf(stderr, "%s\n", why.c_str());
             return 1;
         }
-    } else if (gpuTuningKeys(backend).empty()) {
-        fprintf(stderr, "--autotune tunes the opencl and metal backends, not '%s'%s\n", backend.c_str(),
-                backend == "cuda" || backend == "hip" ? " (its values are compiled in - see src/backends/cuda/tuning.h)" : "");
-        return 1;
-    } else if (std::find(names.begin(), names.end(), backend) == names.end()) {
+        backend = searching->name();
+    }
+    if (std::find(names.begin(), names.end(), backend) == names.end()) {
         fprintf(stderr, "this build has no '%s' backend\n", backend.c_str());
+        return 1;
+    }
+    const bool hasOpenCl = std::find(names.begin(), names.end(), "opencl") != names.end();
+    if (backend == "cuda" || backend == "hip") {
+        fprintf(stderr,
+                "%s searches with the %s backend, whose launch settings are compiled into the program, so --autotune\n"
+                "can't change them. A script in the source code builds the client with each setting and keeps the\n"
+                "fastest: client/scripts/autotune/ at https://github.com/sjoblomj/namebreak-bombe - its README.md\n"
+                "says what it needs.%s\n",
+                requestedBackend.empty() ? "This machine" : "The client", backend.c_str(),
+                hasOpenCl ? "\n(--autotune --backend opencl tunes this build's OpenCL backend instead, for searches run with --backend opencl.)"
+                          : "");
+        return 1;
+    }
+    if (gpuTuningKeys(backend).empty()) {
+        fprintf(stderr, "%s searches with the %s backend, which has nothing to tune - --autotune tunes the opencl and metal backends\n",
+                requestedBackend.empty() ? "This machine" : "The client", backend.c_str());
         return 1;
     }
 

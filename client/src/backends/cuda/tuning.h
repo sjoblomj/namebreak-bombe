@@ -116,17 +116,26 @@ constexpr uint32_t kDictionaryLanesPerRun = dictionaryLanesPerRun(kDictionaryThr
 // at once (__launch_bounds__): 6, as many as its 256 threads fit on an
 // RTX 30 series' (1,536), which caps it at 40 registers - what it used
 // before it had pairs (see DictionaryBatch), which took it to 40 to 50,
-// and 5 blocks, without. Not on AMD's GPUs (HIP), which read the number as
+// and 5 blocks, without. Blocks of another size take as many as fit in
+// those 1,536 threads, at most 6, so the registers each thread may have
+// stay about the same. Not on AMD's GPUs (HIP), which read the number as
 // waves per SIMD, and which it hasn't been measured on.
-constexpr int kDictionaryMinBlocksPerSm = 6;
+constexpr int kDictionaryMinBlocksPerSm =
+    1536 / kDictionaryThreadsPerBlock < 1 ? 1 : 1536 / kDictionaryThreadsPerBlock > 6 ? 6 : 1536 / kDictionaryThreadsPerBlock;
 
 // Largest trailing (GPU-enumerated) length the kernel supports. A row index
 // (alphabetSize^(trailingLen-1)) must fit in 32 bits: 63^5 < 2^32 <= 63^6.
 constexpr int kMaxTrailingLen = 6;
 
-// Threads per block. Must be >= MAX_ALPHABET_SIZE: filteredRowsKernel fills its
-// shared tables one entry per thread.
-constexpr int kThreadsPerBlock = 256;
+// Threads per block of the row search (and the meet-in-the-middle walk). Must
+// be >= MAX_ALPHABET_SIZE: filteredRowsKernel fills its shared tables one
+// entry per thread. Overridable at compile time
+// (-DNAMEBREAK_THREADS_PER_BLOCK=N), for scripts/autotune.
+#ifndef NAMEBREAK_THREADS_PER_BLOCK
+#define NAMEBREAK_THREADS_PER_BLOCK 256
+#endif
+constexpr int kThreadsPerBlock = NAMEBREAK_THREADS_PER_BLOCK;
+static_assert(kThreadsPerBlock >= 64 && kThreadsPerBlock <= 1024, "NAMEBREAK_THREADS_PER_BLOCK must be between 64 and 1024");
 
 static_assert(NAMEBREAK_GPU_WINDOW_CHARS >= 1 && NAMEBREAK_GPU_WINDOW_CHARS <= kMaxTrailingLen,
               "NAMEBREAK_GPU_WINDOW_CHARS must be between 1 and kMaxTrailingLen");

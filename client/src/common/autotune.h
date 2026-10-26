@@ -34,8 +34,9 @@
 // section, so later releases' defaults apply. dictionary_tails_per_cell,
 // which only searches with tails would show, is left as the file has it.
 //
-// `backend` is the backend to tune - empty for the first of opencl and metal
-// this build has. `abortRequested`, if given, ends the tuning early (and
+// `backend` is the backend to tune - empty for the one a search would use
+// here (createBackend's choice, backends.h). CUDA and HIP are refused, with
+// a pointer to scripts/autotune/, which tunes their compiled-in values. `abortRequested`, if given, ends the tuning early (and
 // writes nothing). Returns the process's exit code: 0 once done, 1 on an
 // error, which it has printed.
 int runAutotune(const std::string& configPath, const std::string& backend, double secondsPerTrial, std::atomic<bool>* abortRequested);

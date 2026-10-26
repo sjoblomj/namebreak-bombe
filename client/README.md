@@ -208,7 +208,9 @@ may well do better with other values. None of them changes what a search
 finds; the backend still runs its self-tests with them before it searches.
 The start of a search shows what it uses (`OpenCL launches: ...`). The CUDA
 backend compiles its kernels ahead of time, with these values built into
-them (`src/backends/cuda/tuning.h`), so it takes none of them.
+them (`src/backends/cuda/tuning.h`), so it takes none of them: to tune
+those, [`scripts/autotune/`](scripts/autotune/README.md) builds the client
+with each setting on the machine and keeps the fastest.
 
 | Key | Default (OpenCL / Metal) | Range | What it is |
 |---|---|---|---|
@@ -227,8 +229,10 @@ window_chars = 6
 ```
 
 Rather than trying values by hand, `namebreak --autotune` (with
-`--config <file>` and `--backend opencl|metal` if need be) measures them
-on the machine's GPU and writes the fastest to that section. It times a
+`--config <file>`, and `--backend opencl|metal` to tune one other than the
+one a search would use) measures them on the machine's GPU and writes the
+fastest to that section. On a machine that searches with CUDA or HIP it
+says so, and points at `scripts/autotune/`. It times a
 search like `search_bench`'s (the real 49-character alphabet, nothing
 pruned) for the row search keys, and one like `dictionary_bench`'s
 (english-1, with a key) for the dictionary ones, about two seconds a trial
@@ -742,6 +746,7 @@ Options, passed to the first command as `-D<option>=<value>`:
 | `NAMEBREAK_METAL` | `AUTO` | The Metal backend: `AUTO` builds it on macOS (Xcode's command line tools are all it needs), `OFF` leaves it out |
 | `NAMEBREAK_OPENCL` | `AUTO` | The OpenCL backend: `AUTO` builds it if OpenCL's headers and loader library are found (on Debian/Ubuntu: `opencl-headers ocl-icd-opencl-dev`; on Windows e.g. vcpkg's `opencl`), `ON` insists, `OFF` leaves it out |
 | `NAMEBREAK_BENCH_WINDOW` | *(empty)* | A different GPU window for `search_bench` only, e.g. `6` |
+| `NAMEBREAK_TUNING` | *(empty)* | The CUDA/HIP backend's compile-time launch settings (`src/backends/cuda/tuning.h`), `;`-separated, e.g. `NAMEBREAK_ROWS_PER_THREAD=25;NAMEBREAK_GPU_WINDOW_CHARS=6` - what [`scripts/autotune/`](scripts/autotune/README.md) finds the fastest of for a GPU |
 | `NAMEBREAK_REQUIRE_GPU` | `OFF` | `ON` makes `ctest` fail, rather than skip, the tests of a backend that can't run on the machine - for a machine with the GPUs the build is for, where that means a broken driver (see [Backends](#backends)) |
 
 On Windows, use a Visual Studio developer prompt (MSVC is the host compiler
