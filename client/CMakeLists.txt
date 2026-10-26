@@ -129,6 +129,7 @@ set(SEARCH_SOURCES
     src/engine/meet_in_the_middle_search.cpp
     src/engine/wordlist.cpp
     src/backends/backends.cpp
+    src/backends/gpu_tuning.cpp
     src/backends/self_test.cpp
     src/backends/common/dictionary_batch.cpp
     src/backends/common/launch_waiter.cpp

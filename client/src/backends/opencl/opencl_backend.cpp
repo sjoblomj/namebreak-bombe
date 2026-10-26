@@ -47,8 +47,10 @@ namespace {
 
 // Work-items per work-group, unless the device or kernel allows fewer. Must
 // be >= the alphabet size: the kernel fills its local tables one entry per
-// work-item.
-constexpr size_t kPreferredWorkGroupSize = 256;
+// work-item. This and the other k*Default values below are what the backend
+// uses where config.conf's [opencl] says nothing (GpuTuning, see
+// backends/gpu_tuning.h).
+constexpr int kWorkGroupSizeDefault = 256;
 
 // About how many rows of a row group one work-item searches (ROWS_PER_THREAD
 // in search.cl; see kChunksPerGroup in the CUDA backend). On the RTX 3080 Ti
@@ -56,7 +58,7 @@ constexpr size_t kPreferredWorkGroupSize = 256;
 // about 880 G candidates/s, 7 about 1,300, 25 about 1,435, and 49 and 64 about
 // 1,460 - a whole row group per work-item, for any alphabet size. (CUDA's
 // kernel does best with two chunks per group; this one doesn't.)
-constexpr int kRowsPerThread = rowsPerThreadOr(64);
+constexpr int kRowsPerThreadDefault = rowsPerThreadOr(64);
 
 // How many batches - usually each a whole leading value - one launch searches
 // at most (SearchBackend::maxBatchesPerCall; see NAMEBREAK_BATCHES_PER_LAUNCH
@@ -64,8 +66,10 @@ constexpr int kRowsPerThread = rowsPerThreadOr(64);
 // A launch of one leading value is so short that the gaps between launches,
 // and a CPU core spinning through all of them, cost more than they need to.
 constexpr int kMaxBatchesPerLaunch = 32; // the batches buffer's size
-constexpr int kBatchesPerLaunch = batchesPerLaunchOr(16);
-static_assert(kBatchesPerLaunch >= 1 && kBatchesPerLaunch <= kMaxBatchesPerLaunch, "NAMEBREAK_BATCHES_PER_LAUNCH must be 1-32");
+constexpr int kBatchesPerLaunchDefault = batchesPerLaunchOr(16);
+static_assert(kBatchesPerLaunchDefault >= 1 && kBatchesPerLaunchDefault <= kMaxBatchesPerLaunch, "NAMEBREAK_BATCHES_PER_LAUNCH must be 1-32");
+// How many trailing characters the GPU enumerates (SearchBackend::windowChars).
+constexpr int kWindowCharsDefault = windowCharsOr(5);
 
 // A launch of a search that prunes the whole candidate walks its batches'
 // lists of row groups (LISTED in search.cl) only if they leave out at least
@@ -117,9 +121,9 @@ constexpr uint64_t kDictionaryCandidatesPerLaunch = 1ull << 28;
 constexpr uint64_t kMeetInTheMiddleTailsPerLaunch = NAMEBREAK_MEET_IN_THE_MIDDLE_TAILS_PER_LAUNCH;
 constexpr cl_uint kMeetInTheMiddleHitCapacity = NAMEBREAK_MEET_IN_THE_MIDDLE_HIT_CAPACITY;
 constexpr size_t kMeetInTheMiddleWorkGroupSize = 256;
-constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
-constexpr size_t kDictionaryWorkGroupSize = dictionaryThreadsPerBlockOr(256);
-constexpr int kDictionaryTailsPerCell = dictionaryTailsPerCellOr(32);
+constexpr int kDictionaryWordsPerThreadDefault = dictionaryWordsPerThreadOr(32);
+constexpr int kDictionaryWorkGroupSizeDefault = dictionaryThreadsPerBlockOr(256);
+constexpr int kDictionaryTailsPerCellDefault = dictionaryTailsPerCellOr(32);
 
 std::string deviceInfoString(cl_device_id device, cl_device_info what) {
     size_t size = 0;
@@ -133,8 +137,12 @@ std::string deviceInfoString(cl_device_id device, cl_device_info what) {
 
 class OpenClBackend : public SearchBackend {
 public:
-    OpenClBackend(cl_device_id device, cl_context context, cl_command_queue queue)
-        : device_(device), context_(context), queue_(queue) {
+    // `tuning` has every value set (withDefaults).
+    OpenClBackend(cl_device_id device, cl_context context, cl_command_queue queue, const GpuTuning& tuning)
+        : device_(device), context_(context), queue_(queue), tuning_(tuning), rowsPerThread_(*tuning.rowsPerThread),
+          batchesPerLaunch_(*tuning.batchesPerLaunch), windowChars_(*tuning.windowChars), workGroupSize_((size_t) *tuning.workGroupSize),
+          dictionaryWordsPerThread_(*tuning.dictionaryWordsPerThread), dictionaryWorkGroupSize_((size_t) *tuning.dictionaryWorkGroupSize),
+          dictionaryTailsPerCell_(*tuning.dictionaryTailsPerCell) {
         cl_int err = CL_SUCCESS;
         results_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, sizeof(BatchResults), nullptr, &err);
         CL_CHECK(err);
@@ -188,7 +196,7 @@ public:
     }
 
     const char* name() const override { return "opencl"; }
-    int windowChars() const override { return windowCharsOr(5); }
+    int windowChars() const override { return windowChars_; }
     // Row indices are 32-bit in the kernel: 63^5 < 2^32 <= 63^6.
     int maxTrailingLen() const override { return 6; }
     uint64_t batchSize(int alphabetSize) const override { return (uint64_t) alphabetSize * rowsPerBatchOr(1u << 23); }
@@ -196,7 +204,7 @@ public:
     void beginSearch(const SearchConstants& constants) override;
     BatchOutcome runBatch(int trailingLen, uint64_t start, uint64_t count, const BatchParams& params) override;
     void endSearch() override {}
-    int maxBatchesPerCall() const override { return kBatchesPerLaunch; }
+    int maxBatchesPerCall() const override { return batchesPerLaunch_; }
     BatchOutcome runBatches(int trailingLen, const std::vector<BatchRequest>& batches) override;
 
     // A dictionary search: one launch of dictionary.cl's kernel per call.
@@ -230,9 +238,22 @@ private:
     cl_mem createBuffer(cl_mem_flags flags, size_t bytes);
     void releaseDictionaryBuffers();
 
+    // Prints the device and the launch geometry, before the first search
+    // of any kind.
+    void announceDevice();
+
     cl_device_id device_;
     cl_context context_;
     cl_command_queue queue_;
+    // The launch geometry (see GpuTuning), every value set.
+    GpuTuning tuning_;
+    int rowsPerThread_;
+    int batchesPerLaunch_;
+    int windowChars_;
+    size_t workGroupSize_;
+    int dictionaryWordsPerThread_;
+    size_t dictionaryWorkGroupSize_;
+    int dictionaryTailsPerCell_;
     cl_mem results_ = nullptr; // a BatchResults
     cl_mem batches_ = nullptr; // the launch's LaunchBatches
     // The host's copies: the batches, written without waiting (they must stay
@@ -340,12 +361,16 @@ constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
     exit(1);
 }
 
+void OpenClBackend::announceDevice() {
+    if (announcedDevice_)
+        return;
+    printf("OpenCL device: %s (%s)\n", deviceInfoString(device_, CL_DEVICE_NAME).c_str(), deviceInfoString(device_, CL_DEVICE_VERSION).c_str());
+    printf("OpenCL launches: %s\n", describeGpuTuning("opencl", tuning_).c_str());
+    announcedDevice_ = true;
+}
+
 void OpenClBackend::beginSearch(const SearchConstants& constants) {
-    if (!announcedDevice_) {
-        printf("OpenCL device: %s (%s)\n", deviceInfoString(device_, CL_DEVICE_NAME).c_str(),
-               deviceInfoString(device_, CL_DEVICE_VERSION).c_str());
-        announcedDevice_ = true;
-    }
+    announceDevice();
     verifier_.begin(constants);
     alphabetSize_ = (int) constants.alphabet.size();
     suffixLen_ = (int) constants.suffix.size();
@@ -420,7 +445,7 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, b
                                 " -DTRAILING_LEN=" + std::to_string(trailingLen) + " -DMAX_MATCHES=" + std::to_string(MAX_MATCHES) +
                                 " -DHASHA_MATCH_MASK=" + std::to_string(kHashAMatchMask) + "u" +
                                 " -DFILTER_BITS=" + std::to_string(kLowBitsFilterBits) +
-                                " -DROWS_PER_THREAD=" + std::to_string(kRowsPerThread) + " -DROW_FLAG_BITS=" + std::to_string(kRowFlagBits) +
+                                " -DROWS_PER_THREAD=" + std::to_string(rowsPerThread_) + " -DROW_FLAG_BITS=" + std::to_string(kRowFlagBits) +
                                 " -DLISTED=" + (listed ? "1" : "0") + insertMacros_;
     cl_program program = buildProgram(kSearchKernelSource, options, "search");
     CompiledKernel compiled;
@@ -429,7 +454,7 @@ const OpenClBackend::CompiledKernel& OpenClBackend::kernelFor(int trailingLen, b
     CL_CHECK(err);
     size_t kernelMax = 0;
     CL_CHECK(clGetKernelWorkGroupInfo(compiled.kernel, device_, CL_KERNEL_WORK_GROUP_SIZE, sizeof(kernelMax), &kernelMax, nullptr));
-    compiled.workGroupSize = std::min(kPreferredWorkGroupSize, kernelMax);
+    compiled.workGroupSize = std::min(workGroupSize_, kernelMax);
     if (compiled.workGroupSize < (size_t) alphabetSize_) {
         fprintf(stderr, "OpenCL: the device allows only %zu work-items per group, fewer than the alphabet's %d characters\n",
                 compiled.workGroupSize, alphabetSize_);
@@ -486,8 +511,8 @@ BatchOutcome OpenClBackend::runBatch(int trailingLen, uint64_t start, uint64_t c
 
 BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& requests) {
     const int batchCount = (int) requests.size();
-    if (batchCount < 1 || batchCount > kBatchesPerLaunch) {
-        fprintf(stderr, "INTERNAL ERROR: %d batches for one launch (1 to %d allowed) - exiting\n", batchCount, kBatchesPerLaunch);
+    if (batchCount < 1 || batchCount > batchesPerLaunch_) {
+        fprintf(stderr, "INTERNAL ERROR: %d batches for one launch (1 to %d allowed) - exiting\n", batchCount, batchesPerLaunch_);
         exit(1);
     }
     // Each batch's rows, cut to its range in its first and last row (see
@@ -560,7 +585,7 @@ BatchOutcome OpenClBackend::runBatches(int trailingLen, const std::vector<BatchR
     // work-groups. The kernel works out each batch's chunks itself and covers
     // all of them whatever the global size, so this only spreads the work.
     const size_t local[2] = {compiled.workGroupSize, 1};
-    const size_t chunksPerGroup = (size_t) (alphabetSize_ + kRowsPerThread - 1) / kRowsPerThread;
+    const size_t chunksPerGroup = (size_t) (alphabetSize_ + rowsPerThread_ - 1) / rowsPerThread_;
     const size_t chunks = (size_t) maxGroups * chunksPerGroup;
     const size_t global[2] = {(chunks + local[0] - 1) / local[0] * local[0], (size_t) batchCount};
     const LaunchWaiter::Clock::time_point launched = LaunchWaiter::Clock::now();
@@ -625,11 +650,7 @@ cl_mem OpenClBackend::createBuffer(cl_mem_flags flags, size_t bytes) {
 }
 
 void OpenClBackend::beginDictionarySearch(const DictionaryConstants& constants) {
-    if (!announcedDevice_) {
-        printf("OpenCL device: %s (%s)\n", deviceInfoString(device_, CL_DEVICE_NAME).c_str(),
-               deviceInfoString(device_, CL_DEVICE_VERSION).c_str());
-        announcedDevice_ = true;
-    }
+    announceDevice();
     releaseDictionaryBuffers();
     dictionaryVerifier_.begin(constants);
     dictionaryHashes_ = dictionaryVerifier_.hashes();
@@ -698,11 +719,7 @@ void OpenClBackend::releaseDictionaryBuffers() {
 }
 
 void OpenClBackend::beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) {
-    if (!announcedDevice_) {
-        printf("OpenCL device: %s (%s)\n", deviceInfoString(device_, CL_DEVICE_NAME).c_str(),
-               deviceInfoString(device_, CL_DEVICE_VERSION).c_str());
-        announcedDevice_ = true;
-    }
+    announceDevice();
     releaseMeetInTheMiddleBuffers();
     meet_in_the_middle_ = constants;
     const MeetInTheMiddleTable& table = *constants.table;
@@ -880,9 +897,9 @@ const OpenClBackend::CompiledKernel& OpenClBackend::dictionaryKernel() {
         return found->second;
     const std::string options = "-cl-std=CL1.2 -DSUFFIX_LEN=" + std::to_string(dictionarySuffixLen_) +
                                 " -DHASHES=" + std::to_string((int) dictionaryHashes_) +
-                                " -DWORDS_PER_THREAD=" + std::to_string(kDictionaryWordsPerThread) +
+                                " -DWORDS_PER_THREAD=" + std::to_string(dictionaryWordsPerThread_) +
                                 " -DTAILS=" + (dictionaryHasTails_ ? "1" : "0") +
-                                " -DTAILS_PER_CELL=" + std::to_string(kDictionaryTailsPerCell) +
+                                " -DTAILS_PER_CELL=" + std::to_string(dictionaryTailsPerCell_) +
                                 " -DPAIR_SLOTS=" + std::to_string(kDictionaryPairSlots) +
                                 " -DFILTER_BITS=" + std::to_string(kDictionaryFilterBits) +
                                 " -DFILTER_WORDS=" + std::to_string(kDictionaryFilterWords) +
@@ -895,7 +912,7 @@ const OpenClBackend::CompiledKernel& OpenClBackend::dictionaryKernel() {
     CL_CHECK(err);
     size_t kernelMax = 0;
     CL_CHECK(clGetKernelWorkGroupInfo(compiled.kernel, device_, CL_KERNEL_WORK_GROUP_SIZE, sizeof(kernelMax), &kernelMax, nullptr));
-    compiled.workGroupSize = std::min(kDictionaryWorkGroupSize, kernelMax);
+    compiled.workGroupSize = std::min(dictionaryWorkGroupSize_, kernelMax);
     return dictionaryKernels_.emplace(key, compiled).first->second;
 }
 
@@ -904,8 +921,8 @@ DictionaryOutcome OpenClBackend::runDictionaryBatches(const std::vector<Dictiona
     if (batches.empty())
         return outcome;
     const CompiledKernel& compiled = dictionaryKernel();
-    const uint32_t cellsPerSegment = (uint32_t) (kDictionaryWordsPerThread * compiled.workGroupSize);
-    const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? kDictionaryTailsPerCell : 1, dictionaryLaunch_);
+    const uint32_t cellsPerSegment = (uint32_t) (dictionaryWordsPerThread_ * compiled.workGroupSize);
+    const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? dictionaryTailsPerCell_ : 1, dictionaryLaunch_);
     uint64_t candidates = 0;
     for (const DictionaryBatch& batch : batches)
         candidates += dictionaryBatchCandidates(batch);
@@ -1013,7 +1030,19 @@ DictionaryOutcome OpenClBackend::runDictionaryBatches(const std::vector<Dictiona
 
 } // namespace
 
-std::unique_ptr<SearchBackend> makeOpenClBackend(std::string& error) {
+GpuTuning openClTuningDefaults() {
+    GpuTuning defaults;
+    defaults.rowsPerThread = kRowsPerThreadDefault;
+    defaults.batchesPerLaunch = kBatchesPerLaunchDefault;
+    defaults.windowChars = kWindowCharsDefault;
+    defaults.workGroupSize = kWorkGroupSizeDefault;
+    defaults.dictionaryWordsPerThread = kDictionaryWordsPerThreadDefault;
+    defaults.dictionaryWorkGroupSize = kDictionaryWorkGroupSizeDefault;
+    defaults.dictionaryTailsPerCell = kDictionaryTailsPerCellDefault;
+    return defaults;
+}
+
+std::unique_ptr<SearchBackend> makeOpenClBackend(const GpuTuning& tuning, std::string& error) {
     cl_uint platformCount = 0;
     if (clGetPlatformIDs(0, nullptr, &platformCount) != CL_SUCCESS || platformCount == 0) {
         error = "no OpenCL platform (driver) installed";
@@ -1035,7 +1064,7 @@ std::unique_ptr<SearchBackend> makeOpenClBackend(std::string& error) {
             clReleaseContext(context);
             continue;
         }
-        return std::make_unique<OpenClBackend>(device, context, queue);
+        return std::make_unique<OpenClBackend>(device, context, queue, withDefaults(tuning, openClTuningDefaults()));
     }
     error = "no OpenCL GPU found";
     return nullptr;

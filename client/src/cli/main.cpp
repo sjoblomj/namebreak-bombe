@@ -263,6 +263,13 @@ int main(int argc, char* argv[]) {
     if (!backendOverride.empty())
         config.backend = backendOverride;
 
+    BackendTunings tunings;
+    if (!buildBackendTunings(config, tunings, error)) {
+        fprintf(stderr, "%s %s\n", configPath.c_str(), error.c_str());
+        return 1;
+    }
+    setBackendTunings(tunings);
+
     std::string mode = !modeOverride.empty() ? modeOverride : config.mode;
     if (mode != "continuous" && mode != "bounded" && mode != "coordinator" && mode != "dictionary" && mode != "meet-in-the-middle") {
         fprintf(stderr, "Unknown or missing mode '%s' - expected continuous, bounded, coordinator, dictionary, or meet-in-the-middle "

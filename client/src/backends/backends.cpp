@@ -24,9 +24,24 @@ struct BackendEntry {
     std::unique_ptr<SearchBackend> (*make)(std::string& error);
 };
 
+BackendTunings& tunings() {
+    static BackendTunings value;
+    return value;
+}
+
 std::unique_ptr<SearchBackend> makeReference(std::string&) {
     return makeReferenceBackend();
 }
+#ifdef NAMEBREAK_WITH_METAL
+std::unique_ptr<SearchBackend> makeMetal(std::string& error) {
+    return makeMetalBackend(tunings().metal, error);
+}
+#endif
+#ifdef NAMEBREAK_WITH_OPENCL
+std::unique_ptr<SearchBackend> makeOpenCl(std::string& error) {
+    return makeOpenClBackend(tunings().opencl, error);
+}
+#endif
 
 // Most preferred first.
 const std::vector<BackendEntry>& backendEntries() {
@@ -39,10 +54,10 @@ const std::vector<BackendEntry>& backendEntries() {
         {"hip", makeCudaBackend},
 #endif
 #ifdef NAMEBREAK_WITH_METAL
-        {"metal", makeMetalBackend},
+        {"metal", makeMetal},
 #endif
 #ifdef NAMEBREAK_WITH_OPENCL
-        {"opencl", makeOpenClBackend},
+        {"opencl", makeOpenCl},
 #endif
         {"cpu", makeCpuBackend},
         {"reference", makeReference},
@@ -57,6 +72,26 @@ std::vector<std::string> backendNames() {
     for (const BackendEntry& entry : backendEntries())
         names.push_back(entry.name);
     return names;
+}
+
+void setBackendTunings(const BackendTunings& value) {
+    tunings() = value;
+}
+
+const BackendTunings& backendTunings() {
+    return tunings();
+}
+
+GpuTuning defaultGpuTuning([[maybe_unused]] const std::string& name) {
+#ifdef NAMEBREAK_WITH_METAL
+    if (name == "metal")
+        return metalTuningDefaults();
+#endif
+#ifdef NAMEBREAK_WITH_OPENCL
+    if (name == "opencl")
+        return openClTuningDefaults();
+#endif
+    return GpuTuning();
 }
 
 namespace {

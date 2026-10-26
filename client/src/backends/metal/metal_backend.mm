@@ -34,14 +34,18 @@ namespace {
 
 // Threads per threadgroup, unless the pipeline allows fewer. Must be >= the
 // alphabet size: the kernel fills its threadgroup tables one entry per thread.
-constexpr NSUInteger kPreferredThreadgroupSize = 256;
+// This and the other k*Default values below are what the backend uses where
+// config.conf's [metal] says nothing (GpuTuning, see backends/gpu_tuning.h).
+constexpr int kThreadgroupSizeDefault = 256;
 
 // About how many rows of a row group one thread searches (ROWS_PER_THREAD in
 // search.metal; see kChunksPerGroup in the CUDA backend). Not tuned yet: this
 // is CUDA's value, two chunks per group at the usual alphabet sizes, rather
 // than OpenCL's whole group per thread, so that a batch still has enough
 // threads for the largest Apple GPUs. See PERFORMANCE.md.
-constexpr int kRowsPerThread = rowsPerThreadOr(25);
+constexpr int kRowsPerThreadDefault = rowsPerThreadOr(25);
+// How many trailing characters the GPU enumerates (SearchBackend::windowChars).
+constexpr int kWindowCharsDefault = windowCharsOr(5);
 
 // A dictionary search's launches (dictionary.metal): how many candidates one
 // covers at most (SearchBackend::dictionaryCandidatesPerCall) - a quarter
@@ -51,9 +55,9 @@ constexpr int kRowsPerThread = rowsPerThreadOr(25);
 // product. And with tails, how many a cell has (see DictionaryLaunchBatch).
 // Not tuned yet: the CUDA backend's values (see its tuning.h).
 constexpr uint64_t kDictionaryCandidatesPerLaunch = 1ull << 26;
-constexpr int kDictionaryWordsPerThread = dictionaryWordsPerThreadOr(32);
-constexpr NSUInteger kDictionaryThreadgroupSize = dictionaryThreadsPerBlockOr(256);
-constexpr int kDictionaryTailsPerCell = dictionaryTailsPerCellOr(32);
+constexpr int kDictionaryWordsPerThreadDefault = dictionaryWordsPerThreadOr(32);
+constexpr int kDictionaryThreadgroupSizeDefault = dictionaryThreadsPerBlockOr(256);
+constexpr int kDictionaryTailsPerCellDefault = dictionaryTailsPerCellOr(32);
 
 // A meet-in-the-middle search's launches (meet_in_the_middle.metal): about
 // how many tails one rewinds, how many hits it has room for at first (see
@@ -105,7 +109,11 @@ struct RowArgs {
 
 class MetalBackend : public SearchBackend {
 public:
-    explicit MetalBackend(id<MTLDevice> device) : device_(device) {
+    // `tuning` has every value it takes set (withDefaults).
+    MetalBackend(id<MTLDevice> device, const GpuTuning& tuning)
+        : device_(device), tuning_(tuning), rowsPerThread_(*tuning.rowsPerThread), windowChars_(*tuning.windowChars),
+          threadgroupSize_((NSUInteger) *tuning.workGroupSize), dictionaryWordsPerThread_(*tuning.dictionaryWordsPerThread),
+          dictionaryThreadgroupSize_((NSUInteger) *tuning.dictionaryWorkGroupSize), dictionaryTailsPerCell_(*tuning.dictionaryTailsPerCell) {
         queue_ = [device_ newCommandQueue];
         // Shared storage: CPU and GPU see the same memory (unified on Apple
         // Silicon), so there's nothing to copy back and forth.
@@ -130,7 +138,7 @@ public:
     }
 
     const char* name() const override { return "metal"; }
-    int windowChars() const override { return windowCharsOr(5); }
+    int windowChars() const override { return windowChars_; }
     // Row indices are 32-bit in the kernel: 63^5 < 2^32 <= 63^6.
     int maxTrailingLen() const override { return 6; }
     // A quarter of CUDA's batch: Apple GPUs are slower, and a batch should
@@ -165,7 +173,19 @@ private:
     // `data` copied in, if given. Ends the process if it can't be made.
     id<MTLBuffer> sharedBuffer(size_t bytes, const void* data = nullptr);
 
+    // Prints the device and the launch geometry, before the first search
+    // of any kind.
+    void announceDevice();
+
     id<MTLDevice> device_;
+    // The launch geometry (see GpuTuning), every value it takes set.
+    GpuTuning tuning_;
+    int rowsPerThread_;
+    int windowChars_;
+    NSUInteger threadgroupSize_;
+    int dictionaryWordsPerThread_;
+    NSUInteger dictionaryThreadgroupSize_;
+    int dictionaryTailsPerCell_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> matchCount_, matchIdx_;
     id<MTLBuffer> alphabetKey_, alphabetOrd_, suffixKey_, suffixOrd_;
@@ -255,11 +275,16 @@ constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
     exit(1);
 }
 
+void MetalBackend::announceDevice() {
+    if (announcedDevice_)
+        return;
+    printf("Metal device: %s\n", device_.name.UTF8String);
+    printf("Metal launches: %s\n", describeGpuTuning("metal", tuning_).c_str());
+    announcedDevice_ = true;
+}
+
 void MetalBackend::beginSearch(const SearchConstants& constants) {
-    if (!announcedDevice_) {
-        printf("Metal device: %s\n", device_.name.UTF8String);
-        announcedDevice_ = true;
-    }
+    announceDevice();
     verifier_.begin(constants);
     alphabetSize_ = (int) constants.alphabet.size();
     suffixLen_ = (int) constants.suffix.size();
@@ -356,7 +381,7 @@ id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen, bool list
             @"MAX_MATCHES": @(MAX_MATCHES),
             @"HASHA_MATCH_MASK": @(kHashAMatchMask),
             @"FILTER_BITS": @(kLowBitsFilterBits),
-            @"ROWS_PER_THREAD": @(kRowsPerThread),
+            @"ROWS_PER_THREAD": @(rowsPerThread_),
             @"ROW_FLAG_BITS": @(kRowFlagBits),
             @"LISTED": @(listed ? 1 : 0),
             @"GROUP_INSERT0_AFTER": @(l.groupCharsAfter[0]),
@@ -381,7 +406,7 @@ id<MTLComputePipelineState> MetalBackend::pipelineFor(int trailingLen, bool list
             fprintf(stderr, "Metal: creating the search pipeline failed: %s\n", error.localizedDescription.UTF8String);
             exit(1);
         }
-        if (std::min(kPreferredThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup) < (NSUInteger) alphabetSize_) {
+        if (std::min(threadgroupSize_, pipeline.maxTotalThreadsPerThreadgroup) < (NSUInteger) alphabetSize_) {
             fprintf(stderr, "Metal: the GPU allows only %lu threads per threadgroup, fewer than the alphabet's %d characters\n",
                     (unsigned long) pipeline.maxTotalThreadsPerThreadgroup, alphabetSize_);
             exit(1);
@@ -442,8 +467,8 @@ BatchOutcome MetalBackend::runBatch(int trailingLen, uint64_t start, uint64_t co
         // CHUNKS_PER_GROUP in search.metal), rounded up to whole threadgroups.
         // The kernel works out the chunks itself and covers all of them
         // whatever the grid's size, so this only spreads the work.
-        const NSUInteger threadgroupSize = std::min(kPreferredThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
-        const NSUInteger chunksPerGroup = (NSUInteger) (alphabetSize_ + kRowsPerThread - 1) / kRowsPerThread;
+        const NSUInteger threadgroupSize = std::min(threadgroupSize_, pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger chunksPerGroup = (NSUInteger) (alphabetSize_ + rowsPerThread_ - 1) / rowsPerThread_;
         const NSUInteger chunks = groupCount * chunksPerGroup;
         const NSUInteger threadgroups = (chunks + threadgroupSize - 1) / threadgroupSize;
         [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupSize, 1, 1)];
@@ -485,10 +510,7 @@ id<MTLBuffer> MetalBackend::sharedBuffer(size_t bytes, const void* data) {
 }
 
 void MetalBackend::beginDictionarySearch(const DictionaryConstants& constants) {
-    if (!announcedDevice_) {
-        printf("Metal device: %s\n", device_.name.UTF8String);
-        announcedDevice_ = true;
-    }
+    announceDevice();
     dictionaryVerifier_.begin(constants);
     dictionaryHashes_ = dictionaryVerifier_.hashes();
     dictionaryTargetA_ = constants.targetHashA;
@@ -560,9 +582,9 @@ id<MTLComputePipelineState> MetalBackend::dictionaryPipeline() {
         options.preprocessorMacros = @{
             @"SUFFIX_LEN": @(dictionarySuffixLen_),
             @"HASHES": @((int) dictionaryHashes_),
-            @"WORDS_PER_THREAD": @(kDictionaryWordsPerThread),
+            @"WORDS_PER_THREAD": @(dictionaryWordsPerThread_),
             @"TAILS": @(dictionaryHasTails_ ? 1 : 0),
-            @"TAILS_PER_CELL": @(kDictionaryTailsPerCell),
+            @"TAILS_PER_CELL": @(dictionaryTailsPerCell_),
             @"PAIR_SLOTS": @(kDictionaryPairSlots),
             @"FILTER_BITS": @(kDictionaryFilterBits),
             @"FILTER_WORDS": @(kDictionaryFilterWords),
@@ -592,9 +614,9 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
     if (batches.empty())
         return outcome;
     id<MTLComputePipelineState> pipeline = dictionaryPipeline();
-    const NSUInteger threadgroupSize = std::min(kDictionaryThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup);
-    const uint32_t cellsPerSegment = (uint32_t) (kDictionaryWordsPerThread * threadgroupSize);
-    const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? kDictionaryTailsPerCell : 1, dictionaryLaunch_);
+    const NSUInteger threadgroupSize = std::min(dictionaryThreadgroupSize_, pipeline.maxTotalThreadsPerThreadgroup);
+    const uint32_t cellsPerSegment = (uint32_t) (dictionaryWordsPerThread_ * threadgroupSize);
+    const uint64_t segments = planDictionaryLaunch(batches, cellsPerSegment, dictionaryHasTails_ ? dictionaryTailsPerCell_ : 1, dictionaryLaunch_);
     uint64_t candidates = 0;
     for (const DictionaryBatch& batch : batches)
         candidates += dictionaryBatchCandidates(batch);
@@ -686,10 +708,7 @@ DictionaryOutcome MetalBackend::runDictionaryBatches(const std::vector<Dictionar
 }
 
 void MetalBackend::beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) {
-    if (!announcedDevice_) {
-        printf("Metal device: %s\n", device_.name.UTF8String);
-        announcedDevice_ = true;
-    }
+    announceDevice();
     endMeetInTheMiddleSearch();
     meet_in_the_middle_ = constants;
     const MeetInTheMiddleTable& table = *constants.table;
@@ -871,11 +890,22 @@ MeetInTheMiddleOutcome MetalBackend::runMeetInTheMiddleBatch(const MeetInTheMidd
 
 } // namespace
 
-std::unique_ptr<SearchBackend> makeMetalBackend(std::string& error) {
+GpuTuning metalTuningDefaults() {
+    GpuTuning defaults;
+    defaults.rowsPerThread = kRowsPerThreadDefault;
+    defaults.windowChars = kWindowCharsDefault;
+    defaults.workGroupSize = kThreadgroupSizeDefault;
+    defaults.dictionaryWordsPerThread = kDictionaryWordsPerThreadDefault;
+    defaults.dictionaryWorkGroupSize = kDictionaryThreadgroupSizeDefault;
+    defaults.dictionaryTailsPerCell = kDictionaryTailsPerCellDefault;
+    return defaults;
+}
+
+std::unique_ptr<SearchBackend> makeMetalBackend(const GpuTuning& tuning, std::string& error) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) {
         error = "no Metal device";
         return nullptr;
     }
-    return std::make_unique<MetalBackend>(device);
+    return std::make_unique<MetalBackend>(device, withDefaults(tuning, metalTuningDefaults()));
 }

@@ -233,6 +233,12 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
 
     outConfig.mode = config.mode;
     outConfig.backend = config.backend;
+    BackendTunings tunings;
+    if (!buildBackendTunings(config, tunings, error)) {
+        MessageBoxA(nullptr, (configPath + " " + error).c_str(), "namebreak", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    setBackendTunings(tunings);
     if (config.mode == "coordinator") {
         if (!buildCoordinatorArgs(config, outConfig.coordinatorArgs, error)) {
             MessageBoxA(nullptr, (configPath + " [coordinator]: " + error).c_str(), "namebreak", MB_OK | MB_ICONERROR);

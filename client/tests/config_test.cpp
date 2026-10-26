@@ -1,8 +1,9 @@
 // Correctness test for what the config file (common/config.h) makes of a
 // search: where buildSearchRequest starts one - start_candidate, which is
 // optional, and resume_from_last_candidate, which may move the start to the
-// last line of the matches file - and the [dictionary] and [meet-in-the-middle]
-// sections, every key of them and what they refuse. Pure CPU.
+// last line of the matches file - and the [dictionary], [meet-in-the-middle],
+// [opencl] and [metal] sections, every key of them and what they refuse.
+// Pure CPU.
 //
 // Writes matches files under ./config_test/ - ctest runs this from its own
 // directory under build/testrun/.
@@ -439,6 +440,54 @@ static void testUpdateConfig() {
           "another mode: its own section is written, the mode set, the rest kept");
 }
 
+// What buildBackendTunings says about `config`: "" if it accepts it.
+static std::string tuningErrorOf(const ConfigFile& config, BackendTunings& out) {
+    std::string error;
+    return buildBackendTunings(config, out, error) ? "" : error;
+}
+
+static void testBackendTunings() {
+    printf("--- [opencl] and [metal] ---\n");
+    ConfigFile config;
+    BackendTunings tunings;
+    check(tuningErrorOf(config, tunings).empty() && !tunings.opencl.rowsPerThread && !tunings.metal.windowChars, "no sections: nothing set");
+    config.opencl = {{"rows_per_thread", "25"},          {"batches_per_launch", "32"},          {"window_chars", "6"},
+                     {"work_group_size", "128"},         {"dictionary_words_per_thread", "64"}, {"dictionary_work_group_size", "512"},
+                     {"dictionary_tails_per_cell", "16"}};
+    config.metal = {{"rows_per_thread", "13"}, {"work_group_size", "64"}};
+    check(tuningErrorOf(config, tunings).empty() && tunings.opencl.rowsPerThread == 25 && tunings.opencl.batchesPerLaunch == 32 &&
+              tunings.opencl.windowChars == 6 && tunings.opencl.workGroupSize == 128 && tunings.opencl.dictionaryWordsPerThread == 64 &&
+              tunings.opencl.dictionaryWorkGroupSize == 512 && tunings.opencl.dictionaryTailsPerCell == 16,
+          "every [opencl] key read");
+    check(tunings.metal.rowsPerThread == 13 && tunings.metal.workGroupSize == 64 && !tunings.metal.windowChars, "[metal] read on its own");
+    check(describeGpuTuning("metal", tunings.metal) == "rows_per_thread 13, work_group_size 64", "described as the start-up line shows it");
+    const GpuTuning full = withDefaults(tunings.metal, tunings.opencl);
+    check(full.rowsPerThread == 13 && full.windowChars == 6 && full.dictionaryTailsPerCell == 16, "withDefaults fills in only what's unset");
+
+    auto refused = [&](std::map<std::string, std::string> ConfigFile::* section, const std::string& key, const std::string& value,
+                       const std::string& expected, const std::string& what) {
+        ConfigFile bad;
+        (bad.*section)[key] = value;
+        BackendTunings ignored;
+        const std::string error = tuningErrorOf(bad, ignored);
+        check(error.find(expected) != std::string::npos, what + " (" + error + ")");
+    };
+    refused(&ConfigFile::opencl, "window_chars", "7", "window_chars must be 1 to 6", "window_chars past 6 refused");
+    refused(&ConfigFile::opencl, "rows_per_thread", "0", "rows_per_thread must be 1 to 64", "rows_per_thread 0 refused");
+    refused(&ConfigFile::opencl, "batches_per_launch", "33", "batches_per_launch must be 1 to 32", "more batches than the buffer holds refused");
+    refused(&ConfigFile::opencl, "work_group_size", "32", "work_group_size must be 64 to 1024", "a work-group smaller than an alphabet refused");
+    refused(&ConfigFile::opencl, "rows_per_thread", "-5", "expected a number", "a negative number refused");
+    refused(&ConfigFile::opencl, "rows_per_thread", "25x", "expected a number", "text refused");
+    refused(&ConfigFile::opencl, "rows_per_threads", "25", "[opencl]: unknown key 'rows_per_threads'", "a typo refused");
+    refused(&ConfigFile::metal, "batches_per_launch", "8", "launches one batch at a time", "batches_per_launch refused for Metal, saying why");
+
+    const std::string path = kDir + "/tuning.conf";
+    writeFile(path, "mode = coordinator\n[opencl]\nwindow_chars = 4\n[metal]\nrows_per_thread = 7\n");
+    std::string error;
+    check(loadConfigFile(path, config, error) && config.opencl["window_chars"] == "4" && config.metal["rows_per_thread"] == "7",
+          "loadConfigFile knows both sections (" + error + ")");
+}
+
 // A valid [meet-in-the-middle] section: the directory of SETUPDAT\BWUNIN.PIF,
 // from the hash state after it (the same values as
 // tests/data/meet_in_the_middle_cli.conf.in).
@@ -779,6 +828,7 @@ int main() {
     testDictionaryResume();
     testEnsureDictionaryConfig();
     testUpdateConfig();
+    testBackendTunings();
     testMeetInTheMiddleRequest();
     testMeetInTheMiddleResume();
 

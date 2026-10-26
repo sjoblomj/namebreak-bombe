@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "backends/gpu_tuning.h"
 #include "engine/backend.h"
 
 // The search backends compiled into this build (see NAMEBREAK_GPU etc. in
@@ -14,6 +15,22 @@
 // backends, then `cpu`, then `reference` (the slow one the others are tested
 // against, which is always there).
 std::vector<std::string> backendNames();
+
+// The launch geometry the OpenCL and Metal backends are made with from here
+// on (see GpuTuning, gpu_tuning.h) - config.conf's [opencl] and [metal]
+// sections, set once at start-up, before the first backend is created. Unset,
+// each backend's own defaults.
+struct BackendTunings {
+    GpuTuning opencl;
+    GpuTuning metal;
+};
+void setBackendTunings(const BackendTunings& tunings);
+const BackendTunings& backendTunings();
+
+// The values the backend called `name` uses for whatever its GpuTuning leaves
+// unset - every key of gpuTuningKeys(name) set. Empty for a backend this
+// build doesn't have, or that takes no tuning.
+GpuTuning defaultGpuTuning(const std::string& name);
 
 // The backend called `name` - or, if `name` is empty, the first of
 // backendNames() that can run on this machine. Null, with `error` set, if

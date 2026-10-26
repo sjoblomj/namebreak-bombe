@@ -336,9 +336,13 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 currentSection = &out.dictionary;
             } else if (name == "meet-in-the-middle") {
                 currentSection = &out.meetInTheMiddle;
+            } else if (name == "opencl") {
+                currentSection = &out.opencl;
+            } else if (name == "metal") {
+                currentSection = &out.metal;
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": unknown section [" + name +
-                        "] (expected [search], [coordinator], [dictionary] or [meet-in-the-middle])";
+                        "] (expected [search], [coordinator], [dictionary], [meet-in-the-middle], [opencl] or [metal])";
                 return false;
             }
             continue;
@@ -372,7 +376,7 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 out.checkForUpdates = value == "true";
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search], [coordinator], [dictionary] or [meet-in-the-middle] section (only 'mode', 'matches_dir', "
+                        "' must be inside a [search], [coordinator], [dictionary], [meet-in-the-middle], [opencl] or [metal] section (only 'mode', 'matches_dir', "
                         "'backend' and 'check_for_updates' are allowed before any section)";
                 return false;
             }
@@ -1021,5 +1025,51 @@ bool updateConfigForMode(const std::string& path, const std::string& mode, const
     }
     for (const auto& l : rewritten)
         out << l << "\n";
+    return true;
+}
+
+namespace {
+
+// One backend's section, as buildBackendTunings reads it.
+bool buildGpuTuning(const std::map<std::string, std::string>& section, const std::string& backend, GpuTuning& out, std::string& error) {
+    ConfigSectionReader r(section);
+    for (const GpuTuningKey& key : gpuTuningKeys(backend)) {
+        const std::string value = r.getOptional(key.name, "");
+        if (value.empty())
+            continue;
+        const std::string range = std::to_string(key.min) + " to " + std::to_string(key.max);
+        if (value.size() > 4 || value.find_first_not_of("0123456789") != std::string::npos) {
+            error = "invalid " + std::string(key.name) + ": '" + value + "' (expected a number, " + range + ")";
+            return false;
+        }
+        const int number = std::stoi(value);
+        if (number < key.min || number > key.max) {
+            error = std::string(key.name) + " must be " + range + ", got " + value;
+            return false;
+        }
+        out.*key.field = number;
+    }
+    const std::string unknown = r.firstUnknownKey();
+    if (!unknown.empty()) {
+        error = "unknown key '" + unknown + "'";
+        if (backend == "metal" && unknown == "batches_per_launch")
+            error += " (the Metal backend launches one batch at a time)";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool buildBackendTunings(const ConfigFile& config, BackendTunings& out, std::string& error) {
+    out = BackendTunings();
+    if (!buildGpuTuning(config.opencl, "opencl", out.opencl, error)) {
+        error = "[opencl]: " + error;
+        return false;
+    }
+    if (!buildGpuTuning(config.metal, "metal", out.metal, error)) {
+        error = "[metal]: " + error;
+        return false;
+    }
     return true;
 }

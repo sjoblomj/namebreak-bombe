@@ -802,7 +802,9 @@ afternoon).
   words-per-thread sweep's trend).
 - [ ] **Tune OpenCL and Metal** on their own: both have CUDA's values
   (32 words per thread, 256 threads to a work-group); Metal's kernel has
-  only run emulated on the CPU.
+  only run emulated on the CPU. Each machine can now set its own in
+  config.conf's `[opencl]`/`[metal]` (README.md's "Tuning OpenCL and
+  Metal") - the defaults are still these.
 
 ## Meet-in-the-middle searches
 

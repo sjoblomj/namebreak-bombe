@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "backends/backends.h"
 #include "common/matches_file.h"
 #include "engine/dictionary_search.h"
 #include "engine/meet_in_the_middle_search.h"
@@ -24,7 +25,7 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 
 // namebreak's on-disk config.conf - read from "./config.conf" (the current
 // working directory) unless overridden via --config <file>. A flat key=value
-// file with four possible [section] headers:
+// file with six possible [section] headers:
 //   [search]              - bounded/continuous parameters (mode picks which
 //                           of the two actually runs; both take the same
 //                           parameters)
@@ -37,6 +38,8 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 //                           buildDictionaryRequest)
 //   [meet-in-the-middle]  - meet-in-the-middle-mode parameters (see
 //                           buildMeetInTheMiddleRequest)
+//   [opencl], [metal]     - the OpenCL and Metal backends' launch geometry,
+//                           in every mode (see buildBackendTunings)
 // plus four keys allowed before any section: `mode = continuous|bounded|
 // coordinator|dictionary|meet-in-the-middle` (overridable by passing --mode
 // <mode> - see main()), `matches_dir = <directory>` (optional - see
@@ -60,6 +63,8 @@ struct ConfigFile {
     // unquotes the values that aren't lists.
     std::map<std::string, std::string> dictionary;
     std::map<std::string, std::string> meetInTheMiddle;
+    std::map<std::string, std::string> opencl;
+    std::map<std::string, std::string> metal;
 };
 
 // Returns false with a human-readable `error` (including path:line) on any
@@ -142,6 +147,16 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 // the search will really use - the progress file's fingerprint depends on it.
 bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleRequest& out, std::string& error);
 
+// The [opencl] and [metal] sections, as setBackendTunings (backends/
+// backends.h) takes them: each key of gpuTuningKeys(backend)
+// (backends/gpu_tuning.h) a number in its range - rows_per_thread,
+// batches_per_launch (OpenCL only), window_chars, work_group_size,
+// dictionary_words_per_thread, dictionary_work_group_size,
+// dictionary_tails_per_cell - all optional, unset being the backend's
+// default. Returns false with `error` set on a value out of range or an
+// unknown key. See README.md's "Tuning OpenCL and Metal".
+bool buildBackendTunings(const ConfigFile& config, BackendTunings& out, std::string& error);
+
 // A number of bytes, as [meet-in-the-middle]'s `table_memory` and
 // [coordinator]'s `meet_in_the_middle_table_memory` give it: digits,
 // optionally followed by K, M or G (1024, 1024^2, 1024^3 - case doesn't
@@ -190,6 +205,7 @@ bool ensureConfigForMode(const std::string& path, const std::string& mode, const
 // writes it.
 bool updateConfigForMode(const std::string& path, const std::string& mode, const std::string& sectionName,
                          const std::vector<std::pair<std::string, std::string>>& keys, std::string& error);
+
 
 // Small helper for reading a config section by known key names while
 // catching typos: tracks which keys were actually looked up, so a caller

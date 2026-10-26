@@ -113,7 +113,7 @@ runs its setup dialog instead, and writes one; its tray menu's
 replaces what the file said - a field left blank takes its key out
 altogether. The run in progress carries on with the settings it started
 with, since the file is only read at startup). It's a flat `key = value`
-file with up to four `[section]` blocks; `#`-led lines and blank lines are
+file with up to six `[section]` blocks; `#`-led lines and blank lines are
 ignored, and a value only needs `"..."` quoting if it has meaningful
 leading/trailing whitespace (a literal `\` needs no escaping).
 
@@ -197,6 +197,34 @@ and why) - and, in coordinator mode, reported to the coordinator, which
 lists it on the target's dashboard card - and the search goes on past it as
 if it were any other Hash-A match. Only these checks run on a match of both
 hashes, so they cost nothing.
+
+### Tuning OpenCL and Metal
+
+The OpenCL and Metal backends compile their kernels when a search starts,
+so how they cut up the work can be set in the config, in every mode: an
+`[opencl]` or `[metal]` section. Every key is optional, and an unset one is
+the backend's default - measured on one RTX 3080 Ti Laptop, so another GPU
+may well do better with other values. None of them changes what a search
+finds; the backend still runs its self-tests with them before it searches.
+The start of a search shows what it uses (`OpenCL launches: ...`). The CUDA
+backend compiles its kernels ahead of time, with these values built into
+them (`src/backends/cuda/tuning.h`), so it takes none of them.
+
+| Key | Default (OpenCL / Metal) | Range | What it is |
+|---|---|---|---|
+| `rows_per_thread` | 64 / 25 | 1-64 | About how many rows of a row group one work-item searches; 64 is a whole group, whatever the alphabet. |
+| `batches_per_launch` | 16 / - | 1-32 | How many batches one launch searches at most - OpenCL only, Metal launches one. |
+| `window_chars` | 5 / 5 | 1-6 | How many trailing characters the GPU enumerates (see [The GPU doesn't brute-force the whole candidate](#the-gpu-doesnt-brute-force-the-whole-candidate)). |
+| `work_group_size` | 256 / 256 | 64-1024 | Work-items (threads) per work-group (threadgroup) of a row search - fewer if the device allows fewer. |
+| `dictionary_words_per_thread` | 32 / 32 | 1-256 | How many cells (words) of a batch one work-item hashes in a dictionary search. |
+| `dictionary_work_group_size` | 256 / 256 | 1-1024 | Work-items per work-group of a dictionary search - fewer if the device allows fewer. |
+| `dictionary_tails_per_cell` | 32 / 32 | 1-256 | How many tails a dictionary cell has (with `tails` only). |
+
+```ini
+[opencl]
+rows_per_thread = 25
+window_chars = 6
+```
 
 ## Dictionary mode
 
