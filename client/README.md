@@ -26,7 +26,10 @@ A different config file can be used instead of `config.conf` via
 It searches on the first backend (see [Backends](#backends)) that can run
 on the machine - normally the GPU. A top-level `backend = <name>` line in
 `config.conf`, or `--backend <name>`, picks one instead; running with an
-unknown name lists the ones the build has.
+unknown name lists the ones the build has. Which of the machine's GPUs it
+searches on - in `coordinator` mode all of them at once - is the
+`[hardware]` section's (see [Choosing and tuning the
+hardware](#choosing-and-tuning-the-hardware)).
 
 - **`bounded`** - exhaustively searches candidates of exactly
   `start_candidate`'s length (or `lower_bound`'s, without one), between
@@ -198,13 +201,69 @@ lists it on the target's dashboard card - and the search goes on past it as
 if it were any other Hash-A match. Only these checks run on a match of both
 hashes, so they cost nothing.
 
-### Tuning OpenCL and Metal
+### Choosing and tuning the hardware
+
+The `[hardware]` section says which parts of the machine namebreak searches
+with, and how - in every mode. Every key is optional.
+
+```ini
+[hardware]
+gpus = 0, 2
+cpu_threads = 8
+```
+
+`gpus` picks the GPUs, by the numbers `namebreak --list-gpus` shows for
+each backend (the same card can have another number in another backend):
+
+```
+$ namebreak --list-gpus
+cuda:
+  0: NVIDIA GeForce RTX 3080 Ti Laptop GPU
+opencl:
+  0: Intel(R) Iris(R) Xe Graphics (integrated) - not selected
+  1: NVIDIA GeForce RTX 3080 Ti Laptop GPU
+```
+
+- `auto` (the default): every discrete GPU of the backend that searches -
+  or its integrated one, if it has nothing else. An integrated GPU shares
+  the CPU's power and memory, and the CPU prepares the discrete GPUs' work,
+  so next to a discrete GPU it would mostly slow that one down.
+- `all`: every one, integrated or not.
+- GPU numbers separated by commas, e.g. `0, 2`: those.
+- `none`: no GPU at all - the cpu backend searches.
+
+The CUDA and OpenCL backends number the GPUs in the order they sit on the
+PCI bus (as `nvidia-smi` does), so a number stays the same card from one
+run to the next, through driver updates too - until a card is added, taken
+out or moved to another slot. OpenCL GPUs whose driver doesn't say where
+they sit come after those, in the order the drivers list them; Metal lists
+the system's default GPU first. When a GPU `gpus` picks by number isn't the
+card its `gpu<N>.name` (below) names, the search says so, and
+`--list-gpus` marks it.
+
+`coordinator` mode searches on every GPU it picks at once: one worker each,
+with a backend of its own, registered with the coordinator as a client of
+its own - the machine's `hostname` for GPU 0, `<hostname>/gpu<N>` for GPU N,
+so that the server sizes each GPU's ranges by how fast that GPU searches -
+each claiming, searching and reporting ranges of its own, and writing its
+own matches file (`matches-<target>-gpu<N>.txt` for GPU N). They pause,
+resume and quit together; *finish the current range, then pause* waits for
+every GPU's range. Their messages say which GPU's they are
+(`[coordinator gpu1] starting range ...`), and the Windows GUI shows a
+target, a status line and a progress bar for each. A GPU whose backend
+can't be made, or fails its self-test, is left out, and the others search.
+The other modes search one range on one GPU, the first one `gpus` picks,
+and say so when it picks more. Each GPU's worker builds a meet-in-the-middle
+target's table of its own, so `meet_in_the_middle_table_memory` is per GPU
+(see [Meet-in-the-middle mode](#in-coordinator-mode)).
+
+`cpu_threads` is how many threads the cpu backend searches with - by
+default one per hardware thread, every core.
 
 The OpenCL and Metal backends compile their kernels when a search starts,
-so how they cut up the work can be set in the config, in every mode: an
-`[opencl]` or `[metal]` section. Every key is optional, and an unset one is
-the backend's default - measured on one RTX 3080 Ti Laptop, so another GPU
-may well do better with other values. None of them changes what a search
+so how they cut up the work can be set here too. An unset key is the
+backend's default - measured on one RTX 3080 Ti Laptop, so another GPU may
+well do better with other values. None of them changes what a search
 finds; the backend still runs its self-tests with them before it searches.
 The start of a search shows what it uses (`OpenCL launches: ...`). The CUDA
 backend compiles its kernels ahead of time, with these values built into
@@ -222,31 +281,40 @@ with each setting on the machine and keeps the fastest.
 | `dictionary_work_group_size` | 256 / 256 | 1-1024 | Work-items per work-group of a dictionary search - fewer if the device allows fewer. |
 | `dictionary_tails_per_cell` | 32 / 32 | 1-256 | How many tails a dictionary cell has (with `tails` only). |
 
+Written as they are, they're for every GPU. `gpu<N>.<key>` is GPU N's own,
+over those - for a machine with two different cards, say - and
+`gpu<N>.name` the GPU they're meant for: should another card have number N
+now, it doesn't get them, and the search says so.
+
 ```ini
-[opencl]
-rows_per_thread = 25
+[hardware]
 window_chars = 6
+gpu1.name = AMD Radeon RX 7900 XTX
+gpu1.rows_per_thread = 25
 ```
 
 Rather than trying values by hand, `namebreak --autotune` (with
 `--config <file>`, and `--backend opencl|metal` to tune one other than the
-one a search would use) measures them on the machine's GPU and writes the
-fastest to that section. On a machine that searches with CUDA or HIP it
-says so, and points at `scripts/autotune/`. It times a
+one a search would use) measures them on each GPU `gpus` picks, one after
+the other, and writes the fastest to `[hardware]` as each GPU's own, with
+its name. A GPU of the same name as one already measured gets its values
+without being measured itself. On a machine that searches with CUDA or HIP
+it says so, and points at `scripts/autotune/`. It times a
 search like `search_bench`'s (the real 49-character alphabet, nothing
 pruned) for the row search keys, and one like `dictionary_bench`'s
 (english-1, with a key) for the dictionary ones, about two seconds a trial
 once half a minute of searching has heated the GPU up (a laptop's searches
 up to three times as fast while it's cool), each key in turn from the
-defaults. It then times the defaults and its result again, and writes only
-if the result was more than 2% faster: the keys that
-differ from the defaults, taking out any equal to them, so a later
-release's defaults still apply. It doesn't touch `dictionary_tails_per_cell`,
+defaults. It then times the defaults and its result again, and keeps the
+result only if it was more than 2% faster: the keys that differ from the
+defaults, taking out any equal to them, so a later release's defaults
+still apply - unless the section sets that key for every GPU, which the
+default is then written over. It doesn't touch `dictionary_tails_per_cell`,
 which only searches with tails would show, or any other line of the file.
-It takes a few minutes; anything else on the GPU meanwhile - a running
-namebreak, a game - makes its measurements meaningless. Ctrl+C stops it
-without writing anything. Two caveats: it measures the window without
-pruning, though a wider one leaves the CPU less to prune (see
+It takes a few minutes a GPU; anything else on the GPU meanwhile - a
+running namebreak, a game - makes its measurements meaningless. Ctrl+C
+stops it without writing anything. Two caveats: it measures the window
+without pruning, though a wider one leaves the CPU less to prune (see
 [`prune_symbol_runs`, ...](#prune_symbol_runs-prune_unopened_brackets-and-max_backslash_count-only-run-on-the-cpu)),
 and a work-group size beyond what the device allows runs as the largest it
 does.
@@ -262,7 +330,7 @@ with OK or Cancel, and is used:
 - in a coordinator run already going, after the current range finishes:
   the client makes its backend again with the new settings, and self-tests
   it, before it claims the next one (and carries on with the old backend,
-  saying so, should that fail);
+  saying so, should that fail) - each GPU's worker after its own range;
 - in a local search already going, once namebreak is restarted.
 
 On a machine that searches with CUDA or HIP, it says why it can't, and
@@ -698,7 +766,10 @@ meet_in_the_middle_table_memory = 1G
 
 Left out (or 0), this client is handed no meet-in-the-middle target's work
 at all - a table is memory you have to agree to spare, and on a GPU it has
-to fit in the device's own as well. The client says which it is when it
+to fit in the device's own as well. It's per GPU: a client searching on
+several (see [Choosing and tuning the
+hardware](#choosing-and-tuning-the-hardware)) may have a table this big for
+each. The client says which it is when it
 registers, and a server hands out no target whose table is bigger than it.
 The Windows GUI's setup asks for it on its Coordinator tab, as a slider over
 the sizes a table can usefully take (None, then powers of two from 256 MB up

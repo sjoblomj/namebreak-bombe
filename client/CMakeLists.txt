@@ -560,6 +560,9 @@ namebreak_test(version_test version_test)
 #                                      than 5,000), and a heartbeat every 10
 #                                      seconds - for the parts with more
 #                                      basenames than a report carries
+#   namebreak_two_workers              the cpu backend searching as two
+#                                      workers, as on a machine with two
+#                                      GPUs (coordinator-workers, below)
 if(NAMEBREAK_NETWORK)
     # namebreak_test_program(<name> <definition>...): the program, its
     # coordinator code compiled with the definitions.
@@ -581,6 +584,7 @@ if(NAMEBREAK_NETWORK)
     endfunction()
     namebreak_test_program(namebreak_heartbeat_1s NAMEBREAK_HEARTBEAT_INTERVAL_SECONDS=1)
     namebreak_test_program(namebreak_one_basename_per_report NAMEBREAK_HEARTBEAT_INTERVAL_SECONDS=10 NAMEBREAK_MAX_BASENAMES_PER_REPORT=1)
+    namebreak_test_program(namebreak_two_workers NAMEBREAK_TEST_CPU_WORKERS=2)
     find_program(CARGO_EXECUTABLE cargo)
     find_program(PYTHON3_EXECUTABLE python3)
     if(CARGO_EXECUTABLE AND PYTHON3_EXECUTABLE)
@@ -601,6 +605,13 @@ if(NAMEBREAK_NETWORK)
         namebreak_test(coordinator-false-match ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_false_match_test.py
             --client $<TARGET_FILE:namebreak> --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
         set_tests_properties(coordinator-false-match PROPERTIES TIMEOUT 600)
+        # Several GPUs' workers in one client - played by the cpu backend
+        # (namebreak_two_workers): each registers on its own, they share a
+        # target's ranges, and a quit hands back both ranges in hand - see
+        # the script.
+        namebreak_test(coordinator-workers ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/coordinator_workers_test.py
+            --client $<TARGET_FILE:namebreak_two_workers> --coordinator ${CMAKE_SOURCE_DIR}/../coordinator)
+        set_tests_properties(coordinator-workers PROPERTIES TIMEOUT 600)
     endif()
 endif()
 

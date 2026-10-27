@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <tuple>
@@ -48,7 +49,7 @@ namespace {
 // Work-items per work-group, unless the device or kernel allows fewer. Must
 // be >= the alphabet size: the kernel fills its local tables one entry per
 // work-item. This and the other k*Default values below are what the backend
-// uses where config.conf's [opencl] says nothing (GpuTuning, see
+// uses where config.conf's [hardware] says nothing (GpuTuning, see
 // backends/gpu_tuning.h).
 constexpr int kWorkGroupSizeDefault = 256;
 
@@ -1043,30 +1044,101 @@ GpuTuning openClTuningDefaults() {
     return defaults;
 }
 
-std::unique_ptr<SearchBackend> makeOpenClBackend(const GpuTuning& tuning, std::string& error) {
+namespace {
+
+// cl_khr_pci_bus_info's query - here rather than from cl_ext.h, which has it
+// only from 2021's headers on.
+constexpr cl_device_info kDevicePciBusInfo = 0x410F;
+struct PciBusInfo {
+    cl_uint domain, bus, device, function;
+};
+
+// One GPU of openClDevices(), with what it takes to make a backend on it.
+struct OpenClGpu {
+    cl_device_id id;
+    GpuDevice device;
+    // Its place on the PCI bus, if its driver says (cl_khr_pci_bus_info).
+    std::optional<std::tuple<cl_uint, cl_uint, cl_uint, cl_uint>> pci;
+};
+
+std::vector<OpenClGpu> openClGpus() {
+    std::vector<OpenClGpu> gpus;
+    cl_uint platformCount = 0;
+    if (clGetPlatformIDs(0, nullptr, &platformCount) != CL_SUCCESS || platformCount == 0)
+        return gpus;
+    std::vector<cl_platform_id> platforms(platformCount);
+    clGetPlatformIDs(platformCount, platforms.data(), nullptr);
+    for (cl_platform_id platform : platforms) {
+        cl_uint deviceCount = 0;
+        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &deviceCount) != CL_SUCCESS || deviceCount == 0)
+            continue;
+        std::vector<cl_device_id> ids(deviceCount);
+        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, deviceCount, ids.data(), nullptr) != CL_SUCCESS)
+            continue;
+        for (cl_device_id id : ids) {
+            OpenClGpu gpu = {id, GpuDevice{0, deviceInfoString(id, CL_DEVICE_NAME), false}, std::nullopt};
+            PciBusInfo pci = {};
+            if (clGetDeviceInfo(id, kDevicePciBusInfo, sizeof pci, &pci, nullptr) == CL_SUCCESS) {
+                gpu.pci = std::make_tuple(pci.domain, pci.bus, pci.device, pci.function);
+                if (std::any_of(gpus.begin(), gpus.end(), [&](const OpenClGpu& other) { return other.pci == gpu.pci; }))
+                    continue;
+            }
+            // Deprecated since OpenCL 2.0, but every driver still answers it:
+            // a GPU that shares the host's memory is the CPU's own.
+            cl_bool unified = CL_FALSE;
+            clGetDeviceInfo(id, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof unified, &unified, nullptr);
+            gpu.device.integrated = unified == CL_TRUE;
+            gpus.push_back(gpu);
+        }
+    }
+    // Numbered in PCI order, not the platforms' - whose order is the ICD
+    // loader's, and changes as drivers come and go - so that a number stays
+    // the same card. Those whose drivers don't say where they are come last,
+    // in the platforms' order.
+    std::stable_sort(gpus.begin(), gpus.end(), [](const OpenClGpu& a, const OpenClGpu& b) {
+        return a.pci && (!b.pci || *a.pci < *b.pci);
+    });
+    for (size_t i = 0; i < gpus.size(); ++i)
+        gpus[i].device.index = (int) i;
+    return gpus;
+}
+
+} // namespace
+
+std::vector<GpuDevice> openClDevices() {
+    std::vector<GpuDevice> devices;
+    for (const OpenClGpu& gpu : openClGpus())
+        devices.push_back(gpu.device);
+    return devices;
+}
+
+std::unique_ptr<SearchBackend> makeOpenClBackend(int deviceIndex, const GpuTuning& tuning, std::string& error) {
     cl_uint platformCount = 0;
     if (clGetPlatformIDs(0, nullptr, &platformCount) != CL_SUCCESS || platformCount == 0) {
         error = "no OpenCL platform (driver) installed";
         return nullptr;
     }
-    std::vector<cl_platform_id> platforms(platformCount);
-    clGetPlatformIDs(platformCount, platforms.data(), nullptr);
-    for (cl_platform_id platform : platforms) {
-        cl_device_id device = nullptr;
-        cl_uint deviceCount = 0;
-        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, &deviceCount) != CL_SUCCESS || deviceCount == 0)
-            continue;
-        cl_int err = CL_SUCCESS;
-        cl_context context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
-        if (err != CL_SUCCESS)
-            continue;
-        cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
-        if (err != CL_SUCCESS) {
-            clReleaseContext(context);
-            continue;
-        }
-        return std::make_unique<OpenClBackend>(device, context, queue, withDefaults(tuning, openClTuningDefaults()));
+    const std::vector<OpenClGpu> gpus = openClGpus();
+    if (gpus.empty()) {
+        error = "no OpenCL GPU found";
+        return nullptr;
     }
-    error = "no OpenCL GPU found";
-    return nullptr;
+    if (deviceIndex < 0 || deviceIndex >= (int) gpus.size()) {
+        error = "no OpenCL GPU numbered " + std::to_string(deviceIndex) + " (there are " + std::to_string(gpus.size()) + ")";
+        return nullptr;
+    }
+    cl_device_id device = gpus[(size_t) deviceIndex].id;
+    cl_int err = CL_SUCCESS;
+    cl_context context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        error = "can't make an OpenCL context on " + gpus[(size_t) deviceIndex].device.name + " (error " + std::to_string(err) + ")";
+        return nullptr;
+    }
+    cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
+    if (err != CL_SUCCESS) {
+        clReleaseContext(context);
+        error = "can't make an OpenCL command queue on " + gpus[(size_t) deviceIndex].device.name + " (error " + std::to_string(err) + ")";
+        return nullptr;
+    }
+    return std::make_unique<OpenClBackend>(device, context, queue, withDefaults(tuning, openClTuningDefaults()));
 }

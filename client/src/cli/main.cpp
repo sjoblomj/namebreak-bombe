@@ -171,16 +171,56 @@ void printUsage(const char* argv0) {
         backends += (backends.empty() ? "" : "|") + name;
     fprintf(stderr, "Usage: %s [--mode <mode>] [--config <file>] [--backend %s]\n"
                      "       %s --autotune [--config <file>] [--backend opencl|metal]\n"
+                     "       %s --list-gpus\n"
                      "       %s -v|--version\n"
                      "<mode> is continuous, bounded, coordinator, dictionary or meet-in-the-middle.\n"
                      "Reads the given --config file (default: %s, in the current directory) for\n"
                      "everything else; --mode and --backend, if given, override that file's own\n"
                      "'mode = ...'/'backend = ...'. Without either, the first backend listed that\n"
                      "can run on this machine is used (in dictionary or meet-in-the-middle mode,\n"
-                     "that can search those). --autotune measures the OpenCL or Metal backend's\n"
-                     "launch settings on this GPU and writes the fastest to the config file's\n"
-                     "[opencl] or [metal] section. -v/--version prints this build's version.\n",
-            argv0, backends.c_str(), argv0, argv0, kDefaultConfigPath);
+                     "that can search those). Coordinator mode searches on every GPU the config\n"
+                     "file's [hardware] gpus selects at once; the other modes on the first of\n"
+                     "them. --autotune measures the OpenCL or Metal backend's launch settings on\n"
+                     "those GPUs and writes the fastest to the config file's [hardware] section.\n"
+                     "--list-gpus lists the GPUs each backend can search on, by the numbers gpus\n"
+                     "takes. -v/--version prints this build's version.\n",
+            argv0, backends.c_str(), argv0, argv0, argv0, kDefaultConfigPath);
+}
+
+// --list-gpus: every backend's GPUs, by the numbers [hardware]'s gpus takes,
+// and which of them `hardware` selects.
+int listGpus(const HardwareConfig& hardware) {
+    bool any = false;
+    for (const std::string& name : backendNames()) {
+        const std::vector<GpuDevice> devices = gpuDevices(name);
+        if (devices.empty())
+            continue;
+        any = true;
+        const std::vector<GpuDevice> selected = selectedGpus(devices, hardware);
+        printf("%s:\n", name.c_str());
+        for (const GpuDevice& device : devices) {
+            const bool used = std::any_of(selected.begin(), selected.end(), [&](const GpuDevice& d) { return d.index == device.index; });
+            const auto tunedFor = hardware.gpuNames.find(device.index);
+            const std::string other = tunedFor != hardware.gpuNames.end() && tunedFor->second != device.name
+                                          ? " - [hardware]'s gpu" + std::to_string(device.index) + " settings are for " + tunedFor->second
+                                          : "";
+            printf("  %d: %s%s%s%s\n", device.index, device.name.c_str(), device.integrated ? " (integrated)" : "", used ? "" : " - not selected",
+                   other.c_str());
+        }
+    }
+    if (!any)
+        printf("No backend of this build finds a GPU here - it searches with the cpu backend.\n");
+    return 0;
+}
+
+// A local search runs on one GPU - the first [hardware] selects - and says
+// so when it selects more, which only coordinator mode searches on at once.
+void noteOneGpuOnly(const SearchBackend& backend) {
+    const std::vector<GpuDevice> selected = selectedGpus(gpuDevices(backend.name()), hardwareConfig());
+    if (selected.size() > 1)
+        printf("Searching on GPU %d (%s) only: a local search runs on one GPU - coordinator mode searches on all %zu that [hardware] "
+               "selects.\n",
+               selected.front().index, selected.front().name.c_str(), selected.size());
 }
 
 // For a first run: where the config file was looked for, and the smallest
@@ -217,6 +257,7 @@ int main(int argc, char* argv[]) {
     std::string backendOverride;
     std::string configPath = kDefaultConfigPath;
     bool autotune = false;
+    bool listGpusRequested = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--version") {
@@ -231,6 +272,8 @@ int main(int argc, char* argv[]) {
             configPath = argv[++i];
         } else if (arg == "--autotune") {
             autotune = true;
+        } else if (arg == "--list-gpus") {
+            listGpusRequested = true;
         } else if (arg == "--backend") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--backend requires a backend name\n");
@@ -257,7 +300,7 @@ int main(int argc, char* argv[]) {
 
     std::error_code existsError;
     const bool configExists = std::filesystem::exists(configPath, existsError);
-    if (!configExists && !autotune) {
+    if (!configExists && !autotune && !listGpusRequested) {
         printMissingConfigHelp(configPath);
         return 1;
     }
@@ -273,12 +316,15 @@ int main(int argc, char* argv[]) {
     if (!backendOverride.empty())
         config.backend = backendOverride;
 
-    BackendTunings tunings;
-    if (!buildBackendTunings(config, tunings, error)) {
+    HardwareConfig hardware;
+    if (!buildHardwareConfig(config, hardware, error)) {
         fprintf(stderr, "%s %s\n", configPath.c_str(), error.c_str());
         return 1;
     }
-    setBackendTunings(tunings);
+    setHardwareConfig(hardware);
+
+    if (listGpusRequested)
+        return listGpus(hardware);
 
     if (autotune) {
         // Ctrl+C stops the tuning between trials, without writing anything,
@@ -295,8 +341,13 @@ int main(int argc, char* argv[]) {
                         : "");
             return 1;
         }
+        const std::vector<GpuDevice> devices = autotuneDevices(backend, why);
+        if (devices.empty()) {
+            fprintf(stderr, "%s\n", why.c_str());
+            return 1;
+        }
         printf("Ctrl+C stops the tuning.\n");
-        return runAutotune(configPath, backend, 2.0, &g_quitRequested);
+        return runAutotune(configPath, backend, devices, 2.0, &g_quitRequested);
     }
 
     std::string mode = !modeOverride.empty() ? modeOverride : config.mode;
@@ -386,6 +437,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "%s\n", error.c_str());
             return 1;
         }
+        noteOneGpuOnly(*backend);
         DictionaryResult result = runDictionarySearch(*backend, dictReq, nullptr, nullptr, &g_paused);
         if (!result.ok) {
             fprintf(stderr, "%s\n", result.error.c_str());
@@ -405,6 +457,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "%s\n", error.c_str());
             return 1;
         }
+        noteOneGpuOnly(*backend);
         MeetInTheMiddleResult result = runMeetInTheMiddleSearch(*backend, meetInTheMiddleReq, nullptr, nullptr, &g_paused);
         if (!result.ok) {
             fprintf(stderr, "%s\n", result.error.c_str());
@@ -424,6 +477,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "%s\n", error.c_str());
         return 1;
     }
+    noteOneGpuOnly(*backend);
     SearchResult result = runSearch(*backend, req, nullptr, nullptr, &g_paused);
 
     if (!result.ok) {

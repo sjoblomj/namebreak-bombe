@@ -1,9 +1,11 @@
 // Correctness test for what the config file (common/config.h) makes of a
 // search: where buildSearchRequest starts one - start_candidate, which is
 // optional, and resume_from_last_candidate, which may move the start to the
-// last line of the matches file - and the [dictionary], [meet-in-the-middle],
-// [opencl] and [metal] sections, every key of them and what they refuse, and
-// how --autotune picks its values (tuneAxes, common/autotune.h). Pure CPU.
+// last line of the matches file - and the [dictionary], [meet-in-the-middle]
+// and [hardware] sections, every key of them and what they refuse, which GPUs
+// [hardware] picks and with which settings (selectedGpus, gpuTuningFor,
+// backends/backends.h), and how --autotune picks its values (tuneAxes,
+// common/autotune.h). Pure CPU.
 //
 // Writes matches files under ./config_test/ - ctest runs this from its own
 // directory under build/testrun/.
@@ -444,73 +446,140 @@ static void testUpdateConfig() {
 static void testUpdateConfigSection() {
     printf("--- updateConfigSection ---\n");
     const std::string path = kDir + "/section.conf";
-    writeFile(path, "mode = coordinator\n\n[coordinator]\nserver_url = https://example.com\n\n[opencl]\n# tuned by hand\nrows_per_thread = 7\n"
+    writeFile(path, "mode = coordinator\n\n[coordinator]\nserver_url = https://example.com\n\n[hardware]\n# tuned by hand\nrows_per_thread = 7\n"
                     "window_chars = 6\n");
     std::string error;
     ConfigFile config;
-    check(updateConfigSection(path, "opencl", {{"rows_per_thread", "25"}, {"window_chars", ""}, {"batches_per_launch", "32"}}, error) &&
+    check(updateConfigSection(path, "hardware", {{"rows_per_thread", "25"}, {"window_chars", ""}, {"gpu1.batches_per_launch", "32"}}, error) &&
               loadConfigFile(path, config, error),
           "writes and reads back (" + error + ")");
     check(config.mode == "coordinator" && config.coordinator["server_url"] == "https://example.com", "the mode and the other section untouched");
-    check(config.opencl["rows_per_thread"] == "25" && config.opencl.count("window_chars") == 0 && config.opencl["batches_per_launch"] == "32",
+    check(config.hardware["rows_per_thread"] == "25" && config.hardware.count("window_chars") == 0 &&
+              config.hardware["gpu1.batches_per_launch"] == "32",
           "replaced, taken out and added");
-    check(updateConfigSection(path, "metal", {{"rows_per_thread", "13"}}, error) && loadConfigFile(path, config, error) &&
-              config.metal["rows_per_thread"] == "13" && config.opencl["rows_per_thread"] == "25",
-          "a section the file didn't have: added");
     const std::string fresh = kDir + "/fresh.conf";
     std::filesystem::remove(fresh);
     ConfigFile freshConfig;
-    check(updateConfigSection(fresh, "opencl", {{"work_group_size", "128"}}, error) && loadConfigFile(fresh, freshConfig, error) &&
-              freshConfig.opencl["work_group_size"] == "128" && freshConfig.mode.empty(),
+    check(updateConfigSection(fresh, "hardware", {{"work_group_size", "128"}}, error) && loadConfigFile(fresh, freshConfig, error) &&
+              freshConfig.hardware["work_group_size"] == "128" && freshConfig.mode.empty(),
           "a file that doesn't exist: created, with only the section");
 }
 
-// What buildBackendTunings says about `config`: "" if it accepts it.
-static std::string tuningErrorOf(const ConfigFile& config, BackendTunings& out) {
+// What buildHardwareConfig says about `section`: "" if it accepts it.
+static std::string hardwareErrorOf(const std::map<std::string, std::string>& section, HardwareConfig& out) {
+    ConfigFile config;
+    config.hardware = section;
     std::string error;
-    return buildBackendTunings(config, out, error) ? "" : error;
+    return buildHardwareConfig(config, out, error) ? "" : error;
 }
 
-static void testBackendTunings() {
-    printf("--- [opencl] and [metal] ---\n");
-    ConfigFile config;
-    BackendTunings tunings;
-    check(tuningErrorOf(config, tunings).empty() && !tunings.opencl.rowsPerThread && !tunings.metal.windowChars, "no sections: nothing set");
-    config.opencl = {{"rows_per_thread", "25"},          {"batches_per_launch", "32"},          {"window_chars", "6"},
-                     {"work_group_size", "128"},         {"dictionary_words_per_thread", "64"}, {"dictionary_work_group_size", "512"},
-                     {"dictionary_tails_per_cell", "16"}};
-    config.metal = {{"rows_per_thread", "13"}, {"work_group_size", "64"}};
-    check(tuningErrorOf(config, tunings).empty() && tunings.opencl.rowsPerThread == 25 && tunings.opencl.batchesPerLaunch == 32 &&
-              tunings.opencl.windowChars == 6 && tunings.opencl.workGroupSize == 128 && tunings.opencl.dictionaryWordsPerThread == 64 &&
-              tunings.opencl.dictionaryWorkGroupSize == 512 && tunings.opencl.dictionaryTailsPerCell == 16,
-          "every [opencl] key read");
-    check(tunings.metal.rowsPerThread == 13 && tunings.metal.workGroupSize == 64 && !tunings.metal.windowChars, "[metal] read on its own");
-    check(describeGpuTuning("metal", tunings.metal) == "rows_per_thread 13, work_group_size 64", "described as the start-up line shows it");
-    const GpuTuning full = withDefaults(tunings.metal, tunings.opencl);
-    check(full.rowsPerThread == 13 && full.windowChars == 6 && full.dictionaryTailsPerCell == 16, "withDefaults fills in only what's unset");
+static void testHardwareConfig() {
+    printf("--- [hardware] ---\n");
+    HardwareConfig hardware;
+    check(hardwareErrorOf({}, hardware).empty() && hardware.gpuChoice == HardwareConfig::GpuChoice::Auto && hardware.cpuThreads == 0 &&
+              !hardware.tuning.rowsPerThread && hardware.gpuTunings.empty(),
+          "no section: every GPU of the kind that searches, every CPU thread, nothing tuned");
+    check(hardwareErrorOf({{"rows_per_thread", "25"},          {"batches_per_launch", "32"},          {"window_chars", "6"},
+                           {"work_group_size", "128"},         {"dictionary_words_per_thread", "64"}, {"dictionary_work_group_size", "512"},
+                           {"dictionary_tails_per_cell", "16"}, {"cpu_threads", "6"}},
+                          hardware)
+                  .empty() &&
+              hardware.tuning.rowsPerThread == 25 && hardware.tuning.batchesPerLaunch == 32 && hardware.tuning.windowChars == 6 &&
+              hardware.tuning.workGroupSize == 128 && hardware.tuning.dictionaryWordsPerThread == 64 &&
+              hardware.tuning.dictionaryWorkGroupSize == 512 && hardware.tuning.dictionaryTailsPerCell == 16 && hardware.cpuThreads == 6,
+          "every key read");
+    check(hardwareErrorOf({{"gpu1.rows_per_thread", "13"}, {"gpu1.name", "Radeon RX 7900 XTX"}, {"gpu12.window_chars", "4"}}, hardware).empty() &&
+              hardware.gpuTunings[1].rowsPerThread == 13 && hardware.gpuNames[1] == "Radeon RX 7900 XTX" &&
+              hardware.gpuTunings[12].windowChars == 4 && !hardware.tuning.rowsPerThread,
+          "a GPU's own keys, and the name they're for");
+    check(describeGpuTuning("metal", hardware.gpuTunings[1]) == "rows_per_thread 13", "described as the start-up line shows it");
 
-    auto refused = [&](std::map<std::string, std::string> ConfigFile::* section, const std::string& key, const std::string& value,
-                       const std::string& expected, const std::string& what) {
-        ConfigFile bad;
-        (bad.*section)[key] = value;
-        BackendTunings ignored;
-        const std::string error = tuningErrorOf(bad, ignored);
+    auto gpus = [&](const std::string& value) {
+        check(hardwareErrorOf({{"gpus", value}}, hardware).empty(), "gpus = " + value + " read");
+        return hardware;
+    };
+    check(gpus("auto").gpuChoice == HardwareConfig::GpuChoice::Auto && gpus("all").gpuChoice == HardwareConfig::GpuChoice::All,
+          "gpus = auto, all");
+    check(gpus("none").gpuChoice == HardwareConfig::GpuChoice::Listed && hardware.gpus.empty(), "gpus = none: none of them");
+    check(gpus("2, 0,2").gpuChoice == HardwareConfig::GpuChoice::Listed && hardware.gpus == std::vector<int>({2, 0}),
+          "gpus = 2, 0,2: those, once each");
+
+    auto refused = [&](const std::string& key, const std::string& value, const std::string& expected, const std::string& what) {
+        HardwareConfig ignored;
+        const std::string error = hardwareErrorOf({{key, value}}, ignored);
         check(error.find(expected) != std::string::npos, what + " (" + error + ")");
     };
-    refused(&ConfigFile::opencl, "window_chars", "7", "window_chars must be 1 to 6", "window_chars past 6 refused");
-    refused(&ConfigFile::opencl, "rows_per_thread", "0", "rows_per_thread must be 1 to 64", "rows_per_thread 0 refused");
-    refused(&ConfigFile::opencl, "batches_per_launch", "33", "batches_per_launch must be 1 to 32", "more batches than the buffer holds refused");
-    refused(&ConfigFile::opencl, "work_group_size", "32", "work_group_size must be 64 to 1024", "a work-group smaller than an alphabet refused");
-    refused(&ConfigFile::opencl, "rows_per_thread", "-5", "expected a number", "a negative number refused");
-    refused(&ConfigFile::opencl, "rows_per_thread", "25x", "expected a number", "text refused");
-    refused(&ConfigFile::opencl, "rows_per_threads", "25", "[opencl]: unknown key 'rows_per_threads'", "a typo refused");
-    refused(&ConfigFile::metal, "batches_per_launch", "8", "launches one batch at a time", "batches_per_launch refused for Metal, saying why");
+    refused("window_chars", "7", "window_chars must be 1 to 6", "window_chars past 6 refused");
+    refused("rows_per_thread", "0", "rows_per_thread must be 1 to 64", "rows_per_thread 0 refused");
+    refused("batches_per_launch", "33", "batches_per_launch must be 1 to 32", "more batches than the buffer holds refused");
+    refused("work_group_size", "32", "work_group_size must be 64 to 1024", "a work-group smaller than an alphabet refused");
+    refused("rows_per_thread", "-5", "expected a number", "a negative number refused");
+    refused("rows_per_thread", "25x", "expected a number", "text refused");
+    refused("rows_per_threads", "25", "[hardware]: unknown key 'rows_per_threads'", "a typo refused");
+    refused("gpu0.rows_per_threads", "25", "unknown key 'gpu0.rows_per_threads'", "a typo in a GPU's own key refused");
+    refused("gpu0.window_chars", "9", "gpu0.window_chars must be 1 to 6", "a GPU's own value out of range refused");
+    refused("gpux.window_chars", "4", "unknown key 'gpux.window_chars'", "a GPU that isn't a number refused");
+    refused("gpus", "0, first", "gpus is auto, all, none, or GPU numbers", "gpus that aren't numbers refused");
+    refused("gpus", "64", "gpus must be 0 to 63", "a GPU number past 63 refused");
+    refused("cpu_threads", "many", "invalid cpu_threads", "cpu_threads that isn't a number refused");
 
-    const std::string path = kDir + "/tuning.conf";
-    writeFile(path, "mode = coordinator\n[opencl]\nwindow_chars = 4\n[metal]\nrows_per_thread = 7\n");
+    const std::string path = kDir + "/hardware.conf";
+    writeFile(path, "mode = coordinator\n[hardware]\nwindow_chars = 4\ngpu1.rows_per_thread = 7\n");
     std::string error;
-    check(loadConfigFile(path, config, error) && config.opencl["window_chars"] == "4" && config.metal["rows_per_thread"] == "7",
-          "loadConfigFile knows both sections (" + error + ")");
+    ConfigFile config;
+    check(loadConfigFile(path, config, error) && config.hardware["window_chars"] == "4" && config.hardware["gpu1.rows_per_thread"] == "7",
+          "loadConfigFile knows the section (" + error + ")");
+    writeFile(path, "mode = coordinator\n[opencl]\nwindow_chars = 4\n");
+    check(!loadConfigFile(path, config, error) && error.find("are in [hardware] now") != std::string::npos,
+          "[opencl], which [hardware] took over from, says so (" + error + ")");
+}
+
+// Which GPUs selectedGpus picks of `devices` with `gpus`, by number.
+static std::vector<int> selectedOf(const std::vector<GpuDevice>& devices, const std::string& gpus) {
+    HardwareConfig hardware;
+    check(hardwareErrorOf({{"gpus", gpus}}, hardware).empty(), "gpus = " + gpus + " read");
+    std::vector<int> numbers;
+    for (const GpuDevice& device : selectedGpus(devices, hardware))
+        numbers.push_back(device.index);
+    return numbers;
+}
+
+static void testSelectedGpus() {
+    printf("--- selectedGpus and gpuTuningFor ---\n");
+    const GpuDevice integrated = {0, "Intel Iris Xe", true};
+    const GpuDevice first = {1, "RTX 3080", false};
+    const GpuDevice second = {2, "RTX 3080", false};
+    const std::vector<GpuDevice> mixed = {integrated, first, second};
+    check(selectedOf(mixed, "auto") == std::vector<int>({1, 2}), "auto: the discrete GPUs, not the integrated one");
+    check(selectedOf({integrated}, "auto") == std::vector<int>({0}), "auto: an integrated GPU that's all there is");
+    check(selectedOf(mixed, "all") == std::vector<int>({0, 1, 2}), "all: every one");
+    check(selectedOf(mixed, "2, 0, 7") == std::vector<int>({0, 2}), "listed: those there are, in the backend's order");
+    check(selectedOf(mixed, "none").empty(), "none: no GPU");
+    check(selectedOf({}, "auto").empty(), "no GPUs: none");
+
+    HardwareConfig hardware;
+    check(hardwareErrorOf({{"rows_per_thread", "25"}, {"window_chars", "5"}, {"gpu1.rows_per_thread", "64"}, {"gpu2.window_chars", "6"},
+                           {"gpu2.name", "RX 7900"}},
+                          hardware)
+              .empty(),
+          "a section with a GPU's own settings read");
+    GpuTuning tuning = gpuTuningFor(hardware, first);
+    check(tuning.rowsPerThread == 64 && tuning.windowChars == 5, "a GPU's own value over the section's, the section's for the rest");
+    std::string why;
+    tuning = gpuTuningFor(hardware, second, &why);
+    check(tuning.windowChars == 5 && tuning.rowsPerThread == 25 && why.find("are for RX 7900, but GPU 2 is RTX 3080") != std::string::npos,
+          "settings for another GPU's name not used, saying so (" + why + ")");
+    why.clear();
+    tuning = gpuTuningFor(hardware, integrated, &why);
+    check(tuning.rowsPerThread == 25 && why.empty(), "a GPU without settings of its own: the section's");
+
+    check(gpuNumberMismatch(hardware, second).empty(), "gpus = auto picks by kind, not number: no mismatch");
+    check(hardwareErrorOf({{"gpus", "1, 2"}, {"gpu1.name", "RTX 3080"}, {"gpu2.name", "RX 7900"}}, hardware).empty(), "gpus by number read");
+    check(gpuNumberMismatch(hardware, first).empty(), "a picked GPU of the name its number was tuned for: no mismatch");
+    why = gpuNumberMismatch(hardware, second);
+    check(why.find("picks GPU 2, which is RTX 3080 - but gpu2.name says GPU 2 was RX 7900") != std::string::npos,
+          "a picked GPU whose number was another card's: said (" + why + ")");
+    check(gpuNumberMismatch(hardware, integrated).empty(), "a GPU gpus doesn't pick: no mismatch");
 }
 
 static void testTuneAxes() {
@@ -892,7 +961,8 @@ int main() {
     testEnsureDictionaryConfig();
     testUpdateConfig();
     testUpdateConfigSection();
-    testBackendTunings();
+    testHardwareConfig();
+    testSelectedGpus();
     testTuneAxes();
     testMeetInTheMiddleRequest();
     testMeetInTheMiddleResume();

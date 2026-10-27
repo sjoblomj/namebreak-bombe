@@ -25,7 +25,7 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 
 // namebreak's on-disk config.conf - read from "./config.conf" (the current
 // working directory) unless overridden via --config <file>. A flat key=value
-// file with six possible [section] headers:
+// file with five possible [section] headers:
 //   [search]              - bounded/continuous parameters (mode picks which
 //                           of the two actually runs; both take the same
 //                           parameters)
@@ -38,8 +38,10 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 //                           buildDictionaryRequest)
 //   [meet-in-the-middle]  - meet-in-the-middle-mode parameters (see
 //                           buildMeetInTheMiddleRequest)
-//   [opencl], [metal]     - the OpenCL and Metal backends' launch geometry,
-//                           in every mode (see buildBackendTunings)
+//   [hardware]            - which GPUs to search with, the cpu backend's
+//                           threads and the OpenCL and Metal backends'
+//                           launch geometry, in every mode (see
+//                           buildHardwareConfig)
 // plus four keys allowed before any section: `mode = continuous|bounded|
 // coordinator|dictionary|meet-in-the-middle` (overridable by passing --mode
 // <mode> - see main()), `matches_dir = <directory>` (optional - see
@@ -63,8 +65,7 @@ struct ConfigFile {
     // unquotes the values that aren't lists.
     std::map<std::string, std::string> dictionary;
     std::map<std::string, std::string> meetInTheMiddle;
-    std::map<std::string, std::string> opencl;
-    std::map<std::string, std::string> metal;
+    std::map<std::string, std::string> hardware;
 };
 
 // Returns false with a human-readable `error` (including path:line) on any
@@ -147,15 +148,28 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 // the search will really use - the progress file's fingerprint depends on it.
 bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleRequest& out, std::string& error);
 
-// The [opencl] and [metal] sections, as setBackendTunings (backends/
-// backends.h) takes them: each key of gpuTuningKeys(backend)
-// (backends/gpu_tuning.h) a number in its range - rows_per_thread,
-// batches_per_launch (OpenCL only), window_chars, work_group_size,
-// dictionary_words_per_thread, dictionary_work_group_size,
-// dictionary_tails_per_cell - all optional, unset being the backend's
-// default. Returns false with `error` set on a value out of range or an
-// unknown key. See README.md's "Tuning OpenCL and Metal".
-bool buildBackendTunings(const ConfigFile& config, BackendTunings& out, std::string& error);
+// The [hardware] section, as setHardwareConfig (backends/backends.h) takes
+// it. Every key is optional:
+//   gpus                auto (the default: every discrete GPU, or the
+//                       integrated ones if there's nothing else), all,
+//                       none (the cpu backend), or GPU numbers separated by
+//                       commas, as `namebreak --list-gpus` shows them
+//   cpu_threads         the cpu backend's threads, 0 (the default) for one
+//                       per hardware thread
+//   rows_per_thread, batches_per_launch (OpenCL only), window_chars,
+//   work_group_size, dictionary_words_per_thread, dictionary_work_group_size,
+//   dictionary_tails_per_cell
+//                       the OpenCL and Metal backends' launch geometry,
+//                       each a number in its range (allGpuTuningKeys,
+//                       backends/gpu_tuning.h) - unset being the backend's
+//                       default
+//   gpu<N>.<any of those seven>
+//                       the same for GPU N only, over the ones above
+//   gpu<N>.name         the GPU those are for: another GPU that has number
+//                       N now doesn't get them
+// Returns false with `error` set on a value out of range or an unknown key.
+// See README.md's "Choosing and tuning the hardware".
+bool buildHardwareConfig(const ConfigFile& config, HardwareConfig& out, std::string& error);
 
 // A number of bytes, as [meet-in-the-middle]'s `table_memory` and
 // [coordinator]'s `meet_in_the_middle_table_memory` give it: digits,

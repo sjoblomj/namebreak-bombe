@@ -205,7 +205,7 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
 
 class CpuBackend : public SearchBackend {
 public:
-    CpuBackend() : threadCount_(std::max(1u, std::thread::hardware_concurrency())) {}
+    explicit CpuBackend(int threads) : threadCount_(threads > 0 ? (unsigned) threads : std::max(1u, std::thread::hardware_concurrency())) {}
 
     const char* name() const override { return "cpu"; }
     int windowChars() const override { return windowCharsOr(5); }
@@ -569,6 +569,6 @@ MeetInTheMiddleOutcome CpuBackend::runMeetInTheMiddleBatch(const MeetInTheMiddle
 
 } // namespace
 
-std::unique_ptr<SearchBackend> makeCpuBackend(std::string&) {
-    return std::make_unique<CpuBackend>();
+std::unique_ptr<SearchBackend> makeCpuBackend(int threads, std::string&) {
+    return std::make_unique<CpuBackend>(threads);
 }

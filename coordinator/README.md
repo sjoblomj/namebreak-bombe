@@ -786,7 +786,11 @@ EOF
 ../client/build/namebreak
 ```
 
-`hostname` (optional) defaults to the machine's actual hostname;
+`hostname` (optional) defaults to the machine's actual hostname - on a
+machine with several GPUs, each searches as a client of its own, GPU 0 as
+`hostname` and GPU N as `<hostname>/gpuN`, so that each one's ranges are
+sized by its own speed (see the client README's "Choosing and tuning the
+hardware");
 `poll_interval_secs` (optional) defaults to 30; and
 `meet_in_the_middle_table_memory` (optional, default none) is how much
 memory this client will give a meet-in-the-middle target's table - `1G`,

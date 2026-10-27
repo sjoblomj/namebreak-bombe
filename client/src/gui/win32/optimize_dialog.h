@@ -16,8 +16,9 @@ namespace gui {
 // settings are compiled in, or the CPU - a message box says so, with where to
 // get the script that tunes CUDA and HIP. Otherwise, once the user agrees, it
 // times the backend's settings on the GPU with a progress window
-// (showAutotuneProgress), saves the fastest to `configPath`'s [opencl] or
-// [metal] section, and makes them the process's (setBackendTunings).
+// (showAutotuneProgress) - each GPU [hardware] selects in turn - saves the
+// fastest to `configPath`'s [hardware] section, as each GPU's own, and makes
+// them the process's (setHardwareConfig).
 // `backend` is the config's `backend` (empty for the first that can run).
 //
 // `runningMode` is the mode of the search running already - from the tray

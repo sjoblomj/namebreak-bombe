@@ -24,8 +24,10 @@ constexpr UINT WM_APP_WORKER_STOPPED = WM_APP + 2;
 // warning on this) - they only ever touch this mutex-protected struct.
 // ---------------------------------------------------------------------
 
-struct SharedStatus {
-    std::mutex mutex;
+// One search's state: a local search's, or that of the range a coordinator
+// run's worker has in hand - one per GPU it searches on (see
+// runCoordinator).
+struct SearchStatus {
     std::string targetName;
     std::string outputFilePath;
     // Populated only for "bounded-shaped" work - a coordinator range, or
@@ -60,10 +62,10 @@ struct SharedStatus {
     // time the UI timer reads this struct - a one-shot "a range just ended"
     // edge, not a level, so the progress bar only snaps to 100% once.
     bool rangeJustFinished = false;
-    // Basenames a local dictionary search has found since the UI timer last
-    // took them (and cleared this) - for the matches box.
+    // Basenames a dictionary search has found since the UI timer last took
+    // them (and cleared this) - for the matches box.
     std::vector<std::string> newBasenames;
-    // The same for the directories a local meet-in-the-middle search found
+    // The same for the directories a meet-in-the-middle search found
     // matching the meeting point - kept apart from the basenames because
     // they mean a different thing (see CountedProgressText).
     std::vector<std::string> newMeetingPointMatches;
@@ -71,10 +73,22 @@ struct SharedStatus {
     // one, has got to since the UI timer last took it (and cleared this) -
     // also for the matches box. Empty for none.
     std::string newSearchPosition;
+    std::string statusText = "Starting...";
+};
+
+struct SharedStatus {
+    std::mutex mutex;
+    // The search's - or, in a coordinator run on several GPUs, each GPU's
+    // worker's, by coordinatorWorker() (net/coordinator_runner.h), with
+    // `gpus` naming them. Always at least one; `gpus` is empty with one.
+    std::vector<SearchStatus> searches = std::vector<SearchStatus>(1);
+    std::vector<std::string> gpus;
     // A local search ran to its end - found the file, or searched every
     // candidate - rather than stopping on an error.
     bool searchEnded = false;
-    std::string statusText = "Starting...";
+    // The latest status line of any search - what's said if the run stops
+    // on its own.
+    std::string lastStatus;
 };
 
 extern SharedStatus g_status;

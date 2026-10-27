@@ -4,8 +4,11 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "backends/gpu_device.h"
 #include "common/config.h"
 #include "net/protocol.h"
 #include "engine/search.h"
@@ -28,6 +31,10 @@ struct CoordinatorArgs {
     // Where each target's matches file goes - config.conf's matches_dir (see
     // matches_file.h).
     std::string matchesDir = kDefaultMatchesDir;
+    // Not a config.conf key either: what runCoordinator adds to a target's
+    // name for the matches file of one of its workers (workerMatchesSuffix),
+    // so that two GPUs searching one target don't write the same file.
+    std::string matchesSuffix;
     // The backend to search with - config.conf's `backend`, or --backend;
     // empty for the first one that can run here (see backends/backends.h).
     std::string backend;
@@ -58,6 +65,9 @@ void resolveMissingIdentity(CoordinatorArgs& args);
 
 // Optional hooks a caller (e.g. the Windows GUI, src/gui/win32/worker.cpp)
 // can pass into runCoordinator() to observe its progress without a console -
+// one run's, which searches on several GPUs at once if there are, each with
+// a worker of its own (see runCoordinator). Every callback but onWorkers is
+// called on a worker's thread, which coordinatorWorker() says the number of -
 // the CLI's main() passes none of these (all fields default-null), so its
 // behavior is completely unaffected. Every callback may be called from a background
 // thread (the same thread running runCoordinator()/runOneRange()), never
@@ -96,6 +106,9 @@ struct CoordinatorCallbacks {
     std::function<void(uint64_t searched, uint64_t toSearch)> onMeetInTheMiddleCount;
     std::function<void(const std::string& tail)> onMeetInTheMiddleStatus;
     std::function<void(const std::string& filename)> onMeetInTheMiddleMatch;
+    // Fired once, before any other, if the run searches on more than one GPU:
+    // their names ("GPU 1: Radeon RX 7900 XTX"), by worker.
+    std::function<void(const std::vector<std::string>& gpus)> onWorkers;
     // Outer-loop lifecycle text only (registered, registration failed,
     // claim retry/backoff, no work available) - mirrors the printf/fprintf
     // already at those call sites in runCoordinator(). Does NOT cover
@@ -106,8 +119,31 @@ struct CoordinatorCallbacks {
     std::function<void(const std::string&)> onStatus;
 };
 
+// Which of runCoordinator's workers the calling thread is - 0 for the first
+// GPU's, and for a run with one worker; -1 for a thread that isn't one - so
+// that a CoordinatorCallbacks callback knows whose search it's about.
+int coordinatorWorker();
+
+// The hostname a coordinator run's worker on `device` registers as: the
+// machine's own for GPU 0 - or a run without GPUs - and "<hostname>/gpu<N>"
+// for GPU N. The server measures how fast each client it knows searches, to
+// size the ranges it hands it, so each GPU is a client of its own.
+std::string workerHostname(const std::string& hostname, const std::optional<GpuDevice>& device);
+
+// And what the worker on `device` adds to a target's name for its matches
+// file: nothing for GPU 0, or a run without GPUs - matches-<target>.txt -
+// and "-gpu<N>" for GPU N: matches-<target>-gpu<N>.txt. A matches file
+// holds its search's latest Hash A match (see MatchWriter,
+// engine/match_writer.h), which says how far that search has got.
+std::string workerMatchesSuffix(const std::optional<GpuDevice>& device);
+
 // Runs the claim/search/heartbeat/complete loop against the coordinator
-// server, until `quitRequested` is set or the process is killed. Returns a
+// server, until `quitRequested` is set or the process is killed - on every
+// GPU of its backend that config.conf's [hardware] selects (see
+// selectedGpus, backends/backends.h) at once: one worker each, with a
+// backend of its own, registered as a client of its own (workerHostname)
+// and claiming ranges of its own. They share the pause and the quit, and
+// say which GPU a message is about ("[coordinator gpu1] ..."). Returns a
 // process exit code only on a startup error (e.g. registration failure) or
 // once `quitRequested` is observed (0); otherwise this never returns under
 // normal operation. Takes `args` by value since it fills in (and may prompt
@@ -124,10 +160,15 @@ struct CoordinatorCallbacks {
 // CoordinatorCallbacks above.
 // `finishRangeThenPause`, if given (and `pauseRequested` too), asks for a
 // pause once the range in hand is finished, before any new work is claimed:
-// whenever this loop is about to claim and finds it set, it clears it, sets
-// `*pauseRequested` and waits there like any other pause. Set while no
-// range is in hand (paused between ranges, or waiting for work), that means
-// pausing right away.
+// whenever this loop is about to claim and finds it set, it waits there -
+// and once every GPU's worker is waiting there, it clears it, sets
+// `*pauseRequested` and waits like any other pause. Set while no range is in
+// hand (paused between ranges, or waiting for work), that means pausing
+// right away.
+//
+// Returns 1 if no worker could start, or the server stopped taking this
+// release; a worker whose GPU couldn't (failed its self-test, say) leaves
+// the others searching.
 int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested = nullptr, std::atomic<bool>* quitRequested = nullptr,
                     const CoordinatorCallbacks* callbacks = nullptr, std::atomic<bool>* finishRangeThenPause = nullptr);
 

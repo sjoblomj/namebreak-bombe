@@ -108,7 +108,26 @@ void interruptibleSleep(std::chrono::milliseconds duration, const std::atomic<bo
     }
 }
 
+// The prefix of the calling thread's messages: "[coordinator]", or - with
+// several GPUs searching - "[coordinator gpu<N>]" for GPU N's worker and
+// the threads it starts (see runCoordinator), so that it's clear which GPU a
+// range's messages are about.
+thread_local std::string t_tag = "[coordinator]";
+const std::string& tag() {
+    return t_tag;
+}
+void setTag(const std::string& value) {
+    t_tag = value;
+}
+
+// coordinatorWorker()'s.
+thread_local int t_worker = -1;
+
 } // namespace
+
+int coordinatorWorker() {
+    return t_worker;
+}
 
 // Interactively confirms (or lets the user override) auto-discovered values
 // for whichever of `args`'s username/hostname were left unset by
@@ -193,7 +212,13 @@ bool toMatchCheck(const ClaimResponse& claim, MatchCheck& check, std::string& er
     return true;
 }
 
-SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& matchesDir, std::string& error) {
+// The matches file a range of `claim`'s target is searched into - see
+// CoordinatorArgs::matchesSuffix.
+std::string rangeMatchesPath(const CoordinatorArgs& args, const ClaimResponse& claim) {
+    return matchesFilePath(args.matchesDir, claim.targetName + args.matchesSuffix);
+}
+
+SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& outputFilePath, std::string& error) {
     SearchRequest req;
     req.alphabet = claim.alphabet;
     req.maxBackslashCount = (int) claim.maxBackslashCount;
@@ -212,7 +237,7 @@ SearchRequest toSearchRequest(const ClaimResponse& claim, const std::string& mat
     req.insertFromStart = claim.insertFromStart;
     req.insertFromEnd = claim.insertFromEnd;
     req.continuous = false; // a coordinator range is always run "bounded"
-    req.outputFilePath = matchesFilePath(matchesDir, claim.targetName);
+    req.outputFilePath = outputFilePath;
     if (!hexToU32(claim.hashAHex, req.targetHashA) || !hexToU32(claim.hashBHex, req.targetHashB)) {
         error = "malformed target hash in claim response (hashA=" + claim.hashAHex + " hashB=" + claim.hashBHex + ")";
     }
@@ -239,7 +264,7 @@ public:
             chosen_ = &main_;
             return chosen_;
         }
-        fprintf(stderr, "[coordinator] the %s backend %s - searching dictionary targets with the cpu backend instead\n", main_.name(),
+        fprintf(stderr, "%s the %s backend %s - searching dictionary targets with the cpu backend instead\n", tag().c_str(), main_.name(),
                 main_.supportsDictionary() ? ("failed the dictionary self-test: " + testError).c_str() : "can't search dictionaries");
         cpu_ = createDictionaryBackend("cpu", error);
         chosen_ = cpu_.get();
@@ -268,7 +293,7 @@ public:
             chosen_ = &main_;
             return chosen_;
         }
-        fprintf(stderr, "[coordinator] the %s backend %s - searching meet-in-the-middle targets with the cpu backend instead\n", main_.name(),
+        fprintf(stderr, "%s the %s backend %s - searching meet-in-the-middle targets with the cpu backend instead\n", tag().c_str(), main_.name(),
                 main_.supportsMeetInTheMiddle() ? ("failed the meet-in-the-middle self-test: " + testError).c_str()
                                                 : "can't search meet-in-the-middle targets");
         cpu_ = createMeetInTheMiddleBackend("cpu", error);
@@ -402,19 +427,19 @@ void reportQuit(const CoordinatorArgs& args, const std::string& token, int64_t r
             basenamesDelivered(outbox, req.basenames);
             falseMatchesDelivered(falseMatches, req.falseMatches);
             if (progressed)
-                printf("[coordinator] range %lld: told the coordinator it's %s - the rest goes back to be handed out\n", (long long) rangeId,
+                printf("%s range %lld: told the coordinator it's %s - the rest goes back to be handed out\n", tag().c_str(), (long long) rangeId,
                        describeProgress(req).c_str());
             else
-                printf("[coordinator] range %lld: told the coordinator - no progress to report, so the whole range goes back to be handed out\n",
+                printf("%s range %lld: told the coordinator - no progress to report, so the whole range goes back to be handed out\n", tag().c_str(),
                        (long long) rangeId);
             break;
         case CoordinatorClient::QuitOutcome::Conflict:
             basenamesDelivered(outbox, req.basenames);
             falseMatchesDelivered(falseMatches, req.falseMatches);
-            printf("[coordinator] range %lld: no longer assigned to us - nothing to report\n", (long long) rangeId);
+            printf("%s range %lld: no longer assigned to us - nothing to report\n", tag().c_str(), (long long) rangeId);
             break;
         case CoordinatorClient::QuitOutcome::Error:
-            fprintf(stderr, "[coordinator] range %lld: couldn't tell the coordinator we're quitting (%s) - its lease will expire instead\n",
+            fprintf(stderr, "%s range %lld: couldn't tell the coordinator we're quitting (%s) - its lease will expire instead\n", tag().c_str(),
                     (long long) rangeId, err.c_str());
             break;
     }
@@ -432,8 +457,8 @@ bool sendBasenamesBeforeCompleting(const CoordinatorArgs& args, CoordinatorClien
                                    const std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
     if (outbox.size() <= kMaxBasenamesPerReport)
         return true;
-    printf("[coordinator] range %lld: sending the %zu basenames found before completing it, %zu at a time\n", (long long) claim.rangeId, outbox.size(),
-           kMaxBasenamesPerReport);
+    printf("%s range %lld: sending the %zu basenames found before completing it, %zu at a time\n", tag().c_str(), (long long) claim.rangeId,
+           outbox.size(), kMaxBasenamesPerReport);
     RetryBackoff backoff(std::chrono::seconds(args.pollIntervalSecs));
     while (outbox.size() > kMaxBasenamesPerReport) {
         HeartbeatRequest req;
@@ -447,23 +472,24 @@ bool sendBasenamesBeforeCompleting(const CoordinatorArgs& args, CoordinatorClien
                 outbox.remove(req.basenames.size());
                 backoff.reset();
                 if (resp.rangeReleased) {
-                    printf("[coordinator] range %lld: released by the coordinator before it could be completed\n", (long long) claim.rangeId);
+                    printf("%s range %lld: released by the coordinator before it could be completed\n", tag().c_str(), (long long) claim.rangeId);
                     return false;
                 }
                 break;
             case CoordinatorClient::HeartbeatOutcome::Conflict:
                 outbox.remove(req.basenames.size());
-                printf("[coordinator] range %lld: no longer assigned to us - the rest of it is someone else's to search\n", (long long) claim.rangeId);
+                printf("%s range %lld: no longer assigned to us - the rest of it is someone else's to search\n", tag().c_str(),
+                       (long long) claim.rangeId);
                 return false;
             case CoordinatorClient::HeartbeatOutcome::Error: {
                 if (quitRequested && quitRequested->load(std::memory_order_relaxed)) {
-                    fprintf(stderr, "[coordinator] range %lld: quitting with %zu basenames not sent - the part of the range they're in is handed out again\n",
-                            (long long) claim.rangeId, outbox.size());
+                    fprintf(stderr, "%s range %lld: quitting with %zu basenames not sent - the part of the range they're in is handed out again\n",
+                            tag().c_str(), (long long) claim.rangeId, outbox.size());
                     return false;
                 }
                 auto cap = backoff.cap();
                 auto sleepFor = backoff.nextSleep();
-                std::string msg = "[coordinator] range " + std::to_string(claim.rangeId) + ": failed to send basenames, retrying in " +
+                std::string msg = tag() + " range " + std::to_string(claim.rangeId) + ": failed to send basenames, retrying in " +
                                   std::to_string(sleepFor.count()) + "s (backoff cap " + std::to_string(cap.count()) + "s): " + err;
                 fprintf(stderr, "%s\n", msg.c_str());
                 if (callbacks && callbacks->onStatus)
@@ -527,7 +553,9 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
         });
     }
 
+    const std::string workerTag = tag();
     std::thread heartbeatThread([&]() {
+        setTag(workerTag);
         CoordinatorClient hbClient(args.serverUrl);
         hbClient.setToken(token);
         std::unique_lock<std::mutex> lock(stopMutex);
@@ -556,11 +584,11 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
                         // decide whether to go claim a new range or stay idle.
                         wasPausedWhenStopped = pauseRequested && pauseRequested->load(std::memory_order_relaxed);
                         if (wasPausedWhenStopped) {
-                            printf("[coordinator] range %lld: claim released - no progress was reported while paused. "
-                                   "Still paused; no new work will be claimed until resumed.\n",
+                            printf("%s range %lld: claim released - no progress was reported while paused. "
+                                   "Still paused; no new work will be claimed until resumed.\n", tag().c_str(),
                                    (long long) claim.rangeId);
                         } else {
-                            printf("[coordinator] range %lld: target already solved elsewhere - signaling abort\n", (long long) claim.rangeId);
+                            printf("%s range %lld: target already solved elsewhere - signaling abort\n", tag().c_str(), (long long) claim.rangeId);
                         }
                         abortRequested.store(true, std::memory_order_relaxed);
                         lock.lock();
@@ -584,13 +612,13 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
                     lostOwnership = true;
                     wasPausedWhenStopped = pauseRequested && pauseRequested->load(std::memory_order_relaxed);
                     if (wasPausedWhenStopped) {
-                        printf("[coordinator] range %lld: no longer assigned to us - unsurprising, since this client "
+                        printf("%s range %lld: no longer assigned to us - unsurprising, since this client "
                                "has been paused (and therefore not heartbeating) for a while. Still paused; no new "
-                               "work will be claimed until resumed.\n",
+                               "work will be claimed until resumed.\n", tag().c_str(),
                                (long long) claim.rangeId);
                     } else {
-                        printf("[coordinator] range %lld: no longer assigned to us (the lease likely lapsed while "
-                               "this client was inactive) - stopping\n",
+                        printf("%s range %lld: no longer assigned to us (the lease likely lapsed while "
+                               "this client was inactive) - stopping\n", tag().c_str(),
                                (long long) claim.rangeId);
                     }
                     abortRequested.store(true, std::memory_order_relaxed);
@@ -598,7 +626,7 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
                     goto stopHeartbeating;
                 case CoordinatorClient::HeartbeatOutcome::Error:
                     // The basenames stay, for the next report.
-                    fprintf(stderr, "[coordinator] range %lld: heartbeat failed: %s\n", (long long) claim.rangeId, err.c_str());
+                    fprintf(stderr, "%s range %lld: heartbeat failed: %s\n", tag().c_str(), (long long) claim.rangeId, err.c_str());
                     break;
             }
             lock.lock();
@@ -625,7 +653,7 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
         quitWatcherThread.join();
 
     if (!result.ok) {
-        fprintf(stderr, "[coordinator] range %lld: search failed (%s) - letting the lease expire so it gets reassigned\n",
+        fprintf(stderr, "%s range %lld: search failed (%s) - letting the lease expire so it gets reassigned\n", tag().c_str(),
                 (long long) claim.rangeId, result.error.c_str());
         if (callbacks && callbacks->onRangeFinished)
             callbacks->onRangeFinished(false);
@@ -641,23 +669,23 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
         if (externallyQuit && !lostOwnership && !wasPausedWhenStopped) {
             // Ours until now, so tell the server we're done with it - see
             // reportQuit.
-            printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
+            printf("%s range %lld: aborted - quit requested\n", tag().c_str(), (long long) claim.rangeId);
             QuitRequest req;
             fillReport(search, req);
             reportQuit(args, token, claim.rangeId, req, search.outbox, &search.falseMatches);
         } else if (externallyQuit) {
-            printf("[coordinator] range %lld: aborted - quit requested\n", (long long) claim.rangeId);
+            printf("%s range %lld: aborted - quit requested\n", tag().c_str(), (long long) claim.rangeId);
         } else if (lostOwnership) {
-            printf("[coordinator] range %lld: aborted - no longer assigned to us%s\n", (long long) claim.rangeId,
+            printf("%s range %lld: aborted - no longer assigned to us%s\n", tag().c_str(), (long long) claim.rangeId,
                    wasPausedWhenStopped ? " (still paused)" : "");
         } else if (wasPausedWhenStopped) {
-            printf("[coordinator] range %lld: aborted - claim released while paused\n", (long long) claim.rangeId);
+            printf("%s range %lld: aborted - claim released while paused\n", tag().c_str(), (long long) claim.rangeId);
         } else {
-            printf("[coordinator] range %lld: aborted - target was already solved by someone else\n", (long long) claim.rangeId);
+            printf("%s range %lld: aborted - target was already solved by someone else\n", tag().c_str(), (long long) claim.rangeId);
         }
         if (search.outbox && search.outbox->size() > 0)
-            printf("[coordinator] range %lld: %zu basename(s) not sent - the server hasn't been told the search got past them, so "
-                   "they'll be found again when that part of the range is searched again\n",
+            printf("%s range %lld: %zu basename(s) not sent - the server hasn't been told the search got past them, so "
+                   "they'll be found again when that part of the range is searched again\n", tag().c_str(),
                    (long long) claim.rangeId, search.outbox->size());
         if (callbacks && callbacks->onRangeFinished)
             callbacks->onRangeFinished(false);
@@ -665,9 +693,9 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
     }
 
     if (result.found) {
-        printf("[coordinator] range %lld: MATCH FOUND: %s\n", (long long) claim.rangeId, result.filename.c_str());
+        printf("%s range %lld: MATCH FOUND: %s\n", tag().c_str(), (long long) claim.rangeId, result.filename.c_str());
     } else {
-        printf("[coordinator] range %lld: exhausted, no match\n", (long long) claim.rangeId);
+        printf("%s range %lld: exhausted, no match\n", tag().c_str(), (long long) claim.rangeId);
     }
     if (callbacks && callbacks->onRangeFinished)
         callbacks->onRangeFinished(result.found);
@@ -700,13 +728,13 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
     CoordinatorClient::CompleteOutcome outcome;
     while ((outcome = completeClient.complete(claim.rangeId, completeReq, err)) == CoordinatorClient::CompleteOutcome::TransientError) {
         if (quitRequested && quitRequested->load(std::memory_order_relaxed)) {
-            fprintf(stderr, "[coordinator] range %lld: quitting without having reported completion%s\n", (long long) claim.rangeId,
+            fprintf(stderr, "%s range %lld: quitting without having reported completion%s\n", tag().c_str(), (long long) claim.rangeId,
                     result.found ? (" - the match (" + result.filename + ") is only in " + foundFilePath(search.outputFilePath)).c_str() : "");
             return;
         }
         auto cap = backoff.cap();
         auto sleepFor = backoff.nextSleep();
-        std::string msg = "[coordinator] range " + std::to_string(claim.rangeId) + ": failed to report completion, retrying in " +
+        std::string msg = tag() + " range " + std::to_string(claim.rangeId) + ": failed to report completion, retrying in " +
                           std::to_string(sleepFor.count()) + "s (backoff cap " + std::to_string(cap.count()) + "s): " + err;
         fprintf(stderr, "%s\n", msg.c_str());
         if (callbacks && callbacks->onStatus)
@@ -726,18 +754,18 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
             // outlasted the lease, so the server already reassigned it.
             if (result.found) {
                 fprintf(stderr,
-                        "[coordinator] range %lld: found a match but lost ownership of this range before reporting it - "
+                        "%s range %lld: found a match but lost ownership of this range before reporting it - "
                         "It has been reported now\n",
-                        (long long) claim.rangeId);
+                        tag().c_str(), (long long) claim.rangeId);
             } else {
-                printf("[coordinator] range %lld: lost ownership of this range before reporting completion - "
-                       "the server had already reassigned it, so this GPU time was redundant but nothing is lost\n",
+                printf("%s range %lld: lost ownership of this range before reporting completion - "
+                       "the server had already reassigned it, so this GPU time was redundant but nothing is lost\n", tag().c_str(),
                        (long long) claim.rangeId);
             }
             break;
         case CoordinatorClient::CompleteOutcome::TransientError: // unreachable - retried above
         case CoordinatorClient::CompleteOutcome::Error:
-            fprintf(stderr, "[coordinator] range %lld: failed to report completion: %s\n", (long long) claim.rangeId, err.c_str());
+            fprintf(stderr, "%s range %lld: failed to report completion: %s\n", tag().c_str(), (long long) claim.rangeId, err.c_str());
             break;
     }
 }
@@ -747,9 +775,9 @@ void runRange(const CoordinatorArgs& args, const std::string& token, const Claim
 void runAlphabetRange(SearchBackend& backend, const CoordinatorArgs& args, const std::string& token, const ClaimResponse& claim,
                       const std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
     std::string reqError;
-    SearchRequest req = toSearchRequest(claim, args.matchesDir, reqError);
+    SearchRequest req = toSearchRequest(claim, rangeMatchesPath(args, claim), reqError);
     if (!reqError.empty()) {
-        fprintf(stderr, "[coordinator] range %lld: %s - skipping, letting the lease expire so it gets reassigned\n",
+        fprintf(stderr, "%s range %lld: %s - skipping, letting the lease expire so it gets reassigned\n", tag().c_str(),
                 (long long) claim.rangeId, reqError.c_str());
         return;
     }
@@ -780,7 +808,7 @@ void runAlphabetRange(SearchBackend& backend, const CoordinatorArgs& args, const
 
 // The search of a dictionary target's range (see ClaimResponse::dictionary)
 // - false, with `error` set, if the claim can't make one.
-bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::string>& words, const std::string& matchesDir, DictionaryRequest& req,
+bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::string>& words, const std::string& outputFilePath, DictionaryRequest& req,
                          std::string& error) {
     req.pattern.words = words;
     req.pattern.separators.clear();
@@ -840,7 +868,7 @@ bool toDictionaryRequest(const ClaimResponse& claim, const std::vector<std::stri
     req.wordSource.clear();
     for (const std::string& name : claim.wordLists)
         req.wordSource += (req.wordSource.empty() ? "" : " + ") + name;
-    req.outputFilePath = matchesFilePath(matchesDir, claim.targetName);
+    req.outputFilePath = outputFilePath;
     // The basenames go to the server, by way of the outbox (see
     // BasenameOutbox) - never to a file; the server keeps the progress.
     req.basenamesFilePath.clear();
@@ -866,19 +894,19 @@ bool runDictionaryRange(DictionaryBackend& backends, const CoordinatorArgs& args
     const bool ready = resolveClaimWords(
                            claim, cacheDir,
                            [&](const std::string& name, std::string& text, std::string& downloadError) {
-                               printf("[coordinator] downloading word list %s\n", name.c_str());
+                               printf("%s downloading word list %s\n", tag().c_str(), name.c_str());
                                fflush(stdout);
                                return downloadClient.downloadWordList(name, text, downloadError);
                            },
                            words, downloaded, error) &&
-                       toDictionaryRequest(claim, words, args.matchesDir, req, error) && (backend = backends.get(error)) != nullptr;
+                       toDictionaryRequest(claim, words, rangeMatchesPath(args, claim), req, error) && (backend = backends.get(error)) != nullptr;
     if (!ready) {
-        fprintf(stderr, "[coordinator] range %lld: can't search it (%s) - handing it back\n", (long long) claim.rangeId, error.c_str());
+        fprintf(stderr, "%s range %lld: can't search it (%s) - handing it back\n", tag().c_str(), (long long) claim.rangeId, error.c_str());
         reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr, nullptr);
         return false;
     }
     for (const std::string& name : downloaded)
-        printf("[coordinator] word list %s kept in %s\n", name.c_str(), cacheDir.c_str());
+        printf("%s word list %s kept in %s\n", tag().c_str(), name.c_str(), cacheDir.c_str());
 
     if (callbacks && callbacks->onRangeClaimed) {
         // What a caller can show of it: no lower bound - the numbers aren't a
@@ -977,7 +1005,7 @@ bool toMeetInTheMiddleRequest(const ClaimResponse& claim, const CoordinatorArgs&
     base = space.numberOf(tailLength, 0);
     req.startNumber = space.numberOf(tailLength, (uint64_t) claim.firstTailIndex);
     req.endNumber = space.numberOf(tailLength, (uint64_t) claim.endTailIndex);
-    req.outputFilePath = matchesFilePath(args.matchesDir, claim.targetName);
+    req.outputFilePath = rangeMatchesPath(args, claim);
     // The server keeps the progress (a heartbeat's next_tail_index), so
     // there's no progress file.
     req.progressFilePath.clear();
@@ -995,7 +1023,7 @@ bool runMeetInTheMiddleRange(MeetInTheMiddleBackend& backends, const Coordinator
     uint64_t base = 0;
     SearchBackend* backend = nullptr;
     if (!toMeetInTheMiddleRequest(claim, args, req, base, error) || (backend = backends.get(error)) == nullptr) {
-        fprintf(stderr, "[coordinator] range %lld: can't search it (%s) - handing it back\n", (long long) claim.rangeId, error.c_str());
+        fprintf(stderr, "%s range %lld: can't search it (%s) - handing it back\n", tag().c_str(), (long long) claim.rangeId, error.c_str());
         reportQuit(args, token, claim.rangeId, QuitRequest(), nullptr, nullptr);
         return false;
     }
@@ -1048,7 +1076,7 @@ bool runMeetInTheMiddleRange(MeetInTheMiddleBackend& backends, const Coordinator
 bool runOneRange(SearchBackend& backend, DictionaryBackend& dictionaryBackend, MeetInTheMiddleBackend& meetInTheMiddleBackend,
                  const CoordinatorArgs& args, const std::string& token, const ClaimResponse& claim, const std::atomic<bool>* pauseRequested,
                  std::atomic<bool>* quitRequested, const CoordinatorCallbacks* callbacks) {
-    printf("[coordinator] starting range %lld (target %s) [%s .. %s]\n",
+    printf("%s starting range %lld (target %s) [%s .. %s]\n", tag().c_str(),
            (long long) claim.rangeId, claim.targetName.c_str(), claim.lowerBoundFilename.c_str(), claim.upperBoundFilename.c_str());
     if (claim.dictionary)
         return runDictionaryRange(dictionaryBackend, args, token, claim, pauseRequested, quitRequested, callbacks);
@@ -1095,26 +1123,52 @@ bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::s
     return true;
 }
 
-int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested,
-                    const CoordinatorCallbacks* callbacks, std::atomic<bool>* finishRangeThenPause) {
-    resolveMissingIdentity(args);
+namespace {
 
-    // Not thread-safe to call lazily once the heartbeat thread may already
-    // be making requests concurrently with the main thread - do it once,
-    // up front, before any thread touches libcurl. Paired with
-    // curl_global_cleanup() via this guard's destructor on every return path.
-    CurlGlobalGuard curlGuard;
+// What the workers of one coordinator run share - one worker per GPU it
+// searches on (see runCoordinator).
+struct WorkerGroup {
+    std::atomic<bool>* pauseRequested = nullptr;
+    // The run's own quit: set when the caller's is, and when a worker finds
+    // the server won't take this release any more (`fatal`), which stops
+    // the others too.
+    std::atomic<bool> quit{false};
+    std::atomic<bool> fatal{false};
+    std::atomic<bool>* finishRangeThenPause = nullptr;
+    const CoordinatorCallbacks* callbacks = nullptr;
+    // How many workers are still running, and how many of them are waiting
+    // at their next claim for the others to finish theirs - see
+    // finishRangeThenPause, which only turns into a pause once every worker
+    // is waiting there.
+    std::atomic<int> running{0};
+    std::atomic<int> holding{0};
+};
 
-    // One backend for every range this client claims - runSearch() resets
-    // its state at the start of each. Created before registering, which
-    // tells the server which backend this client uses.
-    std::string backendError;
-    std::unique_ptr<SearchBackend> backend = createBackend(args.backend, backendError);
+// One worker of a coordinator run: registers as `args`' username and
+// hostname, then claims ranges and searches them with `backend` - made
+// here, on `device` of the backend called `backendName`, if it's null -
+// until the group quits. Returns runCoordinator's exit code.
+int runWorker(CoordinatorArgs args, WorkerGroup& group, std::unique_ptr<SearchBackend> backend, const std::string& backendName,
+              const std::optional<GpuDevice>& device) {
+    std::atomic<bool>* pauseRequested = group.pauseRequested;
+    std::atomic<bool>* quitRequested = &group.quit;
+    std::atomic<bool>* finishRangeThenPause = group.finishRangeThenPause;
+    const CoordinatorCallbacks* callbacks = group.callbacks;
+    struct Running {
+        WorkerGroup& group;
+        ~Running() { --group.running; }
+    } running{group};
+
     if (!backend) {
-        fprintf(stderr, "%s\n", backendError.c_str());
-        if (callbacks && callbacks->onStatus)
-            callbacks->onStatus(backendError);
-        return 1;
+        std::string backendError;
+        backend = createBackend(backendName, backendError, nullptr, nullptr, device ? device->index : -1);
+        if (!backend) {
+            const std::string msg = tag() + " " + backendError;
+            fprintf(stderr, "%s\n", msg.c_str());
+            if (callbacks && callbacks->onStatus)
+                callbacks->onStatus(msg);
+            return 1;
+        }
     }
 
     CoordinatorClient client(args.serverUrl);
@@ -1123,7 +1177,11 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
     if (!client.registerClient(args.username, args.hostname, backend->name(), args.meetInTheMiddleTableBytes, registration, error)) {
         // Too old for the server (see CoordinatorClient::upgradeRequired):
         // its message says what to get.
-        std::string msg = client.upgradeRequired() ? error : "failed to register with coordinator: " + error;
+        std::string msg = client.upgradeRequired() ? error : tag() + " failed to register with coordinator: " + error;
+        if (client.upgradeRequired()) {
+            group.fatal = true;
+            group.quit = true;
+        }
         fprintf(stderr, "%s\n", msg.c_str());
         if (callbacks && callbacks->onStatus)
             callbacks->onStatus(msg);
@@ -1136,9 +1194,10 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
         std::string tableNote = "no meet-in-the-middle work (set meet_in_the_middle_table_memory in [coordinator] to take it on)";
         if (args.meetInTheMiddleTableBytes > 0)
             tableNote = std::to_string((uint64_t) args.meetInTheMiddleTableBytes / (1024 * 1024)) + " MB for a meet-in-the-middle table";
-        std::string msg = "[coordinator] registered with coordinator as user " + std::to_string(registration.userId) + " (" + args.username +
-                           "@" + args.hostname + ", " + backend->name() + " backend, " + tableNote + ") - namebreak " + namebreakVersion() +
-                           ", client protocol v" + kProtocolVersion + ", server protocol v" + registration.serverProtocolVersion;
+        const std::string on = device ? " on " + device->name : "";
+        std::string msg = tag() + " registered with coordinator as user " + std::to_string(registration.userId) + " (" + args.username + "@" +
+                          args.hostname + ", " + backend->name() + " backend" + on + ", " + tableNote + ") - namebreak " + namebreakVersion() +
+                          ", client protocol v" + kProtocolVersion + ", server protocol v" + registration.serverProtocolVersion;
         printf("%s\n", msg.c_str());
         fflush(stdout);
         if (callbacks && callbacks->onStatus)
@@ -1150,11 +1209,10 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
     auto dictionaryBackend = std::make_unique<DictionaryBackend>(*backend);
     auto meetInTheMiddleBackend = std::make_unique<MeetInTheMiddleBackend>(*backend);
     // The launch settings an OpenCL or Metal backend was made with - which
-    // the Windows GUI's Optimize for hardware changes (setBackendTunings)
+    // the Windows GUI's Optimize for hardware changes (setHardwareConfig)
     // while a range is in hand.
-    const std::string backendName = backend->name();
-    auto tuningOf = [&backendName](const BackendTunings& tunings) { return backendName == "metal" ? tunings.metal : tunings.opencl; };
-    GpuTuning madeWith = tuningOf(backendTunings());
+    auto tuningNow = [&](const HardwareConfig& hardware) { return device ? gpuTuningFor(hardware, *device) : GpuTuning(); };
+    GpuTuning madeWith = tuningNow(hardwareConfig());
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
     RetryBackoff claimBackoff(pollInterval);
@@ -1170,11 +1228,20 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
         //
         // It's also where finishRangeThenPause turns into a real pause: this
         // is the one point between finishing a range and claiming the next.
-        // Checked on every pass, not just once, so that turning it on while
-        // paused here (which also resumes - see its callers) pauses again
-        // straight away rather than claiming a whole new range.
+        // With several workers, each waits here once it's finished its range,
+        // and the last one to get here pauses them all - the others are still
+        // searching until then. Checked on every pass, not just once, so that
+        // turning it on while paused here (which also resumes - see its
+        // callers) pauses again straight away rather than claiming a whole
+        // new range.
+        bool holding = false;
         while (true) {
-            if (finishRangeThenPause && pauseRequested && finishRangeThenPause->exchange(false, std::memory_order_relaxed)) {
+            const bool finishing = finishRangeThenPause && pauseRequested && finishRangeThenPause->load(std::memory_order_relaxed);
+            if (finishing && !holding) {
+                holding = true;
+                ++group.holding;
+            }
+            if (finishing && group.holding.load() >= group.running.load() && finishRangeThenPause->exchange(false, std::memory_order_relaxed)) {
                 pauseRequested->store(true, std::memory_order_relaxed);
                 // The key hint is for the console only - the GUI (onStatus)
                 // resumes with its Resume button instead.
@@ -1183,24 +1250,26 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
                 if (callbacks && callbacks->onStatus)
                     callbacks->onStatus(msg);
             }
-            if (!(pauseRequested && pauseRequested->load(std::memory_order_relaxed)))
+            if (!(pauseRequested && pauseRequested->load(std::memory_order_relaxed)) && !finishing)
                 break;
-            if (quitRequested && quitRequested->load(std::memory_order_relaxed))
-                return 0;
+            if (quitRequested->load(std::memory_order_relaxed))
+                break;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        if (quitRequested && quitRequested->load(std::memory_order_relaxed))
-            return 0;
+        if (holding)
+            --group.holding;
+        if (quitRequested->load(std::memory_order_relaxed))
+            return group.fatal ? 1 : 0;
 
         // New launch settings: the backend is made again with them, here
         // between two ranges, where nothing is half done - and self-tested
         // with them, as at start-up. Should that fail, the old one carries
         // on, and these settings aren't tried again.
-        const BackendTunings tunings = backendTunings();
-        if (!gpuTuningKeys(backendName).empty() && tuningOf(tunings) != madeWith) {
-            madeWith = tuningOf(tunings);
+        const HardwareConfig hardware = hardwareConfig();
+        if (!gpuTuningKeys(backendName).empty() && tuningNow(hardware) != madeWith) {
+            madeWith = tuningNow(hardware);
             std::string remakeError;
-            std::unique_ptr<SearchBackend> remade = createBackend(backendName, remakeError, nullptr, &tunings);
+            std::unique_ptr<SearchBackend> remade = createBackend(backendName, remakeError, nullptr, &hardware, device ? device->index : -1);
             std::string msg;
             if (remade) {
                 // The helpers hold the backend they were made with: new ones
@@ -1209,13 +1278,12 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
                 meetInTheMiddleBackend = std::make_unique<MeetInTheMiddleBackend>(*remade);
                 backend = std::move(remade);
                 const std::string values = describeGpuTuning(backendName, madeWith);
-                msg = "[coordinator] searching with new " + backendName + " launch settings from this range on (" +
+                msg = tag() + " searching with new " + backendName + " launch settings from this range on (" +
                       (values.empty() ? "the defaults" : values) + ")";
                 printf("%s\n", msg.c_str());
                 fflush(stdout);
             } else {
-                msg = "[coordinator] the new " + backendName + " launch settings can't be used (" + remakeError +
-                      ") - keeping the ones it started with";
+                msg = tag() + " the new " + backendName + " launch settings can't be used (" + remakeError + ") - keeping the ones it started with";
                 fprintf(stderr, "%s\n", msg.c_str());
             }
             if (callbacks && callbacks->onStatus)
@@ -1226,7 +1294,9 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
         if (!client.claim(claim, error)) {
             if (client.upgradeRequired()) {
                 // The server has stopped accepting this release since it
-                // registered - retrying won't change that.
+                // registered - retrying won't change that, on any GPU.
+                group.fatal = true;
+                group.quit = true;
                 fprintf(stderr, "%s\n", error.c_str());
                 if (callbacks && callbacks->onStatus)
                     callbacks->onStatus(error);
@@ -1234,8 +1304,8 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
             }
             auto cap = claimBackoff.cap();
             auto sleepFor = claimBackoff.nextSleep();
-            std::string msg = "[coordinator] claim failed, retrying in " + std::to_string(sleepFor.count()) + "s (backoff cap " +
-                               std::to_string(cap.count()) + "s): " + error;
+            std::string msg = tag() + " claim failed, retrying in " + std::to_string(sleepFor.count()) + "s (backoff cap " +
+                              std::to_string(cap.count()) + "s): " + error;
             fprintf(stderr, "%s\n", msg.c_str());
             if (callbacks && callbacks->onStatus)
                 callbacks->onStatus(msg);
@@ -1245,10 +1315,11 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
         claimBackoff.reset(); // once the server is reachable again
 
         if (!claim) {
-            printf("[coordinator] no work available, sleeping\n");
+            const std::string msg = tag() + " no work available, sleeping";
+            printf("%s\n", msg.c_str());
             fflush(stdout);
             if (callbacks && callbacks->onStatus)
-                callbacks->onStatus("[coordinator] no work available, sleeping");
+                callbacks->onStatus(msg);
             interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(pollInterval), quitRequested);
             continue;
         }
@@ -1258,7 +1329,122 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
             // Most likely the next claim would be the same range again.
             interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(pollInterval), quitRequested);
         }
-        if (quitRequested && quitRequested->load(std::memory_order_relaxed))
-            return 0;
+        if (quitRequested->load(std::memory_order_relaxed))
+            return group.fatal ? 1 : 0;
     }
+}
+
+} // namespace
+
+std::string workerHostname(const std::string& hostname, const std::optional<GpuDevice>& device) {
+    return device && device->index != 0 ? hostname + "/gpu" + std::to_string(device->index) : hostname;
+}
+
+std::string workerMatchesSuffix(const std::optional<GpuDevice>& device) {
+    return device && device->index != 0 ? "-gpu" + std::to_string(device->index) : "";
+}
+
+int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std::atomic<bool>* quitRequested,
+                    const CoordinatorCallbacks* callbacks, std::atomic<bool>* finishRangeThenPause) {
+    resolveMissingIdentity(args);
+
+    // Not thread-safe to call lazily once the heartbeat thread may already
+    // be making requests concurrently with the main thread - do it once,
+    // up front, before any thread touches libcurl. Paired with
+    // curl_global_cleanup() via this guard's destructor on every return path.
+    CurlGlobalGuard curlGuard;
+
+    // The backend every range is searched with - runSearch() resets its
+    // state at the start of each - on the first GPU [hardware] selects, as
+    // createBackend picks it. The other GPUs it selects search too, each with
+    // a backend of the same kind made by its own worker.
+    std::string backendError;
+    std::unique_ptr<SearchBackend> backend = createBackend(args.backend, backendError);
+    if (!backend) {
+        fprintf(stderr, "%s\n", backendError.c_str());
+        if (callbacks && callbacks->onStatus)
+            callbacks->onStatus(backendError);
+        return 1;
+    }
+    const std::string backendName = backend->name();
+    std::vector<std::optional<GpuDevice>> devices;
+    for (const GpuDevice& device : selectedGpus(gpuDevices(backendName), hardwareConfig()))
+        devices.emplace_back(device);
+#ifdef NAMEBREAK_TEST_CPU_WORKERS
+    // A test build's (see CMakeLists.txt): a backend without GPUs searching
+    // as that many workers, as if each were a GPU - how the tests run several
+    // workers on a machine with one GPU, or none.
+    if (devices.empty()) {
+        for (int i = 0; i < NAMEBREAK_TEST_CPU_WORKERS; ++i)
+            devices.emplace_back(GpuDevice{i, backendName + " worker " + std::to_string(i), false});
+    }
+#endif
+    if (devices.empty())
+        devices.emplace_back(std::nullopt);
+
+    WorkerGroup group;
+    group.pauseRequested = pauseRequested;
+    group.finishRangeThenPause = finishRangeThenPause;
+    group.callbacks = callbacks;
+    group.running = (int) devices.size();
+    if (devices.size() > 1) {
+        std::string names;
+        std::vector<std::string> gpus;
+        for (const std::optional<GpuDevice>& device : devices) {
+            names += (names.empty() ? "" : ", ") + std::to_string(device->index) + " (" + device->name + ")";
+            gpus.push_back("GPU " + std::to_string(device->index) + ": " + device->name);
+        }
+        printf("[coordinator] searching on %zu GPUs at once with the %s backend: %s\n", devices.size(), backendName.c_str(), names.c_str());
+        fflush(stdout);
+        if (callbacks && callbacks->onWorkers)
+            callbacks->onWorkers(gpus);
+    }
+
+    // The caller's quit, relayed into the group's - which a worker sets
+    // itself, too, when the server won't take this release any more.
+    std::atomic<bool> relayDone{false};
+    std::thread quitRelay;
+    if (quitRequested) {
+        quitRelay = std::thread([&]() {
+            while (!relayDone.load(std::memory_order_relaxed)) {
+                if (quitRequested->load(std::memory_order_relaxed))
+                    group.quit = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+
+    std::vector<int> codes(devices.size(), 0);
+    std::vector<std::thread> workers;
+    for (size_t i = 1; i < devices.size(); ++i) {
+        workers.emplace_back([&, i]() {
+            CoordinatorArgs own = args;
+            own.hostname = workerHostname(args.hostname, devices[i]);
+            own.matchesSuffix = workerMatchesSuffix(devices[i]);
+            setTag("[coordinator gpu" + std::to_string(devices[i]->index) + "]");
+            t_worker = (int) i;
+            codes[i] = runWorker(own, group, nullptr, backendName, devices[i]);
+        });
+    }
+    {
+        CoordinatorArgs own = args;
+        own.hostname = workerHostname(args.hostname, devices[0]);
+        own.matchesSuffix = workerMatchesSuffix(devices[0]);
+        if (devices.size() > 1)
+            setTag("[coordinator gpu" + std::to_string(devices[0]->index) + "]");
+        t_worker = 0;
+        codes[0] = runWorker(own, group, std::move(backend), backendName, devices[0]);
+        t_worker = -1;
+        setTag("[coordinator]");
+    }
+    for (std::thread& worker : workers)
+        worker.join();
+    relayDone = true;
+    if (quitRelay.joinable())
+        quitRelay.join();
+    // A worker that couldn't start (its GPU failed its self-test, say) left
+    // the others searching; only if none could, or the server turned this
+    // release away, is the run a failure.
+    const bool anyRan = std::any_of(codes.begin(), codes.end(), [](int code) { return code == 0; });
+    return group.fatal || !anyRan ? 1 : 0;
 }

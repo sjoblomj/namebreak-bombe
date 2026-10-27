@@ -36,6 +36,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <deque>
@@ -84,9 +85,7 @@ constexpr size_t kMaxMatchLines = 100;
 constexpr const char* kSearchingPrefix = "Searching: ";
 
 HWND g_hwndMain = nullptr;
-HWND g_hwndTargetLabel = nullptr;
-HWND g_hwndStatusLabel = nullptr;
-HWND g_hwndProgress = nullptr;
+HWND g_hwndLogLabel = nullptr;
 HWND g_hwndMatches = nullptr;
 HWND g_hwndPauseButton = nullptr;
 HWND g_hwndQuitButton = nullptr;
@@ -108,12 +107,26 @@ bool g_quitting = false;
 // latest Hash-A match (see MatchWriter, engine/match_writer.h), so each
 // tick's is added here whenever it changes, and only the last
 // kMaxMatchLines are kept. Started afresh for another matches file (another
-// target), as the box shows only the current one's.
+// target), as the box shows only the current one's - unless several GPUs
+// search (see SearchRow), whose lines all go in it, each saying whose.
 std::deque<std::string> g_recentMatches;
 std::string g_recentMatchesPath;
-// The matches file's line last added to the box - not always its last line,
-// which may be a basename's or a search position's.
-std::string g_lastMatch;
+
+// UI-thread-only: a search's controls - its target line, its status line
+// and its progress bar - and the line of its matches file last added to
+// the box (not always the file's last line in the box, which may be a
+// basename's or a search position's). The first is the window's own; a
+// coordinator run searching on several GPUs gets one for each of them (see
+// addGpuRows), stacked one under the other.
+struct SearchRow {
+    HWND target = nullptr;
+    HWND status = nullptr;
+    HWND progress = nullptr;
+    std::string lastMatch;
+};
+std::vector<SearchRow> g_rows;
+// How far apart two rows are, in 96-DPI pixels.
+constexpr int kRowPitch = 75;
 
 // Set once in main() after prepareConfig() succeeds, never touched again -
 // "coordinator", "bounded", "continuous" or "dictionary" (window title,
@@ -262,7 +275,8 @@ void requestQuit(HWND hwnd) {
     EnableWindow(g_hwndQuitButton, FALSE);
     if (g_hwndFinishCheckbox)
         EnableWindow(g_hwndFinishCheckbox, FALSE);
-    SetWindowTextA(g_hwndStatusLabel, "Status: shutting down...");
+    for (const SearchRow& row : g_rows)
+        SetWindowTextA(row.status, "Status: shutting down...");
     // Clearing pause too (rather than leaving runCoordinator's pause-wait
     // spin to notice quitRequested on its own, which it does - see
     // coordinator_runner.cpp) just keeps this state visually consistent
@@ -272,57 +286,60 @@ void requestQuit(HWND hwnd) {
     g_quitRequested.store(true, std::memory_order_relaxed);
 }
 
-// Re-reads the shared coordinator-status struct and the current matches
-// file, and refreshes every control accordingly - the only place any of
-// this GUI's controls are actually touched, always from the UI thread's own
-// WM_TIMER tick (see SharedStatus's own comment on why).
-void updateUiFromSharedState() {
-    std::string targetName, outputFilePath, statusText;
-    std::string alphabet, prefix, suffix, lowerBound, upperBound;
-    Insertion insertFromStart, insertFromEnd;
-    double progressFraction;
-    bool hasActiveRange, rangeJustFinished, searchEnded;
-    std::vector<std::string> newBasenames, newMeetingPointMatches;
-    std::string newSearchPosition;
-    {
-        std::lock_guard<std::mutex> lock(g_status.mutex);
-        targetName = g_status.targetName;
-        outputFilePath = g_status.outputFilePath;
-        statusText = g_status.statusText;
-        alphabet = g_status.alphabet;
-        prefix = g_status.prefix;
-        suffix = g_status.suffix;
-        insertFromStart = g_status.insertFromStart;
-        insertFromEnd = g_status.insertFromEnd;
-        lowerBound = g_status.lowerBound;
-        upperBound = g_status.upperBound;
-        progressFraction = g_status.progressFraction;
-        hasActiveRange = g_status.hasActiveRange;
-        searchEnded = g_status.searchEnded;
-        rangeJustFinished = g_status.rangeJustFinished;
-        g_status.rangeJustFinished = false; // one-shot edge, consumed here
-        newBasenames.swap(g_status.newBasenames);
-        newMeetingPointMatches.swap(g_status.newMeetingPointMatches);
-        newSearchPosition.swap(g_status.newSearchPosition);
+// One row for each of `gpus` - a coordinator run's on several GPUs (see
+// CoordinatorCallbacks::onWorkers): the window's own row becomes the first
+// GPU's, the rest are added under it, and everything below them - the
+// matches box, the buttons - moves down to make room, the window growing
+// as much - or, where that would take it past the bottom of the screen, the
+// matches box getting shorter instead, as far as it can. Made at the system
+// DPI, as scaleChildWindows has made the rest.
+void addGpuRows(HWND hwnd, size_t gpus) {
+    const int extra = scaled(kRowPitch * (int) (gpus - g_rows.size()));
+    RECT window, workArea, box;
+    GetWindowRect(hwnd, &window);
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &workArea, 0);
+    GetWindowRect(g_hwndMatches, &box);
+    MapWindowPoints(nullptr, hwnd, (POINT*) &box, 2);
+    const int room = std::max(0L, workArea.bottom - window.bottom);
+    const int shrink = std::clamp(extra - room, 0, std::max(0, (int) (box.bottom - box.top) - scaled(80)));
+    // The log's label and box move down past the new rows; what's under
+    // the box moves as much less as it got shorter.
+    for (HWND child : {g_hwndLogLabel, g_hwndMatches, g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton, g_hwndFinishCheckbox}) {
+        if (!child)
+            continue;
+        RECT r;
+        GetWindowRect(child, &r);
+        MapWindowPoints(nullptr, hwnd, (POINT*) &r, 2);
+        const bool underBox = r.top >= box.bottom;
+        const int height = child == g_hwndMatches ? r.bottom - r.top - shrink : r.bottom - r.top;
+        SetWindowPos(child, nullptr, r.left, r.top + extra - (underBox ? shrink : 0), r.right - r.left, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
+    SetWindowPos(hwnd, nullptr, 0, 0, window.right - window.left, window.bottom - window.top + extra - shrink,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
-    bool paused = g_pauseRequested.load(std::memory_order_relaxed);
-    if (!g_quitting)
-        syncPauseControls();
-
-    SetWindowTextA(g_hwndTargetLabel, (targetName.empty() ? "Target: (none yet)" : "Target: " + targetName).c_str());
-    SetWindowTextA(g_hwndStatusLabel, ("Status: " + statusText + (paused ? " (paused)" : "")).c_str());
-
-    // Read once, shared below by both the progress calculation and the
-    // matches box: the most recent Hash-A match (the file's only line - or
-    // its last, in one an older version appended every match to).
-    std::string latestMatch;
-    if (!outputFilePath.empty()) {
-        std::vector<std::string> lines = readLastLines(outputFilePath, 1);
-        if (!lines.empty())
-            latestMatch = lines.back();
+    HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
+    auto child = [&](const char* className, const char* text, DWORD style, int y, int height) {
+        HWND made = CreateWindowExA(0, className, text, WS_CHILD | WS_VISIBLE | style, scaled(10), scaled(y), scaled(470), scaled(height), hwnd,
+                                    nullptr, g_hInstance, nullptr);
+        SendMessage(made, WM_SETFONT, (WPARAM) font, TRUE);
+        return made;
+    };
+    while (g_rows.size() < gpus) {
+        const int top = 10 + kRowPitch * (int) g_rows.size();
+        SearchRow row;
+        row.target = child("STATIC", "", SS_ENDELLIPSIS, top, 20);
+        row.status = child("STATIC", "Status: starting...", SS_ENDELLIPSIS, top + 25, 20);
+        row.progress = child(PROGRESS_CLASSA, nullptr, PBS_MARQUEE, top + 50, 22);
+        SendMessage(row.progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+        SendMessage(row.progress, PBM_SETMARQUEE, TRUE, 100);
+        g_rows.push_back(row);
     }
+}
 
+// Shows `search` in `bar`: how far it has got, if that's known (see
+// below), full once it's done, or the marquee while nothing says.
+// `latestMatch` is its matches file's last line.
+void updateProgressBar(HWND bar, const SearchStatus& search, const std::string& latestMatch, bool searchEnded) {
     // Determinate (a real fraction, from matchProgressFraction below) only
     // for bounded-shaped work, which has a fixed finish line to measure
     // against - a coordinator range, or local bounded mode (see
@@ -330,12 +347,12 @@ void updateUiFromSharedState() {
     // when there isn't one: continuous mode, or nothing running yet) - and
     // for a dictionary search or range, which says how far it has got itself
     // (progressFraction).
-    bool determinate = hasActiveRange && (progressFraction >= 0 || !lowerBound.empty());
+    bool determinate = search.hasActiveRange && (search.progressFraction >= 0 || !search.lowerBound.empty());
     if (determinate) {
-        LONG_PTR style = GetWindowLongPtr(g_hwndProgress, GWL_STYLE);
+        LONG_PTR style = GetWindowLongPtr(bar, GWL_STYLE);
         if (style & PBS_MARQUEE) {
-            SendMessage(g_hwndProgress, PBM_SETMARQUEE, FALSE, 0);
-            SetWindowLongPtr(g_hwndProgress, GWL_STYLE, style & ~PBS_MARQUEE);
+            SendMessage(bar, PBM_SETMARQUEE, FALSE, 0);
+            SetWindowLongPtr(bar, GWL_STYLE, style & ~PBS_MARQUEE);
         }
         // 0% until the first Hash-A match of this range/search arrives -
         // there's nothing else to measure progress from (see
@@ -343,64 +360,124 @@ void updateUiFromSharedState() {
         // exists), and pausing simply stops new matches from arriving, so
         // this naturally freezes/resumes with no extra bookkeeping.
         double fraction = 0.0;
-        if (progressFraction >= 0) {
-            fraction = progressFraction;
+        if (search.progressFraction >= 0) {
+            fraction = search.progressFraction;
         } else if (!latestMatch.empty()) {
-            double f = matchProgressFraction(latestMatch, prefix, suffix, insertFromStart, insertFromEnd, alphabet, lowerBound, upperBound);
+            double f = matchProgressFraction(latestMatch, search.prefix, search.suffix, search.insertFromStart, search.insertFromEnd,
+                                             search.alphabet, search.lowerBound, search.upperBound);
             if (f >= 0.0)
                 fraction = f;
         }
-        SendMessage(g_hwndProgress, PBM_SETPOS, (WPARAM) (fraction * 100.0), 0);
-    } else if (rangeJustFinished || searchEnded) {
+        SendMessage(bar, PBM_SETPOS, (WPARAM) (fraction * 100.0), 0);
+    } else if (search.rangeJustFinished || searchEnded) {
         // Continuous-mode runs (see runLocalSearch) never set a determinate
         // range, so the bar sits in marquee style for their entire run -
         // marquee has to be turned off explicitly here too, not just above.
-        LONG_PTR style = GetWindowLongPtr(g_hwndProgress, GWL_STYLE);
+        LONG_PTR style = GetWindowLongPtr(bar, GWL_STYLE);
         if (style & PBS_MARQUEE) {
-            SendMessage(g_hwndProgress, PBM_SETMARQUEE, FALSE, 0);
-            SetWindowLongPtr(g_hwndProgress, GWL_STYLE, style & ~PBS_MARQUEE);
+            SendMessage(bar, PBM_SETMARQUEE, FALSE, 0);
+            SetWindowLongPtr(bar, GWL_STYLE, style & ~PBS_MARQUEE);
         }
-        SendMessage(g_hwndProgress, PBM_SETPOS, 100, 0);
+        SendMessage(bar, PBM_SETPOS, 100, 0);
     } else {
-        LONG_PTR style = GetWindowLongPtr(g_hwndProgress, GWL_STYLE);
+        LONG_PTR style = GetWindowLongPtr(bar, GWL_STYLE);
         if (!(style & PBS_MARQUEE)) {
-            SetWindowLongPtr(g_hwndProgress, GWL_STYLE, style | PBS_MARQUEE);
-            SendMessage(g_hwndProgress, PBM_SETMARQUEE, TRUE, 100);
+            SetWindowLongPtr(bar, GWL_STYLE, style | PBS_MARQUEE);
+            SendMessage(bar, PBM_SETMARQUEE, TRUE, 100);
         }
     }
+}
+
+// Re-reads the shared coordinator-status struct and the current matches
+// files, and refreshes every control accordingly - the only place any of
+// this GUI's controls are actually touched, always from the UI thread's own
+// WM_TIMER tick (see SharedStatus's own comment on why).
+void updateUiFromSharedState() {
+    std::vector<SearchStatus> searches;
+    std::vector<std::string> gpus;
+    bool searchEnded;
+    {
+        std::lock_guard<std::mutex> lock(g_status.mutex);
+        searches = g_status.searches;
+        gpus = g_status.gpus;
+        searchEnded = g_status.searchEnded;
+        // What only this tick shows - consumed here.
+        for (SearchStatus& search : g_status.searches) {
+            search.rangeJustFinished = false;
+            search.newBasenames.clear();
+            search.newMeetingPointMatches.clear();
+            search.newSearchPosition.clear();
+        }
+    }
+    if (gpus.size() > g_rows.size())
+        addGpuRows(g_hwndMain, gpus.size());
+
+    bool paused = g_pauseRequested.load(std::memory_order_relaxed);
+    if (!g_quitting)
+        syncPauseControls();
 
     bool matchesChanged = false;
-    if (outputFilePath != g_recentMatchesPath) {
-        g_recentMatches.clear();
-        g_recentMatchesPath = outputFilePath;
-        g_lastMatch.clear();
-        matchesChanged = true;
-    }
     auto addMatchLine = [&](const std::string& line) {
         g_recentMatches.push_back(line);
         if (g_recentMatches.size() > kMaxMatchLines)
             g_recentMatches.pop_front();
         matchesChanged = true;
     };
+    // With several GPUs searching, the box has every one's lines, each
+    // saying whose.
+    const bool severalGpus = gpus.size() > 1;
+    if (!severalGpus && searches[0].outputFilePath != g_recentMatchesPath) {
+        g_recentMatches.clear();
+        g_recentMatchesPath = searches[0].outputFilePath;
+        g_rows[0].lastMatch.clear();
+        matchesChanged = true;
+    }
     // Coordinator mode may search dictionary ranges, whose basenames and
     // search positions go in the box too, as a meet-in-the-middle search's
     // own lines do - so its Hash A matches are said to be.
     const bool dictionaryLines =
         g_activeMode == "coordinator" || g_activeMode == "dictionary" || g_activeMode == "meet-in-the-middle";
-    if (!latestMatch.empty() && latestMatch != g_lastMatch) {
-        g_lastMatch = latestMatch;
-        addMatchLine(dictionaryLines ? "Hash A match: " + latestMatch : latestMatch);
-    }
-    for (const std::string& basename : newBasenames)
-        addMatchLine("Basename: " + basename);
-    // A directory whose state matched the meeting point - which is what a
-    // meet-in-the-middle search looks for; the hashes then decide.
-    for (const std::string& filename : newMeetingPointMatches)
-        addMatchLine("Matched the meeting point: " + filename);
-    if (!newSearchPosition.empty()) {
-        if (!g_recentMatches.empty() && g_recentMatches.back().rfind(kSearchingPrefix, 0) == 0)
-            g_recentMatches.pop_back();
-        addMatchLine(kSearchingPrefix + newSearchPosition);
+
+    for (size_t i = 0; i < searches.size() && i < g_rows.size(); ++i) {
+        const SearchStatus& search = searches[i];
+        SearchRow& row = g_rows[i];
+        // "GPU 1: Radeon RX 7900 XTX" - and "GPU 1" before each of its lines
+        // in the box.
+        const std::string gpu = severalGpus ? gpus[i] : "";
+        const std::string whose = severalGpus ? gpu.substr(0, gpu.find(':')) + ": " : "";
+        const std::string target = search.targetName.empty() ? "(none yet)" : search.targetName;
+        SetWindowTextA(row.target, (severalGpus ? gpu + " - target: " + target : "Target: " + target).c_str());
+        SetWindowTextA(row.status, ("Status: " + search.statusText + (paused ? " (paused)" : "")).c_str());
+
+        // Read once, shared below by both the progress calculation and the
+        // matches box: the most recent Hash-A match (the file's only line -
+        // or its last, in one an older version appended every match to).
+        std::string latestMatch;
+        if (!search.outputFilePath.empty()) {
+            std::vector<std::string> lines = readLastLines(search.outputFilePath, 1);
+            if (!lines.empty())
+                latestMatch = lines.back();
+        }
+        updateProgressBar(row.progress, search, latestMatch, searchEnded);
+
+        if (!latestMatch.empty() && latestMatch != row.lastMatch) {
+            row.lastMatch = latestMatch;
+            addMatchLine(whose + (dictionaryLines ? "Hash A match: " + latestMatch : latestMatch));
+        }
+        for (const std::string& basename : search.newBasenames)
+            addMatchLine(whose + "Basename: " + basename);
+        // A directory whose state matched the meeting point - which is what a
+        // meet-in-the-middle search looks for; the hashes then decide.
+        for (const std::string& filename : search.newMeetingPointMatches)
+            addMatchLine(whose + "Matched the meeting point: " + filename);
+        // Only ever the box's last line, each replacing the one before - so
+        // with several GPUs, whose lines come between, the status lines say
+        // how far each has got instead.
+        if (!search.newSearchPosition.empty() && !severalGpus) {
+            if (!g_recentMatches.empty() && g_recentMatches.back().rfind(kSearchingPrefix, 0) == 0)
+                g_recentMatches.pop_back();
+            addMatchLine(kSearchingPrefix + search.newSearchPosition);
+        }
     }
     if (matchesChanged) {
         std::string joined;
@@ -419,23 +496,25 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
     auto setFont = [&](HWND child) { SendMessage(child, WM_SETFONT, (WPARAM) font, TRUE); };
 
-    g_hwndTargetLabel = CreateWindowExA(0, "STATIC", "Target: (none yet)", WS_CHILD | WS_VISIBLE, 10, 10, 470, 20, hwnd, nullptr,
-                                         hInstance, nullptr);
-    g_hwndStatusLabel =
-        CreateWindowExA(0, "STATIC", "Status: starting...", WS_CHILD | WS_VISIBLE, 10, 35, 470, 20, hwnd, nullptr, hInstance, nullptr);
-    g_hwndProgress = CreateWindowExA(0, PROGRESS_CLASSA, nullptr, WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 10, 60, 470, 22, hwnd, nullptr,
-                                      hInstance, nullptr);
-    SendMessage(g_hwndProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-    SendMessage(g_hwndProgress, PBM_SETMARQUEE, TRUE, 100);
+    SearchRow row;
+    row.target = CreateWindowExA(0, "STATIC", "Target: (none yet)", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 10, 10, 470, 20, hwnd, nullptr,
+                                 hInstance, nullptr);
+    row.status = CreateWindowExA(0, "STATIC", "Status: starting...", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 10, 35, 470, 20, hwnd, nullptr,
+                                 hInstance, nullptr);
+    row.progress = CreateWindowExA(0, PROGRESS_CLASSA, nullptr, WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 10, 60, 470, 22, hwnd, nullptr,
+                                   hInstance, nullptr);
+    SendMessage(row.progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    SendMessage(row.progress, PBM_SETMARQUEE, TRUE, 100);
+    g_rows = {row};
 
     // A dictionary search with an encryption key finds basenames that match
     // it too, which go in the same box, as does how far it has got - and so
     // does a meet-in-the-middle search's own progress.
-    CreateWindowExA(0, "STATIC",
-                     g_activeMode == "dictionary" || g_activeMode == "coordinator" || g_activeMode == "meet-in-the-middle"
-                         ? "Search log (most recent last):"
-                         : "Hash A matches (most recent last):",
-                     WS_CHILD | WS_VISIBLE, 10, 95, 470, 18, hwnd, nullptr, hInstance, nullptr);
+    g_hwndLogLabel = CreateWindowExA(0, "STATIC",
+                                     g_activeMode == "dictionary" || g_activeMode == "coordinator" || g_activeMode == "meet-in-the-middle"
+                                         ? "Search log (most recent last):"
+                                         : "Hash A matches (most recent last):",
+                                     WS_CHILD | WS_VISIBLE, 10, 95, 470, 18, hwnd, nullptr, hInstance, nullptr);
     g_hwndMatches = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 115, 470, 280,
                                      hwnd, nullptr, hInstance, nullptr);
@@ -447,7 +526,7 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
     g_hwndQuitButton = CreateWindowExA(0, "BUTTON", "Quit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 330, 405, 150, 30, hwnd,
                                         (HMENU) (INT_PTR) kIdQuitButton, hInstance, nullptr);
 
-    for (HWND child : {g_hwndTargetLabel, g_hwndStatusLabel, g_hwndMatches, g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton})
+    for (HWND child : {row.target, row.status, g_hwndLogLabel, g_hwndMatches, g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton})
         setFont(child);
 
     // Local searches have no ranges to finish.
@@ -538,7 +617,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 bool ended;
                 {
                     std::lock_guard<std::mutex> lock(g_status.mutex);
-                    lastStatus = g_status.statusText;
+                    lastStatus = g_status.lastStatus;
                     ended = g_status.searchEnded;
                 }
                 if (ended)

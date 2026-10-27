@@ -336,13 +336,13 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 currentSection = &out.dictionary;
             } else if (name == "meet-in-the-middle") {
                 currentSection = &out.meetInTheMiddle;
-            } else if (name == "opencl") {
-                currentSection = &out.opencl;
-            } else if (name == "metal") {
-                currentSection = &out.metal;
+            } else if (name == "hardware") {
+                currentSection = &out.hardware;
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": unknown section [" + name +
-                        "] (expected [search], [coordinator], [dictionary], [meet-in-the-middle], [opencl] or [metal])";
+                        "] (expected [search], [coordinator], [dictionary], [meet-in-the-middle] or [hardware])";
+                if (name == "opencl" || name == "metal")
+                    error += " - the OpenCL and Metal backends' launch settings are in [hardware] now";
                 return false;
             }
             continue;
@@ -376,7 +376,7 @@ bool loadConfigFile(const std::string& path, ConfigFile& out, std::string& error
                 out.checkForUpdates = value == "true";
             } else {
                 error = path + ":" + std::to_string(lineNo) + ": '" + key +
-                        "' must be inside a [search], [coordinator], [dictionary], [meet-in-the-middle], [opencl] or [metal] section (only 'mode', 'matches_dir', "
+                        "' must be inside a [search], [coordinator], [dictionary], [meet-in-the-middle] or [hardware] section (only 'mode', 'matches_dir', "
                         "'backend' and 'check_for_updates' are allowed before any section)";
                 return false;
             }
@@ -1043,45 +1043,101 @@ bool updateConfigSection(const std::string& path, const std::string& sectionName
 
 namespace {
 
-// One backend's section, as buildBackendTunings reads it.
-bool buildGpuTuning(const std::map<std::string, std::string>& section, const std::string& backend, GpuTuning& out, std::string& error) {
-    ConfigSectionReader r(section);
-    for (const GpuTuningKey& key : gpuTuningKeys(backend)) {
-        const std::string value = r.getOptional(key.name, "");
-        if (value.empty())
-            continue;
-        const std::string range = std::to_string(key.min) + " to " + std::to_string(key.max);
-        if (value.size() > 4 || value.find_first_not_of("0123456789") != std::string::npos) {
-            error = "invalid " + std::string(key.name) + ": '" + value + "' (expected a number, " + range + ")";
-            return false;
-        }
-        const int number = std::stoi(value);
-        if (number < key.min || number > key.max) {
-            error = std::string(key.name) + " must be " + range + ", got " + value;
-            return false;
-        }
-        out.*key.field = number;
+// A [hardware] number that's `min` to `max` - false, with `error` set, if
+// `value` isn't one.
+bool parseHardwareNumber(const std::string& key, const std::string& value, int min, int max, int& out, std::string& error) {
+    const std::string range = std::to_string(min) + " to " + std::to_string(max);
+    if (value.empty() || value.size() > 4 || value.find_first_not_of("0123456789") != std::string::npos) {
+        error = "invalid " + key + ": '" + value + "' (expected a number, " + range + ")";
+        return false;
     }
-    const std::string unknown = r.firstUnknownKey();
-    if (!unknown.empty()) {
-        error = "unknown key '" + unknown + "'";
-        if (backend == "metal" && unknown == "batches_per_launch")
-            error += " (the Metal backend launches one batch at a time)";
+    out = std::stoi(value);
+    if (out < min || out > max) {
+        error = key + " must be " + range + ", got " + value;
         return false;
     }
     return true;
 }
 
+// `gpus`: auto, all, none, or GPU numbers separated by commas.
+bool parseGpus(const std::string& value, HardwareConfig& out, std::string& error) {
+    out.gpus.clear();
+    if (value == "auto" || value.empty()) {
+        out.gpuChoice = HardwareConfig::GpuChoice::Auto;
+        return true;
+    }
+    if (value == "all") {
+        out.gpuChoice = HardwareConfig::GpuChoice::All;
+        return true;
+    }
+    out.gpuChoice = HardwareConfig::GpuChoice::Listed;
+    if (value == "none")
+        return true;
+    size_t at = 0;
+    while (at <= value.size()) {
+        const size_t comma = std::min(value.find(',', at), value.size());
+        int number = 0;
+        if (!parseHardwareNumber("gpus", trim(value.substr(at, comma - at)), 0, 63, number, error)) {
+            error += " - gpus is auto, all, none, or GPU numbers as `namebreak --list-gpus` shows them, e.g. 0, 2";
+            return false;
+        }
+        if (std::find(out.gpus.begin(), out.gpus.end(), number) == out.gpus.end())
+            out.gpus.push_back(number);
+        at = comma + 1;
+    }
+    return true;
+}
+
+// The GPU `key` (a `gpu<N>.<name>` key) is about, and the rest of it - false
+// if it isn't one.
+bool splitGpuKey(const std::string& key, int& gpu, std::string& rest) {
+    const size_t dot = key.find('.');
+    if (key.rfind("gpu", 0) != 0 || dot == std::string::npos || dot == 3 || dot > 5)
+        return false;
+    const std::string number = key.substr(3, dot - 3);
+    if (number.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    gpu = std::stoi(number);
+    rest = key.substr(dot + 1);
+    return true;
+}
+
 } // namespace
 
-bool buildBackendTunings(const ConfigFile& config, BackendTunings& out, std::string& error) {
-    out = BackendTunings();
-    if (!buildGpuTuning(config.opencl, "opencl", out.opencl, error)) {
-        error = "[opencl]: " + error;
-        return false;
+bool buildHardwareConfig(const ConfigFile& config, HardwareConfig& out, std::string& error) {
+    out = HardwareConfig();
+    for (const auto& [key, value] : config.hardware) {
+        int gpu = 0;
+        std::string name = key;
+        const bool ofOneGpu = splitGpuKey(key, gpu, name);
+        if (!ofOneGpu && key == "gpus") {
+            if (!parseGpus(value, out, error))
+                break;
+            continue;
+        }
+        if (!ofOneGpu && key == "cpu_threads") {
+            if (!parseHardwareNumber(key, value, 0, 4096, out.cpuThreads, error))
+                break;
+            continue;
+        }
+        if (ofOneGpu && name == "name") {
+            out.gpuNames[gpu] = value;
+            continue;
+        }
+        const std::vector<GpuTuningKey>& keys = allGpuTuningKeys();
+        const auto known = std::find_if(keys.begin(), keys.end(), [&](const GpuTuningKey& k) { return name == k.name; });
+        if (known == keys.end()) {
+            error = "unknown key '" + key + "'";
+            break;
+        }
+        int number = 0;
+        if (!parseHardwareNumber(key, value, known->min, known->max, number, error))
+            break;
+        GpuTuning& tuning = ofOneGpu ? out.gpuTunings[gpu] : out.tuning;
+        tuning.*known->field = number;
     }
-    if (!buildGpuTuning(config.metal, "metal", out.metal, error)) {
-        error = "[metal]: " + error;
+    if (!error.empty()) {
+        error = "[hardware]: " + error;
         return false;
     }
     return true;

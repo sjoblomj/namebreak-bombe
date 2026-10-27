@@ -35,7 +35,7 @@ namespace {
 // Threads per threadgroup, unless the pipeline allows fewer. Must be >= the
 // alphabet size: the kernel fills its threadgroup tables one entry per thread.
 // This and the other k*Default values below are what the backend uses where
-// config.conf's [metal] says nothing (GpuTuning, see backends/gpu_tuning.h).
+// config.conf's [hardware] says nothing (GpuTuning, see backends/gpu_tuning.h).
 constexpr int kThreadgroupSizeDefault = 256;
 
 // About how many rows of a row group one thread searches (ROWS_PER_THREAD in
@@ -902,11 +902,46 @@ GpuTuning metalTuningDefaults() {
     return defaults;
 }
 
-std::unique_ptr<SearchBackend> makeMetalBackend(const GpuTuning& tuning, std::string& error) {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (!device) {
+namespace {
+
+// metalDevices()'s, in its order: the system's default device - the one
+// the display uses - first, then the rest as Metal lists them.
+std::vector<id<MTLDevice>> metalDeviceList() {
+    std::vector<id<MTLDevice>> devices;
+    @autoreleasepool {
+        id<MTLDevice> preferred = MTLCreateSystemDefaultDevice();
+        if (preferred)
+            devices.push_back(preferred);
+        NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
+        for (id<MTLDevice> device in all) {
+            if (!preferred || device.registryID != preferred.registryID)
+                devices.push_back(device);
+        }
+    }
+    return devices;
+}
+
+} // namespace
+
+std::vector<GpuDevice> metalDevices() {
+    std::vector<GpuDevice> out;
+    for (id<MTLDevice> device : metalDeviceList()) {
+        // An Intel Mac's integrated GPU is its low-power one; Apple
+        // Silicon's shares the system's memory, and is all it has.
+        out.push_back({(int) out.size(), device.name.UTF8String, (bool) (device.lowPower || device.hasUnifiedMemory)});
+    }
+    return out;
+}
+
+std::unique_ptr<SearchBackend> makeMetalBackend(int deviceIndex, const GpuTuning& tuning, std::string& error) {
+    const std::vector<id<MTLDevice>> devices = metalDeviceList();
+    if (devices.empty()) {
         error = "no Metal device";
         return nullptr;
     }
-    return std::make_unique<MetalBackend>(device, withDefaults(tuning, metalTuningDefaults()));
+    if (deviceIndex < 0 || deviceIndex >= (int) devices.size()) {
+        error = "no Metal device numbered " + std::to_string(deviceIndex) + " (there are " + std::to_string(devices.size()) + ")";
+        return nullptr;
+    }
+    return std::make_unique<MetalBackend>(devices[(size_t) deviceIndex], withDefaults(tuning, metalTuningDefaults()));
 }

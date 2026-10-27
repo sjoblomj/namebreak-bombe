@@ -5,6 +5,7 @@
 
 #include "gui/win32/optimize_dialog.h"
 
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <thread>
@@ -285,8 +286,9 @@ void optimizeForHardware(HWND owner, const std::string& configPath, const std::s
     HCURSOR cursor = SetCursor(LoadCursorA(nullptr, IDC_WAIT));
     std::string why;
     const std::string tuned = autotuneBackend(backend, why);
+    const std::vector<GpuDevice> devices = tuned.empty() ? std::vector<GpuDevice>() : autotuneDevices(tuned, why);
     SetCursor(cursor);
-    if (tuned.empty()) {
+    if (tuned.empty() || devices.empty()) {
         if (why.find(kAutotuneScriptUrl) != std::string::npos) {
             if (MessageBoxA(owner, (why + "\r\n\r\nOpen that page in your browser?").c_str(), kTitle, MB_YESNO | MB_ICONWARNING) == IDYES)
                 ShellExecuteA(owner, "open", kAutotuneScriptUrl, nullptr, nullptr, SW_SHOWNORMAL);
@@ -300,10 +302,18 @@ void optimizeForHardware(HWND owner, const std::string& configPath, const std::s
                              : runningMode == "coordinator" ? "used after the current range finishes"
                                                             : "used once namebreak is restarted";
     const bool pause = searchPause && !searchPause->load();
+    // A GPU of a name already timed isn't timed again (see runAutotune).
+    std::vector<std::string> names;
+    for (const GpuDevice& device : devices) {
+        if (std::find(names.begin(), names.end(), device.name) == names.end())
+            names.push_back(device.name);
+    }
+    const std::string gpus = devices.size() == 1 ? "this machine's GPU" : "each of this machine's " + std::to_string(devices.size()) + " GPUs";
+    const std::string minutes = std::to_string(5 * names.size()) + " to " + std::to_string(10 * names.size());
     const std::string question =
-        "This times the " + std::string(tuned == "opencl" ? "OpenCL" : "Metal") +
-        " backend's settings on this machine's GPU and saves the fastest to " + configPath + ", " + when +
-        ". It takes about five to ten minutes, with the GPU fully busy. " +
+        "This times the " + std::string(tuned == "opencl" ? "OpenCL" : "Metal") + " backend's settings on " + gpus +
+        " and saves the fastest to " + configPath + ", " + when + ". It takes about " + minutes + " minutes, with the GPU" +
+        (devices.size() == 1 ? "" : "s") + " fully busy. " +
         (pause ? "The running search is paused meanwhile, and resumed afterwards. " : "") +
         "Close games and anything else that uses the GPU first: they would make the measurements meaningless.\r\n\r\nStart now?";
     if (MessageBoxA(owner, question.c_str(), kTitle, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
@@ -312,17 +322,20 @@ void optimizeForHardware(HWND owner, const std::string& configPath, const std::s
         searchPause->store(true);
     const std::string finished = "Finished. The settings are " + when + ".";
     const int result = showAutotuneProgress(
-        owner, [&](const AutotuneHooks& hooks, std::atomic<bool>* abortRequested) { return runAutotune(configPath, tuned, 2.0, abortRequested, hooks); },
+        owner,
+        [&](const AutotuneHooks& hooks, std::atomic<bool>* abortRequested) {
+            return runAutotune(configPath, tuned, devices, 2.0, abortRequested, hooks);
+        },
         finished);
     // What it saved, for every backend made from now on - a coordinator run's
     // next range's among them. Read back from the file, which has the rest
-    // of [opencl] and [metal] too.
+    // of [hardware] too.
     if (result == 0) {
         ConfigFile config;
-        BackendTunings tunings;
+        HardwareConfig hardware;
         std::string error;
-        if (loadConfigFile(configPath, config, error) && buildBackendTunings(config, tunings, error))
-            setBackendTunings(tunings);
+        if (loadConfigFile(configPath, config, error) && buildHardwareConfig(config, hardware, error))
+            setHardwareConfig(hardware);
     }
     if (pause)
         searchPause->store(false);

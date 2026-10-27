@@ -15,7 +15,9 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #include "backends/common/meet_in_the_middle_launch.h"
 #include "backends/common/launch_waiter.h"
@@ -1156,9 +1158,12 @@ __global__ void meetInTheMiddleKernel(MeetInTheMiddleLaunch p, MeetInTheMiddleRe
 
 class CudaBackend : public SearchBackend {
 public:
+    CudaBackend(int device, std::string deviceName) : device_(device), deviceName_(std::move(deviceName)) {}
+
     // Not CUDA_CHECK'd, and its result deliberately ignored: this can run as
     // the process exits, after the CUDA runtime itself has shut down.
     ~CudaBackend() override {
+        (void) cudaSetDevice(device_);
         if (pinnedResults_)
             (void) cudaFreeHost(pinnedResults_);
         if (groups_)
@@ -1186,6 +1191,7 @@ public:
 #else
     const char* name() const override { return "cuda"; }
 #endif
+    std::string deviceName() const override { return deviceName_; }
     int windowChars() const override { return NAMEBREAK_GPU_WINDOW_CHARS; }
     int maxTrailingLen() const override { return kMaxTrailingLen; }
     // A whole number of rows (see the terminology comment above
@@ -1219,6 +1225,16 @@ public:
     void endMeetInTheMiddleSearch() override;
 
 private:
+    // The device this backend searches on (see cudaDevices). The runtime's
+    // current device is a thread's own, and a coordinator run searches on
+    // several GPUs from as many threads (see runCoordinator), so every call
+    // that reaches the GPU starts by making it this one - a backend may be
+    // made on one thread and searched with on another, too. Each GPU has
+    // its own copy of the kernels' __constant__ tables.
+    void useDevice() const { CUDA_CHECK(cudaSetDevice(device_)); }
+    int device_;
+    std::string deviceName_;
+
     int alphabetSize_ = 0;
     // The alphabet's size, and the divisions the kernel does by it - see
     // AlphabetShape.
@@ -1323,6 +1339,7 @@ constexpr uint32_t kFilterEntriesCheckedPerSearch = 1024;
 }
 
 void CudaBackend::beginSearch(const SearchConstants& constants) {
+    useDevice();
     alphabetSize_ = (int) constants.alphabet.size();
     if (alphabetSize_ < 1 || alphabetSize_ > MAX_ALPHABET_SIZE) {
         // runSearch checks the alphabet's size before it begins a search.
@@ -1420,6 +1437,7 @@ void CudaBackend::beginSearch(const SearchConstants& constants) {
 }
 
 void CudaBackend::endSearch() {
+    useDevice();
     CUDA_CHECK(cudaFree(bufs_.results));
     CUDA_CHECK(cudaFree(bufs_.filterTable));
     bufs_ = {};
@@ -1456,6 +1474,7 @@ BatchOutcome CudaBackend::runBatch(int trailingLen, uint64_t startIdx, uint64_t 
 }
 
 BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchRequest>& requests) {
+    useDevice();
     const int alphabetSize = alphabetSize_;
     const int batchCount = (int) requests.size();
     BatchOutcome outcome;
@@ -1600,6 +1619,7 @@ BatchOutcome CudaBackend::runBatches(int trailingLen, const std::vector<BatchReq
 
 
 void CudaBackend::beginDictionarySearch(const DictionaryConstants& constants) {
+    useDevice();
     freeDictionaryBuffers();
     dictionaryVerifier_.begin(constants);
     dictionaryHashes_ = dictionaryVerifier_.hashes();
@@ -1682,11 +1702,13 @@ void CudaBackend::freeDictionaryBuffers() {
 }
 
 void CudaBackend::endDictionarySearch() {
+    useDevice();
     CUDA_CHECK(cudaDeviceSynchronize());
     freeDictionaryBuffers();
 }
 
 void CudaBackend::beginMeetInTheMiddleSearch(const MeetInTheMiddleConstants& constants) {
+    useDevice();
     meet_in_the_middle_ = constants;
     const MeetInTheMiddleTable& table = *constants.table;
 
@@ -1752,11 +1774,13 @@ void CudaBackend::freeMeetInTheMiddleBuffers() {
 }
 
 void CudaBackend::endMeetInTheMiddleSearch() {
+    useDevice();
     CUDA_CHECK(cudaDeviceSynchronize());
     freeMeetInTheMiddleBuffers();
 }
 
 MeetInTheMiddleOutcome CudaBackend::runMeetInTheMiddleBatch(const MeetInTheMiddleBatch& batch) {
+    useDevice();
     MeetInTheMiddleOutcome outcome;
     if (batch.count == 0)
         return outcome;
@@ -1860,6 +1884,7 @@ void CudaBackend::launchDictionary(uint32_t batchCount, uint64_t segments) {
 }
 
 DictionaryOutcome CudaBackend::runDictionaryBatches(const std::vector<DictionaryBatch>& batches) {
+    useDevice();
     DictionaryOutcome outcome;
     if (batches.empty())
         return outcome;
@@ -1942,7 +1967,34 @@ DictionaryOutcome CudaBackend::runDictionaryBatches(const std::vector<Dictionary
 
 } // namespace
 
-std::unique_ptr<SearchBackend> makeCudaBackend(std::string& error) {
+namespace {
+
+// The runtime's devices - its numbers and properties - in PCI order.
+std::vector<std::pair<int, cudaDeviceProp>> devicesInPciOrder() {
+    std::vector<std::pair<int, cudaDeviceProp>> devices;
+    int deviceCount = 0;
+    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess)
+        return devices;
+    for (int i = 0; i < deviceCount; ++i) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, i) == cudaSuccess)
+            devices.emplace_back(i, prop);
+    }
+    auto where = [](const cudaDeviceProp& prop) { return std::make_tuple(prop.pciDomainID, prop.pciBusID, prop.pciDeviceID); };
+    std::stable_sort(devices.begin(), devices.end(), [&](const auto& a, const auto& b) { return where(a.second) < where(b.second); });
+    return devices;
+}
+
+} // namespace
+
+std::vector<GpuDevice> cudaDevices() {
+    std::vector<GpuDevice> devices;
+    for (const auto& device : devicesInPciOrder())
+        devices.push_back({(int) devices.size(), device.second.name, device.second.integrated != 0});
+    return devices;
+}
+
+std::unique_ptr<SearchBackend> makeCudaBackend(int device, std::string& error) {
     int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
     if (err != cudaSuccess) {
@@ -1953,5 +2005,11 @@ std::unique_ptr<SearchBackend> makeCudaBackend(std::string& error) {
         error = "no " NAMEBREAK_GPU_RUNTIME_NAME " device";
         return nullptr;
     }
-    return std::make_unique<CudaBackend>();
+    const std::vector<std::pair<int, cudaDeviceProp>> devices = devicesInPciOrder();
+    if (device < 0 || device >= (int) devices.size()) {
+        error = "no " NAMEBREAK_GPU_RUNTIME_NAME " device numbered " + std::to_string(device) + " (there are " + std::to_string(devices.size()) + ")";
+        return nullptr;
+    }
+    const auto& [runtimeNumber, prop] = devices[(size_t) device];
+    return std::make_unique<CudaBackend>(runtimeNumber, prop.name);
 }

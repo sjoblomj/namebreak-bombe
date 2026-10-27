@@ -29,6 +29,11 @@ const std::vector<GpuTuningKey>& gpuTuningKeys(const std::string& backend) {
     return backend == "opencl" ? opencl : backend == "metal" ? metal : none;
 }
 
+const std::vector<GpuTuningKey>& allGpuTuningKeys() {
+    // OpenCL's are every key Metal's are, and batches_per_launch.
+    return gpuTuningKeys("opencl");
+}
+
 bool operator==(const GpuTuning& a, const GpuTuning& b) {
     return a.rowsPerThread == b.rowsPerThread && a.batchesPerLaunch == b.batchesPerLaunch && a.windowChars == b.windowChars &&
            a.workGroupSize == b.workGroupSize && a.dictionaryWordsPerThread == b.dictionaryWordsPerThread &&

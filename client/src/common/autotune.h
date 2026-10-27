@@ -6,13 +6,18 @@
 #include <string>
 #include <vector>
 
+#include "backends/gpu_device.h"
 #include "backends/gpu_tuning.h"
 
 // `namebreak --autotune`: measures the OpenCL or Metal backend's launch
-// geometry (GpuTuning, backends/gpu_tuning.h) on this machine's GPU and
-// writes what searched fastest to the config file's [opencl] or [metal]
-// section (see buildBackendTunings, config.h) - the backend's defaults were
-// only ever measured on one RTX 3080 Ti Laptop.
+// geometry (GpuTuning, backends/gpu_tuning.h) on each of `devices` - this
+// machine's GPUs that [hardware] selects (autotuneDevices) - one after the
+// other, and writes what searched fastest on each to the config file's
+// [hardware] section as that GPU's own (`gpu<N>.<key>`, with `gpu<N>.name`
+// saying which GPU they're for - see buildHardwareConfig, config.h). The
+// backend's defaults were only ever measured on one RTX 3080 Ti Laptop. A GPU
+// of the same name as one already timed gets its values without being timed
+// itself.
 //
 // Each trial makes the backend afresh with the values tried (so it passes
 // its self-tests with them, or the values are skipped), warms it up, and
@@ -30,9 +35,9 @@
 // from the backend's defaults. Then defaults and result are timed twice more
 // each: only if the result is more than 2% faster are its values written,
 // and only those that differ from the defaults - a value equal to one is
-// taken out of the
-// section, so later releases' defaults apply. dictionary_tails_per_cell,
-// which only searches with tails would show, is left as the file has it.
+// taken out of the section, so later releases' defaults apply, unless
+// [hardware] sets that key for every GPU. dictionary_tails_per_cell, which
+// only searches with tails would show, is left as the file has it.
 //
 // `backend` is the backend to tune, as autotuneBackend says.
 // `abortRequested`, if given, ends the tuning after the trial in progress,
@@ -52,8 +57,8 @@ struct AutotuneHooks {
     // a rough guess, from how long the trials so far took.
     std::function<void(double fraction, double secondsLeft)> onProgress;
 };
-int runAutotune(const std::string& configPath, const std::string& backend, double secondsPerTrial, std::atomic<bool>* abortRequested,
-                const AutotuneHooks& hooks = AutotuneHooks());
+int runAutotune(const std::string& configPath, const std::string& backend, const std::vector<GpuDevice>& devices, double secondsPerTrial,
+                std::atomic<bool>* abortRequested, const AutotuneHooks& hooks = AutotuneHooks());
 
 // Where scripts/autotune/ - which tunes the CUDA and HIP backends'
 // compiled-in values - and its README are online.
@@ -66,6 +71,11 @@ inline constexpr const char* kAutotuneScriptUrl = "https://github.com/sjoblomj/n
 // HIP, whose values are compiled in (pointing to kAutotuneScriptUrl), the
 // CPU backends, or a backend this build doesn't have.
 std::string autotuneBackend(const std::string& requested, std::string& why);
+
+// The GPUs of `backend` (as autotuneBackend says) runAutotune tunes: those
+// [hardware]'s gpus selects (see selectedGpus, backends/backends.h). Empty,
+// with `why` saying why for a person, if there are none.
+std::vector<GpuDevice> autotuneDevices(const std::string& backend, std::string& why);
 
 // One value to tune, and the values to try for it.
 struct TuningAxis {

@@ -6,8 +6,9 @@
 #include <vector>
 
 // The launch geometry of a GPU backend that compiles its kernels at runtime
-// (OpenCL, Metal), which config.conf's [opencl] and [metal] sections can set
-// (see buildBackendTunings, common/config.h) and `namebreak --autotune`
+// (OpenCL, Metal), which config.conf's [hardware] section can set, for every
+// GPU and for one (see buildHardwareConfig, common/config.h) and
+// `namebreak --autotune`
 // measures (common/autotune.h). None of it changes what a search finds, only
 // how its work is cut up - every backend still has to pass its self-tests
 // with it. The CUDA backend compiles its kernels ahead of time, with these
@@ -50,6 +51,11 @@ struct GpuTuningKey {
 // The keys `backend` ("opencl" or "metal") takes, in the order the config
 // and --autotune list them. Empty for any other backend.
 const std::vector<GpuTuningKey>& gpuTuningKeys(const std::string& backend);
+
+// Every key any backend takes - what [hardware] accepts, for whichever
+// backend searches: one that doesn't take a key (Metal's
+// batches_per_launch, every key for CUDA) leaves it be.
+const std::vector<GpuTuningKey>& allGpuTuningKeys();
 
 // Whether `a` and `b` set the same values, and leave the same ones unset.
 bool operator==(const GpuTuning& a, const GpuTuning& b);
