@@ -30,18 +30,17 @@ inline constexpr const char* kDefaultServerUrl = "https://namebreak-coordinator.
 //                           of the two actually runs; both take the same
 //                           parameters)
 //   [coordinator]         - coordinator-mode parameters (see
-//                           coordinator_runner.h), including
-//                           meet_in_the_middle_table_memory: how much memory
-//                           this client will give a meet-in-the-middle
-//                           target's table
+//                           coordinator_runner.h)
 //   [dictionary]          - dictionary-mode parameters (see
 //                           buildDictionaryRequest)
 //   [meet-in-the-middle]  - meet-in-the-middle-mode parameters (see
 //                           buildMeetInTheMiddleRequest)
 //   [hardware]            - which GPUs to search with, the cpu backend's
 //                           threads and the OpenCL and Metal backends'
-//                           launch geometry, in every mode (see
-//                           buildHardwareConfig)
+//                           launch geometry, in every mode, and
+//                           meet_in_the_middle_table_memory: how much memory
+//                           a coordinator run gives a meet-in-the-middle
+//                           target's table (see buildHardwareConfig)
 // plus four keys allowed before any section: `mode = continuous|bounded|
 // coordinator|dictionary|meet-in-the-middle` (overridable by passing --mode
 // <mode> - see main()), `matches_dir = <directory>` (optional - see
@@ -156,6 +155,10 @@ bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleReques
 //                       commas, as `namebreak --list-gpus` shows them
 //   cpu_threads         the cpu backend's threads, 0 (the default) for one
 //                       per hardware thread
+//   meet_in_the_middle_table_memory
+//                       how much memory a coordinator run gives a
+//                       meet-in-the-middle target's table - only checked
+//                       here; see buildCoordinatorArgs
 //   rows_per_thread, batches_per_launch (OpenCL only), window_chars,
 //   work_group_size, dictionary_words_per_thread, dictionary_work_group_size,
 //   dictionary_tails_per_cell
@@ -172,7 +175,7 @@ bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleReques
 bool buildHardwareConfig(const ConfigFile& config, HardwareConfig& out, std::string& error);
 
 // A number of bytes, as [meet-in-the-middle]'s `table_memory` and
-// [coordinator]'s `meet_in_the_middle_table_memory` give it: digits,
+// [hardware]'s `meet_in_the_middle_table_memory` give it: digits,
 // optionally followed by K, M or G (1024, 1024^2, 1024^3 - case doesn't
 // matter). False on anything else.
 bool parseConfigBytes(const std::string& text, uint64_t& out);

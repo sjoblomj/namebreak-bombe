@@ -6,7 +6,7 @@
 #include <vector>
 
 // How much memory this client will give a meet-in-the-middle target's table
-// ([coordinator]'s meet_in_the_middle_table_memory) - the Hardware dialog's
+// ([hardware]'s meet_in_the_middle_table_memory) - the Hardware dialog's
 // slider (hardware_dialog.h), and what first-run setup proposes. It is a
 // coarse choice: a character more of the table needs about as many times
 // more memory as the alphabet has characters, so the useful values are

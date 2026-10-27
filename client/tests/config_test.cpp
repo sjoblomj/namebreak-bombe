@@ -518,6 +518,9 @@ static void testHardwareConfig() {
     refused("rows_per_threads", "25", "[hardware]: unknown key 'rows_per_threads'", "a typo refused");
     refused("gpu0.rows_per_threads", "25", "unknown key 'gpu0.rows_per_threads'", "a typo in a GPU's own key refused");
     refused("gpu0.window_chars", "9", "gpu0.window_chars must be 1 to 6", "a GPU's own value out of range refused");
+    check(hardwareErrorOf({{"meet_in_the_middle_table_memory", "4G"}}, hardware).empty(), "meet_in_the_middle_table_memory read");
+    refused("meet_in_the_middle_table_memory", "lots", "invalid meet_in_the_middle_table_memory: 'lots'",
+            "a meet-in-the-middle table memory that isn't a size refused");
     refused("gpux.window_chars", "4", "unknown key 'gpux.window_chars'", "a GPU that isn't a number refused");
     refused("gpus", "0, first", "gpus is auto, all, none, or GPU numbers", "gpus that aren't numbers refused");
     refused("gpus", "64", "gpus must be 0 to 63", "a GPU number past 63 refused");

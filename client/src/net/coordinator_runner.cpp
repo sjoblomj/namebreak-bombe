@@ -1097,7 +1097,12 @@ bool buildCoordinatorArgs(const ConfigFile& config, CoordinatorArgs& out, std::s
     out.username = r.getOptional("username", "");
     out.hostname = r.getOptional("hostname", "");
     std::string pollStr = r.getOptional("poll_interval_secs", "30");
-    const std::string meetInTheMiddleMemoryStr = r.getOptional("meet_in_the_middle_table_memory", "0");
+    // [hardware]'s (which buildHardwareConfig checks) - or [coordinator]'s,
+    // where v2026-10-22 had it, and which is still read.
+    std::string meetInTheMiddleMemoryStr = r.getOptional("meet_in_the_middle_table_memory", "0");
+    const auto hardwareMemory = config.hardware.find("meet_in_the_middle_table_memory");
+    if (hardwareMemory != config.hardware.end())
+        meetInTheMiddleMemoryStr = hardwareMemory->second;
 
     std::string unknown = r.firstUnknownKey();
     if (!unknown.empty()) {
@@ -1191,7 +1196,7 @@ int runWorker(CoordinatorArgs args, WorkerGroup& group, std::unique_ptr<SearchBa
         // What this client will give a meet-in-the-middle target's table
         // decides whether it's offered that work at all, so it's said out
         // loud.
-        std::string tableNote = "no meet-in-the-middle work (set meet_in_the_middle_table_memory in [coordinator] to take it on)";
+        std::string tableNote = "no meet-in-the-middle work (set meet_in_the_middle_table_memory in [hardware] to take it on)";
         if (args.meetInTheMiddleTableBytes > 0)
             tableNote = std::to_string((uint64_t) args.meetInTheMiddleTableBytes / (1024 * 1024)) + " MB for a meet-in-the-middle table";
         const std::string on = device ? " on " + device->name : "";

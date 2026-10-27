@@ -42,7 +42,7 @@ hardware](#choosing-and-tuning-the-hardware)).
   repeats until stopped. A target is searched by alphabet, as `bounded` mode
   searches, by words, as `dictionary` mode does (see [Dictionary targets
   in coordinator mode](#dictionary-targets-in-coordinator-mode)), or from a
-  meeting point, as `meet-in-the-middle` mode does - for which `meet_in_the_middle_table_memory` says
+  meeting point, as `meet-in-the-middle` mode does - for which `[hardware]`'s `meet_in_the_middle_table_memory` says
   how much memory you'll give its table, and without which the server hands
   out none of that work (see [Meet-in-the-middle mode](#meet-in-the-middle-mode)). See
   [`../coordinator/README.md`](../coordinator/README.md) for the server side
@@ -777,13 +777,16 @@ A meet-in-the-middle target can be shared out (the coordinator README's
 table holds - what a tail even is depends on it - and hands out a stretch of
 one directory length's tails at a time. What it costs in memory is therefore
 the same for every client of that target, so a client says how much it will
-give one in `[coordinator]`'s `meet_in_the_middle_table_memory`:
+give one in `[hardware]`'s `meet_in_the_middle_table_memory` - the memory
+being part of the machine it agrees to spare, as its GPUs are:
 
 ```ini
-[coordinator]
-server_url = https://namebreak-coordinator.fly.dev
+[hardware]
 meet_in_the_middle_table_memory = 1G
 ```
+
+(v2026-10-22 had it in `[coordinator]`, where it is still read; `[hardware]`'s
+is used if both have it.)
 
 Left out (or 0), this client is handed no meet-in-the-middle target's work
 at all - a table is memory you have to agree to spare, and on a GPU it has

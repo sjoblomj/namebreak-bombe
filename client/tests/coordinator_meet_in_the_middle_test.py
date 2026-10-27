@@ -202,7 +202,9 @@ class Client:
     # Every client started, to stop whatever happens.
     started = []
 
-    def __init__(self, binary, workdir, server, backend, name, meet_in_the_middle_table_memory="1G"):
+    # `memory_section` is where the config says meet_in_the_middle_table_memory:
+    # [hardware], or [coordinator], where v2026-10-22 had it.
+    def __init__(self, binary, workdir, server, backend, name, meet_in_the_middle_table_memory="1G", memory_section="hardware"):
         self.name = name
         self.matches = os.path.join(workdir, name + "-matches")
         config = os.path.join(workdir, name + ".conf")
@@ -217,6 +219,8 @@ class Client:
             f.write("hostname = test\n")
             f.write("poll_interval_secs = 1\n")
             if meet_in_the_middle_table_memory is not None:
+                if memory_section != "coordinator":
+                    f.write("[%s]\n" % memory_section)
                 f.write("meet_in_the_middle_table_memory = %s\n" % meet_in_the_middle_table_memory)
         self.output_path = os.path.join(workdir, name + ".log")
         self.output = open(self.output_path, "w")
@@ -274,10 +278,11 @@ def phase1(server, client_binary, workdir, backend):
     check((16 << 20) < table_bytes < (64 << 20), "its table is about 30 MB: %d bytes" % table_bytes)
 
     # Too little, and nothing said at all: no work from it, and no range of
-    # it ever carved. (A client's own output is block-buffered into its log,
+    # it ever carved. The one with too little says so where v2026-10-22 had
+    # it, in [coordinator], which is still read. (A client's own output is block-buffered into its log,
     # so what it said is read once it has exited.)
     for name, memory, expected in [("stingy", "16M", 16 << 20), ("silent", None, None)]:
-        client = Client(client_binary, workdir, server, backend, name, meet_in_the_middle_table_memory=memory)
+        client = Client(client_binary, workdir, server, backend, name, meet_in_the_middle_table_memory=memory, memory_section="coordinator")
         wait_for(name + " to register", lambda: server.rows("SELECT 1 FROM users WHERE username = ?", name), client, timeout=120)
         check(registered(server, name) == expected, "the server keeps what %s will give a table: %s" % (name, registered(server, name)))
         time.sleep(2)  # long enough to have claimed, had it been offered anything

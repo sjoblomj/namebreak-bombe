@@ -149,7 +149,7 @@ pub struct RegisterRequest {
     #[serde(default)]
     pub client_release: Option<String>,
     /// How much memory, in bytes, this client will give a meet-in-the-middle
-    /// search's table (its `[coordinator]` `meet_in_the_middle_table_memory`)
+    /// search's table (its `[hardware]` `meet_in_the_middle_table_memory`)
     /// - see `ClaimResponse::meet_in_the_middle`. The server hands it no
     /// meet-in-the-middle target whose table is bigger than this, and none at
     /// all without it (a client older than protocol 1.6, or one that won't

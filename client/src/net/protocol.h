@@ -64,7 +64,7 @@ struct RegisterRequest {
     // the server can refuse a client that's too old.
     std::string clientRelease;
     // How much memory, in bytes, this client will give a meet-in-the-middle
-    // search's table ([coordinator]'s meet_in_the_middle_table_memory - see
+    // search's table ([hardware]'s meet_in_the_middle_table_memory - see
     // meet_in_the_middle.h). The server hands out no meet-in-the-middle
     // target whose table is bigger, and none at all without this. Absent
     // (null) if this client won't spare any.

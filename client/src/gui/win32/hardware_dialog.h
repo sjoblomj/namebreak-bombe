@@ -19,7 +19,7 @@ namespace gui {
 // its default beside it - in another color while it isn't the default - and
 // its Optimize for hardware button times them (optimizeForHardware,
 // optimize_dialog.h) on the GPUs checked. Under the GPUs is how much memory
-// a coordinator run gives meet-in-the-middle work ([coordinator]'s
+// a coordinator run gives meet-in-the-middle work ([hardware]'s
 // meet_in_the_middle_table_memory - see table_memory.h).
 //
 // OK writes what was changed - and only that - to `configPath` straight

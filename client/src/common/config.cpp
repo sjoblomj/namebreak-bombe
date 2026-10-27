@@ -49,7 +49,7 @@ bool parseInsertion(const std::string& s, Insertion& out) {
 }
 
 // parseConfigBytes (config.h), which [meet-in-the-middle]'s `table_memory` and
-// [coordinator]'s `meet_in_the_middle_table_memory` both read.
+// [hardware]'s `meet_in_the_middle_table_memory` both read.
 bool parseBytesImpl(const std::string& s, uint64_t& out) {
     const std::string text = trim(s);
     if (text.empty())
@@ -1118,6 +1118,17 @@ bool buildHardwareConfig(const ConfigFile& config, HardwareConfig& out, std::str
         if (!ofOneGpu && key == "cpu_threads") {
             if (!parseHardwareNumber(key, value, 0, 4096, out.cpuThreads, error))
                 break;
+            continue;
+        }
+        // A coordinator run's, which buildCoordinatorArgs reads: only
+        // checked here, so that a mistake in it is said in every mode.
+        if (!ofOneGpu && key == "meet_in_the_middle_table_memory") {
+            uint64_t bytes = 0;
+            if (!parseConfigBytes(value, bytes) || bytes > (uint64_t) INT64_MAX) {
+                error = "invalid meet_in_the_middle_table_memory: '" + value +
+                        "' (expected a number of bytes, or one with a K, M or G after it)";
+                break;
+            }
             continue;
         }
         if (ofOneGpu && name == "name") {

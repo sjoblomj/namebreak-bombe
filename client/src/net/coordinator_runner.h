@@ -39,7 +39,7 @@ struct CoordinatorArgs {
     // empty for the first one that can run here (see backends/backends.h).
     std::string backend;
     // How much memory this client will give a meet-in-the-middle target's table
-    // ([coordinator]'s meet_in_the_middle_table_memory - see
+    // ([hardware]'s meet_in_the_middle_table_memory - see
     // engine/meet_in_the_middle.h), in bytes. 0 (the default) takes no
     // meet-in-the-middle work at all: the server hands out none of it to a
     // client that won't say what it will give, and a table is memory a

@@ -122,10 +122,12 @@ struct DialogState {
     bool loadedCpu = false;
     int hardwareThreads = 1;
     int loadedThreads = 0;
-    // The meet-in-the-middle memory slider's sizes, and the one it was at.
+    // The meet-in-the-middle memory slider's sizes, the one it was at, and
+    // whether that was [coordinator]'s, where v2026-10-22 had it.
     std::vector<uint64_t> memoryStops;
     uint64_t availableBytes = 0;
     int loadedMemoryStop = 0;
+    bool memoryInCoordinator = false;
     HWND dialog = nullptr, scroll = nullptr, tooltip = nullptr;
     HWND gpuRadio = nullptr, cpuRadio = nullptr, threads = nullptr, threadsNote = nullptr;
     HWND tableMemory = nullptr, tableMemoryText = nullptr;
@@ -309,6 +311,9 @@ std::vector<std::pair<std::string, std::string>> changedKeys(const DialogState* 
         }
         keys.emplace_back(prefix + "name", own ? cell.device.name : "");
     }
+    const int memoryStop = (int) SendMessage(state->tableMemory, TBM_GETPOS, 0, 0);
+    if (memoryStop != state->loadedMemoryStop)
+        keys.emplace_back("meet_in_the_middle_table_memory", gui::bytesForConfig(state->memoryStops[(size_t) std::max(0, memoryStop)]));
     return keys;
 }
 
@@ -338,19 +343,19 @@ void accept(DialogState* state) {
             MessageBoxA(state->dialog, ("Failed to write " + state->configPath + ": " + error).c_str(), kTitle, MB_OK | MB_ICONERROR);
             return;
         }
+        // The memory, now in [hardware], taken out of where it was.
+        const bool memoryMoved = state->memoryInCoordinator && std::any_of(keys.begin(), keys.end(), [](const auto& key) {
+                                     return key.first == "meet_in_the_middle_table_memory";
+                                 });
+        if (memoryMoved && !updateConfigSection(state->configPath, "coordinator", {{"meet_in_the_middle_table_memory", ""}}, error)) {
+            MessageBoxA(state->dialog, ("Failed to write " + state->configPath + ": " + error).c_str(), kTitle, MB_OK | MB_ICONERROR);
+            return;
+        }
         // The launch settings, for every backend made from now on - a
         // coordinator run's next range's among them.
         const HardwareConfig hardware = readHardware(state->configPath, error);
         if (error.empty())
             setHardwareConfig(hardware);
-    }
-    const int memoryStop = (int) SendMessage(state->tableMemory, TBM_GETPOS, 0, 0);
-    if (memoryStop != state->loadedMemoryStop &&
-        !updateConfigSection(state->configPath, "coordinator",
-                             {{"meet_in_the_middle_table_memory", gui::bytesForConfig(state->memoryStops[(size_t) std::max(0, memoryStop)])}},
-                             error)) {
-        MessageBoxA(state->dialog, ("Failed to write " + state->configPath + ": " + error).c_str(), kTitle, MB_OK | MB_ICONERROR);
-        return;
     }
     closeDialog(state);
 }
@@ -639,16 +644,25 @@ void showHardwareDialog(HWND owner, const std::string& configPath, const std::st
     const bool anyDiscrete = std::any_of(devices.begin(), devices.end(), [](const GpuDevice& d) { return !d.integrated; });
 
     // The memory a coordinator run gives meet-in-the-middle work: what the
-    // file says, or - with nothing there - what first-run setup proposes.
+    // file says - in [hardware], or [coordinator] as buildCoordinatorArgs
+    // still reads it - or, with nothing there, what first-run setup
+    // proposes.
     const MachineMemory memory = machineMemory();
     state.memoryStops = tableMemoryStopsFor(memory.totalBytes);
     state.availableBytes = memory.availableBytes;
     {
-        const auto it = config.coordinator.find("meet_in_the_middle_table_memory");
+        const std::string key = "meet_in_the_middle_table_memory";
+        const std::string* value = nullptr;
+        if (const auto it = config.hardware.find(key); it != config.hardware.end()) {
+            value = &it->second;
+        } else if (const auto old = config.coordinator.find(key); old != config.coordinator.end()) {
+            value = &old->second;
+            state.memoryInCoordinator = true;
+        }
         uint64_t bytes = 0;
-        if (it == config.coordinator.end() || it->second.empty())
+        if (!value || value->empty())
             bytes = proposedTableMemory(state.memoryStops, memory.totalBytes);
-        else if (!parseConfigBytes(it->second, bytes))
+        else if (!parseConfigBytes(*value, bytes))
             bytes = 0;
         state.loadedMemoryStop = stopIndexFor(state.memoryStops, bytes);
     }
@@ -800,7 +814,7 @@ void showHardwareDialog(HWND owner, const std::string& configPath, const std::st
     SendMessage(state.tableMemory, TBM_SETPAGESIZE, 0, 1);
     SendMessage(state.tableMemory, TBM_SETPOS, TRUE, state.loadedMemoryStop);
     addHelp(textX + 432, y + 115,
-            "How much memory this client will give the table of a meet-in-the-middle target - [coordinator]'s "
+            "How much memory this client will give the table of a meet-in-the-middle target - [hardware]'s "
             "meet_in_the_middle_table_memory. The server hands out such a target only if its table fits in this, so None means no work "
             "of that kind at all - and no other kind is affected by it.\r\n"
             "The table is only held while such a range is being searched, and on a GPU it is held in the card's own memory too - so "

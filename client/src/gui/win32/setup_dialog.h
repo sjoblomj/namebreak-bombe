@@ -96,8 +96,9 @@ struct SetupDialogFields {
     std::string hostname;
     std::string serverUrl;
     std::string pollIntervalSecs = "30";
-    // meet_in_the_middle_table_memory: how much memory this client will give
-    // a meet-in-the-middle target's table, as config.conf has it ("4G") -
+    // [hardware]'s meet_in_the_middle_table_memory: how much memory this
+    // client will give a meet-in-the-middle target's table, as config.conf
+    // has it ("4G") -
     // "0" for none, and empty to propose a size for this machine (see
     // proposedTableMemory, table_memory.h). Not on any tab: the Hardware
     // dialog sets it, and first-run setup only fills it in where the file

@@ -85,8 +85,10 @@ SetupDialogFields fieldsFromConfig(const ConfigFile& config, bool loaded) {
     fields.hostname = get(config.coordinator, "hostname", resolveHostname());
     fields.serverUrl = get(config.coordinator, "server_url", kDefaultServerUrl);
     fields.pollIntervalSecs = get(config.coordinator, "poll_interval_secs", "30");
-    // Empty: first-run setup proposes a size for this machine instead.
-    fields.meetInTheMiddleTableMemory = get(config.coordinator, "meet_in_the_middle_table_memory", "");
+    // [hardware]'s, or [coordinator]'s, where v2026-10-22 had it. Empty:
+    // first-run setup proposes a size for this machine instead.
+    fields.meetInTheMiddleTableMemory =
+        get(config.hardware, "meet_in_the_middle_table_memory", get(config.coordinator, "meet_in_the_middle_table_memory", ""));
     fields.alphabet = get(config.search, "alphabet", "");
     fields.maxBackslashCount = get(config.search, "max_backslash_count", "0");
     fields.minBackslashCount = get(config.search, "min_backslash_count", "0");
@@ -189,20 +191,23 @@ bool writeConfigForFields(const std::string& path, const SetupDialogFields& fiel
                          : ensureConfigForMode(path, mode, section, keys, error);
     };
     if (fields.mode == "coordinator") {
-        std::vector<std::pair<std::string, std::string>> keys = {{"server_url", fields.serverUrl},
-                                                                 {"username", fields.username},
-                                                                 {"hostname", fields.hostname},
-                                                                 {"poll_interval_secs", fields.pollIntervalSecs}};
-        // The Hardware dialog's, which writes it itself - first-run setup
-        // only proposes a size for this machine to a file without one.
-        if (!overwrite) {
-            const gui::MachineMemory memory = gui::machineMemory();
-            const std::vector<uint64_t> stops = gui::tableMemoryStopsFor(memory.totalBytes);
-            const std::string proposed = gui::bytesForConfig(gui::proposedTableMemory(stops, memory.totalBytes));
-            keys.emplace_back("meet_in_the_middle_table_memory",
-                              fields.meetInTheMiddleTableMemory.empty() ? proposed : fields.meetInTheMiddleTableMemory);
-        }
-        return write("coordinator", "coordinator", keys);
+        if (!write("coordinator", "coordinator",
+                   {{"server_url", fields.serverUrl},
+                    {"username", fields.username},
+                    {"hostname", fields.hostname},
+                    {"poll_interval_secs", fields.pollIntervalSecs}}))
+            return false;
+        // [hardware]'s meet_in_the_middle_table_memory is the Hardware
+        // dialog's, which writes it itself - first-run setup only proposes a
+        // size for this machine to a file without one in either section.
+        if (overwrite || !fields.meetInTheMiddleTableMemory.empty())
+            return true;
+        const gui::MachineMemory memory = gui::machineMemory();
+        const std::vector<uint64_t> stops = gui::tableMemoryStopsFor(memory.totalBytes);
+        return updateConfigSection(path, "hardware",
+                                   {{"meet_in_the_middle_table_memory",
+                                     gui::bytesForConfig(gui::proposedTableMemory(stops, memory.totalBytes))}},
+                                   error);
     }
     if (fields.mode == "dictionary")
         return write("dictionary", "dictionary", gui::dictionaryConfigKeys(fields.dictionary));
