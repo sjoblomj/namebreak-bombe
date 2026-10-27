@@ -69,6 +69,7 @@ constexpr int kIdPauseButton = 101;
 constexpr int kIdQuitButton = 102;
 constexpr int kIdAboutButton = 103;
 constexpr int kIdFinishCheckbox = 104;
+constexpr int kIdGpuList = 105;
 constexpr int kIdTrayShow = 201;
 constexpr int kIdTrayPause = 202;
 constexpr int kIdTrayQuit = 203;
@@ -85,8 +86,6 @@ constexpr size_t kMaxMatchLines = 100;
 constexpr const char* kSearchingPrefix = "Searching: ";
 
 HWND g_hwndMain = nullptr;
-HWND g_hwndLogLabel = nullptr;
-HWND g_hwndMatches = nullptr;
 HWND g_hwndPauseButton = nullptr;
 HWND g_hwndQuitButton = nullptr;
 HWND g_hwndAboutButton = nullptr;
@@ -103,30 +102,48 @@ std::thread g_workerThread;
 // registration failed at startup) and only alarm the user for the latter.
 bool g_quitting = false;
 
-// UI-thread-only: what the matches box shows. A matches file holds just its
-// latest Hash-A match (see MatchWriter, engine/match_writer.h), so each
-// tick's is added here whenever it changes, and only the last
-// kMaxMatchLines are kept. Started afresh for another matches file (another
-// target), as the box shows only the current one's - unless several GPUs
-// search (see SearchRow), whose lines all go in it, each saying whose.
-std::deque<std::string> g_recentMatches;
-std::string g_recentMatchesPath;
-
-// UI-thread-only: a search's controls - its target line, its status line
-// and its progress bar - and the line of its matches file last added to
-// the box (not always the file's last line in the box, which may be a
-// basename's or a search position's). The first is the window's own; a
-// coordinator run searching on several GPUs gets one for each of them (see
-// addGpuRows), stacked one under the other.
-struct SearchRow {
+// UI-thread-only: a search's controls - its target line, its status line,
+// its progress bar and its search log - and what its log shows. The first
+// is the window's own; a coordinator run searching on several GPUs gets one
+// for each of them (see addGpuCells), each framed and titled with its GPU,
+// laid out in a grid - or, with more than fit, one at a time, chosen in a
+// list down the left (see layoutWindow).
+struct SearchCell {
+    HWND frame = nullptr; // the group box - several GPUs only
     HWND target = nullptr;
     HWND status = nullptr;
     HWND progress = nullptr;
+    HWND logLabel = nullptr;
+    HWND log = nullptr;
+    // What the log shows. A matches file holds just its latest Hash-A match
+    // (see MatchWriter, engine/match_writer.h), so each tick's is added here
+    // whenever it changes, and only the last kMaxMatchLines are kept.
+    // Started afresh for another matches file (another target), as the log
+    // shows only the current one's.
+    std::deque<std::string> recentMatches;
+    std::string recentMatchesPath;
+    // The line of its matches file last added to the log (not always the
+    // log's last line, which may be a basename's or a search position's).
     std::string lastMatch;
 };
-std::vector<SearchRow> g_rows;
-// How far apart two rows are, in 96-DPI pixels.
-constexpr int kRowPitch = 75;
+std::vector<SearchCell> g_cells;
+// With more GPUs than fit in a grid: the list of them, and the one whose
+// cell is shown. Null otherwise.
+HWND g_hwndGpuList = nullptr;
+size_t g_selectedCell = 0;
+
+// Layout, in 96-DPI pixels. A cell's contents are as wide as the window's
+// were with one search; the log is as tall as fits, between the two.
+constexpr int kMargin = 10;
+constexpr int kContentWidth = 470;
+constexpr int kCellLogHeight = 280; // one search, or the list's cell
+constexpr int kGridLogHeight = 200;
+constexpr int kMinGridLogHeight = 90;
+// A grid of at most this many columns and rows - more GPUs than that are
+// listed instead, as are as many as won't fit on the screen.
+constexpr int kMaxGridColumns = 3;
+constexpr int kMaxGridRows = 3;
+constexpr int kGpuListWidth = 200;
 
 // Set once in main() after prepareConfig() succeeds, never touched again -
 // "coordinator", "bounded", "continuous" or "dictionary" (window title,
@@ -275,8 +292,8 @@ void requestQuit(HWND hwnd) {
     EnableWindow(g_hwndQuitButton, FALSE);
     if (g_hwndFinishCheckbox)
         EnableWindow(g_hwndFinishCheckbox, FALSE);
-    for (const SearchRow& row : g_rows)
-        SetWindowTextA(row.status, "Status: shutting down...");
+    for (const SearchCell& cell : g_cells)
+        SetWindowTextA(cell.status, "Status: shutting down...");
     // Clearing pause too (rather than leaving runCoordinator's pause-wait
     // spin to notice quitRequested on its own, which it does - see
     // coordinator_runner.cpp) just keeps this state visually consistent
@@ -286,54 +303,186 @@ void requestQuit(HWND hwnd) {
     g_quitRequested.store(true, std::memory_order_relaxed);
 }
 
-// One row for each of `gpus` - a coordinator run's on several GPUs (see
-// CoordinatorCallbacks::onWorkers): the window's own row becomes the first
-// GPU's, the rest are added under it, and everything below them - the
-// matches box, the buttons - moves down to make room, the window growing
-// as much - or, where that would take it past the bottom of the screen, the
-// matches box getting shorter instead, as far as it can. Made at the system
-// DPI, as scaleChildWindows has made the rest.
-void addGpuRows(HWND hwnd, size_t gpus) {
-    const int extra = scaled(kRowPitch * (int) (gpus - g_rows.size()));
-    RECT window, workArea, box;
-    GetWindowRect(hwnd, &window);
-    SystemParametersInfoA(SPI_GETWORKAREA, 0, &workArea, 0);
-    GetWindowRect(g_hwndMatches, &box);
-    MapWindowPoints(nullptr, hwnd, (POINT*) &box, 2);
-    const int room = std::max(0L, workArea.bottom - window.bottom);
-    const int shrink = std::clamp(extra - room, 0, std::max(0, (int) (box.bottom - box.top) - scaled(80)));
-    // The log's label and box move down past the new rows; what's under
-    // the box moves as much less as it got shorter.
-    for (HWND child : {g_hwndLogLabel, g_hwndMatches, g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton, g_hwndFinishCheckbox}) {
-        if (!child)
-            continue;
-        RECT r;
-        GetWindowRect(child, &r);
-        MapWindowPoints(nullptr, hwnd, (POINT*) &r, 2);
-        const bool underBox = r.top >= box.bottom;
-        const int height = child == g_hwndMatches ? r.bottom - r.top - shrink : r.bottom - r.top;
-        SetWindowPos(child, nullptr, r.left, r.top + extra - (underBox ? shrink : 0), r.right - r.left, height, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    SetWindowPos(hwnd, nullptr, 0, 0, window.right - window.left, window.bottom - window.top + extra - shrink,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+// Moves and resizes a child of the main window, in 96-DPI pixels.
+void place(HWND child, int x, int y, int width, int height) {
+    SetWindowPos(child, nullptr, scaled(x), scaled(y), scaled(width), scaled(height), SWP_NOZORDER | SWP_NOACTIVATE);
+}
 
+// A cell's height, frame and all, with a log `logHeight` tall - and its
+// width. Its contents are 105 tall above the log; a frame adds its caption
+// above them and a margin round them.
+int cellHeight(bool framed, int logHeight) {
+    return 105 + logHeight + (framed ? 30 : 0);
+}
+int cellWidth(bool framed) {
+    return kContentWidth + (framed ? 2 * kMargin : 0);
+}
+
+// A cell's controls, to be placed by layoutWindow. `framed` with several
+// GPUs: a group box titled `name`, made first so it's under what it holds.
+SearchCell makeCell(HWND hwnd, bool framed, const std::string& name) {
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
-    auto child = [&](const char* className, const char* text, DWORD style, int y, int height) {
-        HWND made = CreateWindowExA(0, className, text, WS_CHILD | WS_VISIBLE | style, scaled(10), scaled(y), scaled(470), scaled(height), hwnd,
-                                    nullptr, g_hInstance, nullptr);
+    auto child = [&](DWORD exStyle, const char* className, const char* text, DWORD style) {
+        HWND made = CreateWindowExA(exStyle, className, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, hwnd, nullptr, g_hInstance, nullptr);
         SendMessage(made, WM_SETFONT, (WPARAM) font, TRUE);
         return made;
     };
-    while (g_rows.size() < gpus) {
-        const int top = 10 + kRowPitch * (int) g_rows.size();
-        SearchRow row;
-        row.target = child("STATIC", "", SS_ENDELLIPSIS, top, 20);
-        row.status = child("STATIC", "Status: starting...", SS_ENDELLIPSIS, top + 25, 20);
-        row.progress = child(PROGRESS_CLASSA, nullptr, PBS_MARQUEE, top + 50, 22);
-        SendMessage(row.progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-        SendMessage(row.progress, PBM_SETMARQUEE, TRUE, 100);
-        g_rows.push_back(row);
+    SearchCell cell;
+    if (framed)
+        cell.frame = child(0, "BUTTON", name.c_str(), BS_GROUPBOX);
+    cell.target = child(0, "STATIC", "Target: (none yet)", SS_ENDELLIPSIS);
+    cell.status = child(0, "STATIC", "Status: starting...", SS_ENDELLIPSIS);
+    cell.progress = child(0, PROGRESS_CLASSA, nullptr, PBS_MARQUEE);
+    SendMessage(cell.progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    SendMessage(cell.progress, PBM_SETMARQUEE, TRUE, 100);
+    // A dictionary search with an encryption key finds basenames that match
+    // it too, which go in the same log, as does how far it has got - and so
+    // does a meet-in-the-middle search's own progress.
+    cell.logLabel = child(0, "STATIC",
+                          g_activeMode == "dictionary" || g_activeMode == "coordinator" || g_activeMode == "meet-in-the-middle"
+                              ? "Search log (most recent last):"
+                              : "Hash A matches (most recent last):",
+                          0);
+    cell.log = child(WS_EX_CLIENTEDGE, "EDIT", "", WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL);
+    return cell;
+}
+
+void placeCell(const SearchCell& cell, int x, int y, int logHeight) {
+    if (cell.frame) {
+        place(cell.frame, x, y, cellWidth(true), cellHeight(true, logHeight));
+        x += kMargin;
+        y += 20;
     }
+    place(cell.target, x, y, kContentWidth, 20);
+    place(cell.status, x, y + 25, kContentWidth, 20);
+    place(cell.progress, x, y + 50, kContentWidth, 22);
+    place(cell.logLabel, x, y + 85, kContentWidth, 18);
+    place(cell.log, x, y + 105, kContentWidth, logHeight);
+}
+
+void showCell(const SearchCell& cell, bool show) {
+    for (HWND child : {cell.frame, cell.target, cell.status, cell.progress, cell.logLabel, cell.log}) {
+        if (child)
+            ShowWindow(child, show ? SW_SHOW : SW_HIDE);
+    }
+}
+
+// Lays the window out for the cells there are, and sizes it to fit: one
+// search's cell on its own; several GPUs' in a grid, as square as it can be,
+// their logs as tall as the screen has room for; or, with more than
+// kMaxGridColumns x kMaxGridRows, or more than fit on the screen even with
+// the shortest logs, a list of the GPUs down the left, with the chosen
+// one's cell beside it. The buttons go under it all.
+void layoutWindow(HWND hwnd) {
+    const size_t count = g_cells.size();
+    const int buttonsHeight = 30 + (g_hwndFinishCheckbox ? 8 + 20 : 0);
+    RECT workArea;
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &workArea, 0);
+    const DWORD style = (DWORD) GetWindowLongPtr(hwnd, GWL_STYLE), exStyle = (DWORD) GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    // The window's size for a client area of `width` x `height`.
+    auto windowSize = [&](int width, int height) {
+        RECT r = {0, 0, scaled(width), scaled(height)};
+        AdjustWindowRectEx(&r, style, FALSE, exStyle);
+        return SIZE{r.right - r.left, r.bottom - r.top};
+    };
+    auto fits = [&](int width, int height) {
+        const SIZE size = windowSize(width, height);
+        return size.cx <= workArea.right - workArea.left && size.cy <= workArea.bottom - workArea.top;
+    };
+    // The tallest log, from `tallest` down to the shortest, that a body of
+    // `width` x `bodyHeight(log)` fits with, or 0 for none.
+    auto tallestLog = [&](int tallest, int width, auto bodyHeight) {
+        for (int log = tallest; log >= kMinGridLogHeight; log -= 10) {
+            if (fits(width, bodyHeight(log) + kMargin + buttonsHeight + kMargin))
+                return log;
+        }
+        return 0;
+    };
+
+    int width, bodyBottom;
+    bool listed = false;
+    if (count == 1) {
+        placeCell(g_cells[0], kMargin, kMargin, kCellLogHeight);
+        width = kMargin + cellWidth(false) + kMargin;
+        bodyBottom = kMargin + cellHeight(false, kCellLogHeight);
+    } else {
+        size_t columns = 1;
+        while (columns * columns < count)
+            ++columns;
+        const size_t rows = (count + columns - 1) / columns;
+        const int pitch = cellWidth(true) + kMargin;
+        width = kMargin + (int) columns * pitch;
+        const int log = columns <= kMaxGridColumns && rows <= kMaxGridRows
+                            ? tallestLog(kGridLogHeight, width, [&](int log) { return kMargin + (int) rows * (cellHeight(true, log) + kMargin) - kMargin; })
+                            : 0;
+        if (log > 0) {
+            for (size_t i = 0; i < count; ++i)
+                placeCell(g_cells[i], kMargin + (int) (i % columns) * pitch, kMargin + (int) (i / columns) * (cellHeight(true, log) + kMargin), log);
+            bodyBottom = kMargin + (int) rows * (cellHeight(true, log) + kMargin) - kMargin;
+        } else {
+            listed = true;
+            width = kMargin + kGpuListWidth + kMargin + cellWidth(true) + kMargin;
+            const int listLog = std::max(kMinGridLogHeight, tallestLog(kCellLogHeight, width, [&](int log) { return kMargin + cellHeight(true, log); }));
+            bodyBottom = kMargin + cellHeight(true, listLog);
+            if (!g_hwndGpuList) {
+                g_hwndGpuList = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                                                0, 0, 0, 0, hwnd, (HMENU) (INT_PTR) kIdGpuList, g_hInstance, nullptr);
+                SendMessage(g_hwndGpuList, WM_SETFONT, (WPARAM) GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            }
+            SendMessage(g_hwndGpuList, LB_RESETCONTENT, 0, 0);
+            for (const SearchCell& cell : g_cells) {
+                char name[256];
+                GetWindowTextA(cell.frame, name, sizeof name);
+                SendMessage(g_hwndGpuList, LB_ADDSTRING, 0, (LPARAM) name);
+            }
+            SendMessage(g_hwndGpuList, LB_SETCURSEL, g_selectedCell, 0);
+            place(g_hwndGpuList, kMargin, kMargin, kGpuListWidth, bodyBottom - kMargin);
+            for (const SearchCell& cell : g_cells)
+                placeCell(cell, kMargin + kGpuListWidth + kMargin, kMargin, listLog);
+        }
+    }
+    for (size_t i = 0; i < count; ++i)
+        showCell(g_cells[i], !listed || i == g_selectedCell);
+
+    const int buttonsTop = bodyBottom + kMargin;
+    place(g_hwndPauseButton, kMargin, buttonsTop, 150, 30);
+    place(g_hwndAboutButton, kMargin + 160, buttonsTop, 150, 30);
+    place(g_hwndQuitButton, kMargin + 320, buttonsTop, 150, 30);
+    if (g_hwndFinishCheckbox)
+        place(g_hwndFinishCheckbox, kMargin, buttonsTop + 38, kContentWidth, 20);
+
+    // Grown or shrunk where it is - moved only as far as keeps it on the
+    // screen.
+    const SIZE size = windowSize(width, buttonsTop + buttonsHeight + kMargin);
+    RECT window;
+    GetWindowRect(hwnd, &window);
+    const int x = std::max(workArea.left, std::min(window.left, workArea.right - size.cx));
+    const int y = std::max(workArea.top, std::min(window.top, workArea.bottom - size.cy));
+    SetWindowPos(hwnd, nullptr, x, y, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// The list's choice: that GPU's cell, in place of the one shown.
+void selectCell(size_t index) {
+    if (index >= g_cells.size() || index == g_selectedCell)
+        return;
+    showCell(g_cells[g_selectedCell], false);
+    g_selectedCell = index;
+    showCell(g_cells[index], true);
+}
+
+// A cell for each of `gpus` - a coordinator run's on several GPUs (see
+// CoordinatorCallbacks::onWorkers), each framed and titled with its GPU: the
+// window's own one search's cell is made again as the first GPU's, framed,
+// and the window laid out afresh for them all.
+void addGpuCells(HWND hwnd, const std::vector<std::string>& gpus) {
+    if (!g_cells.empty() && !g_cells[0].frame) {
+        for (HWND child : {g_cells[0].target, g_cells[0].status, g_cells[0].progress, g_cells[0].logLabel, g_cells[0].log})
+            DestroyWindow(child);
+        g_cells.clear();
+    }
+    while (g_cells.size() < gpus.size())
+        g_cells.push_back(makeCell(hwnd, true, gpus[g_cells.size()]));
+    layoutWindow(hwnd);
 }
 
 // Shows `search` in `bar`: how far it has got, if that's known (see
@@ -409,86 +558,78 @@ void updateUiFromSharedState() {
             search.newSearchPosition.clear();
         }
     }
-    if (gpus.size() > g_rows.size())
-        addGpuRows(g_hwndMain, gpus.size());
+    if (gpus.size() > g_cells.size())
+        addGpuCells(g_hwndMain, gpus);
 
     bool paused = g_pauseRequested.load(std::memory_order_relaxed);
     if (!g_quitting)
         syncPauseControls();
 
-    bool matchesChanged = false;
-    auto addMatchLine = [&](const std::string& line) {
-        g_recentMatches.push_back(line);
-        if (g_recentMatches.size() > kMaxMatchLines)
-            g_recentMatches.pop_front();
-        matchesChanged = true;
-    };
-    // With several GPUs searching, the box has every one's lines, each
-    // saying whose.
-    const bool severalGpus = gpus.size() > 1;
-    if (!severalGpus && searches[0].outputFilePath != g_recentMatchesPath) {
-        g_recentMatches.clear();
-        g_recentMatchesPath = searches[0].outputFilePath;
-        g_rows[0].lastMatch.clear();
-        matchesChanged = true;
-    }
     // Coordinator mode may search dictionary ranges, whose basenames and
-    // search positions go in the box too, as a meet-in-the-middle search's
+    // search positions go in the log too, as a meet-in-the-middle search's
     // own lines do - so its Hash A matches are said to be.
     const bool dictionaryLines =
         g_activeMode == "coordinator" || g_activeMode == "dictionary" || g_activeMode == "meet-in-the-middle";
 
-    for (size_t i = 0; i < searches.size() && i < g_rows.size(); ++i) {
+    for (size_t i = 0; i < searches.size() && i < g_cells.size(); ++i) {
         const SearchStatus& search = searches[i];
-        SearchRow& row = g_rows[i];
-        // "GPU 1: Radeon RX 7900 XTX" - and "GPU 1" before each of its lines
-        // in the box.
-        const std::string gpu = severalGpus ? gpus[i] : "";
-        const std::string whose = severalGpus ? gpu.substr(0, gpu.find(':')) + ": " : "";
+        SearchCell& cell = g_cells[i];
         const std::string target = search.targetName.empty() ? "(none yet)" : search.targetName;
-        SetWindowTextA(row.target, (severalGpus ? gpu + " - target: " + target : "Target: " + target).c_str());
-        SetWindowTextA(row.status, ("Status: " + search.statusText + (paused ? " (paused)" : "")).c_str());
+        SetWindowTextA(cell.target, ("Target: " + target).c_str());
+        SetWindowTextA(cell.status, ("Status: " + search.statusText + (paused ? " (paused)" : "")).c_str());
+
+        bool logChanged = false;
+        auto addLogLine = [&](const std::string& line) {
+            cell.recentMatches.push_back(line);
+            if (cell.recentMatches.size() > kMaxMatchLines)
+                cell.recentMatches.pop_front();
+            logChanged = true;
+        };
+        if (search.outputFilePath != cell.recentMatchesPath) {
+            cell.recentMatches.clear();
+            cell.recentMatchesPath = search.outputFilePath;
+            cell.lastMatch.clear();
+            logChanged = true;
+        }
 
         // Read once, shared below by both the progress calculation and the
-        // matches box: the most recent Hash-A match (the file's only line -
-        // or its last, in one an older version appended every match to).
+        // log: the most recent Hash-A match (the file's only line - or its
+        // last, in one an older version appended every match to).
         std::string latestMatch;
         if (!search.outputFilePath.empty()) {
             std::vector<std::string> lines = readLastLines(search.outputFilePath, 1);
             if (!lines.empty())
                 latestMatch = lines.back();
         }
-        updateProgressBar(row.progress, search, latestMatch, searchEnded);
+        updateProgressBar(cell.progress, search, latestMatch, searchEnded);
 
-        if (!latestMatch.empty() && latestMatch != row.lastMatch) {
-            row.lastMatch = latestMatch;
-            addMatchLine(whose + (dictionaryLines ? "Hash A match: " + latestMatch : latestMatch));
+        if (!latestMatch.empty() && latestMatch != cell.lastMatch) {
+            cell.lastMatch = latestMatch;
+            addLogLine(dictionaryLines ? "Hash A match: " + latestMatch : latestMatch);
         }
         for (const std::string& basename : search.newBasenames)
-            addMatchLine(whose + "Basename: " + basename);
+            addLogLine("Basename: " + basename);
         // A directory whose state matched the meeting point - which is what a
         // meet-in-the-middle search looks for; the hashes then decide.
         for (const std::string& filename : search.newMeetingPointMatches)
-            addMatchLine(whose + "Matched the meeting point: " + filename);
-        // Only ever the box's last line, each replacing the one before - so
-        // with several GPUs, whose lines come between, the status lines say
-        // how far each has got instead.
-        if (!search.newSearchPosition.empty() && !severalGpus) {
-            if (!g_recentMatches.empty() && g_recentMatches.back().rfind(kSearchingPrefix, 0) == 0)
-                g_recentMatches.pop_back();
-            addMatchLine(kSearchingPrefix + search.newSearchPosition);
+            addLogLine("Matched the meeting point: " + filename);
+        // Only ever the log's last line, each replacing the one before.
+        if (!search.newSearchPosition.empty()) {
+            if (!cell.recentMatches.empty() && cell.recentMatches.back().rfind(kSearchingPrefix, 0) == 0)
+                cell.recentMatches.pop_back();
+            addLogLine(kSearchingPrefix + search.newSearchPosition);
         }
-    }
-    if (matchesChanged) {
-        std::string joined;
-        for (const std::string& match : g_recentMatches) {
-            if (!joined.empty())
-                joined += "\r\n";
-            joined += match;
+        if (logChanged) {
+            std::string joined;
+            for (const std::string& match : cell.recentMatches) {
+                if (!joined.empty())
+                    joined += "\r\n";
+                joined += match;
+            }
+            SetWindowTextA(cell.log, joined.c_str());
+            SendMessage(cell.log, EM_SETSEL, (WPARAM) -1, (LPARAM) -1);
+            SendMessage(cell.log, EM_SCROLLCARET, 0, 0);
         }
-        SetWindowTextA(g_hwndMatches, joined.c_str());
-        SendMessage(g_hwndMatches, EM_SETSEL, (WPARAM) -1, (LPARAM) -1);
-        SendMessage(g_hwndMatches, EM_SCROLLCARET, 0, 0);
     }
 }
 
@@ -496,46 +637,26 @@ void createChildControls(HWND hwnd, HINSTANCE hInstance) {
     HFONT font = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
     auto setFont = [&](HWND child) { SendMessage(child, WM_SETFONT, (WPARAM) font, TRUE); };
 
-    SearchRow row;
-    row.target = CreateWindowExA(0, "STATIC", "Target: (none yet)", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 10, 10, 470, 20, hwnd, nullptr,
-                                 hInstance, nullptr);
-    row.status = CreateWindowExA(0, "STATIC", "Status: starting...", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 10, 35, 470, 20, hwnd, nullptr,
-                                 hInstance, nullptr);
-    row.progress = CreateWindowExA(0, PROGRESS_CLASSA, nullptr, WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 10, 60, 470, 22, hwnd, nullptr,
-                                   hInstance, nullptr);
-    SendMessage(row.progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-    SendMessage(row.progress, PBM_SETMARQUEE, TRUE, 100);
-    g_rows = {row};
+    g_cells.clear();
+    g_cells.push_back(makeCell(hwnd, false, ""));
 
-    // A dictionary search with an encryption key finds basenames that match
-    // it too, which go in the same box, as does how far it has got - and so
-    // does a meet-in-the-middle search's own progress.
-    g_hwndLogLabel = CreateWindowExA(0, "STATIC",
-                                     g_activeMode == "dictionary" || g_activeMode == "coordinator" || g_activeMode == "meet-in-the-middle"
-                                         ? "Search log (most recent last):"
-                                         : "Hash A matches (most recent last):",
-                                     WS_CHILD | WS_VISIBLE, 10, 95, 470, 18, hwnd, nullptr, hInstance, nullptr);
-    g_hwndMatches = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 115, 470, 280,
-                                     hwnd, nullptr, hInstance, nullptr);
-
-    g_hwndPauseButton = CreateWindowExA(0, "BUTTON", "Pause", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 405, 150, 30, hwnd,
+    g_hwndPauseButton = CreateWindowExA(0, "BUTTON", "Pause", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
                                          (HMENU) (INT_PTR) kIdPauseButton, hInstance, nullptr);
-    g_hwndAboutButton = CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 170, 405, 150, 30, hwnd,
+    g_hwndAboutButton = CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
                                          (HMENU) (INT_PTR) kIdAboutButton, hInstance, nullptr);
-    g_hwndQuitButton = CreateWindowExA(0, "BUTTON", "Quit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 330, 405, 150, 30, hwnd,
+    g_hwndQuitButton = CreateWindowExA(0, "BUTTON", "Quit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
                                         (HMENU) (INT_PTR) kIdQuitButton, hInstance, nullptr);
-
-    for (HWND child : {row.target, row.status, g_hwndLogLabel, g_hwndMatches, g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton})
+    for (HWND child : {g_hwndPauseButton, g_hwndAboutButton, g_hwndQuitButton})
         setFont(child);
 
     // Local searches have no ranges to finish.
     if (g_activeMode == "coordinator") {
-        g_hwndFinishCheckbox = CreateWindowExA(0, "BUTTON", kFinishRangeText, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 443, 470, 20,
-                                                hwnd, (HMENU) (INT_PTR) kIdFinishCheckbox, hInstance, nullptr);
+        g_hwndFinishCheckbox = CreateWindowExA(0, "BUTTON", kFinishRangeText, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd,
+                                                (HMENU) (INT_PTR) kIdFinishCheckbox, hInstance, nullptr);
         setFont(g_hwndFinishCheckbox);
     }
-    scaleChildWindows(hwnd);
+    // At the system DPI, as layoutWindow places everything.
+    layoutWindow(hwnd);
 }
 
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -570,6 +691,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     return 0;
                 case kIdTrayShow:
                     showMainWindow(hwnd);
+                    return 0;
+                case kIdGpuList:
+                    if (HIWORD(wParam) == LBN_SELCHANGE)
+                        selectCell((size_t) SendMessage(g_hwndGpuList, LB_GETCURSEL, 0, 0));
                     return 0;
             }
             return 0;

@@ -249,9 +249,12 @@ each claiming, searching and reporting ranges of its own, and writing its
 own matches file (`matches-<target>-gpu<N>.txt` for GPU N). They pause,
 resume and quit together; *finish the current range, then pause* waits for
 every GPU's range. Their messages say which GPU's they are
-(`[coordinator gpu1] starting range ...`), and the Windows GUI shows a
-target, a status line and a progress bar for each. A GPU whose backend
-can't be made, or fails its self-test, is left out, and the others search.
+(`[coordinator gpu1] starting range ...`), and the Windows GUI shows each
+in a cell of its own - target, status line, progress bar and search log -
+laid out in a grid, or, with more GPUs than fit on the screen (or more than
+three by three), listed down the left with the chosen one's cell beside
+the list. A GPU whose backend can't be made, or fails its self-test, is
+left out, and the others search.
 The other modes search one range on one GPU, the first one `gpus` picks,
 and say so when it picks more. Each GPU's worker builds a meet-in-the-middle
 target's table of its own, so `meet_in_the_middle_table_memory` is per GPU
