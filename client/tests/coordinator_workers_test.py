@@ -259,11 +259,14 @@ def main():
     server_binary = os.path.join(coordinator, "target", "debug", "namebreak-server")
 
     workdir = os.path.abspath("coordinator_workers_test")
+    shutil.rmtree(workdir, ignore_errors=True)
     try:
+        # A directory per phase: on Windows the previous phase's files can
+        # still be held open for a moment, so emptying one to reuse it fails
         for phase in (phase1, phase2):
-            shutil.rmtree(workdir, ignore_errors=True)
-            os.makedirs(workdir)
-            phase(server_binary, client_binary, workdir)
+            phase_dir = os.path.join(workdir, phase.__name__)
+            os.makedirs(phase_dir)
+            phase(server_binary, client_binary, phase_dir)
     except Failed as failure:
         print("FAILED: %s" % failure, flush=True)
         return 1
