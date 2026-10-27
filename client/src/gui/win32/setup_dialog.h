@@ -136,6 +136,9 @@ struct SetupDialogFields {
     std::string configPath;
     std::string backend;
     std::atomic<bool>* searchPause = nullptr;
+    // The mode of the search that's running - empty at first run, when none
+    // has started yet.
+    std::string runningMode;
 
     // Result: "coordinator" | "bounded" | "continuous" | "dictionary" |
     // "meet-in-the-middle", set only if OK was pressed (see

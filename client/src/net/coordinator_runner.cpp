@@ -1147,8 +1147,14 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
 
     // Dictionary and meet-in-the-middle ranges' backends, each chosen when
     // the first one of its kind comes.
-    DictionaryBackend dictionaryBackend(*backend);
-    MeetInTheMiddleBackend meetInTheMiddleBackend(*backend);
+    auto dictionaryBackend = std::make_unique<DictionaryBackend>(*backend);
+    auto meetInTheMiddleBackend = std::make_unique<MeetInTheMiddleBackend>(*backend);
+    // The launch settings an OpenCL or Metal backend was made with - which
+    // the Windows GUI's Optimize for hardware changes (setBackendTunings)
+    // while a range is in hand.
+    const std::string backendName = backend->name();
+    auto tuningOf = [&backendName](const BackendTunings& tunings) { return backendName == "metal" ? tunings.metal : tunings.opencl; };
+    GpuTuning madeWith = tuningOf(backendTunings());
 
     auto pollInterval = std::chrono::seconds(args.pollIntervalSecs);
     RetryBackoff claimBackoff(pollInterval);
@@ -1186,6 +1192,36 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
         if (quitRequested && quitRequested->load(std::memory_order_relaxed))
             return 0;
 
+        // New launch settings: the backend is made again with them, here
+        // between two ranges, where nothing is half done - and self-tested
+        // with them, as at start-up. Should that fail, the old one carries
+        // on, and these settings aren't tried again.
+        const BackendTunings tunings = backendTunings();
+        if (!gpuTuningKeys(backendName).empty() && tuningOf(tunings) != madeWith) {
+            madeWith = tuningOf(tunings);
+            std::string remakeError;
+            std::unique_ptr<SearchBackend> remade = createBackend(backendName, remakeError, nullptr, &tunings);
+            std::string msg;
+            if (remade) {
+                // The helpers hold the backend they were made with: new ones
+                // first, before the old backend goes.
+                dictionaryBackend = std::make_unique<DictionaryBackend>(*remade);
+                meetInTheMiddleBackend = std::make_unique<MeetInTheMiddleBackend>(*remade);
+                backend = std::move(remade);
+                const std::string values = describeGpuTuning(backendName, madeWith);
+                msg = "[coordinator] searching with new " + backendName + " launch settings from this range on (" +
+                      (values.empty() ? "the defaults" : values) + ")";
+                printf("%s\n", msg.c_str());
+                fflush(stdout);
+            } else {
+                msg = "[coordinator] the new " + backendName + " launch settings can't be used (" + remakeError +
+                      ") - keeping the ones it started with";
+                fprintf(stderr, "%s\n", msg.c_str());
+            }
+            if (callbacks && callbacks->onStatus)
+                callbacks->onStatus(msg);
+        }
+
         std::optional<ClaimResponse> claim;
         if (!client.claim(claim, error)) {
             if (client.upgradeRequired()) {
@@ -1217,7 +1253,7 @@ int runCoordinator(CoordinatorArgs args, std::atomic<bool>* pauseRequested, std:
             continue;
         }
 
-        if (!runOneRange(*backend, dictionaryBackend, meetInTheMiddleBackend, args, client.token(), *claim, pauseRequested, quitRequested,
+        if (!runOneRange(*backend, *dictionaryBackend, *meetInTheMiddleBackend, args, client.token(), *claim, pauseRequested, quitRequested,
                          callbacks)) {
             // Most likely the next claim would be the same range again.
             interruptibleSleep(std::chrono::duration_cast<std::chrono::milliseconds>(pollInterval), quitRequested);

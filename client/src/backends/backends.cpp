@@ -1,6 +1,7 @@
 #include "backends/backends.h"
 
 #include <cstdio>
+#include <mutex>
 
 #include "backends/cpu/cpu_backend.h"
 #include "backends/reference/reference_backend.h"
@@ -21,37 +22,45 @@ namespace {
 // `error` set, if it can't run on this machine).
 struct BackendEntry {
     const char* name;
-    std::unique_ptr<SearchBackend> (*make)(std::string& error);
+    std::unique_ptr<SearchBackend> (*make)(const BackendTunings& tunings, std::string& error);
 };
 
-BackendTunings& tunings() {
-    static BackendTunings value;
-    return value;
-}
+// setBackendTunings's, which one thread (the Windows GUI's) may set while
+// another (its search's) makes backends.
+std::mutex g_tuningsMutex;
+BackendTunings g_tunings;
 
-std::unique_ptr<SearchBackend> makeReference(std::string&) {
+std::unique_ptr<SearchBackend> makeReference(const BackendTunings&, std::string&) {
     return makeReferenceBackend();
 }
+#if defined(NAMEBREAK_WITH_CUDA) || defined(NAMEBREAK_WITH_HIP)
+std::unique_ptr<SearchBackend> makeCuda(const BackendTunings&, std::string& error) {
+    return makeCudaBackend(error);
+}
+#endif
 #ifdef NAMEBREAK_WITH_METAL
-std::unique_ptr<SearchBackend> makeMetal(std::string& error) {
-    return makeMetalBackend(tunings().metal, error);
+std::unique_ptr<SearchBackend> makeMetal(const BackendTunings& tunings, std::string& error) {
+    return makeMetalBackend(tunings.metal, error);
 }
 #endif
 #ifdef NAMEBREAK_WITH_OPENCL
-std::unique_ptr<SearchBackend> makeOpenCl(std::string& error) {
-    return makeOpenClBackend(tunings().opencl, error);
+std::unique_ptr<SearchBackend> makeOpenCl(const BackendTunings& tunings, std::string& error) {
+    return makeOpenClBackend(tunings.opencl, error);
 }
 #endif
+std::unique_ptr<SearchBackend> makeCpu(const BackendTunings&, std::string& error) {
+    return makeCpuBackend(error);
+}
 
 // Most preferred first.
 const std::vector<BackendEntry>& backendEntries() {
     static const std::vector<BackendEntry> entries = {
 #ifdef NAMEBREAK_WITH_CUDA
-        {"cuda", makeCudaBackend},
+        {"cuda", makeCuda},
 #endif
 #ifdef NAMEBREAK_WITH_HIP
         // The CUDA backend's source, compiled with HIP - see cuda_backend.h.
-        {"hip", makeCudaBackend},
+        {"hip", makeCuda},
 #endif
 #ifdef NAMEBREAK_WITH_METAL
         {"metal", makeMetal},
@@ -59,7 +68,7 @@ const std::vector<BackendEntry>& backendEntries() {
 #ifdef NAMEBREAK_WITH_OPENCL
         {"opencl", makeOpenCl},
 #endif
-        {"cpu", makeCpuBackend},
+        {"cpu", makeCpu},
         {"reference", makeReference},
     };
     return entries;
@@ -75,11 +84,13 @@ std::vector<std::string> backendNames() {
 }
 
 void setBackendTunings(const BackendTunings& value) {
-    tunings() = value;
+    std::lock_guard<std::mutex> lock(g_tuningsMutex);
+    g_tunings = value;
 }
 
-const BackendTunings& backendTunings() {
-    return tunings();
+BackendTunings backendTunings() {
+    std::lock_guard<std::mutex> lock(g_tuningsMutex);
+    return g_tunings;
 }
 
 GpuTuning defaultGpuTuning([[maybe_unused]] const std::string& name) {
@@ -129,7 +140,8 @@ bool passesSelfTests(SearchBackend& backend, Mode mode, std::string& why) {
     return true;
 }
 
-std::unique_ptr<SearchBackend> create(const std::string& name, std::string& error, bool* selfTestFailed, Mode mode) {
+std::unique_ptr<SearchBackend> create(const std::string& name, std::string& error, bool* selfTestFailed, Mode mode, const BackendTunings* given) {
+    const BackendTunings tunings = given ? *given : backendTunings();
     if (selfTestFailed)
         *selfTestFailed = false;
     if (name.empty()) {
@@ -138,7 +150,7 @@ std::unique_ptr<SearchBackend> create(const std::string& name, std::string& erro
         std::string reasons;
         for (const BackendEntry& entry : backendEntries()) {
             std::string why;
-            std::unique_ptr<SearchBackend> backend = entry.make(why);
+            std::unique_ptr<SearchBackend> backend = entry.make(tunings, why);
             if (backend && !supportsMode(*backend, mode)) {
                 // Not one to pick for this mode - and not one that failed
                 // anything either.
@@ -161,7 +173,7 @@ std::unique_ptr<SearchBackend> create(const std::string& name, std::string& erro
     for (const BackendEntry& entry : backendEntries()) {
         if (name == entry.name) {
             std::string why;
-            std::unique_ptr<SearchBackend> backend = entry.make(why);
+            std::unique_ptr<SearchBackend> backend = entry.make(tunings, why);
             if (!backend) {
                 error = "the " + name + " backend can't run on this machine: " + why;
             } else if (!supportsMode(*backend, mode)) {
@@ -185,14 +197,16 @@ std::unique_ptr<SearchBackend> create(const std::string& name, std::string& erro
 
 } // namespace
 
-std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
-    return create(name, error, selfTestFailed, Mode::Plain);
+std::unique_ptr<SearchBackend> createBackend(const std::string& name, std::string& error, bool* selfTestFailed, const BackendTunings* tunings) {
+    return create(name, error, selfTestFailed, Mode::Plain, tunings);
 }
 
-std::unique_ptr<SearchBackend> createDictionaryBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
-    return create(name, error, selfTestFailed, Mode::Dictionary);
+std::unique_ptr<SearchBackend> createDictionaryBackend(const std::string& name, std::string& error, bool* selfTestFailed,
+                                                       const BackendTunings* tunings) {
+    return create(name, error, selfTestFailed, Mode::Dictionary, tunings);
 }
 
-std::unique_ptr<SearchBackend> createMeetInTheMiddleBackend(const std::string& name, std::string& error, bool* selfTestFailed) {
-    return create(name, error, selfTestFailed, Mode::MeetInTheMiddle);
+std::unique_ptr<SearchBackend> createMeetInTheMiddleBackend(const std::string& name, std::string& error, bool* selfTestFailed,
+                                                            const BackendTunings* tunings) {
+    return create(name, error, selfTestFailed, Mode::MeetInTheMiddle, tunings);
 }

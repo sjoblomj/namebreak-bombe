@@ -530,7 +530,8 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     showAboutDialog(hwnd);
                     return 0;
                 case kIdSetupOptimize:
-                    gui::optimizeForHardware(hwnd, state->fields->configPath, state->fields->backend, state->fields->searchPause);
+                    gui::optimizeForHardware(hwnd, state->fields->configPath, state->fields->backend, state->fields->runningMode,
+                                             state->fields->searchPause);
                     return 0;
                 case kIdSetupBrowseWordLists:
                     browseWordLists(hwnd, state);

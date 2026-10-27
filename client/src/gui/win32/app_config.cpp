@@ -282,7 +282,7 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
     return true;
 }
 
-bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner) {
+bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner, const std::string& runningMode) {
     ConfigFile config;
     std::string error;
     if (!loadConfigFile(configPath, config, error)) {
@@ -294,6 +294,7 @@ bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner
     // Over a running search: Optimize for hardware pauses it while it
     // times the GPU.
     fields.searchPause = &g_pauseRequested;
+    fields.runningMode = runningMode;
     if (!showSetupDialog(hInstance, fields, true))
         return false; // cancelled - nothing to write, nothing to report
     std::string writeError;

@@ -29,6 +29,12 @@ const std::vector<GpuTuningKey>& gpuTuningKeys(const std::string& backend) {
     return backend == "opencl" ? opencl : backend == "metal" ? metal : none;
 }
 
+bool operator==(const GpuTuning& a, const GpuTuning& b) {
+    return a.rowsPerThread == b.rowsPerThread && a.batchesPerLaunch == b.batchesPerLaunch && a.windowChars == b.windowChars &&
+           a.workGroupSize == b.workGroupSize && a.dictionaryWordsPerThread == b.dictionaryWordsPerThread &&
+           a.dictionaryWorkGroupSize == b.dictionaryWorkGroupSize && a.dictionaryTailsPerCell == b.dictionaryTailsPerCell;
+}
+
 GpuTuning withDefaults(const GpuTuning& tuning, const GpuTuning& defaults) {
     GpuTuning out = tuning;
     for (std::optional<int> GpuTuning::* field :

@@ -39,7 +39,9 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
 // changed, false if they cancelled or it couldn't be read or written -
 // having already said why, via MessageBox owned by `owner`. The running
 // search is left alone; nothing reads the file again until the next start.
-bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner);
+// `runningMode` is the mode of the search running, for Optimize for
+// hardware (see optimizeForHardware).
+bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner, const std::string& runningMode);
 
 } // namespace gui
 

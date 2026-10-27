@@ -255,10 +255,18 @@ In the Windows GUI, the setup dialog's **Optimize for hardware** button
 (at first run, or from the tray menu's `Settings...`) does the same, with a
 progress bar, an estimate of the time left, what it's measuring, and a
 Cancel button. A search already running is paused while it measures and
-resumes afterwards. What it saves takes effect at the next start, and is
-kept whether the dialog is then closed with OK or Cancel. On a machine that
-searches with CUDA or HIP, it says why it can't, and offers to open
-`scripts/autotune/`'s page.
+resumes afterwards. What it saves is kept whether the dialog is then closed
+with OK or Cancel, and is used:
+
+- at first run, as soon as the search starts;
+- in a coordinator run already going, after the current range finishes:
+  the client makes its backend again with the new settings, and self-tests
+  it, before it claims the next one (and carries on with the old backend,
+  saying so, should that fail);
+- in a local search already going, once namebreak is restarted.
+
+On a machine that searches with CUDA or HIP, it says why it can't, and
+offers to open `scripts/autotune/`'s page.
 
 ## Dictionary mode
 

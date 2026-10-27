@@ -51,6 +51,12 @@ struct GpuTuningKey {
 // and --autotune list them. Empty for any other backend.
 const std::vector<GpuTuningKey>& gpuTuningKeys(const std::string& backend);
 
+// Whether `a` and `b` set the same values, and leave the same ones unset.
+bool operator==(const GpuTuning& a, const GpuTuning& b);
+inline bool operator!=(const GpuTuning& a, const GpuTuning& b) {
+    return !(a == b);
+}
+
 // `tuning` with every value it leaves unset taken from `defaults`.
 GpuTuning withDefaults(const GpuTuning& tuning, const GpuTuning& defaults);
 

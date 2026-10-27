@@ -183,14 +183,16 @@ struct Benchmark {
 };
 
 // The backend called `backend`, made with `tuning`, which createBackend
-// (or the like, `create`) self-tests as it always does.
+// (or the like, `create`) self-tests as it always does. Only this backend
+// gets `tuning`: a search running alongside - the Windows GUI's - keeps
+// making its own with backendTunings().
 std::unique_ptr<SearchBackend> makeTuned(const std::string& backend, const GpuTuning& tuning,
-                                         std::unique_ptr<SearchBackend> (*create)(const std::string&, std::string&, bool*), std::string& error) {
+                                         std::unique_ptr<SearchBackend> (*create)(const std::string&, std::string&, bool*, const BackendTunings*),
+                                         std::string& error) {
     BackendTunings tunings = backendTunings();
     (backend == "metal" ? tunings.metal : tunings.opencl) = tuning;
-    setBackendTunings(tunings);
     SilencedStdout silenced;
-    return create(backend, error, nullptr);
+    return create(backend, error, nullptr, &tunings);
 }
 
 // About how many candidates take `seconds` to search with `tuning`: timed at
@@ -370,11 +372,6 @@ int runAutotune(const std::string& configPath, const std::string& backend, doubl
         }
     } removeDir{dir};
 
-    const BackendTunings configured = backendTunings();
-    struct RestoreTunings {
-        BackendTunings tunings;
-        ~RestoreTunings() { setBackendTunings(tunings); }
-    } restoreTunings{configured};
     const Benchmark rowBenchmark = {
         "row search",
         [&](const GpuTuning& tuning, uint64_t candidates, std::string& error) -> double {

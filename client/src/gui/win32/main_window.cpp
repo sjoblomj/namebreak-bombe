@@ -223,12 +223,14 @@ void togglePause() {
 // run started from (editSettings, app_config.cpp). The search carries on
 // throughout, and goes on using the settings it was started with - the file
 // is only read when namebreak starts, which is what the message box says.
+// (Optimize for hardware's are the exception: a coordinator run uses them
+// from its next range - see optimizeForHardware.)
 // The main window is disabled while the form is up, so its Pause and Quit
 // can't be pressed behind what looks like a modal window (the form runs a
 // message loop of its own - see showSetupDialog).
 void openSettings(HWND hwnd) {
     EnableWindow(hwnd, FALSE);
-    const bool saved = editSettings(g_hInstance, g_configPath, hwnd);
+    const bool saved = editSettings(g_hInstance, g_configPath, hwnd, g_activeMode);
     // The window may be gone by now: a search that ended while the form was
     // up takes it with it (see WM_APP_WORKER_STOPPED).
     if (!IsWindow(hwnd))

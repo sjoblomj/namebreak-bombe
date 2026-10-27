@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/config.h"
 #include "gui/win32/app_icons.h"
 #include "gui/win32/dpi.h"
 
@@ -39,6 +40,7 @@ struct ProgressState {
 struct WindowState {
     ProgressState progress;
     std::atomic<bool> abortRequested{false};
+    std::string finishedText;
     HWND owner = nullptr;
     HWND status = nullptr, bar = nullptr, timeLeft = nullptr, log = nullptr, button = nullptr;
     bool finished = false;
@@ -106,7 +108,7 @@ void refresh(WindowState* state) {
     if (result == 0) {
         SendMessage(state->bar, PBM_SETPOS, kProgressRange, 0);
         SetWindowTextA(state->status, status.c_str());
-        SetWindowTextA(state->timeLeft, "Finished. The settings are used from the next time namebreak starts.");
+        SetWindowTextA(state->timeLeft, state->finishedText.c_str());
     } else if (state->abortRequested) {
         SetWindowTextA(state->status, "Stopped - nothing was changed.");
         SetWindowTextA(state->timeLeft, "");
@@ -163,7 +165,7 @@ LRESULT CALLBACK ProgressWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 namespace gui {
 
-int showAutotuneProgress(HWND owner, AutotuneJob job) {
+int showAutotuneProgress(HWND owner, AutotuneJob job, const std::string& finishedText) {
     HINSTANCE hInstance = GetModuleHandleA(nullptr);
     static bool classRegistered = false;
     if (!classRegistered) {
@@ -196,6 +198,7 @@ int showAutotuneProgress(HWND owner, AutotuneJob job) {
 
     WindowState state;
     state.owner = owner;
+    state.finishedText = finishedText;
     HWND hwnd = CreateWindowExA(kExStyle, kProgressClassName, kTitle, kStyle, x, y, width, height, owner, nullptr, hInstance, nullptr);
     if (!hwnd)
         return 1;
@@ -276,7 +279,8 @@ int showAutotuneProgress(HWND owner, AutotuneJob job) {
     return state.progress.result;
 }
 
-void optimizeForHardware(HWND owner, const std::string& configPath, const std::string& backend, std::atomic<bool>* searchPause) {
+void optimizeForHardware(HWND owner, const std::string& configPath, const std::string& backend, const std::string& runningMode,
+                         std::atomic<bool>* searchPause) {
     // Finding the backend makes it, and self-tests it: a moment.
     HCURSOR cursor = SetCursor(LoadCursorA(nullptr, IDC_WAIT));
     std::string why;
@@ -291,20 +295,35 @@ void optimizeForHardware(HWND owner, const std::string& configPath, const std::s
         }
         return;
     }
+    // When what it finds is used.
+    const std::string when = runningMode.empty()            ? "used as soon as the search starts"
+                             : runningMode == "coordinator" ? "used after the current range finishes"
+                                                            : "used once namebreak is restarted";
     const bool pause = searchPause && !searchPause->load();
     const std::string question =
         "This times the " + std::string(tuned == "opencl" ? "OpenCL" : "Metal") +
-        " backend's settings on this machine's GPU and saves the fastest to " + configPath +
-        ", for the next time namebreak starts. It takes about five to ten minutes, with the GPU fully busy. " +
+        " backend's settings on this machine's GPU and saves the fastest to " + configPath + ", " + when +
+        ". It takes about five to ten minutes, with the GPU fully busy. " +
         (pause ? "The running search is paused meanwhile, and resumed afterwards. " : "") +
         "Close games and anything else that uses the GPU first: they would make the measurements meaningless.\r\n\r\nStart now?";
     if (MessageBoxA(owner, question.c_str(), kTitle, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
         return;
     if (pause)
         searchPause->store(true);
-    showAutotuneProgress(owner, [&](const AutotuneHooks& hooks, std::atomic<bool>* abortRequested) {
-        return runAutotune(configPath, tuned, 2.0, abortRequested, hooks);
-    });
+    const std::string finished = "Finished. The settings are " + when + ".";
+    const int result = showAutotuneProgress(
+        owner, [&](const AutotuneHooks& hooks, std::atomic<bool>* abortRequested) { return runAutotune(configPath, tuned, 2.0, abortRequested, hooks); },
+        finished);
+    // What it saved, for every backend made from now on - a coordinator run's
+    // next range's among them. Read back from the file, which has the rest
+    // of [opencl] and [metal] too.
+    if (result == 0) {
+        ConfigFile config;
+        BackendTunings tunings;
+        std::string error;
+        if (loadConfigFile(configPath, config, error) && buildBackendTunings(config, tunings, error))
+            setBackendTunings(tunings);
+    }
     if (pause)
         searchPause->store(false);
 }
