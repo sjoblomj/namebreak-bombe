@@ -1,6 +1,7 @@
 #ifndef NAMEBREAK_GUI_WIN32_SETUP_DIALOG_H
 #define NAMEBREAK_GUI_WIN32_SETUP_DIALOG_H
 
+#include <atomic>
 #include <string>
 #include <utility>
 #include <vector>
@@ -126,6 +127,15 @@ struct SetupDialogFields {
     // The config's matches_dir - where a dictionary or meet-in-the-middle
     // search's progress file is, which OK checks a resumed search against.
     std::string matchesDir;
+
+    // For the Optimize for hardware button (optimizeForHardware,
+    // optimize_dialog.h), which saves what it finds straight away, whether
+    // or not OK is pressed: the config file, its `backend` (empty for the
+    // first that can run), and - shown over a running search, from
+    // Settings... - that search's pause flag.
+    std::string configPath;
+    std::string backend;
+    std::atomic<bool>* searchPause = nullptr;
 
     // Result: "coordinator" | "bounded" | "continuous" | "dictionary" |
     // "meet-in-the-middle", set only if OK was pressed (see

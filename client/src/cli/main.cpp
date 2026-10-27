@@ -6,6 +6,7 @@
 // (coordinator_runner.h) for coordinator mode - so the tests and the Windows
 // GUI link the same code without this file.
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdio>
@@ -283,7 +284,19 @@ int main(int argc, char* argv[]) {
         // Ctrl+C stops the tuning between trials, without writing anything,
         // and lets it remove its temporary files.
         std::signal(SIGINT, [](int) { g_quitRequested = true; });
-        return runAutotune(configPath, config.backend, 2.0, &g_quitRequested);
+        std::string why;
+        const std::string backend = autotuneBackend(config.backend, why);
+        if (backend.empty()) {
+            const std::vector<std::string> names = backendNames();
+            const bool hasOpenCl = std::find(names.begin(), names.end(), "opencl") != names.end();
+            fprintf(stderr, "%s\n%s", why.c_str(),
+                    why.find(kAutotuneScriptUrl) != std::string::npos && hasOpenCl
+                        ? "(--autotune --backend opencl tunes this build's OpenCL backend instead, for searches run with --backend opencl.)\n"
+                        : "");
+            return 1;
+        }
+        printf("Ctrl+C stops the tuning.\n");
+        return runAutotune(configPath, backend, 2.0, &g_quitRequested);
     }
 
     std::string mode = !modeOverride.empty() ? modeOverride : config.mode;

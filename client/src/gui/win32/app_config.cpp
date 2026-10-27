@@ -5,6 +5,7 @@
 #include "common/config.h"
 #include "common/platform.h"
 #include "gui/win32/setup_dialog.h"
+#include "gui/win32/worker.h"
 
 namespace {
 
@@ -163,6 +164,7 @@ SetupDialogFields fieldsFromConfig(const ConfigFile& config, bool loaded) {
     mitm.matchesName = get(config.meetInTheMiddle, "matches_name", "");
     mitm.resume = get(config.meetInTheMiddle, "resume_from_last_candidate", "true") == "true";
     fields.matchesDir = loaded ? config.matchesDir : kDefaultMatchesDir;
+    fields.backend = loaded ? config.backend : "";
 
     fields.initialTab = !loaded                                                      ? kTabCoordinator
                         : config.mode == "bounded" || config.mode == "continuous" ? kTabLocalSearch
@@ -213,6 +215,7 @@ bool prepareConfig(HINSTANCE hInstance, const std::string& configPath, AppConfig
         // Pre-filled from whatever's already in the file, even if it's
         // only some of one section's keys.
         SetupDialogFields fields = fieldsFromConfig(config, loaded);
+        fields.configPath = configPath;
         if (!showSetupDialog(hInstance, fields))
             return false; // user cancelled - nothing to report
 
@@ -287,6 +290,10 @@ bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner
         return false;
     }
     SetupDialogFields fields = fieldsFromConfig(config, true);
+    fields.configPath = configPath;
+    // Over a running search: Optimize for hardware pauses it while it
+    // times the GPU.
+    fields.searchPause = &g_pauseRequested;
     if (!showSetupDialog(hInstance, fields, true))
         return false; // cancelled - nothing to write, nothing to report
     std::string writeError;

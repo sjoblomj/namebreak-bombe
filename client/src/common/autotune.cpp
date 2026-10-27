@@ -22,7 +22,8 @@
 #include "engine/wordlist.h"
 
 GpuTuning tuneAxes(const GpuTuning& start, const std::vector<TuningAxis>& axes, double minGain, int maxRounds,
-                   const std::function<double(const GpuTuning&)>& measure, const std::function<void(const std::string&)>& log) {
+                   const std::function<double(const GpuTuning&)>& measure, const std::function<void(const std::string&)>& log,
+                   const std::function<void(const std::string&)>& trying) {
     GpuTuning current = start;
     auto say = [&](const std::string& line) {
         if (log)
@@ -34,6 +35,8 @@ GpuTuning tuneAxes(const GpuTuning& start, const std::vector<TuningAxis>& axes, 
             std::optional<int> GpuTuning::* field = axis.key.field;
             const int incumbent = *(current.*field);
             auto measureWith = [&](int value) {
+                if (trying)
+                    trying(std::string(axis.key.name) + " " + std::to_string(value));
                 GpuTuning tuning = current;
                 tuning.*field = value;
                 const double rate = measure(tuning);
@@ -218,8 +221,10 @@ uint64_t sizeFor(const Benchmark& benchmark, const GpuTuning& tuning, double sec
 constexpr double kHeatUpSeconds = 30;
 constexpr double kWarmHeatUpSeconds = 5;
 // What a trial costs besides its timed search, about: making the backend,
-// its self-tests and a warm-up search.
+// its self-tests and a warm-up search. And finding a size, apart from the
+// heat-up search.
 constexpr double kTrialOverheadSeconds = 1.5;
+constexpr double kSizingSeconds = 5;
 // How much faster than the value it stands at another must be to be taken,
 // and the result than the defaults to be written - less is noise.
 constexpr double kMinGain = 0.02;
@@ -230,48 +235,98 @@ std::string gigas(double rate) {
     return text;
 }
 
+// How far the tuning has got, for AutotuneHooks::onProgress: the work
+// planned, in the seconds each step is expected to take, and how long the
+// steps done so far really took - the steps left are expected to take as
+// much longer (or shorter) than planned as those did. A round of a kind of
+// search that turns out not to be needed is taken out of the plan.
+class ProgressTracker {
+public:
+    ProgressTracker(const AutotuneHooks& hooks) : hooks_(hooks), started_(Clock::now()) {}
+    void plan(double seconds) { planned_ += seconds; }
+    void unplan(double seconds) { planned_ -= seconds; }
+    void done(double seconds) {
+        done_ += seconds;
+        report();
+    }
+    void report() const {
+        if (!hooks_.onProgress)
+            return;
+        const double elapsed = std::chrono::duration<double>(Clock::now() - started_).count();
+        const double left = done_ > 0 ? (planned_ - done_) * elapsed / done_ : planned_;
+        hooks_.onProgress(elapsed + left > 0 ? elapsed / (elapsed + left) : 0, std::max(0.0, left));
+    }
+
+private:
+    const AutotuneHooks& hooks_;
+    Clock::time_point started_;
+    double planned_ = 0;
+    double done_ = 0;
+};
+
 } // namespace
 
-int runAutotune(const std::string& configPath, const std::string& requestedBackend, double secondsPerTrial, std::atomic<bool>* abortRequested) {
+std::string autotuneBackend(const std::string& requested, std::string& why) {
     const std::vector<std::string> names = backendNames();
-    std::string backend = requestedBackend;
+    std::string backend = requested;
     if (backend.empty()) {
         // The backend this machine's searches run on - a CUDA build with
         // OpenCL too searches with CUDA, which tuning OpenCL wouldn't speed
         // up.
-        std::string why;
         std::unique_ptr<SearchBackend> searching;
         {
             SilencedStdout silenced;
             searching = createBackend("", why);
         }
-        if (!searching) {
-            fprintf(stderr, "%s\n", why.c_str());
-            return 1;
-        }
+        if (!searching)
+            return "";
         backend = searching->name();
     }
     if (std::find(names.begin(), names.end(), backend) == names.end()) {
-        fprintf(stderr, "this build has no '%s' backend\n", backend.c_str());
-        return 1;
+        why = "this build has no '" + backend + "' backend";
+        return "";
     }
-    const bool hasOpenCl = std::find(names.begin(), names.end(), "opencl") != names.end();
+    const std::string who = requested.empty() ? "This machine" : "The client";
     if (backend == "cuda" || backend == "hip") {
-        fprintf(stderr,
-                "%s searches with the %s backend, whose launch settings are compiled into the program, so --autotune\n"
-                "can't change them. A script in the source code builds the client with each setting and keeps the\n"
-                "fastest: client/scripts/autotune/ at https://github.com/sjoblomj/namebreak-bombe - its README.md\n"
-                "says what it needs.%s\n",
-                requestedBackend.empty() ? "This machine" : "The client", backend.c_str(),
-                hasOpenCl ? "\n(--autotune --backend opencl tunes this build's OpenCL backend instead, for searches run with --backend opencl.)"
-                          : "");
-        return 1;
+        why = who + " searches with the " + (backend == "cuda" ? "CUDA" : "HIP") +
+              " backend, whose launch settings are compiled into the program, so they can't be optimized from here. You can "
+              "download the source code and run a script that builds the client with each setting on this machine and keeps the "
+              "fastest - what it needs, and how to run it, is at " + std::string(kAutotuneScriptUrl);
+        return "";
     }
     if (gpuTuningKeys(backend).empty()) {
-        fprintf(stderr, "%s searches with the %s backend, which has nothing to tune - --autotune tunes the opencl and metal backends\n",
-                requestedBackend.empty() ? "This machine" : "The client", backend.c_str());
-        return 1;
+        why = requested.empty() ? "This machine has no GPU that namebreak can search with - it searches with the " +
+                                      std::string(backend == "cpu" ? "CPU" : backend) + " backend - so there is nothing to optimize."
+                                : "The " + backend + " backend has nothing to optimize - only the OpenCL and Metal backends can be.";
+        return "";
     }
+    return backend;
+}
+
+int runAutotune(const std::string& configPath, const std::string& backend, double secondsPerTrial, std::atomic<bool>* abortRequested,
+                const AutotuneHooks& hooks) {
+    auto line = [&](const std::string& text) {
+        if (hooks.onLine) {
+            hooks.onLine(text);
+        } else {
+            printf("%s\n", text.c_str());
+            fflush(stdout);
+        }
+    };
+    auto fail = [&](const std::string& text) {
+        if (hooks.onError)
+            hooks.onError(text);
+        else
+            fprintf(stderr, "%s\n", text.c_str());
+        return 1;
+    };
+    auto status = [&](const std::string& text) {
+        if (hooks.onStatus)
+            hooks.onStatus(text);
+    };
+    auto stopped = [&] { return abortRequested && *abortRequested; };
+    if (gpuTuningKeys(backend).empty())
+        return fail("--autotune tunes the opencl and metal backends, not '" + backend + "'");
 
     // The config's own [opencl]/[metal] values are what's being replaced:
     // every trial starts from the backend's defaults.
@@ -305,10 +360,8 @@ int runAutotune(const std::string& configPath, const std::string& requestedBacke
     std::error_code ec;
     const std::filesystem::path dir =
         std::filesystem::temp_directory_path(ec) / ("namebreak-autotune-" + std::to_string(std::random_device{}()));
-    if (ec || !std::filesystem::create_directories(dir, ec)) {
-        fprintf(stderr, "--autotune: can't make a temporary directory: %s\n", ec.message().c_str());
-        return 1;
-    }
+    if (ec || !std::filesystem::create_directories(dir, ec))
+        return fail("can't make a temporary directory: " + ec.message());
     struct RemoveDir {
         std::filesystem::path dir;
         ~RemoveDir() {
@@ -318,10 +371,14 @@ int runAutotune(const std::string& configPath, const std::string& requestedBacke
     } removeDir{dir};
 
     const BackendTunings configured = backendTunings();
+    struct RestoreTunings {
+        BackendTunings tunings;
+        ~RestoreTunings() { setBackendTunings(tunings); }
+    } restoreTunings{configured};
     const Benchmark rowBenchmark = {
         "row search",
         [&](const GpuTuning& tuning, uint64_t candidates, std::string& error) -> double {
-            if (abortRequested && *abortRequested)
+            if (stopped())
                 return 0;
             std::unique_ptr<SearchBackend> made = makeTuned(backend, tuning, createBackend, error);
             if (!made)
@@ -340,7 +397,7 @@ int runAutotune(const std::string& configPath, const std::string& requestedBacke
     const Benchmark dictionaryBenchmark = {
         "dictionary search",
         [&](const GpuTuning& tuning, uint64_t candidates, std::string& error) -> double {
-            if (abortRequested && *abortRequested)
+            if (stopped())
                 return 0;
             std::unique_ptr<SearchBackend> made = makeTuned(backend, tuning, createDictionaryBackend, error);
             if (!made)
@@ -361,76 +418,92 @@ int runAutotune(const std::string& configPath, const std::string& requestedBacke
         },
         1'000'000'000ULL};
 
-    // Each axis: its values and its first value once more, twice at most;
-    // then two each of defaults and result - and finding the size and
-    // heating up, apart.
+    // The plan: for each kind of search, finding its size and heating up,
+    // then each axis's values and its first value once more, twice round at
+    // most, and two each of defaults and result.
+    const double trialSeconds = secondsPerTrial + kTrialOverheadSeconds;
+    ProgressTracker progress(hooks);
+    auto roundsTrials = [](const std::vector<TuningAxis>& axes) {
+        int trials = 0;
+        for (const TuningAxis& tuningAxis : axes)
+            trials += (int) tuningAxis.values.size() + 1;
+        return 2 * trials;
+    };
     int trials = 0;
     for (const std::vector<TuningAxis>* axes : {&rowAxes, &dictionaryAxes}) {
-        for (const TuningAxis& tuningAxis : *axes)
-            trials += 2 * ((int) tuningAxis.values.size() + 1);
-        trials += 4;
+        trials += roundsTrials(*axes) + 4;
+        progress.plan((roundsTrials(*axes) + 4) * trialSeconds + kSizingSeconds);
     }
+    progress.plan(kHeatUpSeconds + kWarmHeatUpSeconds);
     {
+        status("Starting the " + backend + " backend");
         std::string why;
         std::unique_ptr<SearchBackend> made = makeTuned(backend, defaults, createBackend, why);
-        if (!made) {
-            fprintf(stderr, "%s\n", why.c_str());
-            setBackendTunings(configured);
-            return 1;
-        }
-            printf("Tuning the %s backend's launches on %s: up to %d trials, about %.0f minutes. Anything else using the\n"
-               "GPU meanwhile - another namebreak, a game - makes the results meaningless. Ctrl+C stops it.\n",
-               backend.c_str(), made->deviceName().c_str(), trials,
-               (trials * (secondsPerTrial + kTrialOverheadSeconds) + kHeatUpSeconds + kWarmHeatUpSeconds) / 60);
+        if (!made)
+            return fail(why);
+        char text[400];
+        snprintf(text, sizeof text,
+                 "Tuning the %s backend's launches on %s: up to %d trials, about %.0f minutes. Anything else using the GPU meanwhile - "
+                 "another namebreak, a game - makes the results meaningless.",
+                 backend.c_str(), made->deviceName().c_str(), trials,
+                 (trials * trialSeconds + 2 * kSizingSeconds + kHeatUpSeconds + kWarmHeatUpSeconds) / 60);
+        line(text);
     }
+    progress.report();
 
     std::vector<std::pair<std::string, std::string>> written;
     std::string summary;
     for (const auto& [benchmark, axes] : {std::make_pair(&rowBenchmark, &rowAxes), std::make_pair(&dictionaryBenchmark, &dictionaryAxes)}) {
         std::string error;
-        printf("\n%s:\n", benchmark->what);
-        fflush(stdout);
+        line("");
+        line(std::string(benchmark->what) + ":");
         const double heatUp = benchmark == &rowBenchmark ? kHeatUpSeconds : kWarmHeatUpSeconds;
+        status("Heating the GPU up with a " + std::string(benchmark->what));
         uint64_t size = sizeFor(*benchmark, defaults, heatUp, abortRequested, error);
         if (size != 0) {
             // A search that long heats the GPU up, and says how fast it is then.
             const double rate = benchmark->rate(defaults, size, error);
             size = rate > 0 ? std::max<uint64_t>(1, (uint64_t) (rate * secondsPerTrial)) : 0;
         }
-        if (abortRequested && *abortRequested)
+        if (stopped())
             break;
-        if (size == 0) {
-            fprintf(stderr, "the %s backend can't search with its own defaults: %s\n", backend.c_str(), error.c_str());
-            setBackendTunings(configured);
-            return 1;
-        }
+        if (size == 0)
+            return fail("the " + backend + " backend can't search with its own defaults: " + error);
+        progress.done(heatUp + kSizingSeconds);
+        int measured = 0;
         auto measure = [&](const GpuTuning& tuning) {
             std::string why;
             const double rate = benchmark->rate(tuning, size, why);
-            if (rate <= 0 && !why.empty() && !(abortRequested && *abortRequested))
-                fprintf(stderr, "  (%s)\n", why.c_str());
+            if (rate <= 0 && !why.empty() && !stopped())
+                line("  (" + why + ")");
+            ++measured;
+            progress.done(trialSeconds);
             return rate;
         };
-        const GpuTuning tuned = tuneAxes(defaults, *axes, kMinGain, 2, measure, [&](const std::string& line) {
-            // Once stopped, every trial left fails at once - nothing to show.
-            if (abortRequested && *abortRequested)
-                return;
-            printf("%s\n", line.c_str());
-            fflush(stdout);
-        });
-        if (abortRequested && *abortRequested)
+        const GpuTuning tuned = tuneAxes(
+            defaults, *axes, kMinGain, 2, measure,
+            [&](const std::string& text) {
+                // Once stopped, every trial left fails at once - nothing to show.
+                if (!stopped())
+                    line(text);
+            },
+            [&](const std::string& what) { status("Timing a " + std::string(benchmark->what) + " with " + what); });
+        if (stopped())
             break;
+        // A second round that wasn't needed.
+        progress.unplan((roundsTrials(*axes) - measured) * trialSeconds);
         // The defaults and the result, timed again in turn.
+        status("Timing the defaults and the result of the " + std::string(benchmark->what) + " again");
         double defaultRate = 0, tunedRate = 0;
         for (int i = 0; i < 2; ++i) {
             defaultRate += measure(defaults) / 2;
             tunedRate += measure(tuned) / 2;
         }
-        if (abortRequested && *abortRequested)
+        if (stopped())
             break;
         const bool better = tunedRate > defaultRate * (1 + kMinGain);
-        printf("  defaults %s, tuned %s G candidates/s%s\n", gigas(defaultRate).c_str(), gigas(tunedRate).c_str(),
-               better ? "" : " - not enough faster, keeping the defaults");
+        line("  defaults " + gigas(defaultRate) + ", tuned " + gigas(tunedRate) + " G candidates/s" +
+             (better ? "" : " - not enough faster, keeping the defaults"));
         summary += std::string(summary.empty() ? "" : "; ") + benchmark->what + " " + gigas(defaultRate) + " -> " +
                    gigas(better ? tunedRate : defaultRate) + " G candidates/s";
         for (const TuningAxis& tuningAxis : *axes) {
@@ -438,26 +511,29 @@ int runAutotune(const std::string& configPath, const std::string& requestedBacke
             written.emplace_back(tuningAxis.key.name, value == *(defaults.*tuningAxis.key.field) ? "" : std::to_string(value));
         }
     }
-    setBackendTunings(configured);
-    if (abortRequested && *abortRequested) {
-        printf("\nTuning stopped - %s left as it was.\n", configPath.c_str());
+    if (stopped()) {
+        line("");
+        line("Tuning stopped - " + configPath + " left as it was.");
         return 1;
     }
 
+    status("Writing " + configPath);
     std::string error;
-    if (!updateConfigSection(configPath, backend, written, error)) {
-        fprintf(stderr, "--autotune: couldn't write %s: %s\n", configPath.c_str(), error.c_str());
-        return 1;
-    }
+    if (!updateConfigSection(configPath, backend, written, error))
+        return fail("couldn't write " + configPath + ": " + error);
     std::string values;
     for (const auto& [key, value] : written) {
         if (!value.empty())
             values += "\n    " + key + " = " + value;
     }
-    printf("\n%s\n", summary.c_str());
+    line("");
+    line(summary);
     if (values.empty())
-        printf("The defaults were fastest: %s's [%s] has none of the tuned keys now.\n", configPath.c_str(), backend.c_str());
+        line("The defaults were fastest: " + configPath + "'s [" + backend + "] has none of the tuned keys now.");
     else
-        printf("Wrote to %s's [%s]:%s\n", configPath.c_str(), backend.c_str(), values.c_str());
+        line("Wrote to " + configPath + "'s [" + backend + "]:" + values);
+    status(values.empty() ? "Done - the defaults were fastest" : "Done - the fastest settings are saved");
+    if (hooks.onProgress)
+        hooks.onProgress(1, 0);
     return 0;
 }

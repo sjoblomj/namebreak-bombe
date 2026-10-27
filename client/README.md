@@ -251,6 +251,15 @@ pruning, though a wider one leaves the CPU less to prune (see
 and a work-group size beyond what the device allows runs as the largest it
 does.
 
+In the Windows GUI, the setup dialog's **Optimize for hardware** button
+(at first run, or from the tray menu's `Settings...`) does the same, with a
+progress bar, an estimate of the time left, what it's measuring, and a
+Cancel button. A search already running is paused while it measures and
+resumes afterwards. What it saves takes effect at the next start, and is
+kept whether the dialog is then closed with OK or Cancel. On a machine that
+searches with CUDA or HIP, it says why it can't, and offers to open
+`scripts/autotune/`'s page.
+
 ## Dictionary mode
 
 Instead of every string of an alphabet, `mode = dictionary` searches

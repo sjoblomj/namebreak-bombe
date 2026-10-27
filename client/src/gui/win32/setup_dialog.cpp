@@ -41,6 +41,7 @@
 #include "gui/win32/about_dialog.h"
 #include "gui/win32/app_icons.h"
 #include "gui/win32/dpi.h"
+#include "gui/win32/optimize_dialog.h"
 
 #pragma comment(lib, "comdlg32.lib")
 
@@ -72,6 +73,7 @@ constexpr int kIdSetupBrowseWordLists = 310;
 constexpr int kIdSetupEncryptionKey = 311;
 constexpr int kIdSetupTableMemory = 312;
 constexpr int kIdSetupVerification = 313;
+constexpr int kIdSetupOptimize = 314;
 
 // The dialog's geometry: everything but the buttons is kContentHeight of a
 // scroll view, and the buttons sit in a strip of their own under it. The
@@ -103,7 +105,7 @@ struct SetupDialogState {
     HWND hwndScroll = nullptr;
     int scrollPos = 0;
     HWND hwndTab = nullptr;
-    HWND hwndAbout = nullptr, hwndOk = nullptr, hwndCancel = nullptr;
+    HWND hwndOptimize = nullptr, hwndOk = nullptr, hwndCancel = nullptr;
     HWND hwndTooltip = nullptr;
     // One plain child window per tab, covering the tab control's body and
     // holding that tab's controls; showTabPage shows exactly one at a time.
@@ -209,7 +211,7 @@ void layoutDialog(SetupDialogState* state) {
     scrollContentTo(state, state->scrollPos);
 
     const int buttonY = viewHeight + scaled(kButtonGap);
-    SetWindowPos(state->hwndAbout, nullptr, scaled(12), buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->hwndOptimize, nullptr, scaled(12), buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     SetWindowPos(state->hwndOk, nullptr, scaled(430) + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     SetWindowPos(state->hwndCancel, nullptr, scaled(520) + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -527,6 +529,9 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 case kIdSetupAbout:
                     showAboutDialog(hwnd);
                     return 0;
+                case kIdSetupOptimize:
+                    gui::optimizeForHardware(hwnd, state->fields->configPath, state->fields->backend, state->fields->searchPause);
+                    return 0;
                 case kIdSetupBrowseWordLists:
                     browseWordLists(hwnd, state);
                     return 0;
@@ -797,7 +802,10 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     // --- Header: logo + what this window is for ---
     // Its image is set once the controls are scaled - see below.
     HWND logoCtl = CreateWindowExA(0, "STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BITMAP, 12, 10, 120, 80, content, nullptr, hInstance, nullptr);
-    HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 150, 14, 450, 28, content, nullptr, hInstance, nullptr);
+    HWND title = CreateWindowExA(0, "STATIC", "namebreak-bombe", WS_CHILD | WS_VISIBLE, 150, 14, 350, 28, content, nullptr, hInstance, nullptr);
+    // On the title's line, at the right: it scrolls with the header.
+    CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, kDialogWidth - 12 - 90, 14, 90, 26, content,
+                    (HMENU) (INT_PTR) kIdSetupAbout, hInstance, nullptr);
     CreateWindowExA(0, "STATIC",
                      reopened ? "Settings. Change how this machine searches, then press OK - your choices replace what the configuration "
                                 "file says, and are used the next time namebreak starts. Hover over a blue ? for help with any option."
@@ -1341,8 +1349,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     makeHashTableRow(pm, rowM(12), mitm.hashTable, state.mitmHashTable);
 
     // --- Buttons, under the scroll view (placed by layoutDialog) ---
-    state.hwndAbout = CreateWindowExA(0, "BUTTON", "About...", WS_CHILD | WS_VISIBLE, 12, 0, 90, 26, hwndDialog,
-                                      (HMENU) (INT_PTR) kIdSetupAbout, hInstance, nullptr);
+    state.hwndOptimize = CreateWindowExA(0, "BUTTON", "Optimize for hardware", WS_CHILD | WS_VISIBLE, 12, 0, 150, 26, hwndDialog,
+                                         (HMENU) (INT_PTR) kIdSetupOptimize, hInstance, nullptr);
     state.hwndOk = CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, 0, 80, 26, hwndDialog,
                                    (HMENU) (INT_PTR) kIdSetupOk, hInstance, nullptr);
     state.hwndCancel = CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 520, 0, 80, 26, hwndDialog,
