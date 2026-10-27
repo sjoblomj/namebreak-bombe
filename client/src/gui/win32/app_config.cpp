@@ -5,6 +5,7 @@
 #include "common/config.h"
 #include "common/platform.h"
 #include "gui/win32/setup_dialog.h"
+#include "gui/win32/table_memory.h"
 #include "gui/win32/worker.h"
 
 namespace {
@@ -84,7 +85,7 @@ SetupDialogFields fieldsFromConfig(const ConfigFile& config, bool loaded) {
     fields.hostname = get(config.coordinator, "hostname", resolveHostname());
     fields.serverUrl = get(config.coordinator, "server_url", kDefaultServerUrl);
     fields.pollIntervalSecs = get(config.coordinator, "poll_interval_secs", "30");
-    // Empty: the dialog proposes a size for this machine instead.
+    // Empty: first-run setup proposes a size for this machine instead.
     fields.meetInTheMiddleTableMemory = get(config.coordinator, "meet_in_the_middle_table_memory", "");
     fields.alphabet = get(config.search, "alphabet", "");
     fields.maxBackslashCount = get(config.search, "max_backslash_count", "0");
@@ -187,13 +188,22 @@ bool writeConfigForFields(const std::string& path, const SetupDialogFields& fiel
         return overwrite ? updateConfigForMode(path, mode, section, keys, error)
                          : ensureConfigForMode(path, mode, section, keys, error);
     };
-    if (fields.mode == "coordinator")
-        return write("coordinator", "coordinator",
-                     {{"server_url", fields.serverUrl},
-                      {"username", fields.username},
-                      {"hostname", fields.hostname},
-                      {"poll_interval_secs", fields.pollIntervalSecs},
-                      {"meet_in_the_middle_table_memory", fields.meetInTheMiddleTableMemory}});
+    if (fields.mode == "coordinator") {
+        std::vector<std::pair<std::string, std::string>> keys = {{"server_url", fields.serverUrl},
+                                                                 {"username", fields.username},
+                                                                 {"hostname", fields.hostname},
+                                                                 {"poll_interval_secs", fields.pollIntervalSecs}};
+        // The Hardware dialog's, which writes it itself - first-run setup
+        // only proposes a size for this machine to a file without one.
+        if (!overwrite) {
+            const gui::MachineMemory memory = gui::machineMemory();
+            const std::vector<uint64_t> stops = gui::tableMemoryStopsFor(memory.totalBytes);
+            const std::string proposed = gui::bytesForConfig(gui::proposedTableMemory(stops, memory.totalBytes));
+            keys.emplace_back("meet_in_the_middle_table_memory",
+                              fields.meetInTheMiddleTableMemory.empty() ? proposed : fields.meetInTheMiddleTableMemory);
+        }
+        return write("coordinator", "coordinator", keys);
+    }
     if (fields.mode == "dictionary")
         return write("dictionary", "dictionary", gui::dictionaryConfigKeys(fields.dictionary));
     if (fields.mode == "meet-in-the-middle")
@@ -291,8 +301,8 @@ bool editSettings(HINSTANCE hInstance, const std::string& configPath, HWND owner
     }
     SetupDialogFields fields = fieldsFromConfig(config, true);
     fields.configPath = configPath;
-    // Over a running search: Optimize for hardware pauses it while it
-    // times the GPU.
+    // Over a running search: the Hardware dialog's Optimize for hardware
+    // pauses it while it times the GPUs.
     fields.searchPause = &g_pauseRequested;
     fields.runningMode = runningMode;
     if (!showSetupDialog(hInstance, fields, true))

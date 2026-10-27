@@ -253,8 +253,8 @@ void togglePause() {
 // run started from (editSettings, app_config.cpp). The search carries on
 // throughout, and goes on using the settings it was started with - the file
 // is only read when namebreak starts, which is what the message box says.
-// (Optimize for hardware's are the exception: a coordinator run uses them
-// from its next range - see optimizeForHardware.)
+// (The Hardware dialog's launch settings are the exception: a coordinator run
+// uses them from its next range - see showHardwareDialog.)
 // The main window is disabled while the form is up, so its Pause and Quit
 // can't be pressed behind what looks like a modal window (the form runs a
 // message loop of its own - see showSetupDialog).

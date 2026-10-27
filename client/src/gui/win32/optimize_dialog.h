@@ -4,21 +4,23 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "common/autotune.h"
 #include "gui/win32/win32.h"
 
 namespace gui {
 
-// The setup dialog's "Optimize for hardware" button: what `namebreak
-// --autotune` does (common/autotune.h), behind a window. If the machine
+// The Hardware dialog's "Optimize for hardware" button (hardware_dialog.h):
+// what `namebreak --autotune` does (common/autotune.h), behind a window. If the machine
 // searches with a backend that can't be tuned this way - CUDA and HIP, whose
 // settings are compiled in, or the CPU - a message box says so, with where to
 // get the script that tunes CUDA and HIP. Otherwise, once the user agrees, it
 // times the backend's settings on the GPU with a progress window
-// (showAutotuneProgress) - each GPU [hardware] selects in turn - saves the
-// fastest to `configPath`'s [hardware] section, as each GPU's own, and makes
-// them the process's (setHardwareConfig).
+// (showAutotuneProgress) - each of `devices` in turn, or each GPU [hardware]
+// selects if that's null - saves the fastest to `configPath`'s [hardware]
+// section, as each GPU's own, and makes them the process's
+// (setHardwareConfig). Returns true if it saved them.
 // `backend` is the config's `backend` (empty for the first that can run).
 //
 // `runningMode` is the mode of the search running already - from the tray
@@ -30,8 +32,8 @@ namespace gui {
 // once namebreak is restarted. `searchPause`, if given, is that search's
 // pause flag: it's paused while the GPU is being timed - it would make every
 // measurement meaningless - and resumed after, unless it was paused already.
-void optimizeForHardware(HWND owner, const std::string& configPath, const std::string& backend, const std::string& runningMode,
-                         std::atomic<bool>* searchPause);
+bool optimizeForHardware(HWND owner, const std::string& configPath, const std::string& backend, const std::string& runningMode,
+                         std::atomic<bool>* searchPause, const std::vector<GpuDevice>* devices = nullptr);
 
 // The work showAutotuneProgress runs on a background thread: reports through
 // the hooks, stops (soon) once `abortRequested` is set, and returns 0 when

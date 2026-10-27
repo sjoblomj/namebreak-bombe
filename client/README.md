@@ -322,12 +322,27 @@ without pruning, though a wider one leaves the CPU less to prune (see
 and a work-group size beyond what the device allows runs as the largest it
 does.
 
-In the Windows GUI, the setup dialog's **Optimize for hardware** button
-(at first run, or from the tray menu's `Settings...`) does the same, with a
-progress bar, an estimate of the time left, what it's measuring, and a
-Cancel button. A search already running is paused while it measures and
-resumes afterwards. What it saves is kept whether the dialog is then closed
-with OK or Cancel, and is used:
+In the Windows GUI, the setup dialog's **Hardware...** button (at first
+run, or from the tray menu's `Settings...`) opens all of `[hardware]` in a
+window of its own. It offers the CPU, with its thread count, or the GPUs
+of the backend that searches, each with a checkbox - never both. An
+integrated GPU next to a discrete one starts unchecked, as `gpus = auto`
+leaves it, and says why; one that is the machine's only GPU starts checked.
+With OpenCL or Metal, each GPU's launch settings are there too, to change
+by hand, each with its default beside it, and shown in the system's
+selection colors while it isn't the default; every value's `?` says what
+it is. Under the GPUs is the memory a coordinator run gives
+meet-in-the-middle work (see [below](#in-coordinator-mode)). OK writes only
+what was changed - `gpus` only if the choice of GPUs changed, a GPU's
+`gpu<N>.*` keys only if one of its values did, with a value that is the
+default taken out. Whatever doesn't fit on the screen scrolls.
+
+Its **Optimize for hardware** button does what `--autotune` does, on the
+GPUs checked, with a progress bar, an estimate of the time left, what it's
+measuring, and a Cancel button, and shows what it found. A search already
+running is paused while it measures and resumes afterwards. What it saves,
+and what the Hardware window's OK saves, is kept whether the setup dialog
+is then closed with OK or Cancel. The launch settings are used:
 
 - at first run, as soon as the search starts;
 - in a coordinator run already going, after the current range finishes:
@@ -335,6 +350,9 @@ with OK or Cancel, and is used:
   it, before it claims the next one (and carries on with the old backend,
   saying so, should that fail) - each GPU's worker after its own range;
 - in a local search already going, once namebreak is restarted.
+
+Which GPUs search, or the CPU, is used as soon as the search starts at
+first run, and otherwise once namebreak is restarted.
 
 On a machine that searches with CUDA or HIP, it says why it can't, and
 offers to open `scripts/autotune/`'s page.
@@ -774,8 +792,10 @@ several (see [Choosing and tuning the
 hardware](#choosing-and-tuning-the-hardware)) may have a table this big for
 each. The client says which it is when it
 registers, and a server hands out no target whose table is bigger than it.
-The Windows GUI's setup asks for it on its Coordinator tab, as a slider over
-the sizes a table can usefully take (None, then powers of two from 256 MB up
+The Windows GUI's first-run setup proposes a size for the machine - an
+eighth of its memory, at most 4 GB - and its Hardware window (see
+[Choosing and tuning the hardware](#choosing-and-tuning-the-hardware)) has
+it as a slider over the sizes a table can usefully take (None, then powers of two from 256 MB up
 to what the machine has), with what this machine has and has free above it
 and, under it, how long a table the chosen size holds.
 The table is built afresh for every range claimed (a few seconds for four

@@ -41,7 +41,7 @@
 #include "gui/win32/about_dialog.h"
 #include "gui/win32/app_icons.h"
 #include "gui/win32/dpi.h"
-#include "gui/win32/optimize_dialog.h"
+#include "gui/win32/hardware_dialog.h"
 
 #pragma comment(lib, "comdlg32.lib")
 
@@ -71,9 +71,8 @@ constexpr int kIdSetupPruneWholeCheckbox = 308;
 constexpr int kIdSetupPruneAdjacentCheckbox = 309;
 constexpr int kIdSetupBrowseWordLists = 310;
 constexpr int kIdSetupEncryptionKey = 311;
-constexpr int kIdSetupTableMemory = 312;
 constexpr int kIdSetupVerification = 313;
-constexpr int kIdSetupOptimize = 314;
+constexpr int kIdSetupHardware = 314;
 
 // The dialog's geometry: everything but the buttons is kContentHeight of a
 // scroll view, and the buttons sit in a strip of their own under it. The
@@ -105,7 +104,7 @@ struct SetupDialogState {
     HWND hwndScroll = nullptr;
     int scrollPos = 0;
     HWND hwndTab = nullptr;
-    HWND hwndOptimize = nullptr, hwndOk = nullptr, hwndCancel = nullptr;
+    HWND hwndHardware = nullptr, hwndOk = nullptr, hwndCancel = nullptr;
     HWND hwndTooltip = nullptr;
     // One plain child window per tab, covering the tab control's body and
     // holding that tab's controls; showTabPage shows exactly one at a time.
@@ -114,11 +113,6 @@ struct SetupDialogState {
     HWND hwndPageDictionary = nullptr;
     HWND hwndPageMeetInTheMiddle = nullptr;
     HWND hwndUsername = nullptr, hwndHostname = nullptr, hwndServerUrl = nullptr, hwndPollInterval = nullptr;
-    // The Coordinator tab's memory slider and the line under it that says
-    // what the stop it's at means - see tableMemoryLabel.
-    HWND hwndTableMemory = nullptr, hwndTableMemoryText = nullptr;
-    std::vector<uint64_t> tableMemoryStops;
-    uint64_t availablePhysicalBytes = 0;
     HWND hwndBoundedRadio = nullptr, hwndContinuousRadio = nullptr, hwndPrune = nullptr, hwndPruneBrackets = nullptr,
          hwndPruneWhole = nullptr, hwndPruneAdjacent = nullptr;
     HWND hwndInsertFromStart = nullptr, hwndInsertFromEnd = nullptr;
@@ -211,7 +205,7 @@ void layoutDialog(SetupDialogState* state) {
     scrollContentTo(state, state->scrollPos);
 
     const int buttonY = viewHeight + scaled(kButtonGap);
-    SetWindowPos(state->hwndOptimize, nullptr, scaled(12), buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->hwndHardware, nullptr, scaled(12), buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     SetWindowPos(state->hwndOk, nullptr, scaled(430) + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     SetWindowPos(state->hwndCancel, nullptr, scaled(520) + scrollbar, buttonY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -241,102 +235,6 @@ std::string windowText(HWND h) {
     std::string text(GetWindowTextLengthA(h) + 1, '\0');
     text.resize(GetWindowTextA(h, &text[0], (int) text.size()));
     return text;
-}
-
-// --- The Coordinator tab's meet-in-the-middle memory slider ---------------
-//
-// How much memory this client will give a meet-in-the-middle target's table
-// is a coarse choice: a character more of the table needs about as many
-// times more memory as the alphabet has characters, so the useful values are
-// powers of two far apart, and a slider over them says more than a number
-// box would (what you are giving, out of what this machine has).
-
-// The sizes the slider stops at - none, then powers of two from 256 MB up.
-constexpr uint64_t kTableMemoryStops[] = {0,            256ull << 20, 512ull << 20, 1ull << 30,  2ull << 30,
-                                           4ull << 30,  8ull << 30,   16ull << 30,  32ull << 30, 64ull << 30};
-
-// Those of them a machine with `totalBytes` of memory could hold at all -
-// always at least None and the smallest size, so there is something to drag
-// even on a very small machine.
-std::vector<uint64_t> tableMemoryStopsFor(uint64_t totalBytes) {
-    std::vector<uint64_t> stops;
-    for (uint64_t stop : kTableMemoryStops)
-        if (stop <= totalBytes || stops.size() < 2)
-            stops.push_back(stop);
-    return stops;
-}
-
-// What to propose on a machine this size: an eighth of its memory at most,
-// and never more than 4 GB unasked - enough for five characters of a
-// 43-character alphabet, which is what the directories looked for in
-// practice need.
-uint64_t proposedTableMemory(const std::vector<uint64_t>& stops, uint64_t totalBytes) {
-    const uint64_t cap = (std::min) (totalBytes / 8, 4ull << 30);
-    uint64_t proposed = 0;
-    for (uint64_t stop : stops)
-        if (stop <= cap)
-            proposed = stop;
-    return proposed;
-}
-
-// The stop at or below `bytes` - which stop a value from config.conf sits
-// at, rounded down so that the slider never offers more than the file asked
-// for.
-int stopIndexFor(const std::vector<uint64_t>& stops, uint64_t bytes) {
-    int index = 0;
-    for (int i = 0; i < (int) stops.size(); ++i)
-        if (stops[i] <= bytes)
-            index = i;
-    return index;
-}
-
-// A size as config.conf writes it: 0, 256M, 4G.
-std::string bytesForConfig(uint64_t bytes) {
-    if (bytes == 0)
-        return "0";
-    if (bytes % (1ull << 30) == 0)
-        return std::to_string(bytes >> 30) + "G";
-    return std::to_string(bytes >> 20) + "M";
-}
-
-// A size as this dialog says it: None, 256 MB, 4 GB (every stop is a whole
-// number of its unit).
-std::string stopText(uint64_t bytes) {
-    if (bytes == 0)
-        return "None";
-    if (bytes < (1ull << 30))
-        return std::to_string(bytes >> 20) + " MB";
-    return std::to_string(bytes >> 30) + " GB";
-}
-
-// A machine's memory, as the line above the slider says it: 31.8 GB.
-std::string memoryText(uint64_t bytes) {
-    char buf[32];
-    snprintf(buf, sizeof buf, "%.1f GB", (double) bytes / (double) (1ull << 30));
-    return buf;
-}
-
-// What a stop means, for the line under the slider: the size, and how long a
-// table of it holds - which is the whole point of giving the memory. Two
-// alphabet sizes, because what one buys depends on the target's own alphabet
-// and the steps are wide: 2 GB and 32 GB are the same five characters of a
-// 43-character alphabet, but six and seven of a 26-character one.
-std::string tableMemoryLabel(uint64_t bytes, uint64_t availableBytes) {
-    if (bytes == 0)
-        return "None: the server hands this client no meet-in-the-middle work.";
-    std::string text = stopText(bytes) + " - a table of " +
-                       std::to_string(meetInTheMiddleTableLengthForBytes(43, MAX_CANDIDATE_LEN, bytes)) +
-                       " characters of a 43-character alphabet, " +
-                       std::to_string(meetInTheMiddleTableLengthForBytes(26, MAX_CANDIDATE_LEN, bytes)) + " of a 26-character one.";
-    if (bytes > availableBytes)
-        text += "\r\nThat is more than is free on this machine right now.";
-    return text;
-}
-
-void syncTableMemoryText(SetupDialogState* state) {
-    const int pos = (int) SendMessage(state->hwndTableMemory, TBM_GETPOS, 0, 0);
-    const uint64_t bytes = state->tableMemoryStops[(size_t) (pos < 0 ? 0 : pos)];
-    SetWindowTextA(state->hwndTableMemoryText, tableMemoryLabel(bytes, state->availablePhysicalBytes).c_str());
 }
 
 // What `controls` say, trimmed.
@@ -510,10 +408,6 @@ LRESULT CALLBACK SetupScrollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* state = reinterpret_cast<SetupDialogState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
     switch (msg) {
-        case WM_HSCROLL:
-            if (state && (HWND) lParam == state->hwndTableMemory)
-                syncTableMemoryText(state);
-            return 0;
         case WM_NOTIFY: {
             if (!state)
                 break;
@@ -529,9 +423,9 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 case kIdSetupAbout:
                     showAboutDialog(hwnd);
                     return 0;
-                case kIdSetupOptimize:
-                    gui::optimizeForHardware(hwnd, state->fields->configPath, state->fields->backend, state->fields->runningMode,
-                                             state->fields->searchPause);
+                case kIdSetupHardware:
+                    gui::showHardwareDialog(hwnd, state->fields->configPath, state->fields->backend, state->fields->runningMode,
+                                            state->fields->searchPause);
                     return 0;
                 case kIdSetupBrowseWordLists:
                     browseWordLists(hwnd, state);
@@ -562,9 +456,6 @@ LRESULT CALLBACK SetupDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         state->fields->hostname = getField(state->hwndHostname);
                         state->fields->serverUrl = serverUrl;
                         state->fields->pollIntervalSecs = getField(state->hwndPollInterval);
-                        const int memoryPos = (int) SendMessage(state->hwndTableMemory, TBM_GETPOS, 0, 0);
-                        state->fields->meetInTheMiddleTableMemory =
-                            bytesForConfig(state->tableMemoryStops[(size_t) (memoryPos < 0 ? 0 : memoryPos)]);
                         state->fields->mode = "coordinator";
                     } else if (sel == kTabDictionary) {
                         DictionaryFields d;
@@ -915,55 +806,6 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     addHelp(pc, 200, kCoordRow0 + 3 * kRowStep + 2,
             "How many seconds to wait before asking the server for work again when none was available. It is also the starting delay "
             "after a failed request, which then backs off. Default: 30.");
-
-    // How much memory this client will give a meet-in-the-middle target's
-    // table. The server only hands out such a target if its table fits in
-    // this, so None is a plain "none of that work, thanks" - see the Meet in
-    // the Middle tab for what the table is for.
-    MEMORYSTATUSEX memory{};
-    memory.dwLength = sizeof memory;
-    if (!GlobalMemoryStatusEx(&memory)) {
-        memory.ullTotalPhys = 4ull << 30; // modest, if Windows won't say
-        memory.ullAvailPhys = 1ull << 30;
-    }
-    state.tableMemoryStops = tableMemoryStopsFor(memory.ullTotalPhys);
-    state.availablePhysicalBytes = memory.ullAvailPhys;
-    uint64_t tableMemory = 0;
-    if (fields.meetInTheMiddleTableMemory.empty())
-        tableMemory = proposedTableMemory(state.tableMemoryStops, memory.ullTotalPhys);
-    else if (!parseConfigBytes(fields.meetInTheMiddleTableMemory, tableMemory))
-        tableMemory = 0;
-
-    // A group box of its own, because none of it is about joining a server
-    // as such: it only matters if that server has meet-in-the-middle work,
-    // and the memory is the one thing a client has to agree to spare before
-    // it is handed any.
-    constexpr int kMemoryY = 222, kMemoryX = 20;
-    CreateWindowExA(0, "BUTTON", "Meet-in-the-middle work", WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 8, kMemoryY, 570, 186, pc, nullptr,
-                     hInstance, nullptr);
-    makeLabel(pc,
-              "Only relevant if the coordinator has meet-in-the-middle targets to hand out - a file whose directory is unknown, "
-              "searched from both ends at once (see the Meet in the Middle tab). That needs a table in memory, and the server hands "
-              "this client such a target only if the table fits in what you give here. Everything else about coordinator mode works "
-              "the same either way.",
-              kMemoryX, kMemoryY + 20, 546, 62);
-    const std::string machineMemory = "This machine has " + memoryText(memory.ullTotalPhys) + " of memory, " +
-                                      memoryText(memory.ullAvailPhys) + " of it free right now.";
-    makeLabel(pc, machineMemory.c_str(), kMemoryX, kMemoryY + 86, 546);
-    makeLabel(pc, "Give at most:", kMemoryX, kMemoryY + 115, 100);
-    state.hwndTableMemory =
-        CreateWindowExA(0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_AUTOTICKS | TBS_HORZ, kMemoryX + 104,
-                         kMemoryY + 109, 320, 32, pc, (HMENU) (INT_PTR) kIdSetupTableMemory, hInstance, nullptr);
-    SendMessage(state.hwndTableMemory, TBM_SETRANGE, TRUE, MAKELONG(0, (int) state.tableMemoryStops.size() - 1));
-    SendMessage(state.hwndTableMemory, TBM_SETPAGESIZE, 0, 1);
-    SendMessage(state.hwndTableMemory, TBM_SETPOS, TRUE, stopIndexFor(state.tableMemoryStops, tableMemory));
-    addHelp(pc, kMemoryX + 432, kMemoryY + 115,
-            "How much memory this client will give the table of a meet-in-the-middle target. The server hands out such a target only "
-            "if its table fits in this, so None means no work of that kind at all - and no other kind is affected by it.\r\n"
-            "The table is only held while such a range is being searched, and on a GPU it is held in the card's own memory too - so "
-            "keep this under what your GPU has free if you search with one.");
-    state.hwndTableMemoryText = makeLabel(pc, "", kMemoryX, kMemoryY + 145, 546, 30);
-    syncTableMemoryText(&state);
 
     // --- Local Search page (two columns: label, field, help) ---
     HWND ps = state.hwndPageSearch;
@@ -1350,8 +1192,8 @@ bool showSetupDialog(HINSTANCE hInstance, SetupDialogFields& fields, bool reopen
     makeHashTableRow(pm, rowM(12), mitm.hashTable, state.mitmHashTable);
 
     // --- Buttons, under the scroll view (placed by layoutDialog) ---
-    state.hwndOptimize = CreateWindowExA(0, "BUTTON", "Optimize for hardware", WS_CHILD | WS_VISIBLE, 12, 0, 150, 26, hwndDialog,
-                                         (HMENU) (INT_PTR) kIdSetupOptimize, hInstance, nullptr);
+    state.hwndHardware = CreateWindowExA(0, "BUTTON", "Hardware...", WS_CHILD | WS_VISIBLE, 12, 0, 100, 26, hwndDialog,
+                                         (HMENU) (INT_PTR) kIdSetupHardware, hInstance, nullptr);
     state.hwndOk = CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 430, 0, 80, 26, hwndDialog,
                                    (HMENU) (INT_PTR) kIdSetupOk, hInstance, nullptr);
     state.hwndCancel = CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 520, 0, 80, 26, hwndDialog,

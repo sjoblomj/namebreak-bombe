@@ -280,13 +280,13 @@ int showAutotuneProgress(HWND owner, AutotuneJob job, const std::string& finishe
     return state.progress.result;
 }
 
-void optimizeForHardware(HWND owner, const std::string& configPath, const std::string& backend, const std::string& runningMode,
-                         std::atomic<bool>* searchPause) {
+bool optimizeForHardware(HWND owner, const std::string& configPath, const std::string& backend, const std::string& runningMode,
+                         std::atomic<bool>* searchPause, const std::vector<GpuDevice>* chosen) {
     // Finding the backend makes it, and self-tests it: a moment.
     HCURSOR cursor = SetCursor(LoadCursorA(nullptr, IDC_WAIT));
     std::string why;
     const std::string tuned = autotuneBackend(backend, why);
-    const std::vector<GpuDevice> devices = tuned.empty() ? std::vector<GpuDevice>() : autotuneDevices(tuned, why);
+    const std::vector<GpuDevice> devices = tuned.empty() ? std::vector<GpuDevice>() : chosen ? *chosen : autotuneDevices(tuned, why);
     SetCursor(cursor);
     if (tuned.empty() || devices.empty()) {
         if (why.find(kAutotuneScriptUrl) != std::string::npos) {
@@ -295,7 +295,7 @@ void optimizeForHardware(HWND owner, const std::string& configPath, const std::s
         } else {
             MessageBoxA(owner, why.c_str(), kTitle, MB_OK | MB_ICONWARNING);
         }
-        return;
+        return false;
     }
     // When what it finds is used.
     const std::string when = runningMode.empty()            ? "used as soon as the search starts"
@@ -317,7 +317,7 @@ void optimizeForHardware(HWND owner, const std::string& configPath, const std::s
         (pause ? "The running search is paused meanwhile, and resumed afterwards. " : "") +
         "Close games and anything else that uses the GPU first: they would make the measurements meaningless.\r\n\r\nStart now?";
     if (MessageBoxA(owner, question.c_str(), kTitle, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
-        return;
+        return false;
     if (pause)
         searchPause->store(true);
     const std::string finished = "Finished. The settings are " + when + ".";
@@ -339,6 +339,7 @@ void optimizeForHardware(HWND owner, const std::string& configPath, const std::s
     }
     if (pause)
         searchPause->store(false);
+    return result == 0;
 }
 
 } // namespace gui

@@ -98,8 +98,10 @@ struct SetupDialogFields {
     std::string pollIntervalSecs = "30";
     // meet_in_the_middle_table_memory: how much memory this client will give
     // a meet-in-the-middle target's table, as config.conf has it ("4G") -
-    // "0" for none, and empty to let the dialog propose a size for this
-    // machine (see proposedTableMemory).
+    // "0" for none, and empty to propose a size for this machine (see
+    // proposedTableMemory, table_memory.h). Not on any tab: the Hardware
+    // dialog sets it, and first-run setup only fills it in where the file
+    // has none (see writeConfigForFields).
     std::string meetInTheMiddleTableMemory;
 
     // Local Search tab - see SearchRequest/buildSearchRequest.
@@ -128,9 +130,8 @@ struct SetupDialogFields {
     // search's progress file is, which OK checks a resumed search against.
     std::string matchesDir;
 
-    // For the Optimize for hardware button (optimizeForHardware,
-    // optimize_dialog.h), which saves what it finds straight away, whether
-    // or not OK is pressed: the config file, its `backend` (empty for the
+    // For the Hardware... button (showHardwareDialog, hardware_dialog.h),
+    // which saves its settings straight away, whether or not OK is pressed: the config file, its `backend` (empty for the
     // first that can run), and - shown over a running search, from
     // Settings... - that search's pause flag.
     std::string configPath;
