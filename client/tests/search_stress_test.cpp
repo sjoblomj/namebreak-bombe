@@ -15,9 +15,9 @@
 //
 // Every case runs the real runSearch() on a random range - random alphabet
 // (size, characters, order, bytes >= 0x80), prefix, suffix and candidate
-// length, and in a third of them the engine's pruning of leading characters
+// length, and in half of them the engine's pruning of leading characters
 // (so pruned leading values fall between the batches a backend searches
-// together), in half of those at every character but the last (so the
+// together), in two thirds of those at every character but the last (so the
 // backend prunes rows and row groups too) - and compares the complete set of hits it reports with an
 // independent brute force that hashes every candidate of the range from
 // scratch: any hit missing, any extra, any reported twice, or any WARNING
@@ -587,7 +587,7 @@ int main(int argc, char** argv) {
         c.targetA = (uint32_t) rng();
         c.targetB = (uint32_t) rng();
         c.leadingLen = c.len - trailingLenFor(c.len, as, window);
-        if (rng() % 3 == 0) {
+        if (rng() % 2 == 0) {
             // Random alphabets are mostly symbols, so these prune a lot of
             // leading values - and leave many between them.
             c.pruneSymbolRuns = rng() % 2 == 0;
@@ -596,9 +596,13 @@ int main(int argc, char** argv) {
             c.pruneAdjacentBackslashes = rng() % 3 == 0;
             if (rng() % 3 == 0)
                 c.minBackslashCount = std::min(1 + (int) (rng() % 3), c.maxBackslashCount != 0 ? c.maxBackslashCount : 3);
-            // Half of them at every character but the last, which the
-            // backend prunes rows and row groups for.
-            c.pruneWholeCandidate = rng() % 2 == 0;
+            // Two thirds of them at every character but the last, which the
+            // backend prunes rows and row groups for: only those reach its
+            // lists of row groups, and when half of them did, mutation
+            // tests that cut a list's last chunk or ignored the text
+            // inserted between a row group's characters got past this test
+            // with a quarter to half of the random seeds tried.
+            c.pruneWholeCandidate = rng() % 3 != 0;
             if (rng() % 4 == 0) {
                 // Brackets and backslashes are rare in a random alphabet:
                 // make sure they're in it.
@@ -607,9 +611,10 @@ int main(int argc, char** argv) {
                         c.alphabet[rng() % c.alphabet.size()] = ch;
             }
         }
-        if (rng() % 3 == 0) {
+        if (rng() % (c.pruneWholeCandidate ? 2 : 3) == 0) {
             // Text inserted anywhere a candidate of this length can have it,
-            // or past it - made of what the rules care about.
+            // or past it - made of what the rules care about. More often
+            // where the backend prunes row groups, which must step over it.
             static const char kInsertable[] = "\\()[]!A_";
             for (Insertion* insertion : {&c.insertFromStart, &c.insertFromEnd}) {
                 if (rng() % 2 != 0)
