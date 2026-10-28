@@ -380,6 +380,30 @@ static void plantAtEdge(Case& c, int window, uint64_t batchSize, uint64_t space,
     c.targetA = hashFromScratch(c.planted, 0x100);
 }
 
+// Where the backend prunes rows and row groups (pruneWholeCandidate), the
+// target taken instead from a candidate inside the range that only its
+// trailing characters prune - one the engine hands the backend, and the
+// backend must leave out, whether it walks its lists of row groups or checks
+// its hits against them. Random hits land in a pruned row group with a
+// surviving one after it too rarely to count on (a mutation that kept them
+// got past this test with the cases one fixed seed made). Nothing planted,
+// if none of a few random candidates is one.
+static void plantInPrunedRow(Case& c, std::mt19937_64& rng) {
+    Case leadingOnly = c;
+    leadingOnly.pruneWholeCandidate = false;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const uint64_t index = c.first + rng() % (c.last - c.first + 1);
+        const std::string candidate = candidateAt(index, c.len, c.alphabet);
+        if (isPruned(c, candidate) && !isPruned(leadingOnly, candidate)) {
+            c.plantedIndex = index;
+            c.planted = nameOf(c, candidate);
+            c.plantedInside = false;
+            c.targetA = hashFromScratch(c.planted, 0x100);
+            return;
+        }
+    }
+}
+
 // Runs one case; returns the number of hits it verified, or -1 if it failed.
 static long runCase(Case c, std::mt19937_64& rng) {
     // A candidate the engine prunes is never searched, even inside the range.
@@ -653,6 +677,8 @@ int main(int argc, char** argv) {
         }
 
         plantAtEdge(c, window, g_backend->batchSize(as), space, rng);
+        if (c.pruneWholeCandidate && rng() % 2 == 0)
+            plantInPrunedRow(c, rng);
         c.foundCase = cases % 4 == 3;
         c.falseMatchCase = cases % 8 == 7;
         const long verified = runCase(c, rng);
