@@ -12,6 +12,24 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
+// The AVX2 row walk (hashRowsAvx2, hashSurvivorsAvx2), on x86-64 only - compiled for AVX2
+// whatever the build's flags, and used only on a CPU that has it (cpuHasAvx2).
+// -DNAMEBREAK_CPU_SIMD=0 leaves it out, for the tests of the plain loop.
+#ifndef NAMEBREAK_CPU_SIMD
+#if defined(__x86_64__) || defined(_M_X64)
+#define NAMEBREAK_CPU_SIMD 1
+#else
+#define NAMEBREAK_CPU_SIMD 0
+#endif
+#endif
+#if NAMEBREAK_CPU_SIMD
+#include <immintrin.h>
+#ifdef _MSC_VER
+#define NAMEBREAK_TARGET_AVX2
+#else
+#define NAMEBREAK_TARGET_AVX2 __attribute__((target("avx2")))
+#endif
+#endif
 
 #include "backends/common/dictionary_batch.h"
 #include "backends/common/lowbits_filter.h"
@@ -65,8 +83,8 @@ struct BatchContext {
     int alphabetSize;
     int suffixLen;
     uint32_t targetA;
-    const uint32_t* key;       // crypt-table key per alphabet position
-    const uint32_t* ord;       // the character itself
+    const uint32_t* key;       // crypt-table key per alphabet position (and 8 zeros past the alphabet, for the AVX2 loads)
+    const uint32_t* ord;       // the character itself (likewise)
     const uint32_t* suffixKey; // suffixLen entries
     const uint32_t* suffixOrd;
     const char* alphabet;      // the characters themselves, for the pruning rules
@@ -85,6 +103,7 @@ struct BatchContext {
     const std::vector<std::string>* inserted;
     const std::vector<std::vector<uint32_t>>* insertedKey;
     TailCapacity lastCapacity;
+    bool avx2;                 // searchRows hashes with hashRowsAvx2 and hashSurvivorsAvx2
 };
 
 void record(ThreadHits& found, int batch, uint64_t trailingIndex) {
@@ -94,14 +113,117 @@ void record(ThreadHits& found, int batch, uint64_t trailingIndex) {
     }
 }
 
+// Candidates the filter let through, waiting to be hashed in full - eight at
+// a time, so that with AVX2 they're hashed at once.
+struct Survivors {
+    alignas(32) uint32_t s1[8];
+    alignas(32) uint32_t s2[8];
+    alignas(32) int32_t k[8] = {}; // the last character - with AVX2 the lanes past count are gathered too, so never garbage
+    uint64_t trailingIndex[8];
+    int count = 0;
+};
+
+// Hashes the waiting candidates' last character and the suffix, and records
+// those whose hashA matches, in the order they came.
+void hashSurvivors(const BatchContext& ctx, int batch, Survivors& waiting, ThreadHits& found) {
+    for (int l = 0; l < waiting.count; ++l) {
+        uint32_t a = waiting.s1[l], b = waiting.s2[l];
+        mpqStep(a, b, ctx.key[waiting.k[l]], ctx.ord[waiting.k[l]]);
+        for (int j = 0; j < ctx.suffixLen; ++j)
+            mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);
+        if (hashAMatches(a, ctx.targetA))
+            record(found, batch, waiting.trailingIndex[l]);
+    }
+    waiting.count = 0;
+}
+
+// The states of `lanes` (at most 8) rows that share all but their last
+// shared character - d, d + 1, ... - from the state (p1, p2) after the rest
+// and the text inserted before it, and their table entries.
+void hashRows(const BatchContext& ctx, uint32_t p1, uint32_t p2, int d, int lanes, uint32_t* s1, uint32_t* s2, uint64_t* entry) {
+    const std::string& after = (*ctx.inserted)[ctx.prefixDigits];
+    const std::vector<uint32_t>& afterKey = (*ctx.insertedKey)[ctx.prefixDigits];
+    for (int l = 0; l < lanes; ++l) {
+        uint32_t a = p1, b = p2;
+        mpqStep(a, b, ctx.key[d + l], ctx.ord[d + l]);
+        for (size_t c = 0; c < after.size(); ++c)
+            mpqStep(a, b, afterKey[c], (unsigned char) after[c]);
+        s1[l] = a;
+        s2[l] = b;
+        entry[l] = ctx.table[lowBitsFilterIndex(a, b)];
+    }
+}
+
+#if NAMEBREAK_CPU_SIMD
+bool cpuHasAvx2() {
+#ifdef _MSC_VER
+    int info[4];
+    __cpuid(info, 0);
+    if (info[0] < 7)
+        return false;
+    __cpuid(info, 1);
+    const bool osSavesYmm = (info[2] & (1 << 27)) != 0 && (_xgetbv(0) & 6) == 6; // OSXSAVE, and XMM and YMM state saved
+    __cpuidex(info, 7, 0);
+    return osSavesYmm && (info[1] & (1 << 5)) != 0;
+#else
+    return __builtin_cpu_supports("avx2");
+#endif
+}
+
+NAMEBREAK_TARGET_AVX2 inline void mpqStep8(__m256i& seed1, __m256i& seed2, __m256i key, __m256i ord) {
+    seed1 = _mm256_xor_si256(key, _mm256_add_epi32(seed1, seed2));
+    seed2 = _mm256_add_epi32(_mm256_add_epi32(ord, seed1),
+                             _mm256_add_epi32(_mm256_add_epi32(seed2, _mm256_slli_epi32(seed2, 5)), _mm256_set1_epi32(3)));
+}
+
+// hashSurvivors, the eight lanes at once.
+NAMEBREAK_TARGET_AVX2 void hashSurvivorsAvx2(const BatchContext& ctx, int batch, Survivors& waiting, ThreadHits& found) {
+    const __m256i k = _mm256_load_si256((const __m256i*) waiting.k);
+    __m256i a = _mm256_load_si256((const __m256i*) waiting.s1);
+    __m256i b = _mm256_load_si256((const __m256i*) waiting.s2);
+    mpqStep8(a, b, _mm256_i32gather_epi32((const int*) ctx.key, k, 4), _mm256_i32gather_epi32((const int*) ctx.ord, k, 4));
+    for (int j = 0; j < ctx.suffixLen; ++j)
+        mpqStep8(a, b, _mm256_set1_epi32((int) ctx.suffixKey[j]), _mm256_set1_epi32((int) ctx.suffixOrd[j]));
+    const __m256i matchMask = _mm256_set1_epi32((int) kHashAMatchMask);
+    const __m256i equal = _mm256_cmpeq_epi32(_mm256_and_si256(a, matchMask), _mm256_set1_epi32((int) (ctx.targetA & kHashAMatchMask)));
+    unsigned hits = (unsigned) _mm256_movemask_ps(_mm256_castsi256_ps(equal)) & ((1u << waiting.count) - 1);
+    while (hits != 0) {
+        record(found, batch, waiting.trailingIndex[lowestBit(hits)]);
+        hits &= hits - 1;
+    }
+    waiting.count = 0;
+}
+
+// hashRows, always all eight lanes at once (the key and ord arrays go on
+// past the alphabet for it).
+NAMEBREAK_TARGET_AVX2 void hashRowsAvx2(const BatchContext& ctx, uint32_t p1, uint32_t p2, int d, uint32_t* s1, uint32_t* s2, uint64_t* entry) {
+    const std::string& after = (*ctx.inserted)[ctx.prefixDigits];
+    const std::vector<uint32_t>& afterKey = (*ctx.insertedKey)[ctx.prefixDigits];
+    __m256i a = _mm256_set1_epi32((int) p1), b = _mm256_set1_epi32((int) p2);
+    mpqStep8(a, b, _mm256_loadu_si256((const __m256i*) (ctx.key + d)), _mm256_loadu_si256((const __m256i*) (ctx.ord + d)));
+    for (size_t c = 0; c < after.size(); ++c)
+        mpqStep8(a, b, _mm256_set1_epi32((int) afterKey[c]), _mm256_set1_epi32((unsigned char) after[c]));
+    // lowBitsFilterIndex(a, b)
+    const __m256i stateMask = _mm256_set1_epi32((int) lowBitsFilterStateMask());
+    const __m256i index = _mm256_or_si256(_mm256_and_si256(a, stateMask), _mm256_slli_epi32(_mm256_and_si256(b, stateMask), kLowBitsFilterBits));
+    _mm256_storeu_si256((__m256i*) entry, _mm256_i32gather_epi64((const long long*) ctx.table, _mm256_castsi256_si128(index), 8));
+    _mm256_storeu_si256((__m256i*) (entry + 4), _mm256_i32gather_epi64((const long long*) ctx.table, _mm256_extracti128_si256(index, 1), 8));
+    _mm256_storeu_si256((__m256i*) s1, a);
+    _mm256_storeu_si256((__m256i*) s2, b);
+}
+#endif
+
 // Searches rows [from, to) of batch `batch` (0 = its first row). A row's shared characters are hashed
 // incrementally, like IncrementalPrefixHasher does for the leading part:
 // consecutive rows differ in their last shared character almost every time,
-// so moving to the next row costs about one hash step, not prefixDigits.
-// Then, as the GPU kernels do, one lookup in this search's filter table
-// gives the set of last characters whose hashA has the target's low bits -
-// always including any that matches the target (README.md's "The lookup
-// filter" has why) - and only those are hashed in full: about
+// and those that differ only in that one - a run of up to alphabetSize rows -
+// all go on from the same state, so the next run costs about one hash step,
+// not prefixDigits. A run's rows are hashed eight at a time (hashRows, or
+// with AVX2 hashRowsAvx2), and as the GPU kernels do, each one's lookup in
+// this search's filter table gives the set of last characters whose hashA
+// has the target's low bits - always including any that matches the target
+// (README.md's "The lookup filter" has why) - and only those are hashed in
+// full, eight at a time (hashSurvivors/hashSurvivorsAvx2): about
 // alphabetSize / 2^kLowBitsFilterBits of a row's candidates.
 void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, ThreadHits& found) {
     const int as = ctx.alphabetSize;
@@ -121,8 +243,8 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
     // first d of them - a row is searched only if none of its characters
     // breaks a rule (valid[prefixDigits]), nor the text inserted between
     // them, and its last character could still make up the backslashes the
-    // rules ask for (rowValid). Text inserted before shared character d is
-    // taken in with it, and the text after the last one in rowS1/rowS2.
+    // rules ask for (rowOk below). Text inserted before shared character d
+    // is taken in with it.
     const bool pruning = ctx.rules->any();
     std::vector<PruneState> pruneState(ctx.prefixDigits + 1);
     std::vector<char> valid(ctx.prefixDigits + 1, 1);
@@ -136,8 +258,6 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
                 ok = ok && pruneStep_CPU(*ctx.rules, prune, inserted[at][i]);
         }
     };
-    uint32_t rowS1 = 0, rowS2 = 0;
-    bool rowValid = true;
     auto rehashFrom = [&](int d) {
         for (; d < ctx.prefixDigits; ++d) {
             state1[d + 1] = state1[d];
@@ -149,50 +269,108 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
             if (pruning)
                 valid[d + 1] = valid[d + 1] && pruneStep_CPU(*ctx.rules, pruneState[d + 1], ctx.alphabet[digit[d]]);
         }
-        rowS1 = state1[ctx.prefixDigits];
-        rowS2 = state2[ctx.prefixDigits];
-        PruneState rowPrune = pruneState[ctx.prefixDigits];
-        char ok = valid[ctx.prefixDigits];
-        stepInserted(ctx.prefixDigits, rowS1, rowS2, rowPrune, ok);
-        rowValid = ok && canReachMinBackslashes_CPU(*ctx.rules, rowPrune, ctx.lastCapacity);
     };
     rehashFrom(0);
 
     const uint64_t alphabetMask = (uint64_t(1) << as) - 1; // as is at most 63
-    for (uint64_t i = from; i < to; ++i) {
-        const uint64_t row = ctx.rows.firstRow + i;
-        const uint32_t s1 = rowS1;
-        const uint32_t s2 = rowS2;
-
-        // Bit k: the candidate with last character k is worth hashing.
-        // Restricted to the alphabet - which the table never exceeds anyway,
-        // but a stray bit must not index past key/ord - and to the batch's
-        // range in its first and last row. None, in a pruned row.
-        uint64_t mask = rowValid ? ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask : 0;
-        if (i == 0)
-            mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;       // firstRowStartK is in [0, as)
-        if (i == ctx.rows.rowCount - 1)
-            mask &= (uint64_t(1) << ctx.rows.lastRowEndK) - 1;     // lastRowEndK is in [1, as]
-        while (mask != 0) {
-            const int k = lowestBit(mask);
-            mask &= mask - 1;
-            uint32_t a = s1, b = s2;
-            mpqStep(a, b, ctx.key[k], ctx.ord[k]);
-            for (int j = 0; j < ctx.suffixLen; ++j)
-                mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);
-            if (hashAMatches(a, ctx.targetA))
-                record(found, batch, row * as + k);
+    const std::string& after = inserted[ctx.prefixDigits];
+    Survivors waiting;
+    auto flush = [&] {
+#if NAMEBREAK_CPU_SIMD
+        if (ctx.avx2)
+            return hashSurvivorsAvx2(ctx, batch, waiting, found);
+#endif
+        hashSurvivors(ctx, batch, waiting, found);
+    };
+    alignas(32) uint32_t s1[8], s2[8];
+    alignas(32) uint64_t entry[8];
+    for (uint64_t i = from; i < to;) {
+        // The run: rows i, i + 1, ... up to the alphabet's end, which go on
+        // from (p1, p2) with last shared character d0, d0 + 1, ... - or with
+        // no shared characters, the batch's only row.
+        const int last = ctx.prefixDigits - 1;
+        const int d0 = last < 0 ? 0 : digit[last];
+        const int n = last < 0 ? 1 : (int) std::min<uint64_t>(to - i, (uint64_t) (as - d0));
+        uint32_t p1 = state1[std::max(last, 0)], p2 = state2[std::max(last, 0)];
+        PruneState parentPrune = pruneState[std::max(last, 0)];
+        char parentOk = valid[std::max(last, 0)];
+        if (last >= 0)
+            stepInserted(last, p1, p2, parentPrune, parentOk);
+        // Bit j: row i + j isn't pruned - neither its last shared character
+        // nor the text inserted after it breaks a rule, and its last
+        // character could still make up the backslashes.
+        uint64_t rowOk = 0;
+        if (!pruning) {
+            rowOk = canReachMinBackslashes_CPU(*ctx.rules, parentPrune, ctx.lastCapacity) ? ~uint64_t(0) : 0;
+        } else {
+            for (int j = 0; j < n; ++j) {
+                PruneState prune = parentPrune;
+                bool ok = parentOk && (last < 0 || pruneStep_CPU(*ctx.rules, prune, ctx.alphabet[d0 + j]));
+                for (size_t c = 0; ok && c < after.size(); ++c)
+                    ok = pruneStep_CPU(*ctx.rules, prune, after[c]);
+                if (ok && canReachMinBackslashes_CPU(*ctx.rules, prune, ctx.lastCapacity))
+                    rowOk |= uint64_t(1) << j;
+            }
         }
 
-        // Next row: increment the shared characters like an odometer, and
-        // rehash from the first one that changed.
-        int p = ctx.prefixDigits - 1;
+        for (int j = 0; j < n; j += 8) {
+            const int lanes = std::min(8, n - j);
+            if (last < 0) {
+                // Nothing shared: the row's state is the start's and the text inserted after it.
+                s1[0] = p1;
+                s2[0] = p2;
+                for (size_t c = 0; c < after.size(); ++c)
+                    mpqStep(s1[0], s2[0], insertedKey[0][c], (unsigned char) after[c]);
+                entry[0] = ctx.table[lowBitsFilterIndex(s1[0], s2[0])];
+            } else {
+#if NAMEBREAK_CPU_SIMD
+                if (ctx.avx2)
+                    hashRowsAvx2(ctx, p1, p2, d0 + j, s1, s2, entry);
+                else
+#endif
+                    hashRows(ctx, p1, p2, d0 + j, lanes, s1, s2, entry);
+            }
+            for (int l = 0; l < lanes; ++l) {
+                const uint64_t row = i + j + l;
+                // Bit k: the candidate with last character k is worth
+                // hashing. Restricted to the alphabet - which the table
+                // never exceeds anyway, but a stray bit must not index past
+                // key/ord - and to the batch's range in its first and last
+                // row. None, in a pruned row.
+                uint64_t mask = (rowOk >> (j + l)) & 1 ? entry[l] & alphabetMask : 0;
+                if (row == 0)
+                    mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;   // firstRowStartK is in [0, as)
+                if (row == ctx.rows.rowCount - 1)
+                    mask &= (uint64_t(1) << ctx.rows.lastRowEndK) - 1; // lastRowEndK is in [1, as]
+                const uint64_t first = (ctx.rows.firstRow + row) * as;
+                while (mask != 0) {
+                    const int k = lowestBit(mask);
+                    mask &= mask - 1;
+                    waiting.s1[waiting.count] = s1[l];
+                    waiting.s2[waiting.count] = s2[l];
+                    waiting.k[waiting.count] = k;
+                    waiting.trailingIndex[waiting.count] = first + k;
+                    if (++waiting.count == 8)
+                        flush();
+                }
+            }
+        }
+        i += n;
+        if (i == to || last < 0)
+            break;
+
+        // Next run: increment the shared characters like an odometer, from
+        // the run's last row, and rehash from the first one that changed.
+        digit[last] = as - 1;
+        int p = last;
         while (p >= 0 && ++digit[p] == as) {
             digit[p] = 0;
             --p;
         }
         rehashFrom(p < 0 ? 0 : p);
     }
+    if (waiting.count > 0)
+        flush();
 }
 
 // A search must not start with a filter table that is wrong: it could drop a
@@ -205,7 +383,11 @@ void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, 
 
 class CpuBackend : public SearchBackend {
 public:
-    explicit CpuBackend(int threads) : threadCount_(threads > 0 ? (unsigned) threads : std::max(1u, std::thread::hardware_concurrency())) {}
+    explicit CpuBackend(int threads) : threadCount_(threads > 0 ? (unsigned) threads : std::max(1u, std::thread::hardware_concurrency())) {
+#if NAMEBREAK_CPU_SIMD
+        avx2_ = cpuHasAvx2();
+#endif
+    }
 
     const char* name() const override { return "cpu"; }
     int windowChars() const override { return windowCharsOr(5); }
@@ -288,8 +470,9 @@ private:
     PruneRules rules_;
     std::vector<TrailingInsertion> insertions_;
     std::vector<uint32_t> cryptTable_;
-    uint32_t key_[MAX_ALPHABET_SIZE] = {};
-    uint32_t ord_[MAX_ALPHABET_SIZE] = {};
+    bool avx2_ = false;
+    uint32_t key_[MAX_ALPHABET_SIZE + 8] = {}; // 8 zeros past the alphabet, for hashRowsAvx2's loads
+    uint32_t ord_[MAX_ALPHABET_SIZE + 8] = {};
     std::vector<uint64_t> table_;
     std::vector<uint32_t> suffixKey_;
     std::vector<uint32_t> suffixOrd_;
@@ -333,6 +516,7 @@ BatchOutcome CpuBackend::runBatches(int trailingLen, const std::vector<BatchRequ
         ctx.inserted = &inserted;
         ctx.insertedKey = &insertedKey;
         ctx.lastCapacity = lastCapacity;
+        ctx.avx2 = avx2_;
         totalRows += ctx.rows.rowCount;
         totalCount += requests[b].count;
     }

@@ -50,9 +50,25 @@ will have grown (not measured again).
   table (the prototype found 8-9 bits best on the CPU, but every width from
   6 to 10 within a few tens of percent). The mutation script now has a
   `cpu` list too.
-  - [ ] **Later**: the row states computed eight at a time with AVX2, and
-    their table entries gathered; a table width of its own, if 8 or 9 bits
-    still measure better here.
+  - [x] **Runs of rows, eight at a time.** The rows that differ only in
+    their last shared character - a run of up to alphabetSize - go on from
+    the same state, so the run loop takes that state once and hashes its
+    rows eight at a time, then looks them up; the candidates the filter
+    lets through are queued and hashed eight at a time, apart from the
+    branchy walk over the masks. On an x86-64 CPU with AVX2 (checked at run
+    time, compiled for it whatever the build's flags) both are done with
+    AVX2 - the eight states, the table entries gathered, the eight queued
+    candidates; elsewhere in plain loops (-DNAMEBREAK_CPU_SIMD=0 forces
+    them, as stress-cpu-plain and the mutation script's stress-plain do).
+    **Measured** (`search_bench --backend cpu --scale 5`, i9-12900H, 20
+    threads, alternating): 59-74 G candidates/s with AVX2 against 27-34
+    before, about **2.15 times** as fast, with or without pruning; with the
+    plain loops 56-60, so most of it is the restructuring and AVX2 adds
+    5-12% to that (none with `--whole`). Other shapes, AVX2 against before:
+    `--size 26` 40 against 17, `--insert-from-end X,1` 59 against 14,
+    `--suffix .MPQ` 64 against 29, `--whole` 49 against 26.
+  - [ ] **Later**: a table width of its own, if 8 or 9 bits still measure
+    better here.
 - [x] **OpenCL.** `filteredRowsKernel` ported to `search.cl`, with the table
   in a global buffer and the same checks as the CUDA backend (a sample of
   the table checked, and read back, before every search). **Measured** 5.3

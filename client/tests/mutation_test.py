@@ -37,7 +37,9 @@ and only this one searches with many - where what one launch leaves behind
 can break the next. A mutation there is expected to be caught by those
 alone; and the engine's mutations can't be caught by the self-test, which
 tests a backend without the engine. Each mutation names the checks that must
-catch it (the first three, by default).
+catch it (the first three, by default). A backend can have checks of its
+own (EXTRA_CHECKS): the cpu backend's "stress-plain" is the stress test with
+its plain row walk, which the others don't run on a CPU with AVX2.
 
 In the copies, createBackend's own self-test is switched off, so that the
 integration and stress tests are judged by themselves; the self-test is run
@@ -1056,23 +1058,23 @@ METAL_MUTATIONS = [
 CPU_MUTATIONS = [
     # The lookup filter's mask.
     Mutation("mask32", "a row's mask cut to 32 bits",
-             [(CPU, "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask : 0;", "ctx.table[lowBitsFilterIndex(s1, s2)] & alphabetMask & 0xFFFFFFFFull : 0;")]),
+             [(CPU, "entry[l] & alphabetMask : 0;", "entry[l] & alphabetMask & 0xFFFFFFFFull : 0;")]),
     Mutation("swapseeds", "seed1 and seed2 swapped in the table lookup",
-             [(CPU, "ctx.table[lowBitsFilterIndex(s1, s2)]", "ctx.table[lowBitsFilterIndex(s2, s1)]")]),
+             [(CPU, "_mm256_or_si256(_mm256_and_si256(a, stateMask), _mm256_slli_epi32(_mm256_and_si256(b, stateMask), kLowBitsFilterBits))",
+               "_mm256_or_si256(_mm256_and_si256(b, stateMask), _mm256_slli_epi32(_mm256_and_si256(a, stateMask), kLowBitsFilterBits))")]),
     Mutation("lastrow", "a batch's last row one candidate short",
              [(CPU, "mask &= (uint64_t(1) << ctx.rows.lastRowEndK) - 1;", "mask &= (uint64_t(1) << (ctx.rows.lastRowEndK - 1)) - 1;")]),
     Mutation("firstrow", "a batch's first row one candidate short",
              [(CPU, "mask &= ~uint64_t(0) << ctx.rows.firstRowStartK;", "mask &= ~uint64_t(0) << (ctx.rows.firstRowStartK + 1);")]),
     Mutation("noedges", "where the range starts and ends mid-row ignored",
-             [(CPU, "if (i == 0)\n            mask &=", "if (false)\n            mask &="),
-              (CPU, "if (i == ctx.rows.rowCount - 1)\n            mask &=", "if (false)\n            mask &=")]),
+             [(CPU, "if (row == 0)\n                    mask &=", "if (false)\n                    mask &="),
+              (CPU, "if (row == ctx.rows.rowCount - 1)\n                    mask &=", "if (false)\n                    mask &=")]),
     Mutation("skiplast", "the loop over a row's flagged candidates stops one early",
              [(CPU, "while (mask != 0) {", "while ((mask & (mask - 1)) != 0) {")]),
     Mutation("highestbit", "a row's highest flagged bit taken for its lowest",
              [(CPU, "return __builtin_ctzll(mask);", "return 63 - __builtin_clzll(mask);")]),
     Mutation("suffixshort", "the suffix hashed one character short",
-             [(CPU, "for (int j = 0; j < ctx.suffixLen; ++j)\n                mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);",
-               "for (int j = 0; j + 1 < ctx.suffixLen; ++j)\n                mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);")]),
+             [(CPU, "for (int j = 0; j < ctx.suffixLen; ++j)\n        mpqStep8(a, b,", "for (int j = 0; j + 1 < ctx.suffixLen; ++j)\n        mpqStep8(a, b,")]),
     WRONG_TARGET,
     # The row walk.
     Mutation("odometer", "a row's shared characters wrapping one early",
@@ -1081,6 +1083,8 @@ CPU_MUTATIONS = [
              [(CPU, "rehashFrom(p < 0 ? 0 : p);", "rehashFrom(p < 0 ? 0 : p + 1);")]),
     Mutation("startrow", "a work item's first row decoded one off",
              [(CPU, "uint64_t rowValue = ctx.rows.firstRow + from;", "uint64_t rowValue = ctx.rows.firstRow + from + 1;")]),
+    Mutation("runshort", "a run of rows stopping one short of the alphabet's end",
+             [(CPU, "(int) std::min<uint64_t>(to - i, (uint64_t) (as - d0));", "(int) std::min<uint64_t>(to - i, (uint64_t) (as - d0 - 1));")]),
     # Sharing the rows out, and the batches.
     Mutation("itemgap", "a row skipped between two work items",
              [(CPU, "from < contexts[b].rows.rowCount; from += rowsPerItem)", "from < contexts[b].rows.rowCount; from += rowsPerItem + 1)")]),
@@ -1088,7 +1092,7 @@ CPU_MUTATIONS = [
              [(CPU, "    for (int b = 0; b < batchCount; ++b) {\n        for (uint64_t from = 0;",
                "    for (int b = 0; b < std::max(1, batchCount - 1); ++b) {\n        for (uint64_t from = 0;")]),
     Mutation("hitbatch", "every hit recorded as the call's first batch's",
-             [(CPU, "record(found, batch, row * as + k);", "record(found, 0, row * as + k);")]),
+             [(CPU, "record(found, batch, waiting.trailingIndex[lowestBit(hits)]);", "record(found, 0, waiting.trailingIndex[lowestBit(hits)]);")]),
     Mutation("verifybatch", "every hit checked with the call's first batch's prefix",
              [(CPU, "requests[mine.batches[i]].params", "requests[0].params")]),
     # Only the overflow test has more hits in a call than can be recorded.
@@ -1100,15 +1104,37 @@ CPU_MUTATIONS = [
              edits=[(CPU, "(totalRows + threads * 8 - 1) / (threads * 8)", "(totalRows + threads * 2 - 1) / (threads * 2)")]),
     Mutation("onethread", "every call searched on one thread", expect="harmless",
              edits=[(CPU, "    threads = std::min<uint64_t>(threads, totalRows);", "    threads = 1;")]),
+    # Nor which of the two row walks searches.
+    Mutation("noavx2", "the plain row walk, even with AVX2", expect="harmless",
+             edits=[(CPU, "avx2_ = cpuHasAvx2();", "avx2_ = false;")]),
     # Pruning the whole candidate: which rows the row walk searches.
     Mutation("cpunoprune", "every row searched, with the whole candidate pruned",
-             [(CPU, "uint64_t mask = rowValid ? ctx.table", "uint64_t mask = true ? ctx.table")]),
+             [(CPU, "if (ok && canReachMinBackslashes_CPU(*ctx.rules, prune, ctx.lastCapacity))", "if (true)")]),
     Mutation("cpuentry", "the rules started as if there were no leading characters",
              [(CPU, "pruneState[0] = ctx.pruneEntry;", "pruneState[0] = PruneState();")]),
     Mutation("cpucarry", "a row's characters checked each on their own, not after those before them",
              [(CPU, "valid[d + 1] = valid[d + 1] && pruneStep_CPU(", "valid[d + 1] = pruneStep_CPU(")]),
+    Mutation("cpulastcarry", "a row's last shared character checked on its own, not after those before it",
+             [(CPU, "bool ok = parentOk && (last < 0 ||", "bool ok = (last < 0 ||")]),
     Mutation("cpurowinsert", "the text inserted after a row's own character not hashed",
-             [(CPU, "        stepInserted(ctx.prefixDigits, rowS1, rowS2, rowPrune, ok);\n", "")]),
+             [(CPU, "    for (size_t c = 0; c < after.size(); ++c)\n        mpqStep8(a, b, _mm256_set1_epi32((int) afterKey[c]), _mm256_set1_epi32((unsigned char) after[c]));\n", "")]),
+    Mutation("cpurowinsertrule", "the text inserted after a row's own character not checked",
+             [(CPU, "                for (size_t c = 0; ok && c < after.size(); ++c)\n                    ok = pruneStep_CPU(*ctx.rules, prune, after[c]);\n", "")]),
+    # The plain row walk, for a CPU without AVX2 - only the cpu backend's
+    # own check of it, stress-plain (EXTRA_CHECKS), runs it.
+    Mutation("swapseedsplain", "seed1 and seed2 swapped in the plain row walk's table lookup",
+             [(CPU, "entry[l] = ctx.table[lowBitsFilterIndex(a, b)];", "entry[l] = ctx.table[lowBitsFilterIndex(b, a)];")],
+             caught_by=("stress-plain",)),
+    Mutation("suffixplain", "the suffix hashed one character short in the plain row walk",
+             [(CPU, "for (int j = 0; j < ctx.suffixLen; ++j)\n            mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);",
+               "for (int j = 0; j + 1 < ctx.suffixLen; ++j)\n            mpqStep(a, b, ctx.suffixKey[j], ctx.suffixOrd[j]);")],
+             caught_by=("stress-plain",)),
+    Mutation("insertplain", "the text inserted after a row's own character not hashed in the plain row walk",
+             [(CPU, "        for (size_t c = 0; c < after.size(); ++c)\n            mpqStep(a, b, afterKey[c], (unsigned char) after[c]);\n", "")],
+             caught_by=("stress-plain",)),
+    Mutation("hitbatchplain", "every hit of the plain row walk recorded as the call's first batch's",
+             [(CPU, "record(found, batch, waiting.trailingIndex[l]);", "record(found, 0, waiting.trailingIndex[l]);")],
+             caught_by=("stress-plain",)),
     # A dictionary search's words shared out among the threads.
     Mutation("dictitemend", "every work item's last word skipped",
              [(CPU, "const uint32_t to = (uint32_t) std::min<uint64_t>(batch.wordCount, from + wordsPerItem);",
@@ -1151,6 +1177,12 @@ BACKENDS = {
     "opencl": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=ON"], OPENCL_MUTATIONS),
     "metal": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=OFF", "-DNAMEBREAK_METAL=ON"], METAL_MUTATIONS),
     "cpu": (["-DNAMEBREAK_GPU=none", "-DNAMEBREAK_OPENCL=OFF"], CPU_MUTATIONS),
+}
+
+# Checks a backend has besides CHECKS - run, as those are, on every copy.
+EXTRA_CHECKS = {
+    # The cpu backend's plain row walk (see search_stress_test_plain in CMakeLists.txt).
+    "cpu": [("stress-plain", "search_stress_test_plain")],
 }
 
 CONTROL = Mutation("none", "the code as it is", [], expect="harmless")
@@ -1397,6 +1429,9 @@ def main():
     args = parser.parse_args()
 
     mutations = BACKENDS[args.backend][1]
+    global CHECKS, TARGETS
+    CHECKS = CHECKS + EXTRA_CHECKS.get(args.backend, [])
+    TARGETS = TARGETS + [executable for _, executable in EXTRA_CHECKS.get(args.backend, [])]
     if args.list:
         for m in mutations:
             print(f"{m.name:<15} {m.expect:<9} {m.what}")

@@ -722,6 +722,12 @@ if(ROW_BACKENDS AND NAMEBREAK_TEST_VARIANTS)
             namebreak_test(stress-${backend}-${variant} search_stress_test_${variant} --backend ${backend})
         endforeach()
     endforeach()
+    # The cpu backend's plain row walk, which it uses where there's no AVX2
+    # (NAMEBREAK_CPU_SIMD, see cpu_backend.cpp) - and so not on most of the
+    # machines the tests run on.
+    namebreak_search_library(namebreak_search_stress_plain ${STRESS_DEFINITIONS} NAMEBREAK_CPU_SIMD=0)
+    namebreak_test_executable(search_stress_test_plain tests/search_stress_test.cpp namebreak_search_stress_plain)
+    namebreak_test(stress-cpu-plain search_stress_test_plain --backend cpu)
 endif()
 
 # Benchmarks - not tests, run with `cmake --build --preset default --target
