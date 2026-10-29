@@ -17,7 +17,7 @@
 // for: the directory is whatever string takes the hash from the prefix's
 // state to it.
 // (A meeting point is recovered from two files of the same unknown directory
-// whose basenames are known - see README.md's "Meet-in-the-middle mode".)
+// whose basenames are known - see docs/meet-in-the-middle.md.)
 //
 // Knowing the state at both ends is what makes the mode worth having,
 // because every step of the hash

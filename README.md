@@ -13,7 +13,7 @@ means finding a candidate string that hashes to both target values - that's
 what the programs here do, by trying every combination of characters in a
 given alphabet.
 
-A progress dashboard for distibuted searching is available
+A progress dashboard for distributed searching is available
 [here](https://namebreak-coordinator.fly.dev/).
 
 ## What is namebreaking?
@@ -66,10 +66,12 @@ For more background, see Ladislav Zezula's
 
 ## Getting started
 
-Most work happens in [`client/`](client/README.md) (see
-its README for configuring and compiling the client) and, for a distributed
-search across multiple machines, [`coordinator/`](coordinator/README.md)
-(see its README for running the server and pointing clients at it).
+Most work happens in [`client/`](client/README.md) (see its README for
+running the client, and its [`docs/`](client/docs/) for configuring,
+building and how it works) and, for a distributed search across multiple
+machines, [`coordinator/`](coordinator/README.md) (see its README for
+running the server and pointing clients at it, and its
+[`docs/`](coordinator/docs/) for managing targets and how it works).
 
 ## Name
 

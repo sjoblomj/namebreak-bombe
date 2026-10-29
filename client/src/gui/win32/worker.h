@@ -41,7 +41,7 @@ struct SearchStatus {
     // fixed order (candidate.h's stringToIndex), so the most recent Hash-A-
     // only match's position in that order is a true measure of how far a
     // search has gotten - the same signal the coordinator server itself
-    // already uses for stall detection (see coordinator/README.md). When
+    // already uses for stall detection (see coordinator/docs/how-it-works.md). When
     // empty, the UI shows the indeterminate marquee style instead.
     std::string alphabet;
     std::string prefix;

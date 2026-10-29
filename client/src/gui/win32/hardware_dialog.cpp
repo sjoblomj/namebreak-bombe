@@ -61,7 +61,7 @@ constexpr LONG_PTR kDefaultMarker = 0x4E424446;
 constexpr LONG_PTR kChangedMarker = 0x4E424443;
 constexpr LONG_PTR kHelpMarker = 0x4E42484C;
 
-// What each launch setting is, for its "?" - README.md says more.
+// What each launch setting is, for its "?" - docs/hardware.md says more.
 std::string settingHelp(const GpuTuningKey& key, int defaultValue) {
     const std::string name = key.name;
     std::string what;

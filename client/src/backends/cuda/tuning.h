@@ -11,7 +11,7 @@
 // value per group of GPU launches). Overridable at compile time
 // (-DNAMEBREAK_GPU_WINDOW_CHARS=N) so tests can force a different leading/
 // trailing split and benchmarks can re-sweep it. See runSearch (search.cpp)
-// and README.md's "Design decisions" for what it trades off.
+// and docs/design.md for what it trades off.
 #ifndef NAMEBREAK_GPU_WINDOW_CHARS
 #if defined(__APPLE__)
 #define NAMEBREAK_GPU_WINDOW_CHARS 6

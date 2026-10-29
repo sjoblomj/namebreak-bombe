@@ -2,8 +2,8 @@
 //! *directory* and a known suffix, where the MPQ hash state right after the
 //! directory - the *meeting point* - is already known, for hashA and for
 //! hashB.
-//! It's the client's meet-in-the-middle mode (see the client README's
-//! "Meet-in-the-middle mode"), shared out.
+//! It's the client's meet-in-the-middle mode (see the client's
+//! docs/meet-in-the-middle.md), shared out.
 //!
 //! The client searches such a directory from both ends at once: forward from
 //! the prefix into a table of every directory of the first `table_length`
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn table_bytes_match_the_clients() {
-        // The same figures as the client README's "Meet-in-the-middle mode"
+        // The same figures as the client's docs/meet-in-the-middle.md
         // table, and its meet_in_the_middle_test's - keys plus the filter in
         // front of them.
         assert_eq!(REAL.chars().count(), 43);

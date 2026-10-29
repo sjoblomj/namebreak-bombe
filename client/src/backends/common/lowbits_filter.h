@@ -11,8 +11,8 @@
 
 // The lookup filter a row-based backend can use to hash only the few
 // candidates of a row that could possibly match, instead of all of them (see
-// the terminology in row_batch.h for rows, and README.md's "The lookup
-// filter" for the whole argument).
+// the terminology in row_batch.h for rows, and docs/lookup-filter.md
+// for the whole argument).
 //
 // Every step of the MPQ hash,
 //     seed1 = key[ch] ^ (seed1 + seed2)

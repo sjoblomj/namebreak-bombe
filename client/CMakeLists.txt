@@ -4,11 +4,11 @@
 #   cmake --build --preset default    # build/namebreak, and the tests
 #   ctest --preset default            # run the tests
 #
-# See README.md's "Compiling" for the options below.
+# See docs/building.md for the options below.
 cmake_minimum_required(VERSION 3.24)
 project(namebreak LANGUAGES CXX)
 
-# Which GPU backends to build (see src/backends/ and README.md's "Backends").
+# Which GPU backends to build (see src/backends/ and docs/backends.md).
 # The CPU backends are in every build.
 #   NAMEBREAK_GPU  `cuda` (the default - needs the CUDA Toolkit), `hip` (AMD
 #                  GPUs - the same code compiled with ROCm's HIP), or `none`

@@ -15,8 +15,8 @@
 
 // CPU-side pruning, applied to the *leading* characters of a candidate
 // (runSearch's leadingIdx loop, cuda_backend.cu) - the GPU-brute-forced trailing
-// characters are never checked at all. See README.md's "Design decisions"
-// section for why.
+// characters are never checked at all. See docs/pruning.md
+// for why.
 //
 // Take string_view rather than a string - a caller with just a substring to
 // check (e.g. a candidate's leading portion) shouldn't have to allocate one

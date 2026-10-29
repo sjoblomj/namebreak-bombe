@@ -451,7 +451,7 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
 // launched (see the leadingIdx loop in runSearch), and when a search prunes
 // the whole candidate, the host works out which row groups and rows survive
 // (RowPruning, backends/common/row_pruning.h) - the kernel only walks its
-// batch's list of them. See README.md's "Design decisions" section for why.
+// batch's list of them. See docs/pruning.md for why.
 //
 // A launch searches up to kMaxBatchesPerLaunch batches - usually each a whole
 // leading value's trailing space, with its own seeds - one per blockIdx.y
@@ -466,8 +466,8 @@ __device__ __forceinline__ void searchChunk(uint32_t group, uint64_t rowMask, ui
 // table (bufs.filterTable, see backends/common/lowbits_filter.h) gives the set
 // of last characters whose hashA has the target's low bits - on average
 // alphabetSize / 2^kCudaLowBitsFilterBits of them, and always including any
-// candidate that matches the target. Only those are hashed in full. README.md's
-// "The lookup filter" has why the lookup can never leave a match out.
+// candidate that matches the target. Only those are hashed in full. docs/lookup-filter.md
+// has why the lookup can never leave a match out.
 //
 // A hashA hit only records its row, last character and batch (BatchResults): the
 // host builds the filename and checks it - hashA again, from scratch, and

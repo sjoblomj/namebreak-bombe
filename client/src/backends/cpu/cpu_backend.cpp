@@ -222,7 +222,7 @@ NAMEBREAK_TARGET_AVX2 void hashRowsAvx2(const BatchContext& ctx, uint32_t p1, ui
 // with AVX2 hashRowsAvx2), and as the GPU kernels do, each one's lookup in
 // this search's filter table gives the set of last characters whose hashA
 // has the target's low bits - always including any that matches the target
-// (README.md's "The lookup filter" has why) - and only those are hashed in
+// (docs/lookup-filter.md has why) - and only those are hashed in
 // full, eight at a time (hashSurvivors/hashSurvivorsAvx2): about
 // alphabetSize / 2^kLowBitsFilterBits of a row's candidates.
 void searchRows(const BatchContext& ctx, int batch, uint64_t from, uint64_t to, ThreadHits& found) {

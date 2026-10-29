@@ -241,9 +241,9 @@ void printMissingConfigHelp(const std::string& configPath) {
             "    server_url = %s\n"
             "\n"
             "To search on your own instead (mode = bounded or continuous), see the [search]\n"
-            "settings in README.md's \"Configuring\" section, and for mode = dictionary or\n"
-            "mode = meet-in-the-middle its \"Dictionary mode\" and \"Meet-in-the-middle\n"
-            "mode\" sections.\n",
+            "settings in docs/configuration.md, and for mode = dictionary or\n"
+            "mode = meet-in-the-middle docs/dictionary-mode.md and\n"
+            "docs/meet-in-the-middle.md.\n",
             (ec ? configPath : where.string()).c_str(), kDefaultConfigPath, kDefaultServerUrl);
 }
 

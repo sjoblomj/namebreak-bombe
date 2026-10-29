@@ -268,7 +268,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
     // small and fixed - NOT "as large as maxSafeIndexLen allows", which is
     // what this project used to do (and still needs to fall back toward for
     // very long candidates - see trailingLen's computation below). See
-    // README.md's "Design decisions" section for why.
+    // docs/design.md for why.
     const int windowChars = backend.windowChars();
 
     int maxLeadingLen = maxSafeIndexLen;
@@ -556,7 +556,7 @@ SearchResult runSearch(SearchBackend& backend, const SearchRequest& req, std::at
 
             // The pruning rules (req.pruneSymbolRuns and the rest) examine `leading` -
             // the CPU-computed first leadingLen characters of the candidate
-            // (see README.md's "Design decisions" section for why checking it
+            // (see docs/pruning.md for why checking it
             // here, instead of in the backend, is worth doing). A prune here
             // skips this leading value's entire trailing batch (up to
             // batchSize candidates) without spending anything in the

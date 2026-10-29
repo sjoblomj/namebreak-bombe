@@ -15,8 +15,8 @@
 // directory and a known suffix, where the hash state after the directory -
 // the meeting point - is already known, for hashA and for hashB. See
 // meet_in_the_middle.h for what that buys (the search comes at the directory
-// from both ends and meets in the middle) and README.md's "Meet-in-the-middle
-// mode" for how to run one.
+// from both ends and meets in the middle) and docs/meet-in-the-middle.md for how
+// to run one.
 //
 // The search goes through the directories in the order of its backward
 // walk's nodes (MeetInTheMiddleSpace): shortest tail first, and within a tail
@@ -32,8 +32,8 @@ struct MeetInTheMiddleRequest {
     std::string prefix;
     std::string suffix;
     // The hash state after prefix + the directory, for hashA and for hashB -
-    // recovered from other files of the same directory (see README.md's
-    // "Meet-in-the-middle mode"). Hashing `suffix` onto them must give the
+    // recovered from other files of the same directory (see
+    // docs/meet-in-the-middle.md). Hashing `suffix` onto them must give the
     // file's two hashes, or the search refuses to start.
     HashState meetingPointA{0, 0};
     HashState meetingPointB{0, 0};

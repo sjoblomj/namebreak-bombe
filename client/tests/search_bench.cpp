@@ -29,7 +29,7 @@
 //
 // --insert-from-start/--insert-from-end <text>,<position> insert text into
 // every candidate (SearchRequest::insertFromStart/insertFromEnd), to time
-// what it costs where it lands - see the README's "Inserted text".
+// what it costs where it lands - see docs/pruning.md's "Inserted text".
 //
 // --alphabet, --prefix and --suffix time another search's - a coordinator
 // target's, say (the dashboard shows them): how much the rules prune

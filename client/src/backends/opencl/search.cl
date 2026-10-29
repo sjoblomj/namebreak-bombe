@@ -30,7 +30,7 @@
 // share once, then one more for each row, and looks each row's state up in
 // this search's filter table, which gives the set of last characters whose
 // hashA has the target's low bits - always including any that matches the
-// target (README.md's "The lookup filter" has why) - and hashes only those,
+// target (docs/lookup-filter.md has why) - and hashes only those,
 // in full. It records the trailing index and batch of every hashA hit; the
 // host rebuilds and checks those.
 //

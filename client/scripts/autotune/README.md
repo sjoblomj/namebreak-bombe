@@ -167,6 +167,6 @@ to heat the GPU up, since a cool GPU searches faster until it's warm. The
 trials are then sized to take `--seconds` each.
 
 The GPU window is measured without pruning. In a real search a wider window
-leaves the CPU a little less to prune (see the client README's
-"`prune_symbol_runs`, ..." section), so a window that wins by only a few
+leaves the CPU a little less to prune (see the client's
+[Pruning and inserted text](../../docs/pruning.md)), so a window that wins by only a few
 percent here may come out even in practice.

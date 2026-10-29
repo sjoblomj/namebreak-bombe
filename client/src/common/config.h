@@ -88,7 +88,7 @@ bool buildSearchRequest(const ConfigFile& config, bool continuous, SearchRequest
 // is missing, a value doesn't parse, a word list can't be read, or - with
 // resume_from_last_candidate - the progress file is from a different search.
 //
-// Keys (see README.md's "Dictionary mode"):
+// Keys (see docs/dictionary-mode.md):
 //   builtin_dictionary  english-1 (the default) or none
 //   dictionaries        more word lists, a list of file paths
 //   min_words           default 1
@@ -117,7 +117,7 @@ bool buildDictionaryRequest(const ConfigFile& config, DictionaryRequest& out, st
 // is missing, a value doesn't parse, or - with resume_from_last_candidate -
 // the progress file is from a different search.
 //
-// Keys (see README.md's "Meet-in-the-middle mode"):
+// Keys (see docs/meet-in-the-middle.md):
 //   alphabet            required
 //   prefix              optional, default none
 //   suffix              required - what follows the unknown directory
@@ -171,7 +171,7 @@ bool buildMeetInTheMiddleRequest(const ConfigFile& config, MeetInTheMiddleReques
 //   gpu<N>.name         the GPU those are for: another GPU that has number
 //                       N now doesn't get them
 // Returns false with `error` set on a value out of range or an unknown key.
-// See README.md's "Choosing and tuning the hardware".
+// See docs/hardware.md.
 bool buildHardwareConfig(const ConfigFile& config, HardwareConfig& out, std::string& error);
 
 // A number of bytes, as [meet-in-the-middle]'s `table_memory` and

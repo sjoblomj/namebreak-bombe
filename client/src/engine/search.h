@@ -58,7 +58,7 @@ struct SearchRequest {
     // maxBackslashCount, minBackslashCount, pruneAdjacentBackslashes) look
     // only at a candidate's leading characters, which the engine enumerates
     // on the CPU. true: at every character but the last - the backend skips the rows of its trailing part that break one
-    // (see README.md's "Design decisions"). A candidate's last character is
+    // (see docs/pruning.md). A candidate's last character is
     // never checked: skipping one costs a GPU as much as searching it.
     bool pruneWholeCandidate = false;
     // false ("bounded"): stop once upperBound is exhausted at its own length.

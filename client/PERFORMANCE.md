@@ -1,8 +1,8 @@
 # Performance task list
 
 Speedups still open for the client, found while adding the lookup filter to
-the CUDA backend (see README.md's [The lookup
-filter](README.md#the-lookup-filter-most-candidates-are-never-hashed)), plus
+the CUDA backend (see [The lookup
+filter](docs/lookup-filter.md)), plus
 the safeguards that would make a missed match even less likely. Each item
 says what's known (**measured**, or **estimated** where it hasn't been
 tried) and what it would take.
@@ -132,8 +132,8 @@ will have grown (not measured again).
     incremental row decoding already, but its 25 rows per thread was tuned
     on an NVIDIA GPU. Many AMD GPUs run 64 threads in lockstep rather than
     32, with different occupancy limits, so the best
-    `NAMEBREAK_ROWS_PER_THREAD` may differ: re-sweep it (the README's kernel
-    section has the NVIDIA numbers to compare with).
+    `NAMEBREAK_ROWS_PER_THREAD` may differ: re-sweep it ([How a search
+    works](docs/design.md#how-the-gpu-kernel-is-structured) has the NVIDIA numbers to compare with).
 
 ## CUDA backend
 
@@ -141,7 +141,8 @@ will have grown (not measured again).
   alphabet's size, eight shared-memory loads, four hash steps - was about
   50 of the 150 instructions a row cost (SASS of `filteredRowsKernel<49, 4>`).
   Now a thread takes a chunk of about 25 consecutive rows of one row group
-  (`NAMEBREAK_ROWS_PER_THREAD`, see the README's kernel section): the
+  (`NAMEBREAK_ROWS_PER_THREAD`, see [How a search
+  works](docs/design.md#how-the-gpu-kernel-is-structured)): the
   group's characters are hashed once, and each row costs about 30
   instructions besides its verify loop. **Measured** +32% side by side
   (1,088-1,124 to 1,434-1,467 G candidates/s), +36% in a cooler sweep, where
@@ -530,7 +531,8 @@ will have grown (not measured again).
   characters leave (`backends/common/row_pruning.h`); the GPU kernels
   walk their batch's list, and a pruned row inside a surviving group gets
   no candidates - skipping it wouldn't save its lane anything, as the warp
-  steps through its rows together. See the README's "Design decisions".
+  steps through its rows together. See [Pruning and inserted
+  text](docs/pruning.md).
   **Measured** (`search_bench --scale 40`, alternating with the code before
   it): a real search projected **+10.8%** on CUDA (2,639 against 2,382 G
   candidates/s, five runs each) and **+9.8%** on OpenCL (2,265 against
@@ -622,7 +624,7 @@ will have grown (not measured again).
 
 ## Dictionary searches
 
-A dictionary search (README.md's [Dictionary mode](README.md#dictionary-mode))
+A dictionary search ([Dictionary mode](docs/dictionary-mode.md))
 hands the backend batches - a leading part's hash states, a run of the word
 list's words and the suffix - rather than rows. The GPU kernels
 (`dictionaryKernel` in `cuda_backend.cu`, `dictionary.cl`,
@@ -724,7 +726,7 @@ afternoon).
     12.58-12.62, as before it. At the GPU's own clocks (72-75 C): 21.9 G
     candidates/s with both, 28.2-28.5 with the basename alone, 28.7-29.2
     with hashA alone.
-- [x] **Tails** (`tails`, README.md's "Tails"): a word followed by each of
+- [x] **Tails** (`tails`, [Dictionary mode](docs/dictionary-mode.md)'s "Tails"): a word followed by each of
   a list of tails - `digits:1-2, letters:0-1` makes 2,970, `0` to `9Z`.
   A word is hashed once for a run of its tails rather than once for each:
   the GPU kernels take *cells*, a word and a chunk of up to 32 of its tails
@@ -753,8 +755,8 @@ afternoon).
     2,970; OpenCL 29.4-30.8, 89.1-93.0 and 75.9-77.3. Two words of all of
     `english-1` with those 2,970 tails, 4.8 * 10^13 candidates, would take
     about ten minutes.
-- [x] **Pairs: the last two words on the GPU** (`separators`, README.md's
-  *Dictionary searches on the GPU*). A batch was a leading part - every
+- [x] **Pairs: the last two words on the GPU** (`separators`, [Dictionary
+  searches on the GPU](docs/dictionary-mode.md#dictionary-searches-on-the-gpu)). A batch was a leading part - every
   word but the last - and the list's words after it, so a short list made
   short batches: the first 337 words of `english-1`, five a candidate,
   made batches of 337 candidates (3,707 with `digits:0-1`'s 11 tails),
@@ -819,14 +821,14 @@ afternoon).
 - [ ] **Tune OpenCL and Metal** on their own: both have CUDA's values
   (32 words per thread, 256 threads to a work-group); Metal's kernel has
   only run emulated on the CPU. Each machine can now set its own in
-  config.conf's `[opencl]`/`[metal]`, and `namebreak --autotune` measures
-  them on its GPU (README.md's "Tuning OpenCL and Metal") - the defaults
+  config.conf's `[hardware]` (once `[opencl]`/`[metal]`), and `namebreak --autotune` measures
+  them on its GPU ([Choosing and tuning the hardware](docs/hardware.md)) - the defaults
   are still these.
 
 ## Meet-in-the-middle searches
 
-A meet-in-the-middle search (README.md's [Meet-in-the-middle
-mode](README.md#meet-in-the-middle-mode)) splits the unknown directory
+A meet-in-the-middle search ([Meet-in-the-middle
+mode](docs/meet-in-the-middle.md)) splits the unknown directory
 between a table of its first characters, built on the CPU, and a backward
 walk of its last, which is what a backend runs: one work-item takes a *row*
 - the tails that share every character but the one rewound last - and each
@@ -876,7 +878,7 @@ divided the tails by 43.
 - [x] **Metal.** `meet_in_the_middle.metal`, the OpenCL kernel in Metal's
   shading language, with the OpenCL backend's launch size and 256-thread
   threadgroups. Only run on the CPU through an emulation of Metal so far
-  (see README.md's Backends), so it has **no figures yet** - neither its
+  (see [Backends](docs/backends.md#backends)), so it has **no figures yet** - neither its
   speed nor whether the launch size and threadgroup suit an Apple GPU;
   what it needs is a Mac to measure on.
 
@@ -903,7 +905,8 @@ divided the tails by 43.
 ## Safeguards against missing a match
 
 The filter is proven, tested densely, checked before every search, and every
-backend is self-tested before use (see the README). What's still open:
+backend is self-tested before use (see [The lookup
+filter](docs/lookup-filter.md#what-guards-the-implementation)). What's still open:
 
 - [x] **Canaries from the coordinator.** Now and then, the server hands out
   a range with a target planted in it - the hashes of a known candidate in
@@ -913,7 +916,7 @@ backend is self-tested before use (see the README). What's still open:
   driver bug, a broken release, a modified client. Nothing on the client
   side can do that. *Done* - no protocol change was needed: 5% of claims, a
   few seconds' worth each, shown per volunteer on the dashboard (see the
-  coordinator README's "Canaries").
+  coordinator's [Canaries](../coordinator/docs/how-it-works.md#canaries)).
 - [ ] **Double-checking.** Re-issue a small random sample of finished ranges
   to a different client, and compare the hashA hits both reported (not only
   "found"). A cheaper, statistical form of the above.
@@ -923,7 +926,8 @@ backend is self-tested before use (see the README). What's still open:
 - [ ] **Longer stress runs.** `search_stress_test --budget <candidates>`
   runs longer than ctest's default of 300 million (about 60,000-73,000 hits
   in the default geometry); worth a long run after any change to a kernel.
-- [x] **Mutation testing as a script.** The experiment in the README
+- [x] **Mutation testing as a script.** The experiment in [Tests and
+  benchmarks](docs/testing.md#the-mutation-experiment)
   (deliberately broken CUDA kernels, each of which the self-test, the
   integration test and the stress test must catch on their own) was run by
   hand in three rounds, and each round found a gap in the checks - the best
