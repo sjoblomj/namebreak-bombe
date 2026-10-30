@@ -1704,6 +1704,39 @@ async fn resolve_progress_index(
     Ok(Some(index))
 }
 
+/// How much a client's measured rate may grow from one completed range to
+/// the next - see `blend_rate`.
+const MAX_RATE_GROWTH: f64 = 2.0;
+
+/// A client's new rate, blending `observed_rate` from a range searched in
+/// `elapsed_seconds` into `old_ema` (`None` before its first). A sample
+/// counts in proportion to how much of `target_chunk_seconds` it took: a
+/// range that's mostly pruned (see `Target::prune_unopened_brackets`) is
+/// done in a second, and its candidates a second would otherwise make the
+/// next range thousands of times too big. On top of that the rate never
+/// more than doubles a range - falling, it's only held back by the EMA.
+fn blend_rate(config: &RangeConfig, old_ema: Option<f64>, observed_rate: f64, elapsed_seconds: f64, meet_in_the_middle: bool, dictionary: bool) -> f64 {
+    let weight = (elapsed_seconds / config.target_chunk_seconds).min(1.0);
+    match old_ema {
+        Some(old) => {
+            let alpha = config.ema_alpha * weight;
+            (alpha * observed_rate + (1.0 - alpha) * old).min(old * MAX_RATE_GROWTH)
+        }
+        // Blended with the default the range was sized by, in full if it
+        // took as long as it should have.
+        None => {
+            let default = if meet_in_the_middle {
+                config.default_meet_in_the_middle_rate_per_sec
+            } else if dictionary {
+                config.default_dictionary_rate_per_sec
+            } else {
+                config.default_rate_per_sec
+            };
+            weight * observed_rate + (1.0 - weight) * default
+        }
+    }
+}
+
 pub struct CompleteOutcome {
     pub target_solved: bool,
 }
@@ -1807,10 +1840,7 @@ pub async fn complete_range(
             } else {
                 (user.ema_rate_per_sec, "UPDATE users SET ema_rate_per_sec = ? WHERE id = ?")
             };
-            let new_ema = match old_ema {
-                Some(old) => config.ema_alpha * observed_rate + (1.0 - config.ema_alpha) * old,
-                None => observed_rate,
-            };
+            let new_ema = blend_rate(config, old_ema, observed_rate, elapsed_seconds, range.is_meet_in_the_middle(), range.is_dictionary());
             sqlx::query(sql)
                 .bind(new_ema)
                 .bind(user.id)
@@ -2657,6 +2687,47 @@ mod tests {
     fn bound_indices_at_len(alphabet: &str, lower_bound: &str, upper_bound: &str, len: i64) -> (i64, i64) {
         let (lo, hi) = crate::alphabet::bound_indices_at_len(alphabet, lower_bound, upper_bound, len);
         (i64::try_from(lo).expect("tests here stay within index_width"), i64::try_from(hi).expect("tests here stay within index_width"))
+    }
+
+    /// A range that's done in a second (mostly pruned, say) barely moves the
+    /// client's rate, so the next range isn't thousands of times too big; a
+    /// full one moves it as before, and the rate falls as fast as measured.
+    #[tokio::test]
+    async fn a_range_done_far_too_fast_barely_moves_the_rate() {
+        let pool = test_pool().await;
+        let mut user = insert_user(&pool, "tester").await;
+        let (lower, upper) = full_bounds(DEFAULT, 5);
+        insert_target(&pool, &lower, &upper).await;
+        let mut config = test_config(1);
+        config.target_chunk_seconds = 3600.0;
+        config.max_chunk_candidates = i64::MAX;
+        config.default_rate_per_sec = 1000.0;
+        let ema = |pool: SqlitePool, id| async move {
+            sqlx::query_scalar::<_, Option<f64>>("SELECT ema_rate_per_sec FROM users WHERE id = ?").bind(id).fetch_one(&pool).await.unwrap()
+        };
+
+        // The first range: blended with the default it was sized by.
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work");
+        assert_eq!(claim.candidate_count, 3_600_000);
+        complete_range(&pool, &config, &user, claim.range_id, false, None, 1.0, claim.candidate_count).await.unwrap();
+        user.ema_rate_per_sec = ema(pool.clone(), user.id).await;
+        assert!(user.ema_rate_per_sec.unwrap() < 2001.0, "{:?}", user.ema_rate_per_sec);
+
+        // Then: at most double, however fast.
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work");
+        assert!(claim.candidate_count <= 2 * 3_600_000 + 3600, "{}", claim.candidate_count);
+        let before = user.ema_rate_per_sec.unwrap();
+        complete_range(&pool, &config, &user, claim.range_id, false, None, 0.001 + f64::EPSILON, claim.candidate_count).await.unwrap();
+        user.ema_rate_per_sec = ema(pool.clone(), user.id).await;
+        assert!(user.ema_rate_per_sec.unwrap() <= before * MAX_RATE_GROWTH, "{:?}", user.ema_rate_per_sec);
+
+        // A range that takes the full hour at a tenth of that: the usual EMA.
+        let before = user.ema_rate_per_sec.unwrap();
+        let claim = claim_range(&pool, &config, &user).await.unwrap().expect("work");
+        let observed = before / 10.0;
+        complete_range(&pool, &config, &user, claim.range_id, false, None, claim.candidate_count as f64 / observed, claim.candidate_count).await.unwrap();
+        let after = ema(pool.clone(), user.id).await.unwrap();
+        assert!((after - (0.3 * observed + 0.7 * before)).abs() < 1e-6 * before, "{after} from {before}");
     }
 
     const DEFAULT: &str = " !&'()+,-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_";

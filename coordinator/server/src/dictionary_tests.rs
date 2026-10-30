@@ -529,12 +529,12 @@ async fn a_dictionary_search_has_its_own_rate() {
     let client = user(&state, "u", "1.5.0").await;
     let c = claim(&state, &client).await.unwrap();
     assert_eq!(c.candidate_count, 10, "the default dictionary rate (1 a second), not the alphabet one");
-    complete(&state, &client, c.range_id, None, 4.0, 10, &[]).await.unwrap();
+    complete(&state, &client, c.range_id, None, 10.0, 25, &[]).await.unwrap();
     let client = reload_user(&state, client.id).await;
     assert_eq!((client.ema_dictionary_rate_per_sec, client.ema_rate_per_sec), (Some(2.5), None));
     let c = claim(&state, &client).await.unwrap();
     assert_eq!(c.candidate_count, 25, "2.5 a second for 10 seconds");
-    complete(&state, &client, c.range_id, None, 5.0, 25, &[]).await.unwrap();
+    complete(&state, &client, c.range_id, None, 10.0, 50, &[]).await.unwrap();
     let client = reload_user(&state, client.id).await;
     assert_eq!(client.ema_dictionary_rate_per_sec, Some(0.5 * 5.0 + 0.5 * 2.5));
 }

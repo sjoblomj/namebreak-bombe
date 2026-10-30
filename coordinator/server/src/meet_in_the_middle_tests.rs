@@ -365,10 +365,10 @@ async fn a_completed_range_measures_the_clients_tails_a_second() {
     create(&state, serde_json::json!({})).await.unwrap();
     let client = client(&state, "u").await;
     let claim = claim_work(&state, &client).await.unwrap();
-    complete(&state, &client, claim.range_id, None, 2.0, 100).await.unwrap();
+    complete(&state, &client, claim.range_id, None, 4.0, 200).await.unwrap();
 
     let client = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?").bind(client.id).fetch_one(&state.pool).await.unwrap();
-    assert_eq!(client.ema_meet_in_the_middle_rate_per_sec, Some(50.0), "100 tails in 2 seconds");
+    assert_eq!(client.ema_meet_in_the_middle_rate_per_sec, Some(50.0), "200 tails in 4 seconds");
     assert_eq!((client.ema_rate_per_sec, client.ema_dictionary_rate_per_sec), (None, None), "measured apart from the other searches");
     // And the next claim is sized from it: 50 a second for 4 seconds is more
     // than the next length has at all, so it gets the whole of it.
