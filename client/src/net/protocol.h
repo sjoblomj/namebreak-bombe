@@ -41,7 +41,7 @@
 // and hashTableSize and so on), whatever kind of target it is - which a
 // match of both hashes is checked against, and the false matches that fail
 // it, sent with every report (HeartbeatRequest::falseMatches).
-constexpr const char* kProtocolVersion = "1.7.0";
+constexpr const char* kProtocolVersion = "1.8.0";
 
 // The most basenames one heartbeat, quit or completion carries - the
 // server's MAX_BASENAMES_PER_REPORT. Any more wait for the next report (see
@@ -63,6 +63,12 @@ struct RegisterRequest {
     // This build's release (namebreakVersion() - see common/version.h), so
     // the server can refuse a client that's too old.
     std::string clientRelease;
+    // What this build is for (namebreakPlatform() - see common/version.h) and
+    // the device it searches on (empty if it doesn't say) - informational
+    // only, so that the server can tell which ranges a bug on one kind of
+    // machine affected.
+    std::string platform;
+    std::string device;
     // How much memory, in bytes, this client will give a meet-in-the-middle
     // search's table ([hardware]'s meet_in_the_middle_table_memory - see
     // meet_in_the_middle.h). The server hands out no meet-in-the-middle

@@ -379,6 +379,7 @@ std::string toJson(const RegisterRequest& req) {
     return "{\"username\":" + escapeJsonString(req.username) + ",\"hostname\":" + escapeJsonString(req.hostname) +
            ",\"backend\":" + escapeJsonString(req.backend) + ",\"protocol_version\":" + escapeJsonString(req.protocolVersion) +
            ",\"client_release\":" + escapeJsonString(req.clientRelease) +
+           ",\"platform\":" + escapeJsonString(req.platform) + ",\"device\":" + escapeJsonString(req.device) +
            ",\"meet_in_the_middle_table_bytes\":" + (req.meetInTheMiddleTableBytes ? std::to_string(*req.meetInTheMiddleTableBytes) : "null") + "}";
 }
 

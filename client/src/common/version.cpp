@@ -13,6 +13,26 @@ const char* namebreakVersion() {
     return NAMEBREAK_VERSION;
 }
 
+const char* namebreakPlatform() {
+#if defined(_WIN32)
+#define NAMEBREAK_OS "windows"
+#elif defined(__APPLE__)
+#define NAMEBREAK_OS "macos"
+#elif defined(__linux__)
+#define NAMEBREAK_OS "linux"
+#else
+#define NAMEBREAK_OS "unknown"
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#define NAMEBREAK_ARCH "x86_64"
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define NAMEBREAK_ARCH "arm64"
+#else
+#define NAMEBREAK_ARCH "unknown"
+#endif
+    return NAMEBREAK_OS " " NAMEBREAK_ARCH;
+}
+
 bool ReleaseVersion::operator<(const ReleaseVersion& other) const {
     return std::tie(year, month, day, number) < std::tie(other.year, other.month, other.day, other.number);
 }

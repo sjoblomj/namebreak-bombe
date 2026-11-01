@@ -12,6 +12,10 @@ const char* namebreakVersion();
 
 inline constexpr const char* kDevVersion = "dev";
 
+// The operating system and CPU architecture this build is for ("linux x86_64"),
+// told to the coordinator when registering.
+const char* namebreakPlatform();
+
 // Where releases are published - see update_check.h.
 inline constexpr const char* kReleasesUrl = "https://github.com/sjoblomj/namebreak-bombe/releases";
 

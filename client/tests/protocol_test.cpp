@@ -55,8 +55,10 @@ static void testReports() {
     reg.hostname = "laptop";
     reg.backend = "cuda";
     reg.clientRelease = "dev";
-    check(toJson(reg) == R"({"username":"ojan","hostname":"laptop","backend":"cuda","protocol_version":"1.7.0",)"
-                         R"("client_release":"dev","meet_in_the_middle_table_bytes":null})",
+    reg.platform = "linux x86_64";
+    reg.device = "A Fine GPU";
+    check(toJson(reg) == R"({"username":"ojan","hostname":"laptop","backend":"cuda","protocol_version":"1.8.0",)"
+                         R"("client_release":"dev","platform":"linux x86_64","device":"A Fine GPU","meet_in_the_middle_table_bytes":null})",
           "a registration without meet_in_the_middle_table_memory: no memory for a meet-in-the-middle table");
     reg.meetInTheMiddleTableBytes = 1073741824;
     check(toJson(reg).find(R"("meet_in_the_middle_table_bytes":1073741824})") != std::string::npos, "... and with it, what it will give");

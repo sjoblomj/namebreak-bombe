@@ -27,9 +27,10 @@ public:
     // `meetInTheMiddleTableBytes` is how much memory this client will give a
     // meet-in-the-middle target's table
     // (CoordinatorArgs::meetInTheMiddleTableBytes); 0 sends none, and the
-    // server then hands out no meet-in-the-middle work.
-    bool registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t meetInTheMiddleTableBytes,
-                        RegisterResponse& out,
+    // server then hands out no meet-in-the-middle work. `device` is the
+    // device it searches on, "" if it doesn't say.
+    bool registerClient(const std::string& username, const std::string& hostname, const std::string& backend, const std::string& device,
+                        int64_t meetInTheMiddleTableBytes, RegisterResponse& out,
                         std::string& error);
 
     void setToken(std::string token) { token_ = std::move(token); }

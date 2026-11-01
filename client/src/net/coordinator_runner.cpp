@@ -1179,7 +1179,7 @@ int runWorker(CoordinatorArgs args, WorkerGroup& group, std::unique_ptr<SearchBa
     CoordinatorClient client(args.serverUrl);
     RegisterResponse registration;
     std::string error;
-    if (!client.registerClient(args.username, args.hostname, backend->name(), args.meetInTheMiddleTableBytes, registration, error)) {
+    if (!client.registerClient(args.username, args.hostname, backend->name(), device ? device->name : backend->deviceName(), args.meetInTheMiddleTableBytes, registration, error)) {
         // Too old for the server (see CoordinatorClient::upgradeRequired):
         // its message says what to get.
         std::string msg = client.upgradeRequired() ? error : tag() + " failed to register with coordinator: " + error;

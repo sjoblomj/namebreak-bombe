@@ -236,6 +236,14 @@ def phase2(server, client_binary, workdir, backend):
         written = sorted(line.split("\t")[0] for line in f.read().splitlines())
     check(written == sorted([names[wrong_key], names[wrong_slots]]), "the client wrote both to false_matches.txt")
 
+    clients = server.rows("SELECT DISTINCT r.client_backend, r.client_release, r.client_protocol_version, r.client_platform, r.client_device "
+                          "FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id WHERE u.username = 'new'")
+    check(len(clients) == 1 and clients[0][0] == backend and clients[0][1] and clients[0][2] == "1.8.0" and len(clients[0][3].split()) == 2,
+          "every range says which client searched it: %s" % clients)
+    old_clients = server.rows("SELECT DISTINCT r.client_backend, r.client_release, r.client_protocol_version, r.client_platform, r.client_device "
+                              "FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id WHERE u.username = 'old'")
+    check(old_clients == [("cpu", None, "1.6.0", None, None)], "and an older client's, as much as it says: %s" % old_clients)
+
 
 def main():
     parser = argparse.ArgumentParser()

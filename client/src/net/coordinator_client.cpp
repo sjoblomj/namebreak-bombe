@@ -8,13 +8,15 @@ std::string authHeader(const std::string& token) {
 }
 } // namespace
 
-bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, const std::string& backend, int64_t meetInTheMiddleTableBytes,
-                                       RegisterResponse& out, std::string& error) {
+bool CoordinatorClient::registerClient(const std::string& username, const std::string& hostname, const std::string& backend, const std::string& device,
+                                       int64_t meetInTheMiddleTableBytes, RegisterResponse& out, std::string& error) {
     RegisterRequest req;
     req.username = username;
     req.hostname = hostname;
     req.backend = backend;
     req.clientRelease = namebreakVersion();
+    req.platform = namebreakPlatform();
+    req.device = device;
     if (meetInTheMiddleTableBytes > 0)
         req.meetInTheMiddleTableBytes = meetInTheMiddleTableBytes;
     HttpResponse resp = http_.post(baseUrl_ + "/api/v1/register", {}, toJson(req));
