@@ -40,6 +40,17 @@ fn resolve_client_protocol_version(req: &RegisterRequest) -> Result<Version, App
     Ok(client_version)
 }
 
+/// The most characters kept of anything a client says about itself. A range
+/// keeps a copy of it, so it mustn't be able to fill the disk with it.
+const MAX_CLIENT_DETAIL_CHARS: usize = 200;
+
+/// `detail`, as a client's description of itself is kept: trimmed, and cut
+/// short if it's too long.
+fn client_detail(detail: &str) -> &str {
+    let detail = detail.trim();
+    detail.char_indices().nth(MAX_CLIENT_DETAIL_CHARS).map_or(detail, |(end, _)| detail[..end].trim_end())
+}
+
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
@@ -50,12 +61,15 @@ pub async fn register(
         return Err(AppError::BadRequest("username and hostname are required".into()));
     }
     let client_version = resolve_client_protocol_version(&req)?.to_string();
-    let backend = req.backend.trim();
-    let client_release = req.client_release.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    let backend = client_detail(&req.backend);
+    let client_release = req.client_release.as_deref().map(client_detail).filter(|r| !r.is_empty());
+    let platform = req.platform.as_deref().map(client_detail).filter(|p| !p.is_empty());
+    let device = req.device.as_deref().map(client_detail).filter(|d| !d.is_empty());
     let releases = client_release::load_client_releases(&state.pool).await?;
     client_release::check_minimum(&releases, client_release)?;
 
     let now = now_unix();
+    tracing::info!(username, hostname, backend, client_release, protocol_version = %client_version, platform, device, "a client registered");
 
     if let Some(existing) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ? AND hostname = ?")
         .bind(username)
@@ -66,12 +80,14 @@ pub async fn register(
         // Refreshed on every registration, not just created once: a
         // returning client may have been upgraded (or downgraded) since it
         // last registered, and claim_range always wants the current picture.
-        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ?, client_release = ?, meet_in_the_middle_table_bytes = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET last_seen_at = ?, protocol_version = ?, backend = ?, client_release = ?, meet_in_the_middle_table_bytes = ?, platform = ?, device = ? WHERE id = ?")
             .bind(now)
             .bind(&client_version)
             .bind(backend)
             .bind(client_release)
             .bind(req.meet_in_the_middle_table_bytes)
+            .bind(platform)
+            .bind(device)
             .bind(existing.id)
             .execute(&state.pool)
             .await?;
@@ -84,8 +100,8 @@ pub async fn register(
 
     let token = generate_token();
     let user_id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend, client_release, meet_in_the_middle_table_bytes) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, hostname, token, created_at, last_seen_at, protocol_version, backend, client_release, meet_in_the_middle_table_bytes, platform, device) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(username)
     .bind(hostname)
@@ -96,6 +112,8 @@ pub async fn register(
     .bind(backend)
     .bind(client_release)
     .bind(req.meet_in_the_middle_table_bytes)
+    .bind(platform)
+    .bind(device)
     .fetch_one(&state.pool)
     .await?;
 
@@ -112,7 +130,10 @@ pub async fn claim(
     let releases = client_release::load_client_releases(&state.pool).await?;
     client_release::check_minimum(&releases, user.client_release.as_deref())?;
     match ranges::claim_range(&state.pool, &state.config, &user).await? {
-        Some(resp) => Ok((StatusCode::OK, Json(resp)).into_response()),
+        Some(resp) => {
+            tracing::info!(range_id = resp.range_id, target = %resp.target_name, client = %user.description(), "a range was claimed");
+            Ok((StatusCode::OK, Json(resp)).into_response())
+        }
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
@@ -175,8 +196,9 @@ pub async fn complete(
         req.candidates_processed,
     )
     .await?;
+    tracing::info!(range_id, found = req.found, client = %user.description(), "a range was completed");
     if outcome.target_solved {
-        tracing::info!(range_id, user_id = user.id, "target solved");
+        tracing::info!(range_id, client = %user.description(), "target solved");
         // The name found is a real filename too - see likely_prefixes.rs.
         // In the background, so the client isn't kept waiting for it.
         let state = state.clone();
@@ -1313,7 +1335,16 @@ mod tests {
             protocol_version: protocol_version.to_string(),
             client_release: None,
             meet_in_the_middle_table_bytes: None,
+            platform: None,
+            device: None,
         }
+    }
+
+    #[test]
+    fn client_detail_is_trimmed_and_cut_short() {
+        assert_eq!(client_detail("  A Fine GPU\n"), "A Fine GPU");
+        assert_eq!(client_detail(&"å".repeat(MAX_CLIENT_DETAIL_CHARS)).chars().count(), MAX_CLIENT_DETAIL_CHARS);
+        assert_eq!(client_detail(&"å".repeat(MAX_CLIENT_DETAIL_CHARS + 1)).chars().count(), MAX_CLIENT_DETAIL_CHARS);
     }
 
     #[test]

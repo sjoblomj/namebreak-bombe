@@ -104,7 +104,8 @@ impl std::str::FromStr for Version {
 ///   the false matches that fail it, sent with every report
 ///   (`HeartbeatRequest::false_matches`). Older clients are given neither,
 ///   and the server checks what they find itself (see `false_matches.rs`).
-pub const PROTOCOL_VERSION: Version = Version::new(1, 7, 0);
+/// - 1.8.0 - `RegisterRequest::platform` and `RegisterRequest::device`.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 8, 0);
 
 /// The first protocol version whose clients search dictionary targets.
 pub const DICTIONARY_SINCE: Version = Version::new(1, 5, 0);
@@ -156,6 +157,16 @@ pub struct RegisterRequest {
     /// spare any).
     #[serde(default)]
     pub meet_in_the_middle_table_bytes: Option<i64>,
+    /// The operating system and CPU architecture this client was built for
+    /// (`"linux x86_64"`) - informational only, like `backend`. Missing from
+    /// clients older than protocol 1.8.0.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// The device this client searches on, for a GPU backend (`"NVIDIA
+    /// GeForce RTX 4090"`) - informational only, like `backend`. Missing from
+    /// clients older than protocol 1.8.0.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

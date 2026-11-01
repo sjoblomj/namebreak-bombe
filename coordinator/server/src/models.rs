@@ -38,6 +38,29 @@ pub struct User {
     /// `None` for a client that doesn't say, which gets no meet-in-the-middle
     /// work.
     pub meet_in_the_middle_table_bytes: Option<i64>,
+    /// The operating system and CPU architecture it was built for, and the
+    /// device it searches on, as declared at `/register` time - see
+    /// `namebreak_protocol::RegisterRequest::platform` and `device`.
+    /// Informational only. `None` for what a client doesn't say.
+    pub platform: Option<String>,
+    pub device: Option<String>,
+}
+
+impl User {
+    /// All that's known about this client, for the log.
+    pub fn description(&self) -> String {
+        format!(
+            "{}@{} (user {}, backend {}, release {}, protocol {}, platform {}, device {})",
+            self.username,
+            self.hostname,
+            self.id,
+            if self.backend.is_empty() { "?" } else { &self.backend },
+            self.client_release.as_deref().unwrap_or("?"),
+            self.protocol_version,
+            self.platform.as_deref().unwrap_or("?"),
+            self.device.as_deref().unwrap_or("?"),
+        )
+    }
 }
 
 #[allow(dead_code)]

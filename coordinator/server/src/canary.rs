@@ -415,7 +415,7 @@ fn plan(alphabet: &str, count: Pos) -> Option<CanaryPlan> {
 /// Records a canary's result, when the client completes its range: found if
 /// it reported exactly the planted filename. Its target is then done with -
 /// solved, or paused. Nothing if `range` isn't a canary's.
-pub async fn complete(tx: &mut sqlx::SqliteConnection, range: &Range, found: bool, filename: Option<&str>, now: i64) -> Result<bool, AppError> {
+pub async fn complete(tx: &mut sqlx::SqliteConnection, range: &Range, user: &User, found: bool, filename: Option<&str>, now: i64) -> Result<bool, AppError> {
     let Some(planted): Option<String> = sqlx::query_scalar("SELECT filename FROM canaries WHERE target_id = ?")
         .bind(range.target_id)
         .fetch_optional(&mut *tx)
@@ -438,7 +438,7 @@ pub async fn complete(tx: &mut sqlx::SqliteConnection, range: &Range, found: boo
         .execute(&mut *tx)
         .await?;
     if !passed {
-        tracing::warn!(range_id = range.id, user_id = ?range.last_assigned_user_id, planted, reported = ?filename, "a canary was MISSED");
+        tracing::warn!(range_id = range.id, client = %user.description(), planted, reported = ?filename, "a canary was MISSED");
     }
     Ok(true)
 }

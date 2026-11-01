@@ -416,8 +416,9 @@ pub(crate) async fn insert_claimed_range(
     let (end_block, end_index) = split_end(alphabet, candidate_len, end_index);
     let range_id = sqlx::query_scalar(
         "INSERT INTO ranges (target_id, candidate_len, start_block, start_index, end_block, end_index, status, \
-         assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id, last_progress_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         assigned_user_id, last_assigned_user_id, assigned_at, lease_seconds, lease_expires_at, created_at, alphabet_name, alphabet, priority_range_id, last_progress_at, \
+         client_backend, client_release, client_protocol_version, client_platform, client_device) \
+         VALUES (?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?) RETURNING id",
     )
     .bind(target_id)
     .bind(candidate_len)
@@ -435,9 +436,42 @@ pub(crate) async fn insert_claimed_range(
     .bind(alphabet)
     .bind(priority_range_id)
     .bind(now)
+    .bind(&user.backend)
+    .bind(&user.client_release)
+    .bind(&user.protocol_version)
+    .bind(&user.platform)
+    .bind(&user.device)
     .fetch_one(tx)
     .await?;
     Ok(range_id)
+}
+
+/// Hands the pending row `range_id` to `user`, keeping what's known about that
+/// client on the row (see the migration adding `client_backend`). Whoever had
+/// the row before leaves no checkpoint in it, as `split_off_searched_portion`
+/// has already split off what they searched - so the row only ever describes
+/// the client that searched it.
+async fn assign_range(tx: &mut sqlx::SqliteConnection, range_id: i64, user: &User, lease_seconds: i64, now: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
+         assigned_at = ?, lease_seconds = ?, lease_expires_at = ?, last_progress_at = ?, \
+         client_backend = NULLIF(?, ''), client_release = ?, client_protocol_version = ?, client_platform = ?, client_device = ? WHERE id = ?",
+    )
+    .bind(user.id)
+    .bind(user.id)
+    .bind(now)
+    .bind(lease_seconds)
+    .bind(now + lease_seconds)
+    .bind(now)
+    .bind(&user.backend)
+    .bind(&user.client_release)
+    .bind(&user.protocol_version)
+    .bind(&user.platform)
+    .bind(&user.device)
+    .bind(range_id)
+    .execute(tx)
+    .await?;
+    Ok(())
 }
 
 /// Sets a priority range's own cursor (`next_index` and its block).
@@ -1100,19 +1134,7 @@ async fn claim_work(pool: &SqlitePool, config: &RangeConfig, user: &User) -> Res
             let range = split_off_chunk(&mut tx, range, chunk).await?;
             let lease_seconds = config.lease_seconds;
 
-            sqlx::query(
-                "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
-                 assigned_at = ?, lease_seconds = ?, lease_expires_at = ?, last_progress_at = ? WHERE id = ?",
-            )
-            .bind(user.id)
-            .bind(user.id)
-            .bind(now)
-            .bind(lease_seconds)
-            .bind(now + lease_seconds)
-            .bind(now)
-            .bind(range.id)
-            .execute(&mut *tx)
-            .await?;
+            assign_range(&mut tx, range.id, user, lease_seconds, now).await?;
 
             tx.commit().await?;
             return Ok(Some(to_claim_response(
@@ -1344,19 +1366,7 @@ async fn claim_dictionary_range(
     if let Some(range) = pending {
         let range = split_off_searched_portion(&mut *tx, range, now).await?;
         let range = split_off_chunk(&mut *tx, range, chunk as Pos).await?;
-        sqlx::query(
-            "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
-             assigned_at = ?, lease_seconds = ?, lease_expires_at = ?, last_progress_at = ? WHERE id = ?",
-        )
-        .bind(user.id)
-        .bind(user.id)
-        .bind(now)
-        .bind(lease_seconds)
-        .bind(now + lease_seconds)
-        .bind(now)
-        .bind(range.id)
-        .execute(&mut *tx)
-        .await?;
+        assign_range(&mut *tx, range.id, user, lease_seconds, now).await?;
         let (start, end) = (range.start() as i64, range.end() as i64);
         return Ok(Some(to_dictionary_claim_response(target, &dictionary, range.id, start, end, lease_seconds)));
     }
@@ -1420,19 +1430,7 @@ async fn claim_meet_in_the_middle_range(
     if let Some(range) = pending {
         let range = split_off_searched_portion(&mut *tx, range, now).await?;
         let range = split_off_chunk(&mut *tx, range, chunk as Pos).await?;
-        sqlx::query(
-            "UPDATE ranges SET status = 'in_progress', assigned_user_id = ?, last_assigned_user_id = ?, \
-             assigned_at = ?, lease_seconds = ?, lease_expires_at = ?, last_progress_at = ? WHERE id = ?",
-        )
-        .bind(user.id)
-        .bind(user.id)
-        .bind(now)
-        .bind(lease_seconds)
-        .bind(now + lease_seconds)
-        .bind(now)
-        .bind(range.id)
-        .execute(&mut *tx)
-        .await?;
+        assign_range(&mut *tx, range.id, user, lease_seconds, now).await?;
         let (start, end) = (range.start() as i64, range.end() as i64);
         return Ok(Some(to_meet_in_the_middle_claim_response(target, &meet_in_the_middle, range.id, range.candidate_len, start, end, lease_seconds)));
     }
@@ -1501,7 +1499,7 @@ pub async fn heartbeat_range(
             .await?;
         range.status = "in_progress".into();
         range.assigned_user_id = Some(user.id);
-        tracing::info!(range_id, user_id = user.id, "re-adopted a released range for its returning previous claimant");
+        tracing::info!(range_id, client = %user.description(), "re-adopted a released range for its returning previous claimant");
     }
 
     // True only if this heartbeat's reported progress is genuinely new, not
@@ -1540,6 +1538,7 @@ pub async fn heartbeat_range(
         if now - last_progress_at >= config.stall_release_seconds {
             release_range(&mut tx, &range, now).await?;
             range_released = true;
+            tracing::info!(range_id, client = %user.description(), "released a stalled range");
         } else {
             sqlx::query("UPDATE ranges SET lease_expires_at = ?, last_progress_at = ? WHERE id = ?")
                 .bind(now + lease_seconds)
@@ -1650,7 +1649,7 @@ pub async fn quit_range(
         }
     }
     tx.commit().await?;
-    tracing::info!(range_id, user_id = user.id, progress = ?range.progress(), "client quit its range");
+    tracing::info!(range_id, client = %user.description(), progress = ?range.progress(), "client quit its range");
     Ok(())
 }
 
@@ -1789,7 +1788,7 @@ pub async fn complete_range(
     // A canary's range: its result is recorded, and that's all - its
     // claimant's rate isn't updated (it stops at the planted name), and its
     // virtual target solves nothing else.
-    if owns_range && crate::canary::complete(&mut tx, &range, found, filename.as_deref(), now).await? {
+    if owns_range && crate::canary::complete(&mut tx, &range, user, found, filename.as_deref(), now).await? {
         sqlx::query("UPDATE ranges SET status = 'completed', completed_at = ?, assigned_user_id = ? WHERE id = ?")
             .bind(now)
             .bind(user.id)
@@ -1810,7 +1809,7 @@ pub async fn complete_range(
         let target = sqlx::query_as::<_, Target>("SELECT * FROM targets WHERE id = ?").bind(range.target_id).fetch_one(&mut *tx).await?;
         if let Some((filename, reason)) = filename.as_deref().and_then(|f| crate::false_matches::false_match_reason(&target, f).map(|reason| (f, reason))) {
             crate::false_matches::store(&mut tx, target.id, filename, &reason, user.id, Some(range_id), now).await?;
-            tracing::warn!(range_id, user_id = user.id, target_id = target.id, filename, reason, "a find that's a false match - the target stays unsolved");
+            tracing::warn!(range_id, client = %user.description(), target_id = target.id, filename, reason, "a find that's a false match - the target stays unsolved");
             if owns_range && target.is_virtual == 0 {
                 hand_back_after_false_match(&mut tx, range, filename, now).await?;
             }
@@ -1991,6 +1990,7 @@ pub async fn reclaim_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
 
         release_range(&mut tx, &range, now).await?;
         tx.commit().await?;
+        tracing::info!(range_id = range.id, user_id = ?range.last_assigned_user_id, "a range's lease expired");
         resolved += 1;
     }
 
@@ -2790,6 +2790,8 @@ mod tests {
             protocol_version: "1.0.0".to_string(),
             backend: String::new(),
             client_release: None,
+            platform: None,
+            device: None,
         }
     }
 
@@ -2825,6 +2827,8 @@ mod tests {
             protocol_version: protocol_version.to_string(),
             backend: String::new(),
             client_release: None,
+            platform: None,
+            device: None,
         }
     }
 
@@ -5408,7 +5412,65 @@ mod tests {
         let v = &volunteers[0];
         assert_eq!((v.candidates, v.ranges_completed, v.found), (0, 0, 0), "canaries count towards nothing else");
         assert_eq!((v.canaries_found, v.canaries_total), (1, 2));
+    }
 
+    /// A range says what searched it, as it was then: not what its client
+    /// has since become, and not whoever searches the rest of it.
+    #[tokio::test]
+    async fn a_range_keeps_what_was_known_about_the_client_that_searched_it() {
+        async fn client_of(pool: &SqlitePool, range_id: i64) -> (Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) {
+            sqlx::query_as("SELECT last_assigned_user_id, client_backend, client_release, client_protocol_version, client_platform, client_device FROM ranges WHERE id = ?")
+                .bind(range_id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        let pool = test_pool().await;
+        let (lower, upper) = full_bounds(DEFAULT, 2);
+        insert_target(&pool, &lower, &upper).await;
+        let config = test_config(100);
+
+        let mut first = insert_user(&pool, "first").await;
+        first.backend = "opencl".into();
+        first.client_release = Some("v2026-10-27".into());
+        first.protocol_version = "1.7.0".into();
+        let mut second = insert_user(&pool, "second").await;
+        second.backend = "cpu".into();
+        second.client_release = Some("v2026-11-01".into());
+        second.protocol_version = "1.8.0".into();
+        second.platform = Some("linux x86_64".into());
+        second.device = Some("A Fine GPU".into());
+        let first_client = (Some(first.id), Some("opencl".to_string()), Some("v2026-10-27".to_string()), Some("1.7.0".to_string()), None, None);
+        let second_client = (
+            Some(second.id),
+            Some("cpu".to_string()),
+            Some("v2026-11-01".to_string()),
+            Some("1.8.0".to_string()),
+            Some("linux x86_64".to_string()),
+            Some("A Fine GPU".to_string()),
+        );
+
+        // A freshly carved range.
+        let fresh = claim_range(&pool, &config, &first).await.unwrap().expect("work");
+        assert_eq!(client_of(&pool, fresh.range_id).await, first_client);
+
+        // Part of it searched: that part stays the first client's, even after
+        // it upgrades, and the second client gets the rest as a new range.
+        sqlx::query("UPDATE ranges SET progress_block = start_block, progress_index = start_index + 1 WHERE id = ?").bind(fresh.range_id).execute(&pool).await.unwrap();
+        quit_range(&pool, &first, fresh.range_id, None, None, None).await.unwrap();
+        first.client_release = Some("v2026-11-01".into());
+        let rest = claim_range(&pool, &config, &second).await.unwrap().expect("the rest");
+        assert_ne!(rest.range_id, fresh.range_id);
+        assert_eq!(client_of(&pool, fresh.range_id).await, first_client);
+        assert_eq!(client_of(&pool, rest.range_id).await, second_client);
+
+        // None of it searched: the row itself goes to the next client, whose
+        // details replace those of the one that searched nothing.
+        quit_range(&pool, &second, rest.range_id, None, None, None).await.unwrap();
+        first.client_release = Some("v2026-10-27".into());
+        let again = claim_range(&pool, &config, &first).await.unwrap().expect("the same row");
+        assert_eq!(again.range_id, rest.range_id);
+        assert_eq!(client_of(&pool, again.range_id).await, first_client);
     }
 
 

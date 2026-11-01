@@ -7,7 +7,7 @@ API that sets these up.
   hands back an opaque bearer token. Every other endpoint requires it - this
   is the only thing standing between a real client and a generic bot scraping
   the API, so it's intentionally simple rather than absent.
-- **Protocol versioning** (now 1.7.0 - dictionary targets came with 1.5,
+- **Protocol versioning** (now 1.8.0 - dictionary targets came with 1.5,
   meet-in-the-middle targets with 1.6, false matches with 1.7): every client declares its own `protocol_version`
   (`X.Y.Z`) at `/register`; the server rejects registration outright on a
   MAJOR version mismatch against its own `PROTOCOL_VERSION`
@@ -289,3 +289,27 @@ and a volunteer's candidates, ranges and names found - and the Volunteers
 tab shows them only as "Canaries found/total". A canary still being searched
 isn't counted yet; one given up on (released or reclaimed) counts as not
 found.
+
+## Which client searched a range
+
+Each range keeps what was known about the client that claimed it, as it was
+then: `client_backend`, `client_release`, `client_protocol_version`,
+`client_platform` (operating system and CPU architecture) and `client_device`
+(the GPU), with `last_assigned_user_id` saying who that was. It covers canaries'
+ranges too. A row released with a checkpoint is split, so what was searched and
+what's left are separate rows, each describing its own client. Should one
+release turn out to be broken on one kind of machine, this finds what it searched:
+
+```sql
+SELECT r.id, r.target_id, r.status, u.username, u.hostname
+FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id
+WHERE r.client_release = 'v2026-10-27' AND r.client_backend = 'opencl';
+```
+
+Ranges claimed before these columns existed have NULL in them, and those the
+client doesn't declare (a client older than protocol 1.8 doesn't say its
+platform or device) are NULL too. The details come from the client's last
+`/register`, so two clients running at once under the same username and hostname
+aren't told apart. Claims, completions, quits, stalls, re-adoptions, finds,
+false matches, and missed canaries are also logged with the client's details,
+and expired leases with its user id.
