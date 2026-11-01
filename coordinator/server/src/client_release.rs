@@ -56,7 +56,7 @@ impl std::str::FromStr for Release {
 /// Whether `client` (as the client reported it) is older than `wanted`. A
 /// dev build never is; a missing or unrecognized release always is, since
 /// it's from before clients reported one.
-fn is_older(client: Option<&str>, wanted: &str) -> bool {
+pub(crate) fn is_older(client: Option<&str>, wanted: &str) -> bool {
     let Ok(wanted) = wanted.parse::<Release>() else {
         return false; // only valid ones are ever stored - see set_client_releases
     };

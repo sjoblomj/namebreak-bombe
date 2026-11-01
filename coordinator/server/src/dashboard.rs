@@ -19,11 +19,12 @@ fn as_decimal<S: Serializer>(n: &Pos, serializer: S) -> Result<S::Ok, S::Error> 
 
 use std::sync::Arc;
 
+use crate::client_release::{is_older, Release, DEV_RELEASE};
 use crate::alphabet::{bound_indices_at_len, ceil_index, floor_index, index_to_candidate, join_pos, max_supported_len, space_size, Pos};
 use crate::dictionary::DictionaryTarget;
 use crate::error::AppError;
 use crate::models::{i64_to_u32, PriorityRange, Segment, SkipRange, Target};
-use namebreak_protocol::HashTablePosition;
+use namebreak_protocol::{HashTablePosition, Version, PROTOCOL_VERSION};
 use crate::ranges::{count_within, owned_spans};
 use crate::state::AppState;
 
@@ -58,10 +59,39 @@ pub struct DashboardVolunteer {
     /// Distinct names found: targets sharing a Hash A/Hash B pair are the
     /// same file, solved together by one find, so they count once.
     pub found: i64,
-    /// Canaries (see `canary.rs`) found, of those handed to it that are
-    /// over: completed, or released unfinished (the client quit or stalled).
-    /// One still being searched isn't counted yet. None of the above counts
-    /// a canary.
+    /// Canaries (see `canary.rs`) found, of those it finished searching. One
+    /// it hasn't finished isn't counted: still being searched, or given up on
+    /// (the client quit or stalled), says nothing about whether it would have
+    /// been found. None of the above counts a canary.
+    pub canaries_found: i64,
+    pub canaries_total: i64,
+    /// Each of its hostnames, by candidates searched, then hostname.
+    pub machines: Vec<DashboardMachine>,
+}
+
+/// One hostname of a volunteer: what its client last registered as, and its
+/// share of the volunteer's tallies, which are counted the same way.
+#[derive(Serialize)]
+pub struct DashboardMachine {
+    pub hostname: String,
+    /// `None` for what a client doesn't say - see `models::User`.
+    pub platform: Option<String>,
+    pub backend: Option<String>,
+    pub client_release: Option<String>,
+    /// Whether `client_release` is older than the newest release any client
+    /// has registered with - this server isn't told about releases any other
+    /// way. A dev build's never is; a missing or unrecognized one always is.
+    pub client_release_outdated: bool,
+    pub protocol_version: String,
+    /// Whether `protocol_version` is older than this server's own.
+    pub protocol_version_outdated: bool,
+    /// When the server last heard from it: a registration, or anything sent
+    /// with its token, such as a heartbeat.
+    pub last_seen_at: i64,
+    #[serde(serialize_with = "as_decimal")]
+    pub candidates: Pos,
+    pub ranges_completed: i64,
+    pub found: i64,
     pub canaries_found: i64,
     pub canaries_total: i64,
 }
@@ -70,8 +100,19 @@ pub struct DashboardVolunteer {
 /// candidates searched, then names found, then username.
 pub(crate) async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardVolunteer>, AppError> {
     #[derive(sqlx::FromRow)]
-    struct CompletedRow {
+    struct UserRow {
+        id: i64,
         username: String,
+        hostname: String,
+        platform: Option<String>,
+        backend: Option<String>,
+        client_release: Option<String>,
+        protocol_version: String,
+        last_seen_at: i64,
+    }
+    #[derive(sqlx::FromRow)]
+    struct CompletedRow {
+        user_id: i64,
         candidate_len: i64,
         start_block: i64,
         start_index: i64,
@@ -80,7 +121,7 @@ pub(crate) async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardV
         alphabet: String,
     }
     let completed: Vec<CompletedRow> = sqlx::query_as(
-        "SELECT u.username, r.candidate_len, r.start_block, r.start_index, r.end_block, r.end_index, r.alphabet \
+        "SELECT r.last_assigned_user_id AS user_id, r.candidate_len, r.start_block, r.start_index, r.end_block, r.end_index, r.alphabet \
          FROM ranges r JOIN users u ON u.id = r.last_assigned_user_id JOIN targets t ON t.id = r.target_id \
          WHERE r.status = 'completed' AND t.is_virtual = 0",
     )
@@ -94,11 +135,11 @@ pub(crate) async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardV
     )
     .fetch_all(pool)
     .await?;
-    let hostnames: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>("SELECT username, COUNT(*) FROM users GROUP BY username")
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .collect();
+    let users: Vec<UserRow> = sqlx::query_as(
+        "SELECT id, username, hostname, platform, NULLIF(backend, '') AS backend, client_release, protocol_version, last_seen_at FROM users",
+    )
+    .fetch_all(pool)
+    .await?;
     let found: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
         "SELECT u.username, COUNT(DISTINCT t.hash_a || ':' || t.hash_b) FROM targets t JOIN users u ON u.id = t.found_by_user_id \
          WHERE t.found_filename IS NOT NULL AND t.is_virtual = 0 GROUP BY u.username",
@@ -107,40 +148,90 @@ pub(crate) async fn volunteers(pool: &sqlx::SqlitePool) -> Result<Vec<DashboardV
     .await?
     .into_iter()
     .collect();
-    let canaries: HashMap<String, (i64, i64)> = sqlx::query_as::<_, (String, i64, i64)>(
-        "SELECT u.username, SUM(c.result = 'found'), COUNT(*) FROM canaries c JOIN users u ON u.id = c.user_id \
-         JOIN ranges r ON r.id = c.range_id WHERE c.result != 'pending' OR r.status != 'in_progress' GROUP BY u.username",
+    let found_by_user: HashMap<i64, i64> = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT found_by_user_id, COUNT(DISTINCT hash_a || ':' || hash_b) FROM targets \
+         WHERE found_filename IS NOT NULL AND is_virtual = 0 AND found_by_user_id IS NOT NULL GROUP BY found_by_user_id",
     )
     .fetch_all(pool)
     .await?
     .into_iter()
-    .map(|(username, found, total)| (username, (found, total)))
     .collect();
+    let canaries: HashMap<i64, (i64, i64)> = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT user_id, SUM(result = 'found'), COUNT(*) FROM canaries WHERE result != 'pending' GROUP BY user_id",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(user_id, found, total)| (user_id, (found, total)))
+    .collect();
+
+    let latest_release = users
+        .iter()
+        .filter_map(|user| user.client_release.as_deref())
+        .filter_map(|release| release.parse::<Release>().ok().map(|parsed| (parsed, release.to_string())))
+        .max_by_key(|(parsed, _)| *parsed)
+        .map(|(_, release)| release);
+
+    let mut searched: HashMap<i64, (Pos, i64)> = HashMap::new();
+    for row in completed {
+        let start = join_pos(&row.alphabet, row.candidate_len, row.start_block, row.start_index);
+        let end = join_pos(&row.alphabet, row.candidate_len, row.end_block, row.end_index);
+        let (candidates, ranges) = searched.entry(row.user_id).or_default();
+        *candidates += end - start;
+        *ranges += 1;
+    }
 
     let mut by_username: HashMap<String, DashboardVolunteer> = contributors
         .into_iter()
         .map(|(username,)| {
             let volunteer = DashboardVolunteer {
-                hostnames: hostnames.get(&username).copied().unwrap_or(0),
+                hostnames: 0,
                 found: found.get(&username).copied().unwrap_or(0),
-                canaries_found: canaries.get(&username).map_or(0, |c| c.0),
-                canaries_total: canaries.get(&username).map_or(0, |c| c.1),
+                canaries_found: 0,
+                canaries_total: 0,
                 candidates: 0,
                 ranges_completed: 0,
+                machines: Vec::new(),
                 username: username.clone(),
             };
             (username, volunteer)
         })
         .collect();
-    for row in completed {
-        let Some(volunteer) = by_username.get_mut(&row.username) else { continue };
-        let start = join_pos(&row.alphabet, row.candidate_len, row.start_block, row.start_index);
-        let end = join_pos(&row.alphabet, row.candidate_len, row.end_block, row.end_index);
-        volunteer.candidates += end - start;
-        volunteer.ranges_completed += 1;
+    for user in users {
+        let Some(volunteer) = by_username.get_mut(&user.username) else { continue };
+        let (candidates, ranges_completed) = searched.get(&user.id).copied().unwrap_or_default();
+        let (canaries_found, canaries_total) = canaries.get(&user.id).copied().unwrap_or_default();
+        volunteer.hostnames += 1;
+        volunteer.candidates += candidates;
+        volunteer.ranges_completed += ranges_completed;
+        volunteer.canaries_found += canaries_found;
+        volunteer.canaries_total += canaries_total;
+        let client_release_outdated = match &latest_release {
+            Some(latest) => is_older(user.client_release.as_deref(), latest),
+            None => user.client_release.as_deref() != Some(DEV_RELEASE),
+        };
+        let protocol_version_outdated = user.protocol_version.parse::<Version>().map_or(true, |version| version < PROTOCOL_VERSION);
+        volunteer.machines.push(DashboardMachine {
+            hostname: user.hostname,
+            platform: user.platform,
+            backend: user.backend,
+            client_release: user.client_release,
+            client_release_outdated,
+            protocol_version: user.protocol_version,
+            protocol_version_outdated,
+            last_seen_at: user.last_seen_at,
+            candidates,
+            ranges_completed,
+            found: found_by_user.get(&user.id).copied().unwrap_or(0),
+            canaries_found,
+            canaries_total,
+        });
     }
 
     let mut volunteers: Vec<DashboardVolunteer> = by_username.into_values().collect();
+    for volunteer in &mut volunteers {
+        volunteer.machines.sort_by(|a, b| b.candidates.cmp(&a.candidates).then_with(|| a.hostname.cmp(&b.hostname)));
+    }
     volunteers.sort_by(|a, b| b.candidates.cmp(&a.candidates).then(b.found.cmp(&a.found)).then_with(|| a.username.cmp(&b.username)));
     Ok(volunteers)
 }
@@ -1319,9 +1410,9 @@ mod tests {
         assert_eq!(effective_sweep_position(2, 650, LETTERS, &jumps, "AA", "ZZZ"), (3, 0));
     }
 
-    /// A username's hostnames are counted together; only completed ranges
-    /// count; and two targets solved by one find (same Hash A/Hash B) count
-    /// as one name found.
+    /// A username's hostnames are counted together, and each on its own too;
+    /// only completed ranges count; and two targets solved by one find (same
+    /// Hash A/Hash B) count as one name found.
     #[tokio::test]
     async fn volunteers_are_tallied_per_username_and_ranked_by_candidates() {
         let pool = crate::db::connect("sqlite::memory:").await.unwrap();
@@ -1377,9 +1468,57 @@ mod tests {
             .unwrap();
         }
 
-        let tally: Vec<(String, i64, Pos, i64, i64)> =
-            volunteers(&pool).await.unwrap().into_iter().map(|v| (v.username, v.hostnames, v.candidates, v.ranges_completed, v.found)).collect();
-        assert_eq!(tally, vec![("alice".into(), 2, 250, 2, 0), ("bob".into(), 1, 50, 1, 1)], "carol never claimed anything");
+        sqlx::query("UPDATE users SET platform = 'linux x86_64', client_release = 'v2026-11-01', protocol_version = ?, last_seen_at = 42 WHERE id = ?")
+            .bind(PROTOCOL_VERSION.to_string())
+            .bind(users["b"])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (hostname, result) in [("a", "found"), ("b", "found"), ("b", "missed"), ("b", "pending")] {
+            let target_id: i64 = sqlx::query_scalar(
+                "INSERT INTO targets (name, prefix, suffix, hash_a, hash_b, lower_bound, upper_bound, prune_symbol_runs, alphabet_name, alphabet, status, created_at, is_virtual) \
+                 VALUES ('canary', '', '', 1, 9, 'A', 'Z', 0, 'letters', ?, 'paused', 0, 1) RETURNING id",
+            )
+            .bind(LETTERS)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO canaries (target_id, range_id, user_id, filename, created_at, result) VALUES (?, 0, ?, 'X', 0, ?)")
+                .bind(target_id)
+                .bind(users[hostname])
+                .bind(result)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let all = volunteers(&pool).await.unwrap();
+        let tally: Vec<(&str, i64, Pos, i64, i64, i64, i64)> =
+            all.iter().map(|v| (v.username.as_str(), v.hostnames, v.candidates, v.ranges_completed, v.found, v.canaries_found, v.canaries_total)).collect();
+        assert_eq!(tally, vec![("alice", 2, 250, 2, 0, 2, 3), ("bob", 1, 50, 1, 1, 0, 0)], "carol never claimed anything");
+
+        let machines: Vec<(&str, Pos, i64, i64, i64, i64)> =
+            all[0].machines.iter().map(|m| (m.hostname.as_str(), m.candidates, m.ranges_completed, m.found, m.canaries_found, m.canaries_total)).collect();
+        assert_eq!(machines, vec![("b", 150, 1, 0, 1, 2), ("a", 100, 1, 0, 1, 1)], "by candidates searched, the pending canary not counted");
+        let b = &all[0].machines[0];
+        assert_eq!((b.platform.as_deref(), b.backend.as_deref(), b.client_release.as_deref(), b.last_seen_at), (Some("linux x86_64"), Some("cuda"), Some("v2026-11-01"), 42));
+        assert_eq!(b.protocol_version, PROTOCOL_VERSION.to_string());
+        assert_eq!((b.client_release_outdated, b.protocol_version_outdated), (false, false), "the newest release, and this server's protocol");
+        let a = &all[0].machines[1];
+        assert_eq!((a.client_release_outdated, a.protocol_version_outdated), (true, true), "no release said, and protocol 1.0.0");
+
+        // A dev build isn't outdated, and a release older than the newest is.
+        for (release, outdated) in [("dev", false), ("v2026-10-31", true), ("v2026-11-01", false), ("v2026-11-01.1", false), ("custom", true)] {
+            sqlx::query("UPDATE users SET client_release = ? WHERE id = ?").bind(release).bind(users["a"]).execute(&pool).await.unwrap();
+            let all = volunteers(&pool).await.unwrap();
+            let a = all[0].machines.iter().find(|m| m.hostname == "a").unwrap();
+            assert_eq!(a.client_release_outdated, outdated, "{release}");
+            if release == "v2026-11-01.1" {
+                let b = all[0].machines.iter().find(|m| m.hostname == "b").unwrap();
+                assert!(b.client_release_outdated, "a newer release makes the one before it outdated");
+            }
+        }
+        assert_eq!((all[1].machines[0].hostname.as_str(), all[1].machines[0].found), ("c", 1), "the find is on the machine that made it");
     }
 
     #[test]

@@ -40,7 +40,12 @@ that has claimed work or found a name by candidates searched (the sizes of
 its completed ranges, across all its hostnames - a little generous, since a
 range closed early by a find still counts in full), alongside its completed
 ranges, hostnames and names found (targets sharing a Hash A/Hash B pair are
-one find), and its canaries found out of those handed to it (see below). The
+one find), and its canaries found out of those it finished (see below). Below
+each volunteer, shown until its name is clicked, is a row for each of its
+hostnames with the same tallies, its operating system, architecture, backend,
+client release and protocol version, and when the server last heard from it.
+A release older than the newest any client has registered with, or a protocol
+version older than the server's, is in red; a `dev` build's release never is. The
 **Introduction** tab explains what namebreaking is. The open tab is kept in
 the URL's `#fragment`, so `/#volunteers` links straight to it. Plain
 HTML/CSS/JS (`server/static/dashboard.html`, embedded into the binary at

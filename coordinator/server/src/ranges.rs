@@ -5406,12 +5406,17 @@ mod tests {
         assert_eq!(real_status, "active");
 
         // One more canary, still being searched: not counted yet.
-        claim_range(&pool, &config, &user).await.unwrap().expect("a canary");
+        let abandoned = claim_range(&pool, &config, &user).await.unwrap().expect("a canary");
         let volunteers = crate::dashboard::volunteers(&pool).await.unwrap();
         assert_eq!(volunteers.len(), 1);
         let v = &volunteers[0];
         assert_eq!((v.candidates, v.ranges_completed, v.found), (0, 0, 0), "canaries count towards nothing else");
         assert_eq!((v.canaries_found, v.canaries_total), (1, 2));
+
+        // Given up on: not a failure, so it isn't counted at all.
+        quit_range(&pool, &user, abandoned.range_id, None, None, None).await.unwrap();
+        let volunteers = crate::dashboard::volunteers(&pool).await.unwrap();
+        assert_eq!((volunteers[0].canaries_found, volunteers[0].canaries_total), (1, 2));
     }
 
     /// A range says what searched it, as it was then: not what its client

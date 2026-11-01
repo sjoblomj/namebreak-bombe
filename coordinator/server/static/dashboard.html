@@ -195,6 +195,28 @@
   .false-matches-table td.reason { white-space: normal; min-width: 240px; }
   .false-matches-table .candidate { white-space: pre; overflow-wrap: normal; }
   .volunteers-table td.canary-missed { color: var(--b-hip); font-weight: 600; }
+  .volunteers-table tr.volunteer-row td { font-weight: 600; }
+  .volunteers-table tr.volunteer-row td.rank { font-weight: normal; }
+  .volunteers-table tr.machine-row[hidden] { display: none; }
+  .volunteers-table tr.machine-row td { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .volunteers-table tr.machine-row td.canary-missed { color: var(--b-hip); }
+  .volunteers-table td.machine-name { padding-left: 26px; }
+  .volunteers-table .version-outdated { color: var(--b-hip); font-weight: 600; }
+  .machine-platform { display: inline-flex; align-items: center; gap: 5px; }
+  /* A volunteer's name doubles as the button hiding its machines. */
+  .volunteer-toggle {
+    all: unset;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .volunteer-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .volunteer-toggle::before {
+    content: '\25B8';
+    display: inline-block;
+    width: 14px;
+    color: var(--muted);
+  }
+  .volunteer-toggle[aria-expanded="true"]::before { transform: rotate(90deg); transform-origin: 4px 50%; }
   .target-card {
     background: var(--card-bg);
     border: 1px solid var(--border);
@@ -736,18 +758,21 @@
   <div class="page-panel" id="page-volunteers" role="tabpanel" hidden>
     <div class="panel-card">
       <p class="volunteers-intro">Everyone who has searched a range or found a name, by how many candidates they've searched
-        - counting completed ranges only, across all their machines. Canaries are small ranges with a name planted in
+        - counting completed ranges only, with a row below each volunteer for each of their machines. Canaries are small ranges with a name planted in
         them, now and then handed out instead of real work, to check that a volunteer's machine finds what it should; they
         count towards nothing else.</p>
       <div class="table-scroll">
         <table class="volunteers-table">
           <thead><tr><th title="Rank, by candidates searched, then names found, then username">#</th>
-            <th title="The username the volunteer's clients register with">Volunteer</th>
-            <th class="num" title="Candidates in the ranges the volunteer has completed, across all its machines. A range cut short because its target was solved still counts in full.">Candidates searched</th>
-            <th class="num" title="Ranges the volunteer has completed">Ranges</th>
+            <th title="The username the volunteer's clients register with, and below it the hostname of each of their machines. Click a username to hide or show its machines.">Volunteer</th>
+            <th class="num" title="Candidates in the ranges the volunteer or machine has completed. A range cut short because its target was solved still counts in full.">Candidates searched</th>
+            <th class="num" title="Ranges the volunteer or machine has completed">Ranges</th>
             <th class="num" title="How many machines (hostnames) the volunteer has run a client on">Hostnames</th>
-            <th class="num" title="Names the volunteer has found. Targets with the same Hash A and Hash B are the same file, so finding it counts once.">Names found</th>
-            <th class="num" title="Canaries found, of those handed to the volunteer: small ranges with a name planted in them, which check that its machine finds what it should. Not counted in the other columns.">Canaries</th></tr></thead>
+            <th class="num" title="Names the volunteer or machine has found. Targets with the same Hash A and Hash B are the same file, so finding it counts once.">Names found</th>
+            <th class="num" title="Canaries found, of those the volunteer or machine finished searching: small ranges with a name planted in them, which check that a machine finds what it should. Not counted in the other columns.">Canaries</th>
+            <th title="The machine's operating system and CPU architecture, and the backend it searches with, as its client last registered. A client older than protocol 1.8 doesn't say the first two.">OS and architecture / backend</th>
+            <th title="The client release and protocol version the machine's client last registered with. In red if older than the newest release any client has registered with, or than the server's protocol version. A dev build's release is never red.">Client / protocol</th>
+            <th title="When the server last heard from the machine, in your local time">Last contact</th></tr></thead>
           <tbody id="volunteers"></tbody>
         </table>
       </div>
@@ -807,13 +832,17 @@
   })();
 
   // The Volunteers tab's table - see dashboard.rs's DashboardVolunteer.
+  // The volunteers whose machines the viewer has hidden - the table is redrawn
+  // every refresh, so this is kept outside it.
+  const collapsedVolunteers = new Set();
+
   function renderVolunteers(volunteers) {
     const tbody = document.getElementById('volunteers');
     tbody.replaceChildren();
     if (volunteers.length === 0) {
       const tr = document.createElement('tr');
       const td = document.createElement('td');
-      td.colSpan = 7;
+      td.colSpan = 10;
       td.className = 'loading';
       td.textContent = 'No volunteers yet.';
       tr.appendChild(td);
@@ -822,26 +851,79 @@
     }
     // Each cell explains itself the same way its column's header does.
     const headerTitles = [...tbody.closest('table').tHead.rows[0].cells].map((th) => th.title);
-    volunteers.forEach((v, i) => {
+    const addRow = (className, cells) => {
       const tr = document.createElement('tr');
-      const cells = [
-        [String(i + 1), 'rank'],
-        [v.username, ''],
-        [fmtNum(v.candidates), 'num mono'],
-        [fmtNum(v.ranges_completed), 'num mono'],
-        [fmtNum(v.hostnames), 'num mono'],
-        [fmtNum(v.found), 'num mono'],
-        [v.canaries_total > 0 ? `${fmtNum(v.canaries_found)}/${fmtNum(v.canaries_total)}` : '-',
-         v.canaries_found < v.canaries_total ? 'num mono canary-missed' : 'num mono'],
-      ];
-      cells.forEach(([text, className], column) => {
+      tr.className = className;
+      cells.forEach(([content, cellClass], column) => {
         const td = document.createElement('td');
-        td.className = className;
-        td.textContent = text;
+        td.className = cellClass;
         td.title = headerTitles[column];
+        td.append(content);
         tr.appendChild(td);
       });
       tbody.appendChild(tr);
+      return tr;
+    };
+    // The columns a volunteer and its machines both have, counted the same way.
+    const tallies = (v) => [
+      [fmtNum(v.candidates), 'num mono'],
+      [fmtNum(v.ranges_completed), 'num mono'],
+    ];
+    const canaries = (v) => [
+      v.canaries_total > 0 ? `${fmtNum(v.canaries_found)}/${fmtNum(v.canaries_total)}` : '-',
+      v.canaries_found < v.canaries_total ? 'num mono canary-missed' : 'num mono',
+    ];
+    volunteers.forEach((v, i) => {
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'volunteer-toggle';
+      toggle.textContent = v.username;
+      toggle.setAttribute('aria-expanded', String(!collapsedVolunteers.has(v.username)));
+      addRow('volunteer-row', [
+        [String(i + 1), 'rank'],
+        [toggle, ''],
+        ...tallies(v),
+        [fmtNum(v.hostnames), 'num mono'],
+        [fmtNum(v.found), 'num mono'],
+        canaries(v),
+        ['', ''], ['', ''], ['', ''],
+      ]);
+      const machineRows = v.machines.map((m) => {
+        const platform = document.createElement('span');
+        platform.className = 'machine-platform';
+        const badge = backendBadge(m.backend);
+        if (badge) platform.append(badge);
+        platform.append([m.platform, m.backend].filter(Boolean).join(' / ') || '-');
+        const versions = document.createDocumentFragment();
+        const version = (text, outdated) => {
+          const span = document.createElement('span');
+          if (outdated) span.className = 'version-outdated';
+          span.textContent = text;
+          return span;
+        };
+        versions.append(version(m.client_release || '-', m.client_release_outdated), ' / ', version(m.protocol_version, m.protocol_version_outdated));
+        const tr = addRow('machine-row', [
+          ['', 'rank'],
+          [m.hostname, 'machine-name'],
+          ...tallies(m),
+          ['', 'num mono'],
+          [fmtNum(m.found), 'num mono'],
+          canaries(m),
+          [platform, ''],
+          [versions, 'mono'],
+          ['', 'mono'],
+        ]);
+        setTimeCell(tr.lastChild, m.last_seen_at);
+        tr.hidden = collapsedVolunteers.has(v.username);
+        return tr;
+      });
+      toggle.addEventListener('click', () => {
+        const collapse = !collapsedVolunteers.has(v.username);
+        if (collapse) collapsedVolunteers.add(v.username);
+        else collapsedVolunteers.delete(v.username);
+        toggle.setAttribute('aria-expanded', String(!collapse));
+        machineRows.forEach((tr) => { tr.hidden = collapse; });
+      });
     });
   }
 

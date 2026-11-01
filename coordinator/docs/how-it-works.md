@@ -286,9 +286,9 @@ only, the planted directory's. Its result goes in the `canaries` table
 targets (`targets.is_virtual`) are left out of everything else - other
 claims, the dashboard's targets and ranges, `/status`, the rate estimate,
 and a volunteer's candidates, ranges and names found - and the Volunteers
-tab shows them only as "Canaries found/total". A canary still being searched
-isn't counted yet; one given up on (released or reclaimed) counts as not
-found.
+tab shows them only as "Canaries found/total". Only the ones a client finished
+searching count: one still being searched, or given up on (released or
+reclaimed), says nothing about whether it would have been found.
 
 ## Which client searched a range
 
